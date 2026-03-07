@@ -1,0 +1,20 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build output
+dist/
+
+# Wrangler
+.wrangler/
+
+# Logs
+*.log
+
+# Environment / secrets
+.env
+.dev.vars
+
+# Large reference files
+kumo-component-registry.json
+kumo-readme.md
