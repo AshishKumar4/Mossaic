@@ -131,6 +131,22 @@ export interface TransferProgress {
   estimatedRemainingMs: number;
   chunks: ChunkProgress[];
   startedAt: number;
+  completedAt?: number;
+  peakThroughputBps?: number;
+  averageThroughputBps?: number;
+}
+
+// ── Transfer Speed Stats (frontend) ──
+
+export interface CompletedTransferStats {
+  fileId: string;
+  fileName: string;
+  direction: "upload" | "download";
+  fileSize: number;
+  durationMs: number;
+  averageThroughputBps: number;
+  peakThroughputBps: number;
+  completedAt: number;
 }
 
 // ── Analytics / Stats ──
@@ -170,6 +186,8 @@ export interface RecentUpload {
   mimeType: string;
   status: string;
   createdAt: number;
+  uploadDurationMs?: number;
+  averageSpeedBps?: number;
 }
 
 export interface UserStats {
@@ -192,6 +210,54 @@ export interface AnalyticsOverview {
     totalRefs: number;
     averageDedupRatio: number;
   };
+}
+
+// ── Gallery Types ──
+
+export interface GalleryPhoto {
+  fileId: string;
+  fileName: string;
+  fileSize: number;
+  mimeType: string;
+  parentId: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface GalleryPhotosResponse {
+  photos: GalleryPhoto[];
+}
+
+export interface Album {
+  id: string;
+  name: string;
+  photoIds: string[];
+  coverPhotoId: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface SharedAlbum {
+  token: string;
+  albumId: string;
+  createdAt: number;
+}
+
+export interface SharedAlbumData {
+  userId: string;
+  fileIds: string[];
+  albumName: string;
+}
+
+export interface SharedAlbumPhotosResponse {
+  albumName: string;
+  photos: {
+    fileId: string;
+    fileName: string;
+    fileSize: number;
+    mimeType: string;
+    createdAt: number;
+  }[];
 }
 
 // ── Env Bindings (Worker) ──

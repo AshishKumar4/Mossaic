@@ -15,6 +15,9 @@ dist/
 .env
 .dev.vars
 
+# TypeScript build info
+*.tsbuildinfo
+
 # Large reference files
 kumo-component-registry.json
 kumo-readme.md

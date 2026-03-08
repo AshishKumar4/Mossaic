@@ -1,7 +1,11 @@
-/**
- * Format bytes into human-readable string.
- */
-export function formatBytes(bytes: number, decimals: number = 1): string {
+import { type ClassValue, clsx } from "clsx";
+import { twMerge } from "tailwind-merge";
+
+export function cn(...inputs: ClassValue[]) {
+  return twMerge(clsx(inputs));
+}
+
+export function formatBytes(bytes: number, decimals = 1): string {
   if (bytes === 0) return "0 B";
   const k = 1024;
   const sizes = ["B", "KB", "MB", "GB", "TB"];
@@ -9,22 +13,19 @@ export function formatBytes(bytes: number, decimals: number = 1): string {
   return `${parseFloat((bytes / Math.pow(k, i)).toFixed(decimals))} ${sizes[i]}`;
 }
 
-/**
- * Format a timestamp into a human-readable date string.
- */
 export function formatDate(timestamp: number): string {
   const date = new Date(timestamp);
   const now = new Date();
-  const diffMs = now.getTime() - date.getTime();
-  const diffMins = Math.floor(diffMs / 60000);
-  const diffHours = Math.floor(diffMs / 3600000);
-  const diffDays = Math.floor(diffMs / 86400000);
+  const diff = now.getTime() - date.getTime();
+  const seconds = Math.floor(diff / 1000);
+  const minutes = Math.floor(seconds / 60);
+  const hours = Math.floor(minutes / 60);
+  const days = Math.floor(hours / 24);
 
-  if (diffMins < 1) return "Just now";
-  if (diffMins < 60) return `${diffMins}m ago`;
-  if (diffHours < 24) return `${diffHours}h ago`;
-  if (diffDays < 7) return `${diffDays}d ago`;
-
+  if (seconds < 60) return "just now";
+  if (minutes < 60) return `${minutes}m ago`;
+  if (hours < 24) return `${hours}h ago`;
+  if (days < 7) return `${days}d ago`;
   return date.toLocaleDateString("en-US", {
     month: "short",
     day: "numeric",
@@ -32,70 +33,34 @@ export function formatDate(timestamp: number): string {
   });
 }
 
-/**
- * Format throughput in human-readable form.
- */
-export function formatThroughput(bytesPerSecond: number): string {
-  if (bytesPerSecond === 0) return "0 B/s";
-  return `${formatBytes(bytesPerSecond)}/s`;
+export function formatDuration(ms: number): string {
+  if (ms < 1000) return "< 1s";
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  if (m < 60) return `${m}m ${rem}s`;
+  const h = Math.floor(m / 60);
+  return `${h}h ${m % 60}m`;
 }
 
-/**
- * Format milliseconds into a time string.
- */
-export function formatTimeRemaining(ms: number): string {
-  if (ms <= 0 || !isFinite(ms)) return "--";
-  const seconds = Math.ceil(ms / 1000);
-  if (seconds < 60) return `${seconds}s`;
-  const minutes = Math.floor(seconds / 60);
-  const secs = seconds % 60;
-  if (minutes < 60) return `${minutes}m ${secs}s`;
-  const hours = Math.floor(minutes / 60);
-  const mins = minutes % 60;
-  return `${hours}h ${mins}m`;
-}
-
-/**
- * Detect file type category from MIME type.
- */
-export function getFileCategory(
-  mimeType: string
-): "image" | "video" | "audio" | "document" | "archive" | "other" {
+export function getMimeIcon(mimeType: string): string {
   if (mimeType.startsWith("image/")) return "image";
   if (mimeType.startsWith("video/")) return "video";
   if (mimeType.startsWith("audio/")) return "audio";
-  if (
-    mimeType.startsWith("text/") ||
-    mimeType.includes("pdf") ||
-    mimeType.includes("document") ||
-    mimeType.includes("spreadsheet") ||
-    mimeType.includes("presentation")
-  ) {
-    return "document";
-  }
-  if (
-    mimeType.includes("zip") ||
-    mimeType.includes("tar") ||
-    mimeType.includes("gzip") ||
-    mimeType.includes("rar") ||
-    mimeType.includes("7z")
-  ) {
-    return "archive";
-  }
-  return "other";
+  if (mimeType.includes("pdf")) return "pdf";
+  if (mimeType.includes("zip") || mimeType.includes("archive") || mimeType.includes("compressed")) return "archive";
+  if (mimeType.includes("text") || mimeType.includes("json") || mimeType.includes("xml")) return "text";
+  return "file";
 }
 
-/**
- * Get file extension from filename.
- */
 export function getFileExtension(fileName: string): string {
   const parts = fileName.split(".");
   return parts.length > 1 ? parts[parts.length - 1].toLowerCase() : "";
 }
 
-/**
- * Classify names utility.
- */
-export function cn(...classes: (string | false | null | undefined)[]): string {
-  return classes.filter(Boolean).join(" ");
+export function truncateMiddle(str: string, maxLen: number): string {
+  if (str.length <= maxLen) return str;
+  const half = Math.floor((maxLen - 3) / 2);
+  return str.slice(0, half) + "..." + str.slice(-half);
 }

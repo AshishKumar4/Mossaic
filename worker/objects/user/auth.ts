@@ -38,7 +38,7 @@ export async function handleSignup(
   );
 
   durableObject.sql.exec(
-    `INSERT INTO quota (user_id, storage_used, storage_limit, file_count, pool_size)
+    `INSERT OR IGNORE INTO quota (user_id, storage_used, storage_limit, file_count, pool_size)
      VALUES (?, 0, 107374182400, 0, 32)`,
     userId
   );

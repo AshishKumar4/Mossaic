@@ -7,6 +7,8 @@ import downloadRoutes from "./routes/download";
 import filesRoutes from "./routes/files";
 import foldersRoutes from "./routes/folders";
 import analyticsRoutes from "./routes/analytics";
+import galleryRoutes from "./routes/gallery";
+import sharedRoutes from "./routes/shared";
 
 export { UserDO } from "./objects/user/index";
 export { ShardDO } from "./objects/shard/index";
@@ -39,6 +41,8 @@ app.route("/api/download", downloadRoutes);
 app.route("/api/files", filesRoutes);
 app.route("/api/folders", foldersRoutes);
 app.route("/api/analytics", analyticsRoutes);
+app.route("/api/gallery", galleryRoutes);
+app.route("/api/shared", sharedRoutes);
 
 // Health check
 app.get("/api/health", (c) => c.json({ status: "ok", timestamp: Date.now() }));

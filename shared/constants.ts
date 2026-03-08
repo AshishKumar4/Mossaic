@@ -7,8 +7,11 @@ export const BASE_POOL_SIZE = 32;
 /** Add 1 shard per this many bytes stored */
 export const BYTES_PER_SHARD = 5 * 1024 * 1024 * 1024; // 5 GB
 
-/** Maximum file size: 10 GB */
-export const MAX_FILE_SIZE = 10 * 1024 * 1024 * 1024;
+/**
+ * No per-file size limit. Files are chunked into 1 MB pieces distributed
+ * across unlimited ShardDOs (each up to 10 GB). The real constraint is
+ * the user's storage quota (DEFAULT_STORAGE_LIMIT).
+ */
 
 /** Default storage quota: 100 GB */
 export const DEFAULT_STORAGE_LIMIT = 100 * 1024 * 1024 * 1024;

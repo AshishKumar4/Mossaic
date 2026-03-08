@@ -247,6 +247,29 @@ export class UserDO extends DurableObject<Env> {
         return Response.json(folderPath);
       }
 
+      // Gallery route — list all images across all folders
+      if (path === "/gallery/photos" && method === "POST") {
+        const body = (await request.json()) as { userId: string };
+        const rows = this.sql
+          .exec(
+            "SELECT file_id, file_name, file_size, mime_type, parent_id, created_at, updated_at FROM files WHERE user_id = ? AND status = 'complete' AND mime_type LIKE 'image/%' ORDER BY created_at DESC",
+            body.userId
+          )
+          .toArray();
+
+        const photos = rows.map((r: Record<string, unknown>) => ({
+          fileId: r.file_id as string,
+          fileName: r.file_name as string,
+          fileSize: r.file_size as number,
+          mimeType: r.mime_type as string,
+          parentId: (r.parent_id as string) || null,
+          createdAt: r.created_at as number,
+          updatedAt: r.updated_at as number,
+        }));
+
+        return Response.json({ photos });
+      }
+
       // Stats route
       if (path === "/stats" && method === "POST") {
         const body = (await request.json()) as { userId: string };
@@ -303,6 +326,11 @@ export class UserDO extends DurableObject<Env> {
       }
     }
 
+    // Derive totalFiles from actual files table for consistency —
+    // the quota row may be stale or missing, so count non-deleted files directly
+    const actualFileCount =
+      filesByStatus.complete + filesByStatus.uploading + filesByStatus.failed;
+
     // Mime type distribution
     const mimeRows = this.sql
       .exec(
@@ -355,7 +383,7 @@ export class UserDO extends DurableObject<Env> {
     }));
 
     return {
-      totalFiles: quota.file_count,
+      totalFiles: Math.max(actualFileCount, quota.file_count),
       totalStorageUsed: quota.storage_used,
       quotaLimit: quota.storage_limit,
       filesByStatus,
