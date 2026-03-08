@@ -1,4 +1,4 @@
-import { CHUNK_SIZE } from "./constants";
+import { MAX_BLOB_SIZE } from "./constants";
 
 export interface ChunkComputeResult {
   chunkSize: number;
@@ -7,15 +7,37 @@ export interface ChunkComputeResult {
 }
 
 /**
+ * Adaptive chunk size based on total file size.
+ *
+ * - ≤ 1 MB  → single chunk (returns fileSize)
+ * - 1–64 MB → 1 MB chunks
+ * - 64–512 MB → 1.5 MB chunks
+ * - 512 MB+ → 2 MB chunks (DO SQLite blob limit)
+ */
+export function getAdaptiveChunkSize(fileSize: number): number {
+  const _1MB = 1_048_576;
+  const _64MB = 64 * _1MB;
+  const _512MB = 512 * _1MB;
+
+  if (fileSize <= _1MB) return fileSize;
+  if (fileSize <= _64MB) return _1MB;
+  if (fileSize <= _512MB) return Math.floor(1.5 * _1MB); // 1,572,864
+  return MAX_BLOB_SIZE; // 2 MB — DO blob limit
+}
+
+/**
  * Compute chunk specification for a given file size.
- * Files <= 1 MB are a single chunk. All others use fixed 1 MB chunks.
+ * Uses adaptive chunk sizing: small files are a single chunk,
+ * larger files use progressively bigger chunks up to the DO blob limit.
  */
 export function computeChunkSpec(fileSize: number): ChunkComputeResult {
   if (fileSize <= 0) {
     return { chunkSize: 0, chunkCount: 0, lastChunkSize: 0 };
   }
 
-  if (fileSize <= CHUNK_SIZE) {
+  const chunkSize = getAdaptiveChunkSize(fileSize);
+
+  if (fileSize <= chunkSize) {
     return {
       chunkSize: fileSize,
       chunkCount: 1,
@@ -23,11 +45,11 @@ export function computeChunkSpec(fileSize: number): ChunkComputeResult {
     };
   }
 
-  const chunkCount = Math.ceil(fileSize / CHUNK_SIZE);
-  const lastChunkSize = fileSize - (chunkCount - 1) * CHUNK_SIZE;
+  const chunkCount = Math.ceil(fileSize / chunkSize);
+  const lastChunkSize = fileSize - (chunkCount - 1) * chunkSize;
 
   return {
-    chunkSize: CHUNK_SIZE,
+    chunkSize,
     chunkCount,
     lastChunkSize,
   };

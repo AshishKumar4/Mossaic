@@ -12,6 +12,11 @@ import type {
   GalleryPhotosResponse,
   SharedAlbumPhotosResponse,
 } from "@shared/types";
+import type {
+  SearchResult,
+  ProviderStatus,
+  SearchProviderConfig,
+} from "@shared/embedding-types";
 
 const API_BASE = "/api";
 
@@ -206,6 +211,52 @@ class ApiClient {
 
   getSharedImageUrl(token: string, fileId: string): string {
     return `${API_BASE}/shared/${token}/image/${fileId}`;
+  }
+
+  // Search
+  async semanticSearch(
+    query: string,
+    topK?: number,
+    provider?: string
+  ): Promise<{ results: SearchResult[]; provider: string; query: string }> {
+    return this.request<{ results: SearchResult[]; provider: string; query: string }>(
+      "/search",
+      {
+        method: "POST",
+        body: JSON.stringify({ query, topK, provider }),
+      }
+    );
+  }
+
+  async getSearchProviders(): Promise<{
+    providers: ProviderStatus[];
+    active: SearchProviderConfig;
+    indexedCount: number;
+  }> {
+    return this.request<{
+      providers: ProviderStatus[];
+      active: SearchProviderConfig;
+      indexedCount: number;
+    }>("/search/providers");
+  }
+
+  async setSearchConfig(
+    config: Partial<SearchProviderConfig>
+  ): Promise<{ ok: boolean; config: Partial<SearchProviderConfig> }> {
+    return this.request<{ ok: boolean; config: Partial<SearchProviderConfig> }>(
+      "/search/config",
+      {
+        method: "POST",
+        body: JSON.stringify(config),
+      }
+    );
+  }
+
+  async reindexSearch(): Promise<{ ok: boolean; indexed: number; provider: string }> {
+    return this.request<{ ok: boolean; indexed: number; provider: string }>(
+      "/search/reindex",
+      { method: "POST", body: JSON.stringify({}) }
+    );
   }
 }
 
