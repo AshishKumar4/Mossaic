@@ -41,6 +41,17 @@ export function checkQuota(
 }
 
 /**
+ * Ensure a quota row exists for a user, inserting defaults if missing.
+ */
+export function ensureQuotaRow(durableObject: UserDO, userId: string): void {
+  durableObject.sql.exec(
+    `INSERT OR IGNORE INTO quota (user_id, storage_used, storage_limit, file_count, pool_size)
+     VALUES (?, 0, 107374182400, 0, 32)`,
+    userId
+  );
+}
+
+/**
  * Update storage usage after file upload/deletion.
  */
 export function updateUsage(
@@ -49,6 +60,10 @@ export function updateUsage(
   deltaBytes: number,
   deltaFiles: number
 ): void {
+  // Ensure the quota row exists before updating (handles edge cases
+  // where the row was never created or was somehow deleted)
+  ensureQuotaRow(durableObject, userId);
+
   durableObject.sql.exec(
     `UPDATE quota SET storage_used = storage_used + ?, file_count = file_count + ? WHERE user_id = ?`,
     deltaBytes,

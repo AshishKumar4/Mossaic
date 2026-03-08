@@ -1,13 +1,16 @@
 import type {
   AuthResponse,
+  FileListResponse,
   UploadInitRequest,
   UploadInitResponse,
-  FileListResponse,
-  FileManifest,
   CreateFolderRequest,
   Folder,
-  QuotaInfo,
+  FileManifest,
   AnalyticsOverview,
+  ApiError as ApiErrorResponse,
+  UserFile,
+  GalleryPhotosResponse,
+  SharedAlbumPhotosResponse,
 } from "@shared/types";
 
 const API_BASE = "/api";
@@ -15,7 +18,7 @@ const API_BASE = "/api";
 class ApiClient {
   private token: string | null = null;
 
-  setToken(token: string | null): void {
+  setToken(token: string | null) {
     this.token = token;
   }
 
@@ -49,10 +52,10 @@ class ApiClient {
     });
 
     if (!res.ok) {
-      const err = await res.json().catch(() => ({ error: "Request failed" }));
-      throw new Error(
-        (err as { error?: string }).error || `HTTP ${res.status}`
-      );
+      const err: ApiErrorResponse = await res.json().catch(() => ({
+        error: `HTTP ${res.status}`,
+      }));
+      throw new ApiError(err.error || `Request failed: ${res.status}`, res.status);
     }
 
     return res.json() as Promise<T>;
@@ -60,14 +63,14 @@ class ApiClient {
 
   // Auth
   async signup(email: string, password: string): Promise<AuthResponse> {
-    return this.request("/auth/signup", {
+    return this.request<AuthResponse>("/auth/signup", {
       method: "POST",
       body: JSON.stringify({ email, password }),
     });
   }
 
   async login(email: string, password: string): Promise<AuthResponse> {
-    return this.request("/auth/login", {
+    return this.request<AuthResponse>("/auth/login", {
       method: "POST",
       body: JSON.stringify({ email, password }),
     });
@@ -75,17 +78,35 @@ class ApiClient {
 
   // Files
   async listFiles(parentId?: string | null): Promise<FileListResponse> {
-    const query = parentId ? `?parentId=${parentId}` : "";
-    return this.request(`/files${query}`);
+    const params = parentId ? `?parentId=${parentId}` : "";
+    return this.request<FileListResponse>(`/files${params}`);
   }
 
-  async deleteFile(fileId: string): Promise<void> {
-    await this.request(`/files/${fileId}`, { method: "DELETE" });
+  async deleteFile(fileId: string): Promise<{ ok: boolean }> {
+    return this.request<{ ok: boolean }>(`/files/${fileId}`, {
+      method: "DELETE",
+    });
+  }
+
+  // Folders
+  async createFolder(data: CreateFolderRequest): Promise<Folder> {
+    return this.request<Folder>("/folders", {
+      method: "POST",
+      body: JSON.stringify(data),
+    });
+  }
+
+  async getFolder(
+    folderId: string
+  ): Promise<FileListResponse & { path: Folder[] }> {
+    return this.request<FileListResponse & { path: Folder[] }>(
+      `/folders/${folderId}`
+    );
   }
 
   // Upload
-  async initUpload(data: UploadInitRequest): Promise<UploadInitResponse> {
-    return this.request("/upload/init", {
+  async uploadInit(data: UploadInitRequest): Promise<UploadInitResponse> {
+    return this.request<UploadInitResponse>("/upload/init", {
       method: "POST",
       body: JSON.stringify(data),
     });
@@ -94,9 +115,9 @@ class ApiClient {
   async uploadChunk(
     fileId: string,
     chunkIndex: number,
+    data: ArrayBuffer,
     chunkHash: string,
-    poolSize: number,
-    data: ArrayBuffer
+    poolSize: number
   ): Promise<{ status: string; bytesStored: number }> {
     const res = await fetch(
       `${API_BASE}/upload/chunk/${fileId}/${chunkIndex}`,
@@ -106,31 +127,33 @@ class ApiClient {
           Authorization: `Bearer ${this.token}`,
           "X-Chunk-Hash": chunkHash,
           "X-Pool-Size": poolSize.toString(),
+          "Content-Type": "application/octet-stream",
         },
         body: data,
       }
     );
-
     if (!res.ok) {
-      throw new Error(`Chunk upload failed: ${res.status}`);
+      throw new ApiError("Chunk upload failed", res.status);
     }
-
     return res.json();
   }
 
-  async completeUpload(
+  async uploadComplete(
     fileId: string,
     fileHash: string
-  ): Promise<{ ok: boolean }> {
-    return this.request(`/upload/complete/${fileId}`, {
-      method: "POST",
-      body: JSON.stringify({ fileHash }),
-    });
+  ): Promise<{ ok: boolean; fileId: string }> {
+    return this.request<{ ok: boolean; fileId: string }>(
+      `/upload/complete/${fileId}`,
+      {
+        method: "POST",
+        body: JSON.stringify({ fileHash }),
+      }
+    );
   }
 
   // Download
   async getManifest(fileId: string): Promise<FileManifest> {
-    return this.request(`/download/manifest/${fileId}`);
+    return this.request<FileManifest>(`/download/manifest/${fileId}`);
   }
 
   async downloadChunk(fileId: string, chunkIndex: number): Promise<ArrayBuffer> {
@@ -142,31 +165,56 @@ class ApiClient {
         },
       }
     );
-
     if (!res.ok) {
-      throw new Error(`Chunk download failed: ${res.status}`);
+      throw new ApiError("Chunk download failed", res.status);
     }
-
     return res.arrayBuffer();
   }
 
-  // Folders
-  async createFolder(data: CreateFolderRequest): Promise<Folder> {
-    return this.request("/folders", {
-      method: "POST",
-      body: JSON.stringify(data),
-    });
-  }
-
-  async getFolderContents(
-    folderId: string
-  ): Promise<FileListResponse & { path: Folder[] }> {
-    return this.request(`/folders/${folderId}`);
-  }
-
   // Analytics
-  async getAnalyticsOverview(): Promise<AnalyticsOverview> {
-    return this.request("/analytics/overview");
+  async getAnalytics(): Promise<AnalyticsOverview> {
+    return this.request<AnalyticsOverview>("/analytics/overview");
+  }
+
+  // Gallery
+  async getGalleryPhotos(): Promise<GalleryPhotosResponse> {
+    return this.request<GalleryPhotosResponse>("/gallery/photos");
+  }
+
+  getImageUrl(fileId: string): string {
+    return `${API_BASE}/gallery/image/${fileId}`;
+  }
+
+  getThumbnailUrl(fileId: string): string {
+    return `${API_BASE}/gallery/thumbnail/${fileId}`;
+  }
+
+  getImageHeaders(): Record<string, string> {
+    return this.token ? { Authorization: `Bearer ${this.token}` } : {};
+  }
+
+  // Shared albums (public — no auth)
+  async getSharedAlbumPhotos(
+    token: string
+  ): Promise<SharedAlbumPhotosResponse> {
+    const res = await fetch(`${API_BASE}/shared/${token}/photos`);
+    if (!res.ok) {
+      throw new ApiError("Failed to load shared album", res.status);
+    }
+    return res.json();
+  }
+
+  getSharedImageUrl(token: string, fileId: string): string {
+    return `${API_BASE}/shared/${token}/image/${fileId}`;
+  }
+}
+
+export class ApiError extends Error {
+  status: number;
+  constructor(message: string, status: number = 500) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
   }
 }
 
