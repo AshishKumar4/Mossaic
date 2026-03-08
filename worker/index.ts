@@ -9,9 +9,11 @@ import foldersRoutes from "./routes/folders";
 import analyticsRoutes from "./routes/analytics";
 import galleryRoutes from "./routes/gallery";
 import sharedRoutes from "./routes/shared";
+import searchRoutes from "./routes/search";
 
 export { UserDO } from "./objects/user/index";
 export { ShardDO } from "./objects/shard/index";
+export { SearchDO } from "./objects/search/index";
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -43,6 +45,7 @@ app.route("/api/folders", foldersRoutes);
 app.route("/api/analytics", analyticsRoutes);
 app.route("/api/gallery", galleryRoutes);
 app.route("/api/shared", sharedRoutes);
+app.route("/api/search", searchRoutes);
 
 // Health check
 app.get("/api/health", (c) => c.json({ status: "ok", timestamp: Date.now() }));
