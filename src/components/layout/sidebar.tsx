@@ -38,6 +38,7 @@ import { useState } from "react";
 
 const navItems = [
   { to: "/files", icon: Files, label: "Files" },
+  { to: "/search", icon: Search, label: "Search" },
   { to: "/gallery", icon: Image, label: "Gallery" },
   { to: "/albums", icon: BookImage, label: "Albums" },
   { to: "/analytics", icon: BarChart3, label: "Analytics" },

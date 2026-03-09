@@ -16,6 +16,7 @@ import {
 import { useFiles } from "@/hooks/use-files";
 import { useUpload } from "@/hooks/use-upload";
 import { useDownload } from "@/hooks/use-download";
+import { useDropZone } from "@/hooks/use-drop-zone";
 import { useImageLoader } from "@/hooks/use-image-loader";
 import { Button } from "@/components/ui/button";
 import { Breadcrumbs } from "@/components/files/breadcrumbs";
@@ -23,6 +24,7 @@ import { FolderRow } from "@/components/files/file-row";
 import { FileIcon } from "@/components/files/file-icon";
 import { CreateFolderDialog } from "@/components/files/create-folder-dialog";
 import { UploadZone } from "@/components/upload/upload-zone";
+import { DropZoneOverlay } from "@/components/upload/drop-zone-overlay";
 import { TransferPanel } from "@/components/upload/transfer-panel";
 import { FilePreviewPanel } from "@/components/files/file-preview";
 import { Lightbox } from "@/components/gallery/lightbox";
@@ -121,6 +123,10 @@ export function FilesPage() {
     [uploadFile, parentId]
   );
 
+  const { isDragOver, dropZoneProps } = useDropZone({
+    onDrop: handleFilesSelected,
+  });
+
   const handleDownload = useCallback(
     (file: UserFile) => {
       downloadFile(file.fileId, file.fileName);
@@ -185,7 +191,8 @@ export function FilesPage() {
   const isEmpty = files.length === 0 && folders.length === 0;
 
   return (
-    <div className="flex h-full" onClick={handleContainerClick}>
+    <div className="relative flex h-full" {...dropZoneProps} onClick={handleContainerClick}>
+      <DropZoneOverlay visible={isDragOver} />
       <div className="flex flex-1 flex-col min-w-0">
         {/* Header */}
         <div className="flex flex-col gap-3 border-b border-white/[0.06] px-6 py-4 sm:flex-row sm:items-center sm:justify-between">

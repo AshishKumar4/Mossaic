@@ -7,13 +7,19 @@ interface SearchState {
   loading: boolean;
   error: string | null;
   query: string;
-  activeProvider: string | null;
+}
+
+interface SpaceInfo {
+  space: string;
+  count: number;
+  dimensions: number | null;
 }
 
 interface ProvidersState {
   providers: ProviderStatus[];
   active: SearchProviderConfig | null;
   indexedCount: number;
+  spaces: SpaceInfo[];
   loading: boolean;
   error: string | null;
 }
@@ -24,7 +30,6 @@ export function useSearch() {
     loading: false,
     error: null,
     query: "",
-    activeProvider: null,
   });
 
   const abortRef = useRef<AbortController | null>(null);
@@ -48,7 +53,6 @@ export function useSearch() {
         loading: false,
         error: null,
         query,
-        activeProvider: data.provider,
       });
     } catch (err) {
       if (err instanceof DOMException && err.name === "AbortError") return;
@@ -65,7 +69,6 @@ export function useSearch() {
       loading: false,
       error: null,
       query: "",
-      activeProvider: null,
     });
   }, []);
 
@@ -77,6 +80,7 @@ export function useSearchProviders() {
     providers: [],
     active: null,
     indexedCount: 0,
+    spaces: [],
     loading: true,
     error: null,
   });
@@ -91,6 +95,7 @@ export function useSearchProviders() {
         providers: data.providers,
         active: data.active,
         indexedCount: data.indexedCount,
+        spaces: data.spaces,
         loading: false,
         error: null,
       });
