@@ -4,9 +4,9 @@
   "compatibility_date": "2026-03-01",
   "compatibility_flags": ["nodejs_compat"],
 
-  "ai": {
-    "binding": "AI"
-  },
+  // NOTE: AI binding added automatically in production.
+  // For local dev, omit to avoid remote proxy session requirement.
+  // "ai": { "binding": "AI" },
 
   "assets": {
     "directory": "dist",
