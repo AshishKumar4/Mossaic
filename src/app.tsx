@@ -8,6 +8,7 @@ import { FilesPage } from "@/pages/files";
 import { GalleryPage } from "@/pages/gallery";
 import { AlbumsPage } from "@/pages/albums";
 import { AnalyticsPage } from "@/pages/analytics";
+import { SearchPage } from "@/pages/search";
 import { SharedAlbumPage } from "@/pages/shared-album";
 import type { ReactNode } from "react";
 
@@ -51,6 +52,7 @@ function AppRoutes() {
         }
       >
         <Route path="/files" element={<FilesPage />} />
+        <Route path="/search" element={<SearchPage />} />
         <Route path="/gallery" element={<GalleryPage />} />
         <Route path="/albums" element={<AlbumsPage />} />
         <Route path="/analytics" element={<AnalyticsPage />} />

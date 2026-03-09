@@ -1,9 +1,15 @@
 import { Hono } from "hono";
 import type { Env } from "@shared/types";
-import type { SearchResult, ProviderStatus } from "@shared/embedding-types";
+import type { SearchResult, ProviderStatus, VectorSpace } from "@shared/embedding-types";
+import { classifyResultType, isClipIndexable, isImageMime } from "@shared/embedding-types";
 import { authMiddleware } from "../lib/auth";
-import { userDOName } from "../lib/utils";
-import { createEmbeddingProviders } from "../lib/embeddings";
+import { userDOName, shardDOName } from "../lib/utils";
+import {
+  createEmbeddingProviders,
+  getBestTextProvider,
+  getCLIPProvider,
+  CLIPEmbedding,
+} from "../lib/embeddings";
 import { DOVectorStore } from "../lib/vector-store";
 
 const search = new Hono<{
@@ -15,56 +21,80 @@ search.use("*", authMiddleware());
 
 /**
  * POST /api/search
- * Semantic search over user's files.
- * Body: { query: string, topK?: number, provider?: string }
+ * Multi-modal semantic search over user's files.
+ * Queries both CLIP (image) and text vector spaces, merges results.
+ * Body: { query: string, topK?: number }
  */
 search.post("/", async (c) => {
   const userId = c.get("userId");
-  const { query, topK = 10, provider } = await c.req.json<{
+  const { query, topK = 10 } = await c.req.json<{
     query: string;
     topK?: number;
-    provider?: string;
   }>();
 
   if (!query || query.trim().length === 0) {
     return c.json({ error: "query is required" }, 400);
   }
 
-  // Determine active embedding provider
-  const providers = createEmbeddingProviders(c.env as unknown as Record<string, unknown>);
-  const activeProviderName = provider || await getActiveProvider(c.env, userId, "embedding") || "simple";
-  const embeddingProvider = providers.get(activeProviderName);
-
-  if (!embeddingProvider) {
-    return c.json({ error: `Unknown embedding provider: ${activeProviderName}` }, 400);
-  }
-
-  const available = await embeddingProvider.isAvailable();
-  if (!available) {
-    return c.json({ error: `Embedding provider '${activeProviderName}' is not available` }, 503);
-  }
-
-  // Generate query embedding
-  const [queryVector] = await embeddingProvider.embed([query]);
-
-  // Query vector store
   const vectorStore = new DOVectorStore(c.env, userId);
-  const matches = await vectorStore.query(queryVector, topK);
+  const allResults: SearchResult[] = [];
 
-  // Build search results with file metadata
-  const results: SearchResult[] = matches
-    .filter((m) => m.score > 0)
-    .map((match) => ({
-      fileId: match.metadata?.fileId || match.id,
-      fileName: match.metadata?.fileName || "Unknown",
-      score: Math.round(match.score * 1000) / 1000,
-      mimeType: match.metadata?.mimeType || "application/octet-stream",
-      highlight: match.metadata?.text,
-    }));
+  // ── CLIP space search (images) ──
+  const clip = getCLIPProvider(c.env);
+  if (clip) {
+    try {
+      const [clipVector] = await clip.embed([query]);
+      const clipMatches = await vectorStore.query(clipVector, topK, undefined, "clip");
+      for (const match of clipMatches) {
+        if (match.score <= 0) continue;
+        const mimeType = match.metadata?.mimeType || "image/jpeg";
+        allResults.push({
+          fileId: match.metadata?.fileId || match.id,
+          fileName: match.metadata?.fileName || "Unknown",
+          score: match.score,
+          mimeType,
+          resultType: classifyResultType(mimeType),
+          space: "clip",
+          hasThumbnail: isImageMime(mimeType),
+          fileSize: match.metadata?.fileSize ? parseInt(match.metadata.fileSize) : undefined,
+          highlight: match.metadata?.text,
+        });
+      }
+    } catch (err) {
+      console.error("CLIP search failed:", err);
+      // Continue — text search may still work
+    }
+  }
+
+  // ── Text space search (documents / all files) ──
+  try {
+    const textProvider = await getBestTextProvider(c.env);
+    const [textVector] = await textProvider.embed([query]);
+    const textMatches = await vectorStore.query(textVector, topK, undefined, "text");
+    for (const match of textMatches) {
+      if (match.score <= 0) continue;
+      const mimeType = match.metadata?.mimeType || "application/octet-stream";
+      allResults.push({
+        fileId: match.metadata?.fileId || match.id,
+        fileName: match.metadata?.fileName || "Unknown",
+        score: match.score,
+        mimeType,
+        resultType: classifyResultType(mimeType),
+        space: "text",
+        hasThumbnail: isImageMime(mimeType),
+        fileSize: match.metadata?.fileSize ? parseInt(match.metadata.fileSize) : undefined,
+        highlight: match.metadata?.text,
+      });
+    }
+  } catch (err) {
+    console.error("Text search failed:", err);
+  }
+
+  // ── Merge and deduplicate ──
+  const merged = mergeResults(allResults, topK);
 
   return c.json({
-    results,
-    provider: activeProviderName,
+    results: merged,
     query,
   });
 });
@@ -75,7 +105,7 @@ search.post("/", async (c) => {
  */
 search.get("/providers", async (c) => {
   const userId = c.get("userId");
-  const embeddingProviders = createEmbeddingProviders(c.env as unknown as Record<string, unknown>);
+  const embeddingProviders = createEmbeddingProviders(c.env);
 
   const statuses: ProviderStatus[] = [];
 
@@ -86,6 +116,7 @@ search.get("/providers", async (c) => {
       type: "embedding",
       available,
       dimensions: provider.dimensions,
+      space: provider.space,
     });
   }
 
@@ -107,16 +138,20 @@ search.get("/providers", async (c) => {
   const activeEmbedding = await getActiveProvider(c.env, userId, "embedding") || "simple";
   const activeVectorStore = await getActiveProvider(c.env, userId, "vectorStore") || "durable-object";
 
-  // Get index stats
-  const vectorStore = new DOVectorStore(c.env, userId);
+  // Get index stats (now includes per-space counts)
   let indexedCount = 0;
+  let spaces: { space: string; count: number; dimensions: number | null }[] = [];
   try {
     const doId = c.env.SEARCH_DO.idFromName(`search:${userId}`);
     const stub = c.env.SEARCH_DO.get(doId);
     const statsRes = await stub.fetch(new Request("http://internal/stats"));
     if (statsRes.ok) {
-      const stats = (await statsRes.json()) as { vectorCount: number };
+      const stats = (await statsRes.json()) as {
+        vectorCount: number;
+        spaces: { space: string; count: number; dimensions: number | null }[];
+      };
       indexedCount = stats.vectorCount;
+      spaces = stats.spaces;
     }
   } catch {
     // Ignore — fresh DO
@@ -129,6 +164,7 @@ search.get("/providers", async (c) => {
       vectorStore: activeVectorStore,
     },
     indexedCount,
+    spaces,
   });
 });
 
@@ -164,7 +200,7 @@ search.post("/config", async (c) => {
 
 /**
  * POST /api/search/reindex
- * Re-embed all user files. Admin action.
+ * Re-embed all user files in both vector spaces.
  */
 search.post("/reindex", async (c) => {
   const userId = c.get("userId");
@@ -185,30 +221,24 @@ search.post("/reindex", async (c) => {
   const files = filesData.files.filter((f) => f.status === "complete");
 
   if (files.length === 0) {
-    return c.json({ ok: true, indexed: 0 });
+    return c.json({ ok: true, indexed: { text: 0, clip: 0 } });
   }
 
-  // Determine active embedding provider
-  const providers = createEmbeddingProviders(c.env as unknown as Record<string, unknown>);
-  const activeProviderName = await getActiveProvider(c.env, userId, "embedding") || "simple";
-  const embeddingProvider = providers.get(activeProviderName);
-
-  if (!embeddingProvider) {
-    return c.json({ error: `Embedding provider '${activeProviderName}' not found` }, 400);
-  }
-
-  // Generate embeddings in batches
   const vectorStore = new DOVectorStore(c.env, userId);
-  let indexed = 0;
+  let textIndexed = 0;
+  let clipIndexed = 0;
 
-  for (let i = 0; i < files.length; i += embeddingProvider.maxBatchSize) {
-    const batch = files.slice(i, i + embeddingProvider.maxBatchSize);
+  // ── Text space: embed all files by metadata ──
+  const textProvider = await getBestTextProvider(c.env);
+  const textBatchSize = textProvider.maxBatchSize;
 
+  for (let i = 0; i < files.length; i += textBatchSize) {
+    const batch = files.slice(i, i + textBatchSize);
     const texts = batch.map((f) =>
       buildEmbeddingText(f.file_name, f.mime_type, f.file_size)
     );
 
-    const embeddings = await embeddingProvider.embed(texts);
+    const embeddings = await textProvider.embed(texts);
 
     const vectors = batch.map((f, j) => ({
       id: f.file_id,
@@ -218,15 +248,54 @@ search.post("/reindex", async (c) => {
         fileName: f.file_name,
         mimeType: f.mime_type,
         fileSize: f.file_size.toString(),
+        isImage: isImageMime(f.mime_type) ? "true" : "false",
         text: texts[j],
       },
     }));
 
-    await vectorStore.upsert(vectors);
-    indexed += vectors.length;
+    await vectorStore.upsert(vectors, "text");
+    textIndexed += vectors.length;
   }
 
-  return c.json({ ok: true, indexed, provider: activeProviderName });
+  // ── CLIP space: embed image files by content ──
+  const clip = getCLIPProvider(c.env);
+  if (clip) {
+    const imageFiles = files.filter((f) => isClipIndexable(f.mime_type, f.file_size));
+
+    for (const file of imageFiles) {
+      try {
+        const imageBytes = await fetchFileBytes(c.env, userId, file.file_id);
+        if (!imageBytes) continue;
+
+        const embedding = await clip.embedImage(imageBytes);
+        await vectorStore.upsert(
+          [
+            {
+              id: file.file_id,
+              values: embedding,
+              metadata: {
+                fileId: file.file_id,
+                fileName: file.file_name,
+                mimeType: file.mime_type,
+                fileSize: file.file_size.toString(),
+                isImage: "true",
+              },
+            },
+          ],
+          "clip"
+        );
+        clipIndexed++;
+      } catch (err) {
+        console.error(`CLIP indexing failed for ${file.file_name}:`, err);
+      }
+    }
+  }
+
+  return c.json({
+    ok: true,
+    indexed: { text: textIndexed, clip: clipIndexed },
+    providers: { text: textProvider.name, clip: clip ? "clip" : "unavailable" },
+  });
 });
 
 // ── Helpers ──
@@ -268,6 +337,117 @@ export function buildEmbeddingText(
 }
 
 /**
+ * Fetch full file bytes by reassembling chunks from ShardDOs.
+ * Used for CLIP image indexing. Returns null on failure.
+ */
+async function fetchFileBytes(
+  env: Env,
+  userId: string,
+  fileId: string
+): Promise<Uint8Array | null> {
+  try {
+    const userDoId = env.USER_DO.idFromName(userDOName(userId));
+    const userStub = env.USER_DO.get(userDoId);
+
+    const manifestRes = await userStub.fetch(
+      new Request(`http://internal/files/manifest/${fileId}`)
+    );
+    if (!manifestRes.ok) return null;
+
+    const manifest = (await manifestRes.json()) as {
+      fileSize: number;
+      chunks: Array<{ index: number; hash: string; shardIndex: number; size: number }>;
+    };
+
+    // Single chunk — fast path
+    if (manifest.chunks.length === 1) {
+      const chunk = manifest.chunks[0];
+      const shardId = env.SHARD_DO.idFromName(shardDOName(userId, chunk.shardIndex));
+      const shardStub = env.SHARD_DO.get(shardId);
+      const chunkRes = await shardStub.fetch(
+        new Request(`http://internal/chunk/${chunk.hash}`)
+      );
+      if (!chunkRes.ok) return null;
+      return new Uint8Array(await chunkRes.arrayBuffer());
+    }
+
+    // Multi-chunk — reassemble
+    const sortedChunks = manifest.chunks.sort((a, b) => a.index - b.index);
+    const combined = new Uint8Array(manifest.fileSize);
+    let offset = 0;
+
+    for (const chunk of sortedChunks) {
+      const shardId = env.SHARD_DO.idFromName(shardDOName(userId, chunk.shardIndex));
+      const shardStub = env.SHARD_DO.get(shardId);
+      const chunkRes = await shardStub.fetch(
+        new Request(`http://internal/chunk/${chunk.hash}`)
+      );
+      if (!chunkRes.ok) return null;
+      const buf = new Uint8Array(await chunkRes.arrayBuffer());
+      combined.set(buf, offset);
+      offset += buf.byteLength;
+    }
+
+    return combined;
+  } catch (err) {
+    console.error("Failed to fetch file bytes:", err);
+    return null;
+  }
+}
+
+/**
+ * Merge results from multiple vector spaces.
+ * Deduplicates by fileId (keeping the higher-scoring entry),
+ * normalizes scores within each space using min-max,
+ * then ranks by normalized score.
+ */
+function mergeResults(results: SearchResult[], topK: number): SearchResult[] {
+  if (results.length === 0) return [];
+
+  // Group by space for normalization
+  const bySpace = new Map<VectorSpace, SearchResult[]>();
+  for (const r of results) {
+    const group = bySpace.get(r.space) || [];
+    group.push(r);
+    bySpace.set(r.space, group);
+  }
+
+  // Min-max normalize within each space
+  const normalized: SearchResult[] = [];
+  for (const [, group] of bySpace) {
+    if (group.length === 0) continue;
+
+    const scores = group.map((r) => r.score);
+    const min = Math.min(...scores);
+    const max = Math.max(...scores);
+    const range = max - min;
+
+    for (const r of group) {
+      // Normalize to [0, 1] range within this space
+      const normalizedScore = range > 0 ? (r.score - min) / range : 1;
+      normalized.push({
+        ...r,
+        score: Math.round(normalizedScore * 1000) / 1000,
+      });
+    }
+  }
+
+  // Deduplicate by fileId — keep higher score
+  const deduped = new Map<string, SearchResult>();
+  for (const r of normalized) {
+    const existing = deduped.get(r.fileId);
+    if (!existing || r.score > existing.score) {
+      deduped.set(r.fileId, r);
+    }
+  }
+
+  // Sort by score descending, take topK
+  return Array.from(deduped.values())
+    .sort((a, b) => b.score - a.score)
+    .slice(0, topK);
+}
+
+/**
  * Get active provider from SearchDO config.
  */
 async function getActiveProvider(
@@ -288,7 +468,11 @@ async function getActiveProvider(
 }
 
 /**
- * Embed and index a single file. Called from upload complete hook.
+ * Index a single file into both vector spaces.
+ * Called fire-and-forget from upload complete hook.
+ *
+ * - Always indexes into text space (filename/metadata embedding)
+ * - For CLIP-indexable images, also indexes into clip space (image content embedding)
  */
 export async function indexFile(
   env: Env,
@@ -298,36 +482,64 @@ export async function indexFile(
   mimeType: string,
   fileSize: number
 ): Promise<void> {
+  const vectorStore = new DOVectorStore(env, userId);
+
+  // ── Text space: always index ──
   try {
-    const providers = createEmbeddingProviders(env as unknown as Record<string, unknown>);
-    const activeProviderName = await getActiveProvider(env, userId, "embedding") || "simple";
-    const embeddingProvider = providers.get(activeProviderName);
-
-    if (!embeddingProvider) return;
-
-    const available = await embeddingProvider.isAvailable();
-    if (!available) return;
-
+    const textProvider = await getBestTextProvider(env);
     const text = buildEmbeddingText(fileName, mimeType, fileSize);
-    const [embedding] = await embeddingProvider.embed([text]);
+    const [embedding] = await textProvider.embed([text]);
 
-    const vectorStore = new DOVectorStore(env, userId);
-    await vectorStore.upsert([
-      {
-        id: fileId,
-        values: embedding,
-        metadata: {
-          fileId,
-          fileName,
-          mimeType,
-          fileSize: fileSize.toString(),
-          text,
+    await vectorStore.upsert(
+      [
+        {
+          id: fileId,
+          values: embedding,
+          metadata: {
+            fileId,
+            fileName,
+            mimeType,
+            fileSize: fileSize.toString(),
+            isImage: isImageMime(mimeType) ? "true" : "false",
+            text,
+          },
         },
-      },
-    ]);
+      ],
+      "text"
+    );
   } catch (err) {
-    // Indexing failure should not block uploads
-    console.error("Search indexing failed:", err);
+    console.error("Text indexing failed:", err);
+  }
+
+  // ── CLIP space: index if image and within limits ──
+  if (isClipIndexable(mimeType, fileSize)) {
+    try {
+      const clip = getCLIPProvider(env);
+      if (clip) {
+        const imageBytes = await fetchFileBytes(env, userId, fileId);
+        if (imageBytes) {
+          const embedding = await clip.embedImage(imageBytes);
+          await vectorStore.upsert(
+            [
+              {
+                id: fileId,
+                values: embedding,
+                metadata: {
+                  fileId,
+                  fileName,
+                  mimeType,
+                  fileSize: fileSize.toString(),
+                  isImage: "true",
+                },
+              },
+            ],
+            "clip"
+          );
+        }
+      }
+    } catch (err) {
+      console.error("CLIP indexing failed:", err);
+    }
   }
 }
 

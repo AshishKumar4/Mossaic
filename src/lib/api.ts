@@ -216,14 +216,13 @@ class ApiClient {
   // Search
   async semanticSearch(
     query: string,
-    topK?: number,
-    provider?: string
-  ): Promise<{ results: SearchResult[]; provider: string; query: string }> {
-    return this.request<{ results: SearchResult[]; provider: string; query: string }>(
+    topK?: number
+  ): Promise<{ results: SearchResult[]; query: string }> {
+    return this.request<{ results: SearchResult[]; query: string }>(
       "/search",
       {
         method: "POST",
-        body: JSON.stringify({ query, topK, provider }),
+        body: JSON.stringify({ query, topK }),
       }
     );
   }
@@ -232,11 +231,13 @@ class ApiClient {
     providers: ProviderStatus[];
     active: SearchProviderConfig;
     indexedCount: number;
+    spaces: { space: string; count: number; dimensions: number | null }[];
   }> {
     return this.request<{
       providers: ProviderStatus[];
       active: SearchProviderConfig;
       indexedCount: number;
+      spaces: { space: string; count: number; dimensions: number | null }[];
     }>("/search/providers");
   }
 
@@ -252,11 +253,16 @@ class ApiClient {
     );
   }
 
-  async reindexSearch(): Promise<{ ok: boolean; indexed: number; provider: string }> {
-    return this.request<{ ok: boolean; indexed: number; provider: string }>(
-      "/search/reindex",
-      { method: "POST", body: JSON.stringify({}) }
-    );
+  async reindexSearch(): Promise<{
+    ok: boolean;
+    indexed: { text: number; clip: number };
+    providers: { text: string; clip: string };
+  }> {
+    return this.request<{
+      ok: boolean;
+      indexed: { text: number; clip: number };
+      providers: { text: string; clip: string };
+    }>("/search/reindex", { method: "POST", body: JSON.stringify({}) });
   }
 }
 

@@ -4,6 +4,10 @@
   "compatibility_date": "2026-03-01",
   "compatibility_flags": ["nodejs_compat"],
 
+  "ai": {
+    "binding": "AI"
+  },
+
   "assets": {
     "directory": "dist",
     "not_found_handling": "single-page-application",

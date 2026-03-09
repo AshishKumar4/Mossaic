@@ -267,5 +267,6 @@ export interface Env {
   SHARD_DO: DurableObjectNamespace;
   SEARCH_DO: DurableObjectNamespace;
   ASSETS: Fetcher;
+  AI?: Ai;
   JWT_SECRET?: string;
 }
