@@ -1,12 +1,15 @@
 {
   "name": "mossaic",
   "main": "worker/index.ts",
+  "account_id": "f44999d1ddda7012e9a87729eba250f1",
   "compatibility_date": "2026-03-01",
   "compatibility_flags": ["nodejs_compat"],
 
-  // NOTE: AI binding added automatically in production.
-  // For local dev, omit to avoid remote proxy session requirement.
-  // "ai": { "binding": "AI" },
+  "routes": [
+    { "pattern": "mossaic.ashishkumarsingh.com", "custom_domain": true }
+  ],
+
+  "ai": { "binding": "AI" },
 
   "assets": {
     "directory": "dist",
