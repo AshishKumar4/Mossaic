@@ -1,6 +1,6 @@
 # Mossaic
 
-**Distributed file storage powered by Cloudflare Durable Objects.**
+**Distributed file storage powered by Cloudflare Durable Objects.** &nbsp;·&nbsp; [**Live Demo →**](https://mossaic.ashishkumarsingh.com)
 
 Mossaic splits every file into 1 MB chunks, hashes them with SHA-256, distributes them across a dynamic pool of Durable Object shards via rendezvous hashing, and transfers them in parallel. The result is a fast, deduplicated, horizontally-scaling storage system that runs entirely on the Cloudflare edge — no origin servers, no S3 buckets, no external databases.
 
@@ -226,6 +226,53 @@ Builds the SPA and deploys the worker + assets to Cloudflare.
 - **Resumable uploads** — persist upload state to recover from interruptions
 - **Chunk-level integrity verification** — client-side hash verification on download
 - **Storage tiering** — hot/cold chunk migration based on access patterns
+
+---
+
+## Build & Deploy
+
+### Prerequisites
+
+- [Node.js](https://nodejs.org/) v20+
+- [pnpm](https://pnpm.io/)
+- A [Cloudflare account](https://dash.cloudflare.com/sign-up) (free tier works)
+- A custom domain on the same Cloudflare account, if you intend to serve from one (otherwise the default `*.workers.dev` subdomain is used)
+
+### Local development
+
+```bash
+pnpm install
+pnpm dev
+```
+
+Vite + the Cloudflare plugin run the worker, Durable Objects (via Miniflare), and the SPA together — no Cloudflare account needed for local work.
+
+### Production build
+
+```bash
+pnpm build
+```
+
+Outputs the SPA assets and worker bundle that `wrangler deploy` will publish.
+
+### Deploy to Cloudflare
+
+```bash
+npx wrangler login
+```
+
+Then open [`wrangler.jsonc`](wrangler.jsonc) and set:
+
+- `account_id` — your Cloudflare account ID (visible in the dashboard sidebar)
+- `routes` — the hostname(s) you want to serve from, e.g. `[{ "pattern": "mossaic.example.com", "custom_domain": true }]`. Omit `routes` to deploy to the default `*.workers.dev` subdomain.
+
+Then ship it:
+
+```bash
+npx wrangler deploy
+```
+
+The first deploy provisions the Durable Object namespaces and applies the migrations declared in `wrangler.jsonc`.
 
 ---
 
