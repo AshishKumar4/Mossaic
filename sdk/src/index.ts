@@ -31,7 +31,13 @@
  *     // wrangler.jsonc — copy from @mossaic/sdk/templates/wrangler.jsonc
  */
 
-export { VFS, type CreateVFSOptions, type MossaicEnv } from "./vfs";
+export {
+  VFS,
+  type CreateVFSOptions,
+  type MossaicEnv,
+  type VersionInfo,
+  type DropVersionsPolicy,
+} from "./vfs";
 export { VFSStat } from "./stats";
 export {
   VFSFsError,

@@ -232,6 +232,19 @@ class BatchedLstatFs implements VFSClient {
     chunkIndex: number,
     range?: { start?: number; end?: number }
   ) { return this.inner.pullReadStream(handle, chunkIndex, range); }
+  // Phase 9 versioning pass-through.
+  listVersions(p: string, opts?: { limit?: number }) {
+    return this.inner.listVersions(p, opts);
+  }
+  restoreVersion(p: string, sourceVersionId: string) {
+    return this.inner.restoreVersion(p, sourceVersionId);
+  }
+  dropVersions(
+    p: string,
+    policy: Parameters<VFSClient["dropVersions"]>[1]
+  ) {
+    return this.inner.dropVersions(p, policy);
+  }
 }
 
 /** ENOENT factory for missing-path entries returned from readManyStat. */
