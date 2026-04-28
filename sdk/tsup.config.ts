@@ -20,7 +20,7 @@ import path from "node:path";
  * Output is ESM only (the SDK is for Workers, which is ESM-native).
  */
 export default defineConfig({
-  entry: ["src/index.ts", "src/igit.ts"],
+  entry: ["src/index.ts", "src/igit.ts", "src/yjs.ts"],
   format: ["esm"],
   dts: true,
   sourcemap: true,
@@ -28,7 +28,12 @@ export default defineConfig({
   splitting: false,
   bundle: true,
   treeshake: true,
-  external: ["cloudflare:workers", "isomorphic-git"],
+  // `yjs` and `isomorphic-git` are peer deps — the consumer brings them.
+  // If we bundled `yjs` into our dist we'd ship two copies of the
+  // CRDT runtime alongside the consumer's Y.Doc imports, which would
+  // silently break edits (the two `Y.Doc` constructors wouldn't be
+  // identity-compatible). Mark external.
+  external: ["cloudflare:workers", "isomorphic-git", "yjs"],
   target: "es2022",
   esbuildOptions(options) {
     options.alias = {
