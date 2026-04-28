@@ -11,4 +11,4 @@ export {
   signVFSToken as issueVFSToken,
   verifyVFSToken,
   type VFSTokenPayload,
-} from "../../worker/lib/auth";
+} from "../../worker/core/lib/auth";

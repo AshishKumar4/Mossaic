@@ -35,7 +35,7 @@ import {
   ENOENT,
   EINVAL,
 } from "../../sdk/src/index";
-import { vfsUserDOName, vfsShardDOName } from "../../worker/lib/utils";
+import { vfsUserDOName, vfsShardDOName } from "@core/lib/utils";
 
 interface E {
   USER_DO: DurableObjectNamespace<UserDO>;

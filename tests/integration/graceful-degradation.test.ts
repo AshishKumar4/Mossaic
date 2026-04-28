@@ -24,7 +24,7 @@ import {
   ENOENT,
   VFSFsError,
 } from "../../sdk/src/index";
-import { signVFSToken } from "../../worker/lib/auth";
+import { signVFSToken } from "@core/lib/auth";
 
 interface E {
   USER_DO: DurableObjectNamespace;

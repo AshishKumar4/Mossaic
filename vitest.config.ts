@@ -32,6 +32,7 @@ export default defineWorkersConfig({
   resolve: {
     alias: {
       "@shared": new URL("./shared", import.meta.url).pathname,
+      "@core": new URL("./worker/core", import.meta.url).pathname,
     },
   },
 });

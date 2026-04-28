@@ -13,7 +13,8 @@
     "noEmit": true,
     "types": ["@cloudflare/workers-types"],
     "paths": {
-      "@shared/*": ["./shared/*"]
+      "@shared/*": ["./shared/*"],
+      "@core/*": ["./worker/core/*"]
     }
   },
   "include": ["worker", "shared"]

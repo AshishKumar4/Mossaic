@@ -337,7 +337,7 @@ export interface DropVersionsPolicy {
   exceptVersions?: string[];
 }
 
-import { vfsUserDOName } from "../../worker/lib/utils";
+import { vfsUserDOName } from "../../worker/core/lib/utils";
 
 /**
  * fs/promises-shaped client.

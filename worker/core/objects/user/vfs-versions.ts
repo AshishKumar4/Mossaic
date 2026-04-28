@@ -1,4 +1,4 @@
-import type { UserDO } from "./user-do";
+import type { UserDOCore as UserDO } from "./user-do-core";
 import type { ShardDO } from "../shard/shard-do";
 import { VFSError, type VFSScope } from "@shared/vfs-types";
 import { vfsShardDOName } from "../../lib/utils";

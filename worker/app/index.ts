@@ -10,11 +10,17 @@ import analyticsRoutes from "./routes/analytics";
 import galleryRoutes from "./routes/gallery";
 import sharedRoutes from "./routes/shared";
 import searchRoutes from "./routes/search";
-import vfsRoutes from "./routes/vfs";
+import vfsRoutes from "@core/routes/vfs";
 
+// Phase 11: UserDO is the App-side subclass that adds the legacy
+// photo-app HTTP routes on top of UserDOCore. Production wrangler
+// binds class_name: "UserDO" — the class name preserved verbatim
+// from Phase 10. ShardDO / SearchDO are pure-Core classes
+// re-exported through this entry so wrangler can resolve all three
+// from one main file.
 export { UserDO } from "./objects/user/index";
-export { ShardDO } from "./objects/shard/index";
-export { SearchDO } from "./objects/search/index";
+export { ShardDO } from "@core/objects/shard/index";
+export { SearchDO } from "@core/objects/search/index";
 
 const app = new Hono<{ Bindings: Env }>();
 

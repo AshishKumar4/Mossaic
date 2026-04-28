@@ -25,7 +25,7 @@ import { env, runInDurableObject } from "cloudflare:test";
  *      delete the in-flight tmp row (status='uploading' is filtered)
  */
 
-import { vfsShardDOName, vfsUserDOName } from "../../worker/lib/utils";
+import { vfsShardDOName, vfsUserDOName } from "@core/lib/utils";
 
 interface E {
   USER_DO: DurableObjectNamespace;

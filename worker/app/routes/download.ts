@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import type { Env } from "@shared/types";
-import { authMiddleware } from "../lib/auth";
-import { userDOName, shardDOName } from "../lib/utils";
+import { authMiddleware } from "@core/lib/auth";
+import { userDOName, shardDOName } from "@core/lib/utils";
 
 const download = new Hono<{
   Bindings: Env;

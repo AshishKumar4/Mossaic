@@ -2,8 +2,8 @@ import { Hono } from "hono";
 import type { Env } from "@shared/types";
 import type { SearchResult, ProviderStatus, VectorSpace } from "@shared/embedding-types";
 import { classifyResultType, isClipIndexable, isImageMime } from "@shared/embedding-types";
-import { authMiddleware } from "../lib/auth";
-import { userDOName, shardDOName } from "../lib/utils";
+import { authMiddleware } from "@core/lib/auth";
+import { userDOName, shardDOName } from "@core/lib/utils";
 import {
   createEmbeddingProviders,
   getBestTextProvider,
