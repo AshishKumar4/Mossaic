@@ -17,6 +17,7 @@ import { generateId, vfsShardDOName } from "../../lib/utils";
 import {
   commitVersion,
   isVersioningEnabled,
+  placeChunkForVersion,
   shardRefId,
 } from "./vfs-versions";
 import { resolvePath, resolvePathFollow } from "./path-walk";
@@ -467,7 +468,7 @@ export function vfsReadManyStat(
  *      (Phase 4). The recorded `shard_index` is unchanged from what
  *      `placeChunk` returned at write time, so reads remain
  *      deterministic across pool growth.
- *   3. Cap at READFILE_MAX (default 500 MB; configurable) — beyond
+ *   3. Cap at READFILE_MAX (default 100 MB; configurable) — beyond
  *      that, throw EFBIG and direct callers to createReadStream /
  *      openManifest+readChunk.
  *
@@ -583,8 +584,22 @@ async function readFileVersioned(
   if (chunkRows.length === 0) return new Uint8Array(0);
   const env = durableObject.envPublic;
   const out = new Uint8Array(size);
-  let written = 0;
-  for (const c of chunkRows) {
+
+  // H3: parallel chunk fetches with bounded concurrency (mirrors the
+  // Phase 8 read path). Per-chunk destination offset is precomputed
+  // from chunk_size so order doesn't depend on arrival.
+  const offsets = new Array<number>(chunkRows.length);
+  {
+    let acc = 0;
+    for (let i = 0; i < chunkRows.length; i++) {
+      offsets[i] = acc;
+      acc += chunkRows[i].chunk_size;
+    }
+  }
+  const CONCURRENCY = 8;
+  let next = 0;
+  async function fetchOne(i: number): Promise<void> {
+    const c = chunkRows[i];
     const shardName = vfsShardDOName(
       scope.ns,
       scope.tenant,
@@ -602,9 +617,25 @@ async function readFileVersioned(
       );
     }
     const buf = new Uint8Array(await res.arrayBuffer());
-    out.set(buf, written);
-    written += buf.byteLength;
+    out.set(buf, offsets[i]);
   }
+  async function lane(): Promise<void> {
+    while (true) {
+      const i = next++;
+      if (i >= chunkRows.length) return;
+      await fetchOne(i);
+    }
+  }
+  const lanes: Promise<void>[] = [];
+  for (let w = 0; w < Math.min(CONCURRENCY, chunkRows.length); w++) {
+    lanes.push(lane());
+  }
+  await Promise.all(lanes);
+
+  const written =
+    chunkRows.length > 0
+      ? offsets[chunkRows.length - 1] + chunkRows[chunkRows.length - 1].chunk_size
+      : 0;
   if (written !== size) return out.slice(0, written);
   return out;
 }
@@ -699,8 +730,37 @@ export async function vfsReadFile(
   // the consumer's invocation only paid 1 to enter this method.
   const env = durableObject.envPublic;
   const out = new Uint8Array(row.file_size);
-  let written = 0;
-  for (const c of chunkRows) {
+
+  // H3: parallel chunk fetches with bounded concurrency.
+  //
+  // Previously: serial `for (...) await stub.fetch(...)` capped
+  // throughput at 1 chunk per ~10–30 ms intra-DO RPC, i.e. ~33–100 MB/s
+  // for 1 MB chunks. The feasibility study's 200–500 MB/s claim
+  // (study §5.2) needs parallel issuance.
+  //
+  // Bound at 8 concurrent in-flight to stay well under the Workers
+  // concurrent-subrequest limit (50 free, 1000 paid). 8 saturates
+  // typical home/cloud bandwidth on read while leaving headroom for
+  // any other RPCs the calling Worker has in flight. Order of `out.set`
+  // is preserved by the destination offset, which is computed from
+  // each chunk's known position in the manifest, not its arrival
+  // order. Throw-on-first-error is preserved by Promise.all semantics.
+  const CONCURRENCY = 8;
+  let next = 0;
+  // Each chunk's destination offset = sum of preceding chunks' sizes,
+  // computed up-front. This decouples the parallel fetches from any
+  // notion of arrival order — a chunk's slot is fixed by its index.
+  const offsets = new Array<number>(chunkRows.length);
+  {
+    let acc = 0;
+    for (let i = 0; i < chunkRows.length; i++) {
+      offsets[i] = acc;
+      acc += chunkRows[i].chunk_size;
+    }
+  }
+
+  async function fetchOne(i: number): Promise<void> {
+    const c = chunkRows[i];
     const shardName = vfsShardDOName(
       scope.ns,
       scope.tenant,
@@ -718,9 +778,25 @@ export async function vfsReadFile(
       );
     }
     const buf = new Uint8Array(await res.arrayBuffer());
-    out.set(buf, written);
-    written += buf.byteLength;
+    out.set(buf, offsets[i]);
   }
+
+  async function worker(): Promise<void> {
+    while (true) {
+      const i = next++;
+      if (i >= chunkRows.length) return;
+      await fetchOne(i);
+    }
+  }
+  const workers: Promise<void>[] = [];
+  for (let w = 0; w < Math.min(CONCURRENCY, chunkRows.length); w++) {
+    workers.push(worker());
+  }
+  await Promise.all(workers);
+
+  const written = offsets.length > 0
+    ? offsets[offsets.length - 1] + chunkRows[offsets.length - 1].chunk_size
+    : 0;
   // Trim if file_size disagrees with sum of chunks (defensive; should not happen).
   if (written !== row.file_size) {
     return out.slice(0, written);
@@ -1014,6 +1090,21 @@ function folderExists(
  *
  * Subrequest cost: U fan-out RPCs to ShardDOs (one per unique shard).
  */
+/**
+ * External re-export of `hardDeleteFileRow` for the H1 alarm sweeper.
+ * The internal callers stay on the private name to keep the surface
+ * minimal; the alarm in `user-do.ts` reaches this via dynamic import
+ * (avoiding a module-init cycle on the type-side).
+ */
+export async function hardDeleteFileRowExternal(
+  durableObject: UserDO,
+  userId: string,
+  scope: VFSScope,
+  fileId: string
+): Promise<void> {
+  return hardDeleteFileRow(durableObject, userId, scope, fileId);
+}
+
 async function hardDeleteFileRow(
   durableObject: UserDO,
   userId: string,
@@ -1186,11 +1277,16 @@ async function vfsWriteFileVersioned(
   const env = durableObject.envPublic;
   const shardNs = env.SHARD_DO as unknown as DurableObjectNamespace<ShardDO>;
   const refId = shardRefId(pathId, versionId);
-  const fileHashParts: string[] = [];
   const touchedShards = new Set<number>();
 
+  // H3: parallel chunk PUTs with bounded concurrency, mirroring the
+  // Phase 8 path. Each lane processes one chunk at a time; chunks
+  // are independent so up to CONCURRENCY can be in flight.
+  const fileHashByIdx = new Array<string>(chunkCount);
   try {
-    for (let i = 0; i < chunkCount; i++) {
+    const CONCURRENCY = 8;
+    let cursor = 0;
+    async function uploadOne(i: number): Promise<void> {
       const start = i * chunkSize;
       const end = Math.min(start + chunkSize, data.byteLength);
       const slice = data.subarray(start, end);
@@ -1203,7 +1299,9 @@ async function vfsWriteFileVersioned(
       // refcount = (number of versions referencing it).
       // The Phase 8 / non-versioning path still uses (fileId, idx)
       // placement for spread across shards on a single file.
-      const sIdx = placeChunk(userId, hash, 0, poolSize);
+      // (H4 freezes poolSize at the chunk's first-write so pool
+      //  growth never re-routes a hash to a different shard.)
+      const sIdx = placeChunkForVersion(durableObject, userId, hash, poolSize);
       const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, sIdx);
       const stub = shardNs.get(shardNs.idFromName(shardName));
       await stub.putChunk(hash, slice, refId, i, userId);
@@ -1218,8 +1316,20 @@ async function vfsWriteFileVersioned(
         slice.byteLength,
         sIdx
       );
-      fileHashParts.push(hash);
+      fileHashByIdx[i] = hash;
     }
+    async function lane(): Promise<void> {
+      while (true) {
+        const i = cursor++;
+        if (i >= chunkCount) return;
+        await uploadOne(i);
+      }
+    }
+    const lanes: Promise<void>[] = [];
+    for (let w = 0; w < Math.min(CONCURRENCY, chunkCount); w++) {
+      lanes.push(lane());
+    }
+    await Promise.all(lanes);
   } catch (err) {
     // Abort: reap the chunk_refs we already pushed under refId so
     // ShardDO refcounts decrement. version_chunks rows: drop them;
@@ -1242,7 +1352,7 @@ async function vfsWriteFileVersioned(
   }
 
   const fileHash = await hashChunk(
-    new TextEncoder().encode(fileHashParts.join(""))
+    new TextEncoder().encode(fileHashByIdx.join(""))
   );
   commitVersion(durableObject, {
     pathId,
@@ -1327,12 +1437,15 @@ export async function vfsWriteFile(
       mode,
       data
     );
+    // H1: schedule the stale-upload sweep so this row is reclaimed
+    // even if commitRename never runs (DO crash mid-method).
+    await durableObject.scheduleStaleUploadSweep();
     await commitRename(durableObject, userId, scope, tmpId, parentId, leaf);
     return;
   }
 
   // ── Chunked tier ──
-  // EFBIG is already enforced above against WRITEFILE_MAX (500 MB).
+  // EFBIG is already enforced above against WRITEFILE_MAX (100 MB).
   // The previous redundant READFILE_MAX gate has been folded; both caps
   // are equal so a writeFile that succeeds is always readable via
   // readFile. For larger workloads use createWriteStream (memory-bounded
@@ -1358,15 +1471,32 @@ export async function vfsWriteFile(
     now,
     mode
   );
+  // H1: schedule stale-upload sweep so a crash mid-streaming reclaims
+  // this row + its chunk_refs.
+  await durableObject.scheduleStaleUploadSweep();
 
   // Chunk + place + putChunk per chunk. Any throw aborts via abortTempFile.
+  //
+  // H3: parallel chunk PUTs with bounded concurrency. The previous
+  // serial loop capped throughput at one ShardDO RPC per chunk (~10–30
+  // ms each); 100 chunks took 1–3 s. The hash + put + record triple
+  // is parallelisable because each chunk is independent (no
+  // cross-chunk shared state), and the per-chunk file_chunks INSERT
+  // is sync SQL inside the DO single-thread so SQL ordering is
+  // preserved without coordination.
+  //
+  // Concurrency cap = 8 (same rationale as the read path: stays well
+  // inside the Workers concurrent-subrequest limit and saturates
+  // typical bandwidth).
   const env = durableObject.envPublic;
   // Cast the un-parameterized namespace to the typed one so .putChunk RPC
   // resolves. (See hardDeleteFileRow for the same pattern on deleteChunks.)
   const shardNs = env.SHARD_DO as unknown as DurableObjectNamespace<ShardDO>;
-  const fileHashParts: string[] = [];
+  const fileHashParts = new Array<string>(chunkCount);
   try {
-    for (let i = 0; i < chunkCount; i++) {
+    const CONCURRENCY = 8;
+    let cursor = 0;
+    async function uploadOne(i: number): Promise<void> {
       const start = i * chunkSize;
       const end = Math.min(start + chunkSize, data.byteLength);
       const slice = data.subarray(start, end);
@@ -1384,8 +1514,20 @@ export async function vfsWriteFile(
         slice.byteLength,
         sIdx
       );
-      fileHashParts.push(hash);
+      fileHashParts[i] = hash;
     }
+    async function lane(): Promise<void> {
+      while (true) {
+        const i = cursor++;
+        if (i >= chunkCount) return;
+        await uploadOne(i);
+      }
+    }
+    const lanes: Promise<void>[] = [];
+    for (let w = 0; w < Math.min(CONCURRENCY, chunkCount); w++) {
+      lanes.push(lane());
+    }
+    await Promise.all(lanes);
   } catch (err) {
     // Abort: hard-delete the tmp row + dispatch deleteChunks for any
     // chunks already pushed.
@@ -1683,6 +1825,9 @@ export function vfsRmdir(
     throw new VFSError("EBUSY", "rmdir: cannot remove root");
   }
   // Empty check: any folder or live file with this folder as parent_id?
+  // H2: throw ENOTEMPTY (was ENOTDIR) — README + SDK promise the
+  // POSIX-aligned code. ENOTEMPTY now exists in the server-side
+  // VFSErrorCode union (shared/vfs-types.ts).
   const childFolder = durableObject.sql
     .exec(
       "SELECT 1 FROM folders WHERE user_id=? AND parent_id=? LIMIT 1",
@@ -1691,7 +1836,7 @@ export function vfsRmdir(
     )
     .toArray();
   if (childFolder.length > 0) {
-    throw new VFSError("ENOTDIR", `rmdir: directory not empty: ${path}`);
+    throw new VFSError("ENOTEMPTY", `rmdir: directory not empty: ${path}`);
   }
   const childFile = durableObject.sql
     .exec(
@@ -1701,7 +1846,7 @@ export function vfsRmdir(
     )
     .toArray();
   if (childFile.length > 0) {
-    throw new VFSError("ENOTDIR", `rmdir: directory not empty: ${path}`);
+    throw new VFSError("ENOTEMPTY", `rmdir: directory not empty: ${path}`);
   }
   durableObject.sql.exec(
     "DELETE FROM folders WHERE folder_id = ?",

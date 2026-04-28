@@ -136,7 +136,7 @@ This is **one** outbound DO RPC regardless of how many paths you batch.
 
 ## Streaming for large files
 
-The default `readFile` / `writeFile` cap at **500 MB** (configurable). Above that, use the streaming API:
+The default `readFile` / `writeFile` cap at **100 MB** (configurable). Above that, use the streaming API:
 
 ```ts
 // Read: ReadableStream<Uint8Array>, memory-bounded to one chunk
@@ -581,10 +581,10 @@ Most behaviour is sensible-default. Knobs you can turn:
 
 | Knob | Default | Where |
 |---|---|---|
-| `READFILE_MAX` | 500 MB | `shared/inline.ts` constant; deployment-time |
-| `WRITEFILE_MAX` | 500 MB | `shared/inline.ts` constant; deployment-time |
+| `READFILE_MAX` | 100 MB | `shared/inline.ts` constant; deployment-time. Lowered from 500 MB per audit H7 — Worker soft memory is ~128 MB and `readFile` allocates the full buffer before chunk fetches. |
+| `WRITEFILE_MAX` | 100 MB | `shared/inline.ts` constant; deployment-time. Same rationale as `READFILE_MAX`. |
 | `INLINE_LIMIT`  | 16 KB  | `shared/inline.ts` constant; raise to ≤2 MB if you store many slightly-larger small files (note SQLite BLOB row cap) |
-| `JWT_SECRET`    | required | `wrangler secret put JWT_SECRET` in production |
+| `JWT_SECRET`    | **required, no fallback** | `wrangler secret put JWT_SECRET` in production. There is **no** dev fallback string in the source. Any `/api/auth/*` or `/api/vfs/*` request on a deploy without this secret returns 503 (`VFSConfigError`); the legacy `/api/upload`/`/api/download` and SPA assets remain available. Set the secret BEFORE routing real traffic. |
 
 The SDK does not currently expose these as runtime options on `createVFS`; they're per-deployment compile-time constants. Override by patching `shared/inline.ts` and rebuilding.
 

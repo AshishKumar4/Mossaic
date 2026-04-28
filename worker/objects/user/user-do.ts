@@ -20,6 +20,7 @@ import {
 import { createFolder, listFolders, getFolder, getFolderPath } from "./folders";
 import { getQuota, checkQuota, updateUsage } from "./quota";
 import {
+  hardDeleteFileRowExternal,
   vfsAbortWriteStream,
   vfsAppendWriteStream,
   vfsBeginWriteStream,
@@ -53,6 +54,7 @@ import type {
   VFSScope,
   VFSStatRaw,
 } from "@shared/vfs-types";
+import { VFSError } from "@shared/vfs-types";
 import { dedupePaths, type DedupeResult } from "./admin";
 import { enforceRateLimit } from "./rate-limit";
 import {
@@ -333,6 +335,14 @@ export class UserDO extends DurableObject<Env> {
         PRIMARY KEY (version_id, chunk_index)
       )
     `);
+    // Audit H4: secondary index on chunk_hash so placeChunkForVersion's
+    // "have we placed this hash before?" probe is O(log N), not a full
+    // scan. Without this, every chunked write under versioning-on
+    // costs O(total_version_chunks_in_tenant) per chunk.
+    this.sql.exec(`
+      CREATE INDEX IF NOT EXISTS idx_version_chunks_hash
+        ON version_chunks(chunk_hash)
+    `);
 
     // Head-pointer column on `files`: when versioning is enabled, the
     // `files` row is just a stable identity for the path; the actual
@@ -345,6 +355,115 @@ export class UserDO extends DurableObject<Env> {
     } catch {
       // column already exists
     }
+
+    // ── Audit H1: stale-upload sweeper bookkeeping ───────────────────────
+    //
+    // Plan §7 requires a UserDO `alarm()` that hard-deletes
+    // `_vfs_tmp_*` rows abandoned by a crash mid-write. The alarm
+    // runs without an HTTP/RPC scope, so it cannot synthesize
+    // (ns, tenant, sub) from a request. We persist the DO's scope on
+    // every gated VFS call so the alarm can reconstruct it.
+    //
+    // `vfs_meta` is a tiny key/value table that survives DO
+    // hibernation. We store one row keyed `scope` whose value is a
+    // JSON-encoded `{ ns, tenant, sub? }`. Writes are idempotent
+    // (INSERT OR REPLACE) and hot-path-cheap (a single SQL UPSERT
+    // bounded to one row). Pre-existing tenants without this row
+    // keep working — the alarm becomes a no-op for them until the
+    // first gated call records their scope.
+    //
+    // The same table also carries the H6 migration_state markers
+    // ('files_unique_index', 'folders_unique_index') to surface a
+    // failed CREATE UNIQUE INDEX rather than silently swallow it.
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS vfs_meta (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      )
+    `);
+
+    // ── Audit H6: surface UNIQUE INDEX failure on legacy data ────────────
+    //
+    // The previous code swallowed the throw silently when the file
+    // table contained live (parent_id, file_name) duplicates. The DO
+    // then ran WITHOUT the index and the central commit-rename
+    // atomicity guarantee silently degraded.
+    //
+    // New behaviour: detect via PRAGMA whether the index is present
+    // after the CREATE attempt; if absent, log via console.error AND
+    // persist a `migration_state` row in vfs_meta so subsequent VFS
+    // writes can refuse with EBUSY (see gateVfs). The recovery path
+    // is the existing admin dedupe route, which the operator can
+    // trigger manually; once dedupe completes, the next ensureInit
+    // re-creates the index and clears the marker.
+    this.checkAndRecordIndex(
+      "uniq_files_parent_name",
+      "files_unique_index",
+      "files"
+    );
+    this.checkAndRecordIndex(
+      "uniq_folders_parent_name",
+      "folders_unique_index",
+      "folders"
+    );
+  }
+
+  /**
+   * Audit H6 helper: verify the named UNIQUE INDEX exists, recording
+   * a degraded marker in vfs_meta if not. Logs to console.error so
+   * operators see the problem in wrangler tail / Logpush.
+   *
+   * sqlite_master rows for indexes have type='index'; missing index
+   * means the CREATE was swallowed because of duplicate-row data.
+   */
+  private checkAndRecordIndex(
+    indexName: string,
+    markerKey: string,
+    table: string
+  ): void {
+    const present = this.sql
+      .exec(
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name = ? LIMIT 1",
+        indexName
+      )
+      .toArray();
+    if (present.length > 0) {
+      // Index is healthy. Clear any stale marker (e.g. an admin run
+      // dedupe and re-init).
+      this.sql.exec(
+        "DELETE FROM vfs_meta WHERE key = ?",
+        markerKey
+      );
+      return;
+    }
+    // Degraded path: index missing because legacy data has live
+    // duplicates. Record + log.
+    const value = JSON.stringify({
+      table,
+      indexName,
+      detectedAt: Date.now(),
+      reason: "duplicate-rows-block-create-unique",
+    });
+    this.sql.exec(
+      "INSERT OR REPLACE INTO vfs_meta (key, value) VALUES (?, ?)",
+      markerKey,
+      value
+    );
+    // eslint-disable-next-line no-console
+    console.error(
+      `[mossaic:H6] UNIQUE INDEX ${indexName} missing on ${table} — duplicate live rows block CREATE. ` +
+        `VFS writes will refuse with EBUSY until \`POST /admin/dedupe-paths\` resolves the duplicates.`
+    );
+  }
+
+  /** Read H6 markers; returns the list of degraded index keys. */
+  private readDegradedIndexes(): string[] {
+    const rows = this.sql
+      .exec(
+        "SELECT key FROM vfs_meta WHERE key IN ('files_unique_index', 'folders_unique_index')"
+      )
+      .toArray() as { key: string }[];
+    return rows.map((r) => r.key);
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -664,10 +783,162 @@ export class UserDO extends DurableObject<Env> {
    * legacy fetch handler is unaffected — it has its own ensureInit
    * and is exempt from the new rate limiter (back-compat with the
    * existing user-facing app's traffic patterns).
+   *
+   * Audit H1: also persist the call scope so the stale-upload
+   * sweeper alarm can reconstruct a (ns, tenant, sub) without an
+   * RPC caller.
    */
   private gateVfs(scope: VFSScope): void {
     this.ensureInit();
     enforceRateLimit(this, scope);
+    this.recordScope(scope);
+  }
+
+  /**
+   * Audit H6: write-specific gate. Refuses with EBUSY when the
+   * UNIQUE partial index on `files` is missing — legacy duplicate
+   * rows would otherwise let two concurrent writeFiles to the same
+   * path both insert their own `complete` row and corrupt the path
+   * mapping silently. Reads bypass this gate (they tolerate dupes
+   * by returning the first match).
+   */
+  private gateVfsWrite(scope: VFSScope): void {
+    this.gateVfs(scope);
+    const degraded = this.readDegradedIndexes();
+    if (degraded.includes("files_unique_index")) {
+      throw new VFSError(
+        "EBUSY",
+        "VFS writes refused: legacy duplicate rows block uniq_files_parent_name. " +
+          "Run admin dedupe (`POST /admin/dedupe-paths`) and reload the DO."
+      );
+    }
+  }
+
+  /**
+   * Persist the active scope into `vfs_meta` so alarm() can rehydrate
+   * a VFSScope. Idempotent UPSERT bounded to one row. The DO is
+   * already per-(ns, tenant, sub?) so this is mostly a "first-write
+   * wins" lookup; we still UPSERT on every gated call because the
+   * cost is one SQL statement and it self-heals if a row was wiped
+   * by a manual SQL repair.
+   */
+  private recordScope(scope: VFSScope): void {
+    const value = JSON.stringify({
+      ns: scope.ns,
+      tenant: scope.tenant,
+      ...(scope.sub !== undefined ? { sub: scope.sub } : {}),
+    });
+    this.sql.exec(
+      "INSERT OR REPLACE INTO vfs_meta (key, value) VALUES ('scope', ?)",
+      value
+    );
+  }
+
+  /** Read the scope persisted by gateVfs. Null if no VFS call has ever run. */
+  private loadScope(): VFSScope | null {
+    const row = this.sql
+      .exec("SELECT value FROM vfs_meta WHERE key = 'scope'")
+      .toArray()[0] as { value: string } | undefined;
+    if (!row) return null;
+    try {
+      const parsed = JSON.parse(row.value) as {
+        ns: string;
+        tenant: string;
+        sub?: string;
+      };
+      if (typeof parsed.ns !== "string" || typeof parsed.tenant !== "string") {
+        return null;
+      }
+      return parsed;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Public alias used by the alarm-sweep tests to invoke the
+   * scheduling helper without introspecting private methods.
+   * Production callers reach this via writeFile / beginWriteStream
+   * which schedule the alarm as a side effect of the tmp insert.
+   */
+  scheduleStaleUploadSweep(): Promise<void> {
+    return this.ensureStaleSweepScheduled();
+  }
+
+  /**
+   * Ensure an alarm is scheduled within the next ~10 minutes.
+   * Idempotent: leaves an existing earlier alarm in place. Called
+   * from vfs-ops at every tmp-row insert so a crashing tenant gets
+   * its sweep regardless of subsequent traffic.
+   */
+  private async ensureStaleSweepScheduled(): Promise<void> {
+    const cur = await this.ctx.storage.getAlarm();
+    const target = Date.now() + 10 * 60 * 1000; // 10 min cadence
+    if (cur === null || cur > target) {
+      await this.ctx.storage.setAlarm(target);
+    }
+  }
+
+  /**
+   * Audit H1: stale-upload sweeper.
+   *
+   * Reaps `_vfs_tmp_<id>` rows older than 1 hour with `status='uploading'`.
+   * For each, runs the same hard-delete path as a synchronous abort:
+   * UserDO metadata first (DELETE file_chunks + DELETE files), then
+   * one ShardDO `deleteChunks` RPC per touched shard. The shard
+   * refcount drops; the per-shard alarm reclaims the chunk blobs
+   * after the 30s grace.
+   *
+   * Idempotent: re-running over an already-reaped tmp is a no-op
+   * (DELETE matches zero rows; ShardDO `removeFileRefs` finds zero
+   * chunk_refs). Cloudflare alarms have at-least-once semantics so
+   * idempotence is load-bearing.
+   *
+   * Reschedules itself if the LIMIT batch was filled, on the same
+   * 10-minute cadence as a fresh tmp-row insert.
+   */
+  async alarm(): Promise<void> {
+    this.ensureInit();
+    const scope = this.loadScope();
+    if (!scope) {
+      // No VFS call has ever run on this DO ⇒ no tmp rows could exist.
+      // Be defensive though: an operator might wipe vfs_meta but
+      // leave files behind. We still skip — without a scope we
+      // cannot route deleteChunks to the right ShardDO instance.
+      return;
+    }
+
+    const cutoff = Date.now() - 60 * 60 * 1000; // 1h staleness
+    const rows = this.sql
+      .exec(
+        `SELECT file_id FROM files
+          WHERE status = 'uploading'
+            AND file_name LIKE '_vfs_tmp_%'
+            AND created_at < ?
+          LIMIT 200`,
+        cutoff
+      )
+      .toArray() as { file_id: string }[];
+
+    for (const { file_id } of rows) {
+      // user_id encoding mirrors userIdFor(scope) in vfs-ops.
+      const userId =
+        scope.sub !== undefined ? `${scope.tenant}::${scope.sub}` : scope.tenant;
+      try {
+        await hardDeleteFileRowExternal(this, userId, scope, file_id);
+      } catch {
+        // Best-effort: a transient ShardDO error leaves the row
+        // intact; the next alarm fires on the same row. The 1h
+        // staleness window is large enough that retry storms are
+        // bounded.
+      }
+    }
+
+    // Reschedule if the batch was capped, otherwise fall through —
+    // the next gated VFS call will re-arm via ensureStaleSweepScheduled.
+    if (rows.length === 200) {
+      await this.ctx.storage.setAlarm(Date.now() + 60_000);
+    }
   }
 
   /** stat() — follows trailing symlinks. Throws ENOENT/ELOOP/ENOTDIR. */
@@ -762,13 +1033,13 @@ export class UserDO extends DurableObject<Env> {
     data: Uint8Array,
     opts?: { mode?: number; mimeType?: string }
   ): Promise<void> {
-    this.gateVfs(scope);
+    this.gateVfsWrite(scope);
     return vfsWriteFile(this, scope, path, data, opts);
   }
 
   /** unlink() — hard-delete file/symlink + dispatch chunk GC. EISDIR for dirs. */
   async vfsUnlink(scope: VFSScope, path: string): Promise<void> {
-    this.gateVfs(scope);
+    this.gateVfsWrite(scope);
     return vfsUnlink(this, scope, path);
   }
 
@@ -778,13 +1049,13 @@ export class UserDO extends DurableObject<Env> {
     path: string,
     opts?: { recursive?: boolean; mode?: number }
   ): Promise<void> {
-    this.gateVfs(scope);
+    this.gateVfsWrite(scope);
     vfsMkdir(this, scope, path, opts);
   }
 
   /** rmdir() — remove empty directory. ENOTEMPTY/ENOTDIR/ENOENT. */
   async vfsRmdir(scope: VFSScope, path: string): Promise<void> {
-    this.gateVfs(scope);
+    this.gateVfsWrite(scope);
     vfsRmdir(this, scope, path);
   }
 
@@ -794,7 +1065,7 @@ export class UserDO extends DurableObject<Env> {
     src: string,
     dst: string
   ): Promise<void> {
-    this.gateVfs(scope);
+    this.gateVfsWrite(scope);
     return vfsRename(this, scope, src, dst);
   }
 
@@ -814,7 +1085,7 @@ export class UserDO extends DurableObject<Env> {
     target: string,
     linkPath: string
   ): Promise<void> {
-    this.gateVfs(scope);
+    this.gateVfsWrite(scope);
     vfsSymlink(this, scope, target, linkPath);
   }
 
@@ -824,7 +1095,7 @@ export class UserDO extends DurableObject<Env> {
     path: string,
     cursor?: string
   ): Promise<{ done: boolean; cursor?: string }> {
-    this.gateVfs(scope);
+    this.gateVfsWrite(scope);
     return vfsRemoveRecursive(this, scope, path, cursor);
   }
 
@@ -884,8 +1155,14 @@ export class UserDO extends DurableObject<Env> {
     path: string,
     opts?: { mode?: number; mimeType?: string }
   ): Promise<VFSWriteHandle> {
-    this.gateVfs(scope);
-    return vfsBeginWriteStream(this, scope, path, opts);
+    this.gateVfsWrite(scope);
+    const handle = vfsBeginWriteStream(this, scope, path, opts);
+    // H1: schedule sweeper after the tmp row is in place. If the
+    // caller never sends a commit / abort the alarm reclaims after
+    // 1h. setAlarm is awaited but the latency is hidden behind the
+    // existing await at the call site.
+    await this.ensureStaleSweepScheduled();
+    return handle;
   }
 
   /** appendWriteStream — push one chunk. chunkIndex must be sequential. Returns cumulative bytes. */
@@ -895,6 +1172,11 @@ export class UserDO extends DurableObject<Env> {
     chunkIndex: number,
     data: Uint8Array
   ): Promise<{ bytesWritten: number }> {
+    // Append doesn't insert into `files`; it INSERTs into file_chunks
+    // and the tmp row already exists. The H6 EBUSY guard sits on
+    // begin/commit (the pair that establishes new (parent, name)
+    // claims). Append rate-limits and audits scope but skips the
+    // index check.
     this.gateVfs(scope);
     return vfsAppendWriteStream(this, scope, handle, chunkIndex, data);
   }
@@ -904,7 +1186,7 @@ export class UserDO extends DurableObject<Env> {
     scope: VFSScope,
     handle: VFSWriteHandle
   ): Promise<void> {
-    this.gateVfs(scope);
+    this.gateVfsWrite(scope);
     return vfsCommitWriteStream(this, scope, handle);
   }
 
@@ -928,7 +1210,7 @@ export class UserDO extends DurableObject<Env> {
     path: string,
     opts?: { mode?: number; mimeType?: string }
   ): Promise<{ stream: WritableStream<Uint8Array>; handle: VFSWriteHandle }> {
-    this.gateVfs(scope);
+    this.gateVfsWrite(scope);
     return vfsCreateWriteStream(this, scope, path, opts);
   }
 
@@ -971,7 +1253,7 @@ export class UserDO extends DurableObject<Env> {
     path: string,
     sourceVersionId: string
   ): Promise<{ versionId: string }> {
-    this.gateVfs(scope);
+    this.gateVfsWrite(scope);
     const userId = scope.sub
       ? `${scope.tenant}::${scope.sub}`
       : scope.tenant;

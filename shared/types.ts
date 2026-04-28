@@ -1,3 +1,5 @@
+/// <reference types="@cloudflare/workers-types" />
+
 // ── Chunk & File Types ──
 
 export type ChunkHash = string; // hex-encoded SHA-256, 64 chars

@@ -1,8 +1,29 @@
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import type { Env } from "@shared/types";
-import { signJWT } from "../lib/auth";
+import { signJWT, VFSConfigError } from "../lib/auth";
 
 const auth = new Hono<{ Bindings: Env }>();
+
+type AuthCtx = Context<{ Bindings: Env }>;
+
+/**
+ * Mint a JWT, mapping a missing-secret VFSConfigError to a clean
+ * 503 instead of a generic 500. Auth signup/login pre-existed but
+ * inherited the same JWT_SECRET; they now share the same fail-mode.
+ */
+async function mintJWT(
+  c: AuthCtx,
+  result: { userId: string; email: string }
+): Promise<Response | string> {
+  try {
+    return await signJWT(c.env, result);
+  } catch (err) {
+    if (err instanceof VFSConfigError) {
+      return c.json({ error: err.message }, 503);
+    }
+    throw err;
+  }
+}
 
 /**
  * POST /api/auth/signup
@@ -39,10 +60,11 @@ auth.post("/signup", async (c) => {
   }
 
   const result = (await res.json()) as { userId: string; email: string };
-  const token = await signJWT(c.env, result);
+  const tokenOrResp = await mintJWT(c, result);
+  if (typeof tokenOrResp !== "string") return tokenOrResp;
 
   return c.json({
-    token,
+    token: tokenOrResp,
     userId: result.userId,
     email: result.email,
   });
@@ -78,10 +100,11 @@ auth.post("/login", async (c) => {
   }
 
   const result = (await res.json()) as { userId: string; email: string };
-  const token = await signJWT(c.env, result);
+  const tokenOrResp = await mintJWT(c, result);
+  if (typeof tokenOrResp !== "string") return tokenOrResp;
 
   return c.json({
-    token,
+    token: tokenOrResp,
     userId: result.userId,
     email: result.email,
   });

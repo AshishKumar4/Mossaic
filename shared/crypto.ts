@@ -3,9 +3,19 @@ import type { ChunkHash } from "./types";
 /**
  * Compute SHA-256 hash of chunk data.
  * Returns hex-encoded string (64 chars).
+ *
+ * NOTE: under strict workers-types `crypto.subtle.digest` accepts
+ * `BufferSource` parameterised on `ArrayBuffer`, not `ArrayBufferLike`
+ * (which would admit `SharedArrayBuffer`). The `data.buffer as ArrayBuffer`
+ * cast narrows the underlying buffer type. The byte payload is unchanged.
  */
 export async function hashChunk(data: Uint8Array): Promise<ChunkHash> {
-  const digest = await crypto.subtle.digest("SHA-256", data);
+  const view = new Uint8Array(
+    data.buffer as ArrayBuffer,
+    data.byteOffset,
+    data.byteLength
+  );
+  const digest = await crypto.subtle.digest("SHA-256", view);
   return bufferToHex(digest);
 }
 

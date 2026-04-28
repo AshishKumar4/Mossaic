@@ -72,6 +72,10 @@ export type VFSErrorCode =
   | "EEXIST"
   | "EISDIR"
   | "ENOTDIR"
+  // ENOTEMPTY: rmdir on a non-empty dir. README + SDK promise this
+  // code; audit H2 added it to the union so the server can actually
+  // throw it. Routed to HTTP 409 in worker/routes/vfs.ts.
+  | "ENOTEMPTY"
   | "EFBIG"
   | "ELOOP"
   | "EBUSY"

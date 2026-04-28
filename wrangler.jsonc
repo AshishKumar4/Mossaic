@@ -1,3 +1,15 @@
+// Mossaic Worker config.
+//
+// REQUIRED secrets (set via `wrangler secret put`, NEVER committed):
+//   JWT_SECRET — signs auth + VFS tokens. There is no in-source dev
+//                fallback. Workers without this secret will refuse to
+//                sign or verify any token (auth.ts:VFSConfigError → 503).
+//                Set with: `wrangler secret put JWT_SECRET`
+//
+// REQUIRED bindings: USER_DO, SHARD_DO, SEARCH_DO (below). The Worker
+// boots without JWT_SECRET; auth-bearing routes refuse with 503 until
+// the secret is set, so legacy `/api/upload`/`/api/download` paths that
+// don't touch JWT remain available during a partial rollout.
 {
   "name": "mossaic",
   "main": "worker/index.ts",
