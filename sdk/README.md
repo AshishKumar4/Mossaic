@@ -371,6 +371,73 @@ Cloudflare Artifacts is **per-tree** and **versioned-as-Git**: every commit is a
 
 The two products **compose**. A Worker can hold both bindings: Artifacts for source repos, Mossaic for blob storage with per-file history. Use whichever shape matches the data.
 
+## Live editing with Yjs (per-file CRDT mode)
+
+Phase 10 adds **native Yjs** as a per-file mode. A regular file can be promoted to "yjs-mode" with a one-line `setYjsMode` call; from then on, every `writeFile` becomes a CRDT transaction, `readFile` materialises the current state, and any number of clients can co-edit live over a WebSocket.
+
+### Mental model
+
+- **Per-file**, not per-tenant. Mix CRDT and plain files freely; only files you toggle become CRDTs.
+- **Storage**: one `yjs_oplog` row per Yjs update, keyed by `(path_id, seq)`. Updates are content-hashed and pushed into Mossaic's existing chunk fabric — they share the rendezvous-hashed shard placement, refcounted GC, and per-tenant isolation that ordinary blobs use. **Compaction** periodically emits a `Y.Doc` state snapshot and reaps prior op rows.
+- **Wire protocol**: standard Yjs sync protocol (sync_step_1 / sync_step_2 / update) tagged with a single byte. **Binary frames** end-to-end — no JSON, no base64, no envelope overhead.
+- **WebSocket transport**: Cloudflare's [Hibernation API](https://developers.cloudflare.com/durable-objects/api/websockets/#hibernation-api). **Idle connections cost $0** — workerd evicts the DO between frames and rehydrates per message. Per-socket state survives via `serializeAttachment`.
+- **Versioning interop**: when both versioning and yjs-mode are on, **compaction snapshots** create Mossaic version rows. Live ops between snapshots are NOT versioned — the Yjs op log IS the live history.
+- **`yjs` is an optional peer dependency** — bring your own Yjs version. Importing from `@mossaic/sdk/yjs` is the opt-in.
+
+### Example
+
+```ts
+import { createVFS, VFS_MODE_YJS_BIT } from "@mossaic/sdk";
+import { openYDoc } from "@mossaic/sdk/yjs";
+
+export default {
+  async fetch(req: Request, env: Env) {
+    const vfs = createVFS(env, { tenant: "acme" });
+
+    // 1. Promote a file to yjs-mode (one-time per file).
+    await vfs.writeFile("/notes/today.md", "# Today\n");
+    await vfs.setYjsMode("/notes/today.md", true);
+    // Equivalent overload:
+    // await vfs.chmod("/notes/today.md", { yjs: true });
+
+    // 2. Subsequent writeFile calls become CRDT transactions.
+    await vfs.writeFile("/notes/today.md", "# Today\n- [ ] ship phase 10\n");
+
+    // 3. Clients co-edit live over a WebSocket.
+    const handle = await openYDoc(vfs, "/notes/today.md");
+    await handle.synced; // initial round-trip complete
+
+    handle.doc.getText("content").insert(0, "DRAFT — ");
+    // ... edits propagate to every other open client ...
+
+    await handle.close();
+    return new Response("ok");
+  },
+};
+```
+
+### Detecting yjs-mode
+
+Stat surfaces the bit on `mode`:
+
+```ts
+import { VFS_MODE_YJS_BIT } from "@mossaic/sdk";
+
+const stat = await vfs.stat("/notes/today.md");
+if ((stat.mode & VFS_MODE_YJS_BIT) !== 0) {
+  // yjs-mode file — readFile returns the materialised content,
+  // writeFile becomes a CRDT replacement of Y.Text("content").
+}
+```
+
+### Caveats
+
+- **Demoting back to plain mode is rejected** (`EINVAL`) — it would silently lose CRDT history. If you need a plain copy, do `readFile` and `writeFile` to a different path.
+- **`writeFile` semantics on yjs-mode files**: the new bytes **replace** the value of `Y.Text("content")` inside a single `doc.transact`. If two writers race, both transactions commit and merge in CRDT order — neither is lost. To make finer-grained edits, open a `Y.Doc` via `openYDoc` and mutate it directly.
+- **isomorphic-git interop**: a tracked file can be promoted in-place. Once promoted, blob hashes change every transaction (the underlying chunks are Yjs updates, not the file content), so don't expect Git-friendly diffs against earlier commits — promote a file when you want CRDT semantics, not on the source you want Git to track.
+- **`yjs` peer dependency**: install in your consumer Worker. Mossaic does NOT bundle it. Tested against `yjs >=13.6.0`.
+- **No awareness yet**: the WebSocket protocol carries sync only in v1. Awareness (cursors, selections, presence) ships in a follow-up minor.
+
 ## Subrequest model
 
 > **Each VFS method = exactly 1 outbound DO RPC subrequest in the consumer's Worker invocation, regardless of internal chunk fan-out.**

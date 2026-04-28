@@ -13,6 +13,10 @@
     "./fs": {
       "types": "./dist/igit.d.ts",
       "import": "./dist/igit.js"
+    },
+    "./yjs": {
+      "types": "./dist/yjs.d.ts",
+      "import": "./dist/yjs.js"
     }
   },
   "files": [
@@ -27,10 +31,14 @@
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "peerDependencies": {
-    "isomorphic-git": ">=1.25.0"
+    "isomorphic-git": ">=1.25.0",
+    "yjs": ">=13.6.0"
   },
   "peerDependenciesMeta": {
     "isomorphic-git": {
+      "optional": true
+    },
+    "yjs": {
       "optional": true
     }
   },
