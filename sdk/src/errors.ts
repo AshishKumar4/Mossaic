@@ -178,22 +178,60 @@ export function mapServerError(
   const explicitCode =
     typeof e?.code === "string" ? (e.code as VFSErrorCode) : undefined;
 
-  // Server message convention: "CODE: rest". Extract the prefix.
+  // Server message convention: "CODE: rest". Extract by scanning the
+  // message for any token that matches a known code. We don't anchor
+  // to ^ because workerd's Error serialisation may prepend the
+  // class name (`"VFSError: ENOENT: …"`) so the code is the SECOND
+  // colon-delimited token, not the first. Take the FIRST recognised
+  // code and use it.
   let codeFromMsg: VFSErrorCode | undefined;
   const rawMsg = typeof e?.message === "string" ? e.message : String(err);
-  const m = rawMsg.match(/^([A-Z_]+):/);
-  if (m) {
-    const candidate = m[1] as VFSErrorCode;
-    if (candidate in ERRNO) codeFromMsg = candidate;
+  const tokens = rawMsg.match(/[A-Z_]{3,}/g) ?? [];
+  for (const tok of tokens) {
+    if (tok in ERRNO) {
+      codeFromMsg = tok as VFSErrorCode;
+      break;
+    }
   }
 
   const code: VFSErrorCode =
     (explicitCode && explicitCode in ERRNO ? explicitCode : codeFromMsg) ??
     "EINVAL";
 
-  return new VFSFsError(code, {
+  // Construct the base VFSFsError with the server's contextualised
+  // message, then re-set the prototype to the matching subclass so
+  // `instanceof ENOENT` / `instanceof EFBIG` etc. work for consumer
+  // code that prefers type-pattern matching over `.code` string
+  // comparison. The base class's runtime fields (code, errno,
+  // syscall, path, message) are unchanged.
+  const inst = new VFSFsError(code, {
     path: ctx.path,
     syscall: ctx.syscall,
     message: rawMsg,
   });
+  const SubProto = SUBCLASS_PROTO[code];
+  if (SubProto) {
+    Object.setPrototypeOf(inst, SubProto);
+  }
+  return inst;
 }
+
+/**
+ * Map of code → subclass.prototype for instanceof retro-fitting in
+ * mapServerError. Defined AFTER the subclasses are declared above,
+ * so the prototype chain is valid at module-init time.
+ */
+const SUBCLASS_PROTO: Partial<Record<VFSErrorCode, object>> = {
+  ENOENT: ENOENT.prototype,
+  EEXIST: EEXIST.prototype,
+  EISDIR: EISDIR.prototype,
+  ENOTDIR: ENOTDIR.prototype,
+  EFBIG: EFBIG.prototype,
+  ELOOP: ELOOP.prototype,
+  EBUSY: EBUSY.prototype,
+  EINVAL: EINVAL.prototype,
+  EACCES: EACCES.prototype,
+  EROFS: EROFS.prototype,
+  ENOTEMPTY: ENOTEMPTY.prototype,
+  EMOSSAIC_UNAVAILABLE: MossaicUnavailableError.prototype,
+};

@@ -394,8 +394,9 @@ export function vfsReadManyStat(
  *      (Phase 4). The recorded `shard_index` is unchanged from what
  *      `placeChunk` returned at write time, so reads remain
  *      deterministic across pool growth.
- *   3. Cap at READFILE_MAX (100 MB) — beyond that, throw EFBIG and
- *      direct callers to createReadStream / openManifest+readChunk.
+ *   3. Cap at READFILE_MAX (default 500 MB; configurable) — beyond
+ *      that, throw EFBIG and direct callers to createReadStream /
+ *      openManifest+readChunk.
  *
  * EISDIR: path resolves to a directory.
  * Symlinks: followed (resolveOrThrow with follow=true).
@@ -929,17 +930,11 @@ export async function vfsWriteFile(
   }
 
   // ── Chunked tier ──
-  if (data.byteLength > READFILE_MAX) {
-    // Cap: even though writeFile is one-shot, an oversized buffer would
-    // be unreadable through readFile after commit. We could allow it
-    // (callers could still use openManifest+readChunk), but EFBIG is
-    // the safer default.
-    throw new VFSError(
-      "EFBIG",
-      `writeFile: ${data.byteLength} bytes exceeds 100 MB readFile cap; use createWriteStream`
-    );
-  }
-
+  // EFBIG is already enforced above against WRITEFILE_MAX (500 MB).
+  // The previous redundant READFILE_MAX gate has been folded; both caps
+  // are equal so a writeFile that succeeds is always readable via
+  // readFile. For larger workloads use createWriteStream (memory-bounded
+  // streaming) or, on the read side, openManifest + readChunk.
   const { chunkSize, chunkCount } = computeChunkSpec(data.byteLength);
   const tmpId = generateId();
   const tmpName = `_vfs_tmp_${tmpId}`;
