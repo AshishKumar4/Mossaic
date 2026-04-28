@@ -6,6 +6,28 @@ Mossaic splits every file into 1 MB chunks, hashes them with SHA-256, distribute
 
 ---
 
+## `@mossaic/sdk` — fs/promises VFS for Cloudflare Workers
+
+Mossaic's storage layer is also packaged as an npm SDK (**[`@mossaic/sdk`](./sdk/README.md)**) that any Cloudflare Worker can consume to get a Node-`fs/promises`-shaped, isomorphic-git-compatible filesystem with content-addressed dedup, multi-tenancy, streaming, and typed errors.
+
+```ts
+// src/index.ts
+import { UserDO, ShardDO, SearchDO, createVFS } from "@mossaic/sdk";
+export { UserDO, ShardDO, SearchDO };
+
+export default {
+  async fetch(req, env) {
+    const vfs = createVFS(env, { tenant: "acme-corp" });
+    await vfs.writeFile("/hello.txt", "world");
+    return new Response(await vfs.readFile("/hello.txt"));
+  },
+};
+```
+
+One outbound DO RPC per VFS call regardless of internal chunk fan-out; isomorphic-git plugs in directly via `vfs.promises === vfs`. Multi-tenant via `vfs:${ns}:${tenant}[:${sub}]` DO naming; per-tenant rate limits; HTTP fallback for non-Worker consumers; auto-batched `lstat` for git-style workloads. See **[`sdk/README.md`](./sdk/README.md)** for the full DX walkthrough.
+
+---
+
 ## Architecture
 
 ```mermaid

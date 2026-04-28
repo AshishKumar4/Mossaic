@@ -54,6 +54,7 @@ import type {
   VFSStatRaw,
 } from "@shared/vfs-types";
 import { dedupePaths, type DedupeResult } from "./admin";
+import { enforceRateLimit } from "./rate-limit";
 
 export class UserDO extends DurableObject<Env> {
   sql: SqlStorage;
@@ -214,6 +215,38 @@ export class UserDO extends DurableObject<Env> {
       CREATE INDEX IF NOT EXISTS idx_folders_parent
         ON folders(user_id, parent_id)
     `);
+
+    // ── Phase 8: per-tenant rate-limit state (token bucket) ──────────────
+    //
+    // Token-bucket limiter applied to VFS RPC methods (not the legacy
+    // fetch handler). State persists across DO hibernation so the
+    // bucket survives cold starts. Defaults: 100 ops/sec refill, 200
+    // burst capacity. Operators can override per-tenant via direct
+    // SQL or admin tooling. NULL columns inherit defaults at runtime.
+    try {
+      this.sql.exec(
+        "ALTER TABLE quota ADD COLUMN rate_limit_per_sec INTEGER"
+      );
+    } catch {
+      // column already exists
+    }
+    try {
+      this.sql.exec(
+        "ALTER TABLE quota ADD COLUMN rate_limit_burst INTEGER"
+      );
+    } catch {
+      // column already exists
+    }
+    try {
+      this.sql.exec("ALTER TABLE quota ADD COLUMN rl_tokens REAL");
+    } catch {
+      // column already exists
+    }
+    try {
+      this.sql.exec("ALTER TABLE quota ADD COLUMN rl_updated_at INTEGER");
+    } catch {
+      // column already exists
+    }
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -527,33 +560,45 @@ export class UserDO extends DurableObject<Env> {
   // run before any VFS access on a DO that hasn't seen any legacy
   // /fetch traffic yet.
 
+  /**
+   * Phase 8 gate: ensureInit + per-tenant rate-limit check. Every
+   * VFS RPC method calls this BEFORE delegating to vfs-ops. The
+   * legacy fetch handler is unaffected — it has its own ensureInit
+   * and is exempt from the new rate limiter (back-compat with the
+   * existing user-facing app's traffic patterns).
+   */
+  private gateVfs(scope: VFSScope): void {
+    this.ensureInit();
+    enforceRateLimit(this, scope);
+  }
+
   /** stat() — follows trailing symlinks. Throws ENOENT/ELOOP/ENOTDIR. */
   async vfsStat(scope: VFSScope, path: string): Promise<VFSStatRaw> {
-    this.ensureInit();
+    this.gateVfs(scope);
     return vfsStat(this, scope, path);
   }
 
   /** lstat() — does NOT follow trailing symlinks. */
   async vfsLstat(scope: VFSScope, path: string): Promise<VFSStatRaw> {
-    this.ensureInit();
+    this.gateVfs(scope);
     return vfsLstat(this, scope, path);
   }
 
   /** exists() — returns true iff the path resolves to a file/dir/symlink. */
   async vfsExists(scope: VFSScope, path: string): Promise<boolean> {
-    this.ensureInit();
+    this.gateVfs(scope);
     return vfsExists(this, scope, path);
   }
 
   /** readlink() — returns the symlink target string. EINVAL if not a symlink. */
   async vfsReadlink(scope: VFSScope, path: string): Promise<string> {
-    this.ensureInit();
+    this.gateVfs(scope);
     return vfsReadlink(this, scope, path);
   }
 
   /** readdir() — entry names under a directory. ENOTDIR/ENOENT if applicable. */
   async vfsReaddir(scope: VFSScope, path: string): Promise<string[]> {
-    this.ensureInit();
+    this.gateVfs(scope);
     return vfsReaddir(this, scope, path);
   }
 
@@ -562,13 +607,13 @@ export class UserDO extends DurableObject<Env> {
     scope: VFSScope,
     paths: string[]
   ): Promise<(VFSStatRaw | null)[]> {
-    this.ensureInit();
+    this.gateVfs(scope);
     return vfsReadManyStat(this, scope, paths);
   }
 
   /** readFile() — returns Uint8Array bytes. EISDIR/EFBIG/ENOENT/ELOOP. */
   async vfsReadFile(scope: VFSScope, path: string): Promise<Uint8Array> {
-    this.ensureInit();
+    this.gateVfs(scope);
     return vfsReadFile(this, scope, path);
   }
 
@@ -577,7 +622,7 @@ export class UserDO extends DurableObject<Env> {
     scope: VFSScope,
     path: string
   ): Promise<OpenManifestResult> {
-    this.ensureInit();
+    this.gateVfs(scope);
     return vfsOpenManifest(this, scope, path);
   }
 
@@ -587,7 +632,7 @@ export class UserDO extends DurableObject<Env> {
     path: string,
     chunkIndex: number
   ): Promise<Uint8Array> {
-    this.ensureInit();
+    this.gateVfs(scope);
     return vfsReadChunk(this, scope, path, chunkIndex);
   }
 
@@ -611,13 +656,13 @@ export class UserDO extends DurableObject<Env> {
     data: Uint8Array,
     opts?: { mode?: number; mimeType?: string }
   ): Promise<void> {
-    this.ensureInit();
+    this.gateVfs(scope);
     return vfsWriteFile(this, scope, path, data, opts);
   }
 
   /** unlink() — hard-delete file/symlink + dispatch chunk GC. EISDIR for dirs. */
   async vfsUnlink(scope: VFSScope, path: string): Promise<void> {
-    this.ensureInit();
+    this.gateVfs(scope);
     return vfsUnlink(this, scope, path);
   }
 
@@ -627,13 +672,13 @@ export class UserDO extends DurableObject<Env> {
     path: string,
     opts?: { recursive?: boolean; mode?: number }
   ): Promise<void> {
-    this.ensureInit();
+    this.gateVfs(scope);
     vfsMkdir(this, scope, path, opts);
   }
 
   /** rmdir() — remove empty directory. ENOTEMPTY/ENOTDIR/ENOENT. */
   async vfsRmdir(scope: VFSScope, path: string): Promise<void> {
-    this.ensureInit();
+    this.gateVfs(scope);
     vfsRmdir(this, scope, path);
   }
 
@@ -643,7 +688,7 @@ export class UserDO extends DurableObject<Env> {
     src: string,
     dst: string
   ): Promise<void> {
-    this.ensureInit();
+    this.gateVfs(scope);
     return vfsRename(this, scope, src, dst);
   }
 
@@ -653,7 +698,7 @@ export class UserDO extends DurableObject<Env> {
     path: string,
     mode: number
   ): Promise<void> {
-    this.ensureInit();
+    this.gateVfs(scope);
     vfsChmod(this, scope, path, mode);
   }
 
@@ -663,7 +708,7 @@ export class UserDO extends DurableObject<Env> {
     target: string,
     linkPath: string
   ): Promise<void> {
-    this.ensureInit();
+    this.gateVfs(scope);
     vfsSymlink(this, scope, target, linkPath);
   }
 
@@ -673,7 +718,7 @@ export class UserDO extends DurableObject<Env> {
     path: string,
     cursor?: string
   ): Promise<{ done: boolean; cursor?: string }> {
-    this.ensureInit();
+    this.gateVfs(scope);
     return vfsRemoveRecursive(this, scope, path, cursor);
   }
 
@@ -702,7 +747,7 @@ export class UserDO extends DurableObject<Env> {
     scope: VFSScope,
     path: string
   ): Promise<VFSReadHandle> {
-    this.ensureInit();
+    this.gateVfs(scope);
     return vfsOpenReadStream(this, scope, path);
   }
 
@@ -713,7 +758,7 @@ export class UserDO extends DurableObject<Env> {
     chunkIndex: number,
     range?: { start?: number; end?: number }
   ): Promise<Uint8Array> {
-    this.ensureInit();
+    this.gateVfs(scope);
     return vfsPullReadStream(this, scope, handle, chunkIndex, range);
   }
 
@@ -723,7 +768,7 @@ export class UserDO extends DurableObject<Env> {
     path: string,
     range?: { start?: number; end?: number }
   ): Promise<ReadableStream<Uint8Array>> {
-    this.ensureInit();
+    this.gateVfs(scope);
     return vfsCreateReadStream(this, scope, path, range);
   }
 
@@ -733,7 +778,7 @@ export class UserDO extends DurableObject<Env> {
     path: string,
     opts?: { mode?: number; mimeType?: string }
   ): Promise<VFSWriteHandle> {
-    this.ensureInit();
+    this.gateVfs(scope);
     return vfsBeginWriteStream(this, scope, path, opts);
   }
 
@@ -744,7 +789,7 @@ export class UserDO extends DurableObject<Env> {
     chunkIndex: number,
     data: Uint8Array
   ): Promise<{ bytesWritten: number }> {
-    this.ensureInit();
+    this.gateVfs(scope);
     return vfsAppendWriteStream(this, scope, handle, chunkIndex, data);
   }
 
@@ -753,7 +798,7 @@ export class UserDO extends DurableObject<Env> {
     scope: VFSScope,
     handle: VFSWriteHandle
   ): Promise<void> {
-    this.ensureInit();
+    this.gateVfs(scope);
     return vfsCommitWriteStream(this, scope, handle);
   }
 
@@ -762,7 +807,7 @@ export class UserDO extends DurableObject<Env> {
     scope: VFSScope,
     handle: VFSWriteHandle
   ): Promise<void> {
-    this.ensureInit();
+    this.gateVfs(scope);
     return vfsAbortWriteStream(this, scope, handle);
   }
 
@@ -777,7 +822,7 @@ export class UserDO extends DurableObject<Env> {
     path: string,
     opts?: { mode?: number; mimeType?: string }
   ): Promise<{ stream: WritableStream<Uint8Array>; handle: VFSWriteHandle }> {
-    this.ensureInit();
+    this.gateVfs(scope);
     return vfsCreateWriteStream(this, scope, path, opts);
   }
 

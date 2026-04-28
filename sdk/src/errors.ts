@@ -26,6 +26,7 @@ export type VFSErrorCode =
   | "EACCES"
   | "EROFS"
   | "ENOTEMPTY"
+  | "EAGAIN"
   | "EMOSSAIC_UNAVAILABLE";
 
 /**
@@ -44,6 +45,7 @@ const ERRNO: Record<VFSErrorCode, number> = {
   EACCES: -13,
   EROFS: -30,
   ENOTEMPTY: -39,
+  EAGAIN: -11, // POSIX EAGAIN — rate-limit / try-again
   EMOSSAIC_UNAVAILABLE: -111, // ECONNREFUSED-equivalent
 };
 
@@ -59,6 +61,7 @@ const HUMAN: Record<VFSErrorCode, string> = {
   EACCES: "permission denied",
   EROFS: "read-only file system",
   ENOTEMPTY: "directory not empty",
+  EAGAIN: "rate limit exceeded; retry",
   EMOSSAIC_UNAVAILABLE: "Mossaic VFS unavailable",
 };
 
@@ -148,10 +151,62 @@ export class ENOTEMPTY extends VFSFsError {
     super("ENOTEMPTY", opts);
   }
 }
+export class EAGAIN extends VFSFsError {
+  constructor(opts: { syscall?: string; path?: string; message?: string } = {}) {
+    super("EAGAIN", opts);
+  }
+}
 export class MossaicUnavailableError extends VFSFsError {
   constructor(opts: { message?: string } = {}) {
     super("EMOSSAIC_UNAVAILABLE", opts);
   }
+}
+
+/**
+ * Heuristic detector for transport-level failures that should surface
+ * as `MossaicUnavailableError` rather than a generic EINVAL.
+ *
+ * Workers RPC and Durable Object stub calls can fail with several
+ * patterns that aren't VFSError-shaped:
+ *   - Plain `Error` with messages like "Internal error", "Network
+ *     connection lost.", "Durable Object hibernation timed out",
+ *     "The Durable Object's code threw an exception", "fetch failed",
+ *     "ECONNREFUSED", "Failed to fetch".
+ *   - `TypeError("Network request failed")` from the global fetch.
+ *   - undici `fetch failed` wrappers.
+ *
+ * We pattern-match on `e.message` (case-insensitive) and on `e.name`
+ * (TypeError + 'fetch' anywhere). Anything that matches gets
+ * remapped to EMOSSAIC_UNAVAILABLE so consumers can soft-fail or
+ * retry with backoff. False positives are bounded — server-side
+ * VFSError messages start with "CODE: …", which won't trigger
+ * because none of the patterns are substrings of any VFSError code.
+ */
+const UNAVAILABLE_PATTERNS = [
+  /network connection lost/i,
+  /durable object.*(hibernat|timed? ?out|threw)/i,
+  /fetch failed/i,
+  /failed to fetch/i,
+  /econnrefused/i,
+  /econnreset/i,
+  /network (?:error|request failed)/i,
+  /service binding.*(unavailable|unreachable)/i,
+];
+
+export function isLikelyUnavailable(err: unknown): boolean {
+  const e = err as { name?: unknown; message?: unknown; code?: unknown };
+  // Already-typed pass-through.
+  if (e?.code === "EMOSSAIC_UNAVAILABLE") return true;
+  const msg = typeof e?.message === "string" ? e.message : String(err);
+  // TypeError thrown by fetch on network failure.
+  if (
+    typeof e?.name === "string" &&
+    e.name === "TypeError" &&
+    /fetch/i.test(msg)
+  ) {
+    return true;
+  }
+  return UNAVAILABLE_PATTERNS.some((re) => re.test(msg));
 }
 
 /**
@@ -173,6 +228,24 @@ export function mapServerError(
   if (err instanceof VFSFsError) {
     // Already typed; pass-through.
     return err;
+  }
+  // Transport-level unavailability detection happens BEFORE code
+  // extraction. A network failure / DO hibernation / fetch reject
+  // doesn't carry a VFS code; we surface MossaicUnavailableError so
+  // consumers can soft-fail or retry with backoff rather than seeing
+  // a misleading EINVAL.
+  if (isLikelyUnavailable(err)) {
+    const rawMsg =
+      typeof (err as { message?: unknown })?.message === "string"
+        ? ((err as { message: string }).message)
+        : String(err);
+    const inst = new VFSFsError("EMOSSAIC_UNAVAILABLE", {
+      path: ctx.path,
+      syscall: ctx.syscall,
+      message: rawMsg,
+    });
+    Object.setPrototypeOf(inst, MossaicUnavailableError.prototype);
+    return inst;
   }
   const e = err as { code?: unknown; message?: unknown };
   const explicitCode =
@@ -233,5 +306,6 @@ const SUBCLASS_PROTO: Partial<Record<VFSErrorCode, object>> = {
   EACCES: EACCES.prototype,
   EROFS: EROFS.prototype,
   ENOTEMPTY: ENOTEMPTY.prototype,
+  EAGAIN: EAGAIN.prototype,
   EMOSSAIC_UNAVAILABLE: MossaicUnavailableError.prototype,
 };
