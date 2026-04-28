@@ -16,12 +16,15 @@
  * handlers, providing an end-to-end regression gate.
  *
  * Phase 11: the worker entry now lives at `worker/app/index.ts` (the
- * App-mode bundle). DO re-exports point to the new layout: `UserDO`
- * (App subclass) from worker/app, `ShardDO` + `SearchDO` from
- * worker/core. Class names are unchanged so existing test bindings
- * (`class_name: "UserDO"`) continue to resolve.
+ * App-mode bundle). DO re-exports point to the new layout. Class names
+ * are unchanged so existing test bindings (`class_name: "UserDO"`)
+ * continue to resolve.
+ *
+ * Phase 11.1: SearchDO moved from worker/core/objects/search/ to
+ * worker/app/objects/search/ (App-only — backs the photo-library's
+ * /api/search route, not part of the SDK contract).
  */
 export { default } from "../worker/app/index";
 export { UserDO } from "../worker/app/objects/user/index";
 export { ShardDO } from "../worker/core/objects/shard/index";
-export { SearchDO } from "../worker/core/objects/search/index";
+export { SearchDO } from "../worker/app/objects/search/index";

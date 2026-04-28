@@ -15,12 +15,17 @@ import vfsRoutes from "@core/routes/vfs";
 // Phase 11: UserDO is the App-side subclass that adds the legacy
 // photo-app HTTP routes on top of UserDOCore. Production wrangler
 // binds class_name: "UserDO" — the class name preserved verbatim
-// from Phase 10. ShardDO / SearchDO are pure-Core classes
-// re-exported through this entry so wrangler can resolve all three
-// from one main file.
+// from Phase 10. ShardDO is a pure-Core class re-exported through
+// this entry so wrangler can resolve both from one main file.
+//
+// Phase 11.1: SearchDO is App-only (CLIP/BGE vector store backing
+// the photo-library's /api/search route). It moved from
+// `worker/core/objects/search/` to `worker/app/objects/search/`
+// and is no longer re-exported from `@mossaic/sdk` — SDK consumers
+// who want vector search bring their own DO.
 export { UserDO } from "./objects/user/index";
 export { ShardDO } from "@core/objects/shard/index";
-export { SearchDO } from "@core/objects/search/index";
+export { SearchDO } from "./objects/search/index";
 
 const app = new Hono<{ Bindings: Env }>();
 

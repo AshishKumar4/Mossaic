@@ -10,14 +10,13 @@
   "durable_objects": {
     "bindings": [
       { "name": "MOSSAIC_USER", "class_name": "UserDO" },
-      { "name": "MOSSAIC_SHARD", "class_name": "ShardDO" },
-      { "name": "MOSSAIC_SEARCH", "class_name": "SearchDO" }
+      { "name": "MOSSAIC_SHARD", "class_name": "ShardDO" }
     ]
   },
   "migrations": [
     {
       "tag": "v1",
-      "new_sqlite_classes": ["UserDO", "ShardDO", "SearchDO"]
+      "new_sqlite_classes": ["UserDO", "ShardDO"]
     }
   ],
   "vars": {
