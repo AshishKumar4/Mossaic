@@ -14,7 +14,10 @@ const KEY_LENGTH = 32;
 export async function hashPassword(password: string): Promise<string> {
   const salt = crypto.getRandomValues(new Uint8Array(SALT_LENGTH));
   const key = await deriveKey(password, salt);
-  const hash = await crypto.subtle.exportKey("raw", key);
+  // exportKey("raw", ...) is statically typed `ArrayBuffer | JsonWebKey`
+  // but at runtime returns ArrayBuffer for "raw"; cast is safe per the
+  // WebCrypto spec (4.7.6) and matches the existing call shape.
+  const hash = (await crypto.subtle.exportKey("raw", key)) as ArrayBuffer;
   const saltB64 = btoa(String.fromCharCode(...salt));
   const hashB64 = btoa(String.fromCharCode(...new Uint8Array(hash)));
   return `${saltB64}:${hashB64}`;
@@ -22,6 +25,10 @@ export async function hashPassword(password: string): Promise<string> {
 
 /**
  * Verify a password against a stored hash.
+ *
+ * Uses constant-time comparison on the raw derived bytes (H5) before
+ * any base64 encoding so PBKDF2 hash bytes don't leak via string-eq
+ * timing on a remote login endpoint.
  */
 export async function verifyPassword(
   password: string,
@@ -32,9 +39,25 @@ export async function verifyPassword(
 
   const salt = Uint8Array.from(atob(saltB64), (c) => c.charCodeAt(0));
   const key = await deriveKey(password, salt);
-  const hash = await crypto.subtle.exportKey("raw", key);
-  const actualB64 = btoa(String.fromCharCode(...new Uint8Array(hash)));
-  return actualB64 === expectedB64;
+  const hash = (await crypto.subtle.exportKey("raw", key)) as ArrayBuffer;
+  const actual = new Uint8Array(hash);
+  const expected = Uint8Array.from(atob(expectedB64), (c) => c.charCodeAt(0));
+  return constantTimeEqualBytes(actual, expected);
+}
+
+/**
+ * Constant-time byte equality. Returns false immediately on length
+ * mismatch (length is not secret); otherwise compares every byte with
+ * an XOR-OR fold so the runtime is independent of the position of the
+ * first mismatching byte.
+ */
+function constantTimeEqualBytes(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.byteLength !== b.byteLength) return false;
+  let r = 0;
+  for (let i = 0; i < a.byteLength; i++) {
+    r |= a[i] ^ b[i];
+  }
+  return r === 0;
 }
 
 async function deriveKey(

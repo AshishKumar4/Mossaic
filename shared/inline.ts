@@ -11,22 +11,26 @@
  * createWriteStream (memory-bounded streaming) or openManifest +
  * readChunk (caller-orchestrated, multi-invocation).
  *
- * Cap rationale: a Worker invocation has ~128 MB of soft memory and
- * the paid-tier subrequest budget is 10,000 / invocation. A 500 MB
- * file at the 1 MB chunk size adaptive cap is 500 chunk fetches — well
- * inside the paid budget, and the Uint8Array result requires holding
- * the whole buffer in memory which is ABOVE the soft limit. So 500 MB
- * is a generous ceiling that still fails fast for pathological
- * payloads; in practice, callers approaching 100 MB should already be
- * streaming. The cap is configurable per-deployment via an env var
- * (consumed by vfs-ops at request time, not baked into this constant).
+ * Cap rationale (audit H7): a Worker invocation has ~128 MB of soft
+ * memory; readFile allocates `new Uint8Array(file_size)` BEFORE chunk
+ * fetches start, so any cap that exceeds soft memory OOMs the Worker
+ * mid-read. The plan §11 mandates 100 MB as the canonical cap;
+ * previously the constant said 500 MB and the README was misaligned.
+ * 100 MB is the truth — callers needing larger files MUST use
+ * `createReadStream` (memory-bounded ReadableStream) or
+ * `openManifest` + `readChunk` (caller-orchestrated, multi-invocation
+ * fan-in).
  */
 
 /** Files ≤ this many bytes are inlined into the manifest's `inline_data` BLOB. */
 export const INLINE_LIMIT = 16 * 1024;
 
-/** Max bytes returned from a single `readFile` RPC. Above → EFBIG, use streaming. */
-export const READFILE_MAX = 500 * 1024 * 1024;
+/**
+ * Max bytes returned from a single `readFile` RPC. Above → EFBIG, use
+ * streaming. 100 MB matches plan §11 and stays well below the 128 MB
+ * Worker soft-memory ceiling so allocation never OOMs.
+ */
+export const READFILE_MAX = 100 * 1024 * 1024;
 
 /** Max bytes accepted by a single `writeFile` RPC. Above → EFBIG, use streaming. */
-export const WRITEFILE_MAX = 500 * 1024 * 1024;
+export const WRITEFILE_MAX = 100 * 1024 * 1024;

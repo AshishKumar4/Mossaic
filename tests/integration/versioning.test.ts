@@ -480,3 +480,137 @@ describe("Phase 9 — head-version idempotency", () => {
     expect(["a", "b", "c"]).toContain(head);
   });
 });
+
+describe("Phase 9 — restoreVersion vs swept chunks (audit C2 regression)", () => {
+  it("restoreVersion of a version whose chunks were swept throws ENOENT (never silently corrupts)", async () => {
+    const tenant = "ver-c2-regression";
+    const vfs = createVFS(envFor(), { tenant, versioning: "enabled" });
+
+    // v1: chunked content (>INLINE_LIMIT so chunks land on shards).
+    // v2: different chunked content so v1's chunks are not deduped.
+    const v1Bytes = new Uint8Array(20 * 1024).fill(0x11);
+    const v2Bytes = new Uint8Array(20 * 1024).fill(0x22);
+    await vfs.writeFile("/file.bin", v1Bytes);
+    const versionsAfterV1 = await vfs.listVersions("/file.bin");
+    expect(versionsAfterV1.length).toBe(1);
+    const v1Id = versionsAfterV1[0].id;
+
+    await vfs.writeFile("/file.bin", v2Bytes);
+
+    // Drop everything except the head (v2). v1's chunks become
+    // soft-marked on their shard.
+    const dropped = await vfs.dropVersions("/file.bin", { keepLast: 1 });
+    expect(dropped.dropped).toBe(1);
+
+    // Force the alarm sweep on every shard touched.
+    const userStub = E.USER_DO.get(
+      E.USER_DO.idFromName(vfsUserDOName("default", tenant))
+    );
+    // Identify shards via the surviving version_chunks rows + shard
+    // capacity. Easier: enumerate the 32-shard pool head and force-
+    // sweep any with soft-marked chunks.
+    for (let s = 0; s < 32; s++) {
+      const shard = E.SHARD_DO.get(
+        E.SHARD_DO.idFromName(vfsShardDOName("default", tenant, undefined, s))
+      );
+      // Backdate any deleted_at into the past, force the alarm to
+      // run immediately. If the shard has no soft-marked rows OR
+      // hasn't been initialised at all (the rendezvous-hashed pool
+      // only ever touches a subset of the 32 instances), this is a
+      // cheap no-op.
+      const touched = await runInDurableObject(
+        shard,
+        async (_inst, state) => {
+          try {
+            state.storage.sql.exec(
+              "UPDATE chunks SET deleted_at = 0 WHERE deleted_at IS NOT NULL"
+            );
+            await state.storage.setAlarm(Date.now() + 1);
+            return true;
+          } catch {
+            // chunks table not created → this shard never received
+            // any writes; skip the alarm dance.
+            return false;
+          }
+        }
+      );
+      if (touched) await runDurableObjectAlarm(shard);
+    }
+
+    // C2 contract: even if the corresponding file_versions row had
+    // somehow survived (by upgrade race / partial replay), restoreVersion
+    // MUST refuse rather than silently insert empty bytes.
+    //
+    // dropVersionRows in the current implementation also deletes the
+    // file_versions row, which makes restoreVersion throw ENOENT via
+    // getVersion-returns-null. We assert ENOENT either way.
+    let threw: unknown = null;
+    try {
+      await vfs.restoreVersion("/file.bin", v1Id);
+    } catch (err) {
+      threw = err;
+    }
+    // Either path is acceptable per audit C2:
+    //   - getVersion returns null → ENOENT "version <id> not found"
+    //   - chunksAlive pre-flight detects swept chunks → ENOENT
+    //     "source chunks swept on shard ..."
+    expect(threw).toBeInstanceOf(ENOENT);
+
+    // The head (v2) must remain readable end-to-end — no collateral
+    // damage from the failed restore.
+    const head = await vfs.readFile("/file.bin");
+    expect(head.byteLength).toBe(v2Bytes.byteLength);
+    expect(head[0]).toBe(0x22);
+  });
+
+  it("chunksAlive ShardDO RPC returns only present, live, and unmarked chunks", async () => {
+    const tenant = "ver-c2-chunksalive";
+    const vfs = createVFS(envFor(), { tenant, versioning: "enabled" });
+    const buf = new Uint8Array(20 * 1024).fill(0x33);
+    await vfs.writeFile("/x.bin", buf);
+
+    // Find one shard that holds a chunk for /x.bin.
+    const userStub = E.USER_DO.get(
+      E.USER_DO.idFromName(vfsUserDOName("default", tenant))
+    );
+    const refs = await runInDurableObject(userStub, async (_inst, state) => {
+      return state.storage.sql
+        .exec("SELECT chunk_hash, shard_index FROM version_chunks LIMIT 1")
+        .toArray() as { chunk_hash: string; shard_index: number }[];
+    });
+    expect(refs.length).toBe(1);
+    const { chunk_hash, shard_index } = refs[0];
+    const shard = E.SHARD_DO.get(
+      E.SHARD_DO.idFromName(
+        vfsShardDOName("default", tenant, undefined, shard_index)
+      )
+    );
+
+    // Live + present → returned in alive set.
+    const live = await (shard as unknown as {
+      chunksAlive: (h: string[]) => Promise<{ alive: string[] }>;
+    }).chunksAlive([chunk_hash]);
+    expect(live.alive).toEqual([chunk_hash]);
+
+    // A made-up hash → not returned.
+    const fake = "0".repeat(64);
+    const missing = await (shard as unknown as {
+      chunksAlive: (h: string[]) => Promise<{ alive: string[] }>;
+    }).chunksAlive([fake]);
+    expect(missing.alive).toEqual([]);
+
+    // Soft-mark the live chunk → it becomes "not alive" for the
+    // purposes of restoreVersion safety.
+    await runInDurableObject(shard, async (_inst, state) => {
+      state.storage.sql.exec(
+        "UPDATE chunks SET deleted_at = ? WHERE hash = ?",
+        Date.now(),
+        chunk_hash
+      );
+    });
+    const marked = await (shard as unknown as {
+      chunksAlive: (h: string[]) => Promise<{ alive: string[] }>;
+    }).chunksAlive([chunk_hash]);
+    expect(marked.alive).toEqual([]);
+  });
+});

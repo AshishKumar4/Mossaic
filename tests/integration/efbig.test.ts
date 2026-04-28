@@ -6,12 +6,14 @@ import { env, runInDurableObject } from "cloudflare:test";
  *
  * The plan §11 requires per-method size caps so a pathological
  * payload fails fast with EFBIG rather than blowing the Worker's
- * memory limit. Caps are configured in shared/inline.ts:
+ * memory limit. Caps are configured in shared/inline.ts (audit H7
+ * fix lowered both from 500 MB to 100 MB to stay below the Worker's
+ * ~128 MB soft memory ceiling):
  *
- *   READFILE_MAX  = 500 MB
- *   WRITEFILE_MAX = 500 MB
+ *   READFILE_MAX  = 100 MB
+ *   WRITEFILE_MAX = 100 MB
  *
- * Real-time pumping 500 MB through Miniflare RPC would dominate test
+ * Real-time pumping 100 MB through Miniflare RPC would dominate test
  * runtime (multi-minute) and trip the per-RPC 32 MiB serialization
  * cap. We instead seed the row's file_size to just above the cap
  * via direct DO state manipulation, then assert the public API
@@ -90,7 +92,7 @@ describe("EFBIG enforcement", () => {
     // code: it can't be reached through the public write API
     // (INLINE_LIMIT = 16 KB enforced at write time) AND can't be
     // reached via SQL seed (workerd's SQLite BLOB row limit is
-    // 2 MB << READFILE_MAX = 500 MB). We document the gap and
+    // 2 MB << READFILE_MAX = 100 MB). We document the gap and
     // assert the happy-path: a small inline read works.
     const vfs = createVFS(makeEnv(), { tenant: "efbig-inline-sanity" });
     await vfs.writeFile("/i.txt", new TextEncoder().encode("hello"));
@@ -101,12 +103,11 @@ describe("EFBIG enforcement", () => {
   it("writeFile rejects oversized payloads (RPC arg cap fires before EFBIG)", async () => {
     // The WRITEFILE_MAX EFBIG check inside vfsWriteFile is reached
     // only AFTER the RPC layer accepts the payload. workerd caps
-    // serialised RPC args at 32 MiB, well below WRITEFILE_MAX (500
-    // MB), so any consumer payload approaching the cap fails at
-    // the RPC boundary first — the EFBIG branch is defensive and
-    // primarily relevant when the DO method is invoked
-    // intra-process (not over RPC) or when WRITEFILE_MAX is
-    // configured BELOW the RPC cap.
+    // serialised RPC args at 32 MiB. With WRITEFILE_MAX now at
+    // 100 MB, the RPC arg cap still fires first for payloads in the
+    // 33–100 MB range; payloads above 100 MB would also clear the
+    // RPC cap if it were configured wider. Either way the consumer
+    // sees a typed error.
     //
     // We assert that an oversized SDK writeFile fails with SOME
     // typed error (not silent corruption / silent truncation). The
@@ -206,7 +207,8 @@ describe("EFBIG enforcement", () => {
 
   it("matches expected cap values (regression guard)", () => {
     // Pin the public cap values so a future bump is intentional.
-    expect(READFILE_MAX).toBe(500 * 1024 * 1024);
-    expect(WRITEFILE_MAX).toBe(500 * 1024 * 1024);
+    // Audit H7: lowered to 100 MB to stay below Worker soft memory.
+    expect(READFILE_MAX).toBe(100 * 1024 * 1024);
+    expect(WRITEFILE_MAX).toBe(100 * 1024 * 1024);
   });
 });

@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import type { Env } from "@shared/types";
 import type { MiddlewareHandler } from "hono";
-import { verifyVFSToken } from "../lib/auth";
+import { verifyVFSToken, VFSConfigError } from "../lib/auth";
 import { vfsUserDOName } from "../lib/utils";
 import type { UserDO } from "../objects/user/user-do";
 import type { VFSScope } from "@shared/vfs-types";
@@ -66,7 +66,20 @@ const vfsAuth = (): MiddlewareHandler<{
     return c.json({ code: "EACCES", message: "Bearer token required" }, 401);
   }
   const token = auth.slice(7);
-  const payload = await verifyVFSToken(c.env, token);
+  let payload;
+  try {
+    payload = await verifyVFSToken(c.env, token);
+  } catch (err) {
+    // VFSConfigError = JWT_SECRET missing on the deploy. 503 surfaces
+    // a clear "service mis-configured" rather than masking as 401.
+    if (err instanceof VFSConfigError) {
+      return c.json(
+        { code: "EMOSSAIC_UNAVAILABLE", message: err.message },
+        503
+      );
+    }
+    throw err;
+  }
   if (!payload) {
     return c.json(
       { code: "EACCES", message: "Invalid or expired VFS token" },

@@ -4,6 +4,73 @@ import { VFSError, type VFSScope } from "@shared/vfs-types";
 import { vfsShardDOName } from "../../lib/utils";
 import { generateId } from "../../lib/utils";
 import { resolvePath } from "./path-walk";
+import { placeChunk } from "@shared/placement";
+
+/**
+ * Audit H4 — placement function for the Phase 9 versioning path.
+ *
+ * The Phase 9 invariant — "two writes of the same content share the
+ * same chunk row, refcount = (number of versions referencing it)" —
+ * requires that an identical content hash always lands on the same
+ * shard. The previous code computed `placeChunk(userId, hash, 0, poolSize)`
+ * which is rendezvous-deterministic only as long as `poolSize` stays
+ * constant. When pool_size grows (every 5 GB stored, per
+ * `computePoolSize`), rendezvous hashing re-routes ~1/N of hashes to
+ * a different shard, which breaks cross-version dedup silently:
+ *
+ *   write(P, content) at pool=32 → shard S1, refcount=1
+ *   ... user accumulates >5GB, pool grows to 33 ...
+ *   write(P, content) at pool=33 → shard S2 (rendezvous re-routed)
+ *
+ * S2 has no chunk H, so the cold-path INSERT runs and storage is
+ * doubled. `chunks.ref_count` claims become false.
+ *
+ * Fix: BEFORE placing a hash via the rendezvous formula, look it up
+ * in `version_chunks` for the current tenant. If a row exists, reuse
+ * that shard_index — the chunk has a frozen home for as long as any
+ * version references it. Only on first appearance of a hash do we
+ * compute placement, and that placement becomes the canonical home
+ * for all future versions until the chunk is fully reaped.
+ *
+ * Lookup cost: one indexed SQL probe per chunk hash. Negligible
+ * (single-digit µs in SQLite per call) compared to the ShardDO RPC.
+ *
+ * Caveats:
+ * - Two concurrent first-writes of the same hash may both miss the
+ *   probe and pick different shards (different poolSizes if growth
+ *   happened between them). DO single-thread serializes them, so the
+ *   second write finds the first's row in version_chunks and reuses.
+ *   The rare cross-DO race is bounded by the per-tenant DO model.
+ * - If admin manually deletes a version_chunks row while the chunk
+ *   row survives on a shard, a future write may compute a different
+ *   placement and dedupe miss. Acceptable: admin operations are
+ *   off-path.
+ */
+export function placeChunkForVersion(
+  durableObject: UserDO,
+  userId: string,
+  hash: string,
+  poolSize: number
+): number {
+  // First check: have we placed this hash before? Any existing
+  // version_chunks row pins the shard. We don't need user_id in the
+  // query because version_chunks doesn't carry it directly — but
+  // version_chunks rows are per-DO so isolation is implicit (one
+  // UserDO per tenant scope).
+  const existing = durableObject.sql
+    .exec(
+      "SELECT shard_index FROM version_chunks WHERE chunk_hash = ? LIMIT 1",
+      hash
+    )
+    .toArray()[0] as { shard_index: number } | undefined;
+  if (existing !== undefined) {
+    return existing.shard_index;
+  }
+  // First placement: rendezvous-hash as before. The result will be
+  // recorded in version_chunks by the caller, freezing future
+  // placements for this hash even if poolSize subsequently grows.
+  return placeChunk(userId, hash, 0, poolSize);
+}
 
 /**
  * Phase 9 — file-level versioning (S3-style, opt-in).
@@ -303,6 +370,15 @@ export async function dropVersionRows(
 
   let reaped = 0;
   for (const versionId of versionIds) {
+    // Audit C2 structural guard: we MUST NOT decrement ShardDO refs
+    // for a version whose file_versions row still exists. The
+    // (UserDO-side metadata) → (ShardDO refs) order matters: if we
+    // drop refs first and then crash before deleting the metadata,
+    // a subsequent restoreVersion would resolve a stale manifest
+    // pointing at chunks whose refcount may already be 0 / swept,
+    // and the reuse path in restoreVersion would silently corrupt
+    // data. Always delete metadata BEFORE the RPC fan-out.
+
     // Find unique shards this version's chunks live on.
     const shardRows = durableObject.sql
       .exec(
@@ -312,6 +388,8 @@ export async function dropVersionRows(
       .toArray() as { shard_index: number }[];
 
     // Drop UserDO-side metadata first (mirrors hardDeleteFileRow).
+    // version_chunks must go before file_versions because some
+    // future GC paths key off file_versions presence.
     durableObject.sql.exec(
       "DELETE FROM version_chunks WHERE version_id = ?",
       versionId
@@ -321,6 +399,27 @@ export async function dropVersionRows(
       pathId,
       versionId
     );
+
+    // Sanity: re-read and confirm both metadata rows are gone before
+    // we touch any ShardDO. Refusing to drop refs when metadata is
+    // still present is the load-bearing structural invariant —
+    // chunk_refs are reachable from file_versions/version_chunks; if
+    // one side leaks, the other does too. This is belt-and-suspenders
+    // (DO single-thread guarantees no concurrent INSERT can re-create
+    // the rows we just deleted), but it pins the invariant in code.
+    const stillPresent = durableObject.sql
+      .exec(
+        "SELECT 1 FROM file_versions WHERE path_id = ? AND version_id = ? LIMIT 1",
+        pathId,
+        versionId
+      )
+      .toArray();
+    if (stillPresent.length > 0) {
+      throw new VFSError(
+        "EINVAL",
+        `dropVersionRows: file_versions row for ${versionId} still present after delete; refusing to fan out chunk decrement`
+      );
+    }
 
     // Dispatch deleteChunks RPC per touched shard. The synthetic
     // file_id matches what was used at write time so chunk_refs
@@ -522,6 +621,50 @@ export async function restoreVersion(
     shard_index: number;
   }[];
 
+  // Audit C2: pre-flight liveness check on every shard the source
+  // manifest touches. If ANY chunk has been swept (alarm GC'd it
+  // because its last reference dropped to 0 and the grace window
+  // elapsed), we MUST refuse the restore and surface ENOENT — the
+  // alternative (proceed and let putChunk's cold-path INSERT silently
+  // store an empty buffer under the original hash because we passed
+  // `new Uint8Array(0)`) would corrupt every future read of the
+  // restored version. Bytes return zero, manifests look intact, and
+  // the corruption is silent.
+  //
+  // We group the source's chunk hashes by shard, then issue one
+  // chunksAlive RPC per shard in parallel. The expected steady-state
+  // is "every chunk is alive" — versioning's whole point is that
+  // dropVersionRows hard-deletes the file_versions/version_chunks
+  // rows in the same transaction as the deleteChunks RPC, so a
+  // version_chunks row pointing at a swept chunk is a concurrency
+  // bug or a partial-replay scenario.
+  const byShard = new Map<number, string[]>();
+  for (const c of chunks) {
+    const arr = byShard.get(c.shard_index) ?? [];
+    arr.push(c.chunk_hash);
+    byShard.set(c.shard_index, arr);
+  }
+  await Promise.all(
+    Array.from(byShard.entries()).map(async ([shardIndex, hashes]) => {
+      const shardName = vfsShardDOName(
+        scope.ns,
+        scope.tenant,
+        scope.sub,
+        shardIndex
+      );
+      const stub = shardNs.get(shardNs.idFromName(shardName));
+      const { alive } = await stub.chunksAlive(hashes);
+      if (alive.length !== hashes.length) {
+        const aliveSet = new Set(alive);
+        const missing = hashes.filter((h) => !aliveSet.has(h));
+        throw new VFSError(
+          "ENOENT",
+          `restoreVersion: source chunks swept on shard ${shardIndex}: ${missing.slice(0, 3).join(",")}${missing.length > 3 ? "..." : ""}`
+        );
+      }
+    })
+  );
+
   for (const c of chunks) {
     const shardName = vfsShardDOName(
       scope.ns,
@@ -530,21 +673,17 @@ export async function restoreVersion(
       c.shard_index
     );
     const stub = shardNs.get(shardNs.idFromName(shardName));
-    // putChunk with a 0-byte placeholder is wrong — we want to
-    // INCREMENT the refcount on an existing chunk by adding a new
-    // chunk_refs row. The dedup PUT path does exactly that when
-    // the chunk already exists; we send an empty Uint8Array (the
-    // hash check happens BEFORE the bytes are stored, so dedup
-    // sees the existing chunk and adds a ref).
-    //
-    // Wait: the existing putChunk recomputes nothing — it accepts
-    // hash + data, checks if hash exists, and if so just adds a
-    // ref. We pass the hash and a placeholder; the bytes are
-    // ignored because dedup short-circuits. To be safe we pass an
-    // empty buffer AND the existing chunk_size in chunk_refs.
-    //
-    // Concretely: putChunk(hash, data, fileId, idx, userId) →
-    // existing path adds a ref iff (hash, fileId, idx) is new.
+    // The chunksAlive pre-flight above guarantees the chunk row is
+    // present and live on this shard, so putChunk's existence check
+    // (`SELECT hash FROM chunks WHERE hash = ?`) hits the dedup
+    // branch unconditionally and the empty `new Uint8Array(0)` is
+    // discarded. The cold-path INSERT in writeChunkInternal is
+    // unreachable here. If a race elapses between the pre-flight
+    // and putChunk (e.g. another concurrent dropVersions hits the
+    // alarm-grace boundary), the alarm sweeper's resurrection-aware
+    // logic in shard-do.ts:355-362 un-marks any chunk that gained a
+    // new ref — so even the worst-case race upgrades a swept chunk
+    // back to alive without inserting empty bytes.
     await stub.putChunk(
       c.chunk_hash,
       new Uint8Array(0),
