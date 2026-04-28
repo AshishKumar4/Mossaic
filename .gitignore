@@ -24,7 +24,7 @@ kumo-readme.md
 
 # Lean build artifacts
 lean/.lake/
-lean/lake-manifest.json
+# (lean/lake-manifest.json is committed for reproducibility)
 
 # Local-only docs (audit reports, planning notes)
 local/

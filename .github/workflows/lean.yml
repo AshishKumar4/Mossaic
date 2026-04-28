@@ -18,7 +18,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -28,26 +28,83 @@ jobs:
             | sh -s -- -y --default-toolchain none
           echo "$HOME/.elan/bin" >> $GITHUB_PATH
 
-      - name: Cache Lean toolchain + build artifacts
+      # Cache the toolchain itself
+      - name: Cache elan toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/.elan/toolchains
+          key: elan-${{ runner.os }}-${{ hashFiles('lean/lean-toolchain') }}
+
+      # Cache Mathlib build artifacts (the largest cost). Keyed on the
+      # lake-manifest so it invalidates only when the Mathlib pin changes.
+      - name: Cache Mathlib build
         uses: actions/cache@v4
         with:
           path: |
-            ~/.elan
-            lean/.lake
-          key: lean-${{ runner.os }}-${{ hashFiles('lean/lean-toolchain', 'lean/lakefile.toml') }}
+            lean/.lake/packages
+            lean/.lake/build
+          key: mathlib-${{ runner.os }}-${{ hashFiles('lean/lake-manifest.json') }}
           restore-keys: |
-            lean-${{ runner.os }}-
+            mathlib-${{ runner.os }}-
 
-      - name: Install toolchain (warm cache will skip download)
+      # Install Lean toolchain (skipped if cached)
+      - name: Install Lean toolchain
         working-directory: lean
-        run: lean --version
+        run: lake --version && lean --version
 
-      - name: lake build
+      # If the Mathlib build cache wasn't restored, fetch the prebuilt
+      # Mathlib oleans from leanprover-community's Azure CDN. This skips
+      # Mathlib's ~25 minutes of compile time and reduces it to ~3 minutes
+      # of download + decompress.
+      - name: Resolve Mathlib (fetch deps)
+        working-directory: lean
+        run: |
+          if [ ! -d ".lake/packages/mathlib" ]; then
+            lake update
+          fi
+
+      - name: Fetch Mathlib oleans cache
+        working-directory: lean/.lake/packages/mathlib
+        run: |
+          if [ ! -f "../../build/lib/lean/Mathlib.olean" ] && [ ! -f ".lake/build/lib/lean/Mathlib.olean" ]; then
+            lake exe cache get || echo "Cache fetch warning (non-fatal); will fall back to compiling Mathlib"
+          fi
+
+      # Now build our own proofs. With Mathlib pre-built, this should be
+      # fast (a few seconds for our ~2000 LoC).
+      - name: lake build (Mossaic)
         working-directory: lean
         run: lake build
 
-      - name: Verify zero sorrys in must-have proofs
+      - name: Verify zero sorry in must-have proofs
         run: bash lean/scripts/check-no-sorry.sh
+
+      - name: Verify zero project axioms
+        run: |
+          if grep -rnE '^axiom|^[[:space:]]+axiom' lean/Mossaic/; then
+            echo "FAIL: project-level axiom declaration found in lean/Mossaic/"
+            exit 1
+          fi
+          echo "OK: zero project axioms."
 
       - name: Verify TS↔Lean cross-references
         run: bash lean/scripts/check-xrefs.sh
+
+      - name: Print kernel-axiom dependencies (informational)
+        working-directory: lean
+        run: |
+          cat > /tmp/probe.lean << 'EOF'
+          import Mossaic.Vfs.Refcount
+          import Mossaic.Vfs.Tenant
+          import Mossaic.Vfs.Gc
+          import Mossaic.Vfs.AtomicWrite
+          import Mossaic.Vfs.Versioning
+          #print axioms Mossaic.Vfs.Refcount.step_preserves_validState
+          #print axioms Mossaic.Vfs.Refcount.refCount_zero_implies_no_refs
+          #print axioms Mossaic.Vfs.Tenant.cross_tenant_isolation
+          #print axioms Mossaic.Vfs.Gc.alarm_preserves_validState
+          #print axioms Mossaic.Vfs.AtomicWrite.readFile_unchanged_under_beginWrite
+          #print axioms Mossaic.Vfs.Versioning.listVersions_sorted
+          #print axioms Mossaic.Vfs.Versioning.insertVersion_max_ge
+          EOF
+          lake env lean /tmp/probe.lean
