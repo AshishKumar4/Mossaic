@@ -17,11 +17,13 @@ import {
   createVFS,
   UserDO,
   ShardDO,
-  SearchDO,
   type MossaicEnv,
 } from "../../../../sdk/src/index";
 
-export { UserDO, ShardDO, SearchDO };
+// Phase 11.1: SearchDO is no longer part of the SDK contract. The
+// consumer fixture mirrors a real customer adoption — no SearchDO
+// re-export, no MOSSAIC_SEARCH binding.
+export { UserDO, ShardDO };
 
 export interface Env extends MossaicEnv {
   TEST_TENANT?: string;

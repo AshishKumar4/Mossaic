@@ -9,8 +9,8 @@
  *      Mossaic's UserDO and is billed against Mossaic's own
  *      per-invocation subrequest budget, not the consumer's.
  *
- *   2. Re-exports of `UserDO`, `ShardDO`, `SearchDO` so consumer Workers
- *      can re-export them in turn — wrangler discovers DO classes from
+ *   2. Re-exports of `UserDO` and `ShardDO` so consumer Workers can
+ *      re-export them in turn — wrangler discovers DO classes from
  *      the consumer's main module's exports, not from package
  *      dependencies. Mirrors the `cloudflare/sandbox-sdk` and
  *      `cloudflare/agents` precedent.
@@ -66,14 +66,20 @@ export type {
 // Re-export the DO classes so consumer Workers can re-export them in
 // their own entry module — wrangler resolves DO bindings via the
 // consumer's main module's exports, not via npm dep graph.
+//
 // Phase 11: re-export the Core class as `UserDO` so consumer Workers
 // can continue to declare `class_name: "UserDO"` in their wrangler
 // without any change. The class itself is `UserDOCore` in the
 // production tree (worker/core/objects/user/user-do-core.ts);
 // aliasing on export preserves the SDK's public API contract.
+//
+// Phase 11.1: SearchDO is intentionally NOT re-exported. It backed
+// the photo-library's CLIP/BGE vector search, which is not part of
+// the SDK's pure-VFS contract. Consumers who need semantic search
+// should run their own Vectorize index or DO; nothing in the VFS
+// surface (UserDO + ShardDO) depends on SearchDO.
 export { UserDOCore as UserDO } from "../../worker/core/objects/user/index";
 export { ShardDO } from "../../worker/core/objects/shard/index";
-export { SearchDO } from "../../worker/core/objects/search/index";
 
 // VFSScope is the wire shape of the multi-tenant scope; consumers
 // rarely need it directly but isomorphic-git plugins or HTTP fallback

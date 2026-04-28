@@ -1,11 +1,16 @@
 // Phase 11: Service-mode deployment.
 //
 // Deploys ONLY the SDK-essential surface (UserDOCore + ShardDO +
-// SearchDO + the Phase 7 HTTP fallback at /api/vfs and a /api/health
-// route) as a standalone Worker. Pair this with consumer Workers
-// that bind via `script_name: "mossaic-core"` to get a turn-key
-// Mossaic backend without re-exporting the DO classes from
-// `@mossaic/sdk` themselves.
+// the Phase 7 HTTP fallback at /api/vfs and a /api/health route)
+// as a standalone Worker. Pair this with consumer Workers that
+// bind via `script_name: "mossaic-core"` to get a turn-key Mossaic
+// backend without re-exporting the DO classes from `@mossaic/sdk`
+// themselves.
+//
+// Phase 11.1: SearchDO was misclassified as Core in Phase 11. It
+// backs the photo-library's CLIP/BGE vector search and is App-only.
+// Service-mode no longer binds SEARCH_DO — vector search is not
+// part of the SDK contract.
 //
 // Class names: this Worker exports `UserDOCore` (NOT `UserDO`). The
 // service-mode namespace is therefore distinct from the App-mode
@@ -48,8 +53,7 @@
   "durable_objects": {
     "bindings": [
       { "name": "USER_DO", "class_name": "UserDOCore" },
-      { "name": "SHARD_DO", "class_name": "ShardDO" },
-      { "name": "SEARCH_DO", "class_name": "SearchDO" }
+      { "name": "SHARD_DO", "class_name": "ShardDO" }
     ]
   },
 
@@ -57,10 +61,6 @@
     {
       "tag": "v1",
       "new_sqlite_classes": ["UserDOCore", "ShardDO"]
-    },
-    {
-      "tag": "v2",
-      "new_sqlite_classes": ["SearchDO"]
     }
   ]
 }

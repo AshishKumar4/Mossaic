@@ -255,12 +255,18 @@ describe("Consumer fixture: SDK as-Library DX + subrequest accounting", () => {
     expect(counter.outbound).toBe(0);
   });
 
-  it("re-exports UserDO, ShardDO, SearchDO classes for wrangler discovery", async () => {
+  it("re-exports UserDO + ShardDO classes for wrangler discovery", async () => {
     const fixture = await import("../fixtures/consumer/src/index");
     // The fixture must re-export the DO classes for the wrangler
     // discovery pattern to work in a real deploy.
+    //
+    // Phase 11.1: SearchDO is no longer part of the SDK surface —
+    // verify the fixture does NOT carry a `.SearchDO` export so any
+    // future regression that re-introduces it (and silently inflates
+    // every consumer's bundle with the CLIP/BGE vector code) trips
+    // this assertion.
     expect(typeof fixture.UserDO).toBe("function");
     expect(typeof fixture.ShardDO).toBe("function");
-    expect(typeof fixture.SearchDO).toBe("function");
+    expect("SearchDO" in fixture).toBe(false);
   });
 });

@@ -29,15 +29,14 @@ The package re-exports the Mossaic Durable Object classes; consumer Workers re-e
 
 ```ts
 // src/index.ts
-import { UserDO, ShardDO, SearchDO, createVFS } from "@mossaic/sdk";
+import { UserDO, ShardDO, createVFS } from "@mossaic/sdk";
 
 // wrangler discovers DO classes from the Worker's main-module exports.
-export { UserDO, ShardDO, SearchDO };
+export { UserDO, ShardDO };
 
 export interface Env {
-  MOSSAIC_USER:   DurableObjectNamespace<UserDO>;
-  MOSSAIC_SHARD:  DurableObjectNamespace<ShardDO>;
-  MOSSAIC_SEARCH: DurableObjectNamespace<SearchDO>;
+  MOSSAIC_USER:  DurableObjectNamespace<UserDO>;
+  MOSSAIC_SHARD: DurableObjectNamespace<ShardDO>;
 }
 
 export default {
@@ -63,13 +62,12 @@ Copy the [`templates/wrangler.jsonc`](./templates/wrangler.jsonc) snippet into y
 
   "durable_objects": {
     "bindings": [
-      { "name": "MOSSAIC_USER",   "class_name": "UserDO" },
-      { "name": "MOSSAIC_SHARD",  "class_name": "ShardDO" },
-      { "name": "MOSSAIC_SEARCH", "class_name": "SearchDO" }
+      { "name": "MOSSAIC_USER",  "class_name": "UserDO" },
+      { "name": "MOSSAIC_SHARD", "class_name": "ShardDO" }
     ]
   },
   "migrations": [
-    { "tag": "mossaic-v1", "new_sqlite_classes": ["UserDO", "ShardDO", "SearchDO"] }
+    { "tag": "mossaic-v1", "new_sqlite_classes": ["UserDO", "ShardDO"] }
   ]
 }
 ```
@@ -596,14 +594,13 @@ They compose at the Worker level: a single Worker can hold both bindings, hand o
 
 ```ts
 // src/index.ts (consumer Worker)
-import { UserDO, ShardDO, SearchDO, createVFS } from "@mossaic/sdk";
-export { UserDO, ShardDO, SearchDO };
+import { UserDO, ShardDO, createVFS } from "@mossaic/sdk";
+export { UserDO, ShardDO };
 
 export interface Env {
   ARTIFACTS: Artifacts;                       // CF Artifacts binding
-  MOSSAIC_USER:   DurableObjectNamespace<UserDO>;
-  MOSSAIC_SHARD:  DurableObjectNamespace<ShardDO>;
-  MOSSAIC_SEARCH: DurableObjectNamespace<SearchDO>;
+  MOSSAIC_USER:  DurableObjectNamespace<UserDO>;
+  MOSSAIC_SHARD: DurableObjectNamespace<ShardDO>;
 }
 
 export default {

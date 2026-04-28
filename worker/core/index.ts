@@ -1,8 +1,8 @@
 /**
  * Phase 11: Core-only Worker entry — used by the service-mode
  * deployment at `deployments/service/wrangler.jsonc`. Exports just
- * the three Durable Object classes (UserDOCore, ShardDO, SearchDO)
- * and a minimal Hono router that mounts only the VFS HTTP fallback
+ * the two Durable Object classes (UserDOCore, ShardDO) and a
+ * minimal Hono router that mounts only the VFS HTTP fallback
  * (Phase 7) and a health check.
  *
  * The legacy photo-app routes (/api/auth, /api/upload, /api/files,
@@ -10,14 +10,25 @@
  * /api/shared, /api/download) live in `worker/app/index.ts` and are
  * NOT exposed here — service-mode is a pure SDK backend.
  *
+ * Phase 11.1: SearchDO was App-misclassified as Core in Phase 11.
+ * It backs the photo-library's CLIP/BGE vector search in
+ * `worker/app/routes/search.ts` and is not used by any Core surface
+ * (UserDOCore + ShardDO never touch it). It now lives at
+ * `worker/app/objects/search/` and is bound only by the App-mode
+ * production wrangler.
+ *
  * SDK consumers who want a turn-key Mossaic backend on Cloudflare
  * either:
- *   (a) bind UserDOCore + ShardDO + SearchDO directly via
+ *   (a) bind UserDOCore + ShardDO directly via
  *       `script_name: "mossaic-core"` in their own wrangler (Mode B
  *       in the SDK README), letting Cloudflare's edge route DO RPC
  *       across Workers; OR
- *   (b) re-export UserDO + ShardDO + SearchDO from `@mossaic/sdk`
- *       inside their own Worker (Mode A — library mode).
+ *   (b) re-export UserDO + ShardDO from `@mossaic/sdk` inside their
+ *       own Worker (Mode A — library mode).
+ *
+ * Vector search is intentionally NOT part of either mode. Consumers
+ * who need semantic search should run their own Vectorize index or
+ * a separate Durable Object — Mossaic stays a pure VFS.
  */
 import { Hono } from "hono";
 import { cors } from "hono/cors";
@@ -26,7 +37,6 @@ import vfsRoutes from "./routes/vfs";
 
 export { UserDOCore } from "./objects/user/index";
 export { ShardDO } from "./objects/shard/index";
-export { SearchDO } from "./objects/search/index";
 
 const app = new Hono<{ Bindings: Env }>();
 
