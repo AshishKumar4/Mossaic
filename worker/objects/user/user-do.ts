@@ -55,6 +55,15 @@ import type {
 } from "@shared/vfs-types";
 import { dedupePaths, type DedupeResult } from "./admin";
 import { enforceRateLimit } from "./rate-limit";
+import {
+  dropVersions,
+  isVersioningEnabled,
+  listVersions,
+  resolvePathId,
+  restoreVersion,
+  setVersioningEnabled,
+  type VersionRow,
+} from "./vfs-versions";
 
 export class UserDO extends DurableObject<Env> {
   sql: SqlStorage;
@@ -244,6 +253,95 @@ export class UserDO extends DurableObject<Env> {
     }
     try {
       this.sql.exec("ALTER TABLE quota ADD COLUMN rl_updated_at INTEGER");
+    } catch {
+      // column already exists
+    }
+
+    // ── Phase 9: per-tenant versioning toggle (S3-style, opt-in) ─────────
+    // versioning_enabled: NULL/0 = disabled (Phase 8 byte-equivalent
+    // behavior); 1 = every writeFile/unlink creates a `file_versions`
+    // row, readFile resolves the head version, and historical
+    // readFile(path, {version: id}) becomes available. The default is
+    // off; tenants opt-in via setTenantVersioning().
+    try {
+      this.sql.exec(
+        "ALTER TABLE quota ADD COLUMN versioning_enabled INTEGER NOT NULL DEFAULT 0"
+      );
+    } catch {
+      // column already exists
+    }
+
+    // ── Phase 9: file_versions table ─────────────────────────────────────
+    // S3-style versioning. Each row is one historical snapshot of a
+    // (path_id, version_id) pair. `path_id` is the stable `files.file_id`
+    // (Design A: sticky path identity — the first writeFile creates a
+    // `files` row + a v1 row; subsequent writes only add version rows
+    // and update files.head_version_id). `version_id` is a fresh ULID
+    // per write.
+    //
+    // Inline-tier (≤16KB): inline_data column on this table mirrors
+    // files.inline_data semantics. No ShardDO call required.
+    //
+    // Chunked tier: chunk metadata lives in `version_chunks` (mirrors
+    // file_chunks but keyed by version_id). ShardDO chunk_refs use a
+    // synthetic file_id of `${path_id}#${version_id}` so per-version
+    // refcount is independent — the alarm sweeper from Phase 3
+    // reclaims chunks when the last version referencing them is
+    // dropped. No new GC plumbing.
+    //
+    // Tombstones: deleted=1 + chunks=0; readFile(head) skips them and
+    // returns ENOENT if no live version remains. unlink() inserts a
+    // tombstone version (preserving history); chunks NOT decremented.
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS file_versions (
+        path_id      TEXT NOT NULL,
+        version_id   TEXT NOT NULL,
+        user_id      TEXT NOT NULL,
+        size         INTEGER NOT NULL,
+        mode         INTEGER NOT NULL DEFAULT 420,
+        mtime_ms     INTEGER NOT NULL,
+        deleted      INTEGER NOT NULL DEFAULT 0,
+        inline_data  BLOB,
+        chunk_size   INTEGER NOT NULL DEFAULT 0,
+        chunk_count  INTEGER NOT NULL DEFAULT 0,
+        file_hash    TEXT NOT NULL DEFAULT '',
+        mime_type    TEXT NOT NULL DEFAULT 'application/octet-stream',
+        PRIMARY KEY (path_id, version_id)
+      )
+    `);
+    // Newest-first index for listVersions over arbitrarily-large
+    // history. SQLite uses this as a covering index for ORDER BY
+    // mtime_ms DESC LIMIT N — sub-millisecond at 10k versions.
+    this.sql.exec(`
+      CREATE INDEX IF NOT EXISTS idx_file_versions_path_mtime
+        ON file_versions(path_id, mtime_ms DESC)
+    `);
+    this.sql.exec(`
+      CREATE INDEX IF NOT EXISTS idx_file_versions_user
+        ON file_versions(user_id, path_id)
+    `);
+
+    // version_chunks: per-version chunk manifest. Mirrors file_chunks
+    // but keyed by version_id.
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS version_chunks (
+        version_id   TEXT NOT NULL,
+        chunk_index  INTEGER NOT NULL,
+        chunk_hash   TEXT NOT NULL,
+        chunk_size   INTEGER NOT NULL,
+        shard_index  INTEGER NOT NULL,
+        PRIMARY KEY (version_id, chunk_index)
+      )
+    `);
+
+    // Head-pointer column on `files`: when versioning is enabled, the
+    // `files` row is just a stable identity for the path; the actual
+    // head version lives in file_versions. Legacy / versioning-OFF
+    // tenants leave this NULL and continue using files' own columns.
+    try {
+      this.sql.exec(
+        "ALTER TABLE files ADD COLUMN head_version_id TEXT"
+      );
     } catch {
       // column already exists
     }
@@ -611,10 +709,18 @@ export class UserDO extends DurableObject<Env> {
     return vfsReadManyStat(this, scope, paths);
   }
 
-  /** readFile() — returns Uint8Array bytes. EISDIR/EFBIG/ENOENT/ELOOP. */
-  async vfsReadFile(scope: VFSScope, path: string): Promise<Uint8Array> {
+  /**
+   * readFile() — returns Uint8Array bytes. EISDIR/EFBIG/ENOENT/ELOOP.
+   * Phase 9: pass `opts.versionId` to read a historical version
+   * directly. Tombstone versions throw ENOENT.
+   */
+  async vfsReadFile(
+    scope: VFSScope,
+    path: string,
+    opts?: { versionId?: string }
+  ): Promise<Uint8Array> {
     this.gateVfs(scope);
-    return vfsReadFile(this, scope, path);
+    return vfsReadFile(this, scope, path, opts);
   }
 
   /** openManifest() — public, shard-index-stripped manifest for caller-orchestrated reads. */
@@ -824,6 +930,111 @@ export class UserDO extends DurableObject<Env> {
   ): Promise<{ stream: WritableStream<Uint8Array>; handle: VFSWriteHandle }> {
     this.gateVfs(scope);
     return vfsCreateWriteStream(this, scope, path, opts);
+  }
+
+  // ── Phase 9: file-level versioning RPCs ───────────────────────────────
+  //
+  // Opt-in per tenant via `adminSetVersioning(tenant, enabled)`.
+  // Subsequent writeFile/unlink calls insert file_versions rows;
+  // readFile resolves the head version (or an explicit version_id).
+  // Refcount-per-version is enforced via synthetic shard ref keys
+  // `${pathId}#${versionId}`. The Phase 3 alarm sweeper reaps chunks
+  // whose last reference was dropped.
+
+  /** Newest-first list of versions for a path. ENOENT if path doesn't exist. */
+  async vfsListVersions(
+    scope: VFSScope,
+    path: string,
+    opts?: { limit?: number }
+  ): Promise<VersionRow[]> {
+    this.gateVfs(scope);
+    const userId = scope.sub
+      ? `${scope.tenant}::${scope.sub}`
+      : scope.tenant;
+    const pathId = resolvePathId(this, userId, path);
+    if (!pathId) {
+      // Match the rest of the API: path-not-found surfaces as ENOENT
+      // through mapServerError on the consumer side. We throw the
+      // server-side VFSError shape directly here.
+      const { VFSError } = await import("@shared/vfs-types");
+      throw new VFSError("ENOENT", `listVersions: path not found: ${path}`);
+    }
+    return listVersions(this, pathId, opts);
+  }
+
+  /**
+   * Restore a historical version: creates a NEW version row whose
+   * content matches the source. Source must not be a tombstone.
+   */
+  async vfsRestoreVersion(
+    scope: VFSScope,
+    path: string,
+    sourceVersionId: string
+  ): Promise<{ versionId: string }> {
+    this.gateVfs(scope);
+    const userId = scope.sub
+      ? `${scope.tenant}::${scope.sub}`
+      : scope.tenant;
+    const pathId = resolvePathId(this, userId, path);
+    if (!pathId) {
+      const { VFSError } = await import("@shared/vfs-types");
+      throw new VFSError(
+        "ENOENT",
+        `restoreVersion: path not found: ${path}`
+      );
+    }
+    return restoreVersion(this, scope, userId, pathId, sourceVersionId);
+  }
+
+  /**
+   * Drop versions per a retention policy. Head version is always
+   * preserved (S3 invariant). Returns counts. Chunks whose last
+   * version reference was dropped are reaped by the Phase 3 alarm
+   * sweeper after its 30s grace.
+   */
+  async vfsDropVersions(
+    scope: VFSScope,
+    path: string,
+    policy: {
+      olderThan?: number;
+      keepLast?: number;
+      exceptVersions?: string[];
+    }
+  ): Promise<{ dropped: number; kept: number }> {
+    this.gateVfs(scope);
+    const userId = scope.sub
+      ? `${scope.tenant}::${scope.sub}`
+      : scope.tenant;
+    const pathId = resolvePathId(this, userId, path);
+    if (!pathId) {
+      const { VFSError } = await import("@shared/vfs-types");
+      throw new VFSError(
+        "ENOENT",
+        `dropVersions: path not found: ${path}`
+      );
+    }
+    return dropVersions(this, scope, userId, pathId, policy);
+  }
+
+  /**
+   * Operator-only: toggle versioning for a tenant. Affects only
+   * future writes; existing files / versions are unchanged. Pass
+   * `userId` directly (matches admin convention; not scope-derived
+   * because the caller may not have a token-scoped session).
+   */
+  async adminSetVersioning(
+    userId: string,
+    enabled: boolean
+  ): Promise<{ enabled: boolean }> {
+    this.ensureInit();
+    setVersioningEnabled(this, userId, enabled);
+    return { enabled };
+  }
+
+  /** Operator-only: read the versioning flag for a tenant. */
+  async adminGetVersioning(userId: string): Promise<{ enabled: boolean }> {
+    this.ensureInit();
+    return { enabled: isVersioningEnabled(this, userId) };
   }
 
   // ── Phase 6: admin tooling ────────────────────────────────────────────

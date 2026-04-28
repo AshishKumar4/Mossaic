@@ -439,6 +439,81 @@ vfs.post("/readChunk", async (c) => {
   }
 });
 
+// ── Phase 9: versioning ────────────────────────────────────────────────
+
+vfs.post("/listVersions", async (c) => {
+  try {
+    const body = await c.req.json<{ path: string; limit?: number }>();
+    const path = expectPath(body);
+    const rows = await userStub(c).vfsListVersions(c.var.scope, path, {
+      limit: body.limit,
+    });
+    // Map server VersionRow → public VersionInfo (id field).
+    const versions = rows.map((r) => ({
+      id: r.versionId,
+      mtimeMs: r.mtimeMs,
+      size: r.size,
+      mode: r.mode,
+      deleted: r.deleted,
+    }));
+    return c.json({ versions });
+  } catch (err) {
+    const r = errToResponse(err);
+    return c.json(r.body, r.status as 400);
+  }
+});
+
+vfs.post("/restoreVersion", async (c) => {
+  try {
+    const body = await c.req.json<{
+      path: string;
+      sourceVersionId: string;
+    }>();
+    const path = expectPath(body);
+    if (typeof body.sourceVersionId !== "string") {
+      return c.json(
+        {
+          code: "EINVAL",
+          message: "body.sourceVersionId must be a string",
+        },
+        400
+      );
+    }
+    const r = await userStub(c).vfsRestoreVersion(
+      c.var.scope,
+      path,
+      body.sourceVersionId
+    );
+    return c.json({ id: r.versionId });
+  } catch (err) {
+    const r = errToResponse(err);
+    return c.json(r.body, r.status as 400);
+  }
+});
+
+vfs.post("/dropVersions", async (c) => {
+  try {
+    const body = await c.req.json<{
+      path: string;
+      policy: {
+        olderThan?: number;
+        keepLast?: number;
+        exceptVersions?: string[];
+      };
+    }>();
+    const path = expectPath(body);
+    const r = await userStub(c).vfsDropVersions(
+      c.var.scope,
+      path,
+      body.policy ?? {}
+    );
+    return c.json(r);
+  } catch (err) {
+    const r = errToResponse(err);
+    return c.json(r.body, r.status as 400);
+  }
+});
+
 // Catch-all 404 for unknown /api/vfs/<method> paths. Without this,
 // the parent app's wildcard route would forward to ASSETS (or
 // wherever) and clients would see weird 500s instead of a clean 404.
