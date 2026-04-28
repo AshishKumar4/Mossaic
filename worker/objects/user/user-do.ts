@@ -19,14 +19,38 @@ import {
 } from "./files";
 import { createFolder, listFolders, getFolder, getFolderPath } from "./folders";
 import { getQuota, checkQuota, updateUsage } from "./quota";
+import {
+  vfsExists,
+  vfsLstat,
+  vfsOpenManifest,
+  vfsReadChunk,
+  vfsReadFile,
+  vfsReadlink,
+  vfsReadManyStat,
+  vfsReaddir,
+  vfsStat,
+} from "./vfs-ops";
+import type {
+  OpenManifestResult,
+  VFSScope,
+  VFSStatRaw,
+} from "@shared/vfs-types";
 
 export class UserDO extends DurableObject<Env> {
   sql: SqlStorage;
+  /**
+   * Public alias for the protected `env` from the DurableObject base
+   * class. Phase 2 vfs-ops needs to dispatch ShardDO subrequests by
+   * binding name; without this alias TS rejects external access. The
+   * base class's `env` remains protected; we shadow it.
+   */
+  envPublic: Env;
   private initialized = false;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
+    this.envPublic = env;
   }
 
   private ensureInit(): void {
@@ -469,5 +493,82 @@ export class UserDO extends DurableObject<Env> {
       recentUploads,
       shardDistribution,
     };
+  }
+
+  // ── VFS RPC surface (Phase 2: read-side) ───────────────────────────────
+  //
+  // Cloudflare DO RPC: any public async method on the DO class is callable
+  // from a holder of the stub via `stub.methodName(args)`. The consumer
+  // pays exactly one subrequest per call regardless of internal fan-out.
+  // See sdk-impl-plan §5.3 for the full contract; these are the read-side
+  // methods that land in Phase 2. Write-side and streaming methods come
+  // in Phases 3 and 4.
+  //
+  // Each method calls ensureInit() so the schema migrations (Phase 1)
+  // run before any VFS access on a DO that hasn't seen any legacy
+  // /fetch traffic yet.
+
+  /** stat() — follows trailing symlinks. Throws ENOENT/ELOOP/ENOTDIR. */
+  async vfsStat(scope: VFSScope, path: string): Promise<VFSStatRaw> {
+    this.ensureInit();
+    return vfsStat(this, scope, path);
+  }
+
+  /** lstat() — does NOT follow trailing symlinks. */
+  async vfsLstat(scope: VFSScope, path: string): Promise<VFSStatRaw> {
+    this.ensureInit();
+    return vfsLstat(this, scope, path);
+  }
+
+  /** exists() — returns true iff the path resolves to a file/dir/symlink. */
+  async vfsExists(scope: VFSScope, path: string): Promise<boolean> {
+    this.ensureInit();
+    return vfsExists(this, scope, path);
+  }
+
+  /** readlink() — returns the symlink target string. EINVAL if not a symlink. */
+  async vfsReadlink(scope: VFSScope, path: string): Promise<string> {
+    this.ensureInit();
+    return vfsReadlink(this, scope, path);
+  }
+
+  /** readdir() — entry names under a directory. ENOTDIR/ENOENT if applicable. */
+  async vfsReaddir(scope: VFSScope, path: string): Promise<string[]> {
+    this.ensureInit();
+    return vfsReaddir(this, scope, path);
+  }
+
+  /** readManyStat() — batched lstat for git-style workloads. */
+  async vfsReadManyStat(
+    scope: VFSScope,
+    paths: string[]
+  ): Promise<(VFSStatRaw | null)[]> {
+    this.ensureInit();
+    return vfsReadManyStat(this, scope, paths);
+  }
+
+  /** readFile() — returns Uint8Array bytes. EISDIR/EFBIG/ENOENT/ELOOP. */
+  async vfsReadFile(scope: VFSScope, path: string): Promise<Uint8Array> {
+    this.ensureInit();
+    return vfsReadFile(this, scope, path);
+  }
+
+  /** openManifest() — public, shard-index-stripped manifest for caller-orchestrated reads. */
+  async vfsOpenManifest(
+    scope: VFSScope,
+    path: string
+  ): Promise<OpenManifestResult> {
+    this.ensureInit();
+    return vfsOpenManifest(this, scope, path);
+  }
+
+  /** readChunk() — fetch one chunk by (path, chunkIndex). */
+  async vfsReadChunk(
+    scope: VFSScope,
+    path: string,
+    chunkIndex: number
+  ): Promise<Uint8Array> {
+    this.ensureInit();
+    return vfsReadChunk(this, scope, path, chunkIndex);
   }
 }
