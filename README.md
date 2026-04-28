@@ -1,30 +1,78 @@
 # Mossaic
 
-**Distributed file storage powered by Cloudflare Durable Objects.** &nbsp;·&nbsp; [**Live Demo →**](https://mossaic.ashishkumarsingh.com)
+**Horizontally-scalable chunked filesystem on Cloudflare Durable Objects.** &nbsp;·&nbsp; [**Live Demo →**](https://mossaic.ashishkumarsingh.com)
 
-Mossaic splits every file into 1 MB chunks, hashes them with SHA-256, distributes them across a dynamic pool of Durable Object shards via rendezvous hashing, and transfers them in parallel. The result is a fast, deduplicated, horizontally-scaling storage system that runs entirely on the Cloudflare edge — no origin servers, no S3 buckets, no external databases.
+Mossaic exposes a Node `fs/promises`-shaped API over a content-addressed, deduplicating, parallel-chunked storage layer that runs entirely on the Cloudflare edge — no origin servers, no S3 buckets, no external databases. Use it for: photo libraries, ML datasets, build artifacts, isomorphic-git filesystem layer, container layers, attachments — anything that needs real filesystem semantics with content-addressed dedup and parallel chunked streaming.
+
+Files are split into 1 MB chunks, SHA-256 hashed, distributed across a dynamic pool of Durable Object shards via rendezvous hashing, and transferred in parallel. Identical bytes are stored once per tenant; tenants are isolated by construction; critical correctness invariants are formally proved in Lean 4.
+
+---
+
+## Two products in one repo
+
+| | What | Where |
+|---|---|---|
+| **Storage app** | A runnable photo library / file manager — drag-and-drop uploads, justified-grid gallery, lightbox, albums, analytics dashboard. Live at [mossaic.ashishkumarsingh.com](https://mossaic.ashishkumarsingh.com). | `src/` (React SPA) + `worker/` (Hono router + DOs) |
+| **`@mossaic/sdk`** | An npm package any Cloudflare Worker can consume to embed Mossaic as a `fs/promises`-shaped VFS. Multi-tenant scoping, streaming, isomorphic-git compatible, typed errors, HTTP fallback for non-Worker consumers. | `sdk/` — see **[`sdk/README.md`](./sdk/README.md)** for the full DX walkthrough |
+
+Both share the same Durable Object backend (`UserDO`, `ShardDO`, `SearchDO`) and the same chunking / placement primitives in `shared/`.
 
 ---
 
 ## `@mossaic/sdk` — fs/promises VFS for Cloudflare Workers
 
-Mossaic's storage layer is also packaged as an npm SDK (**[`@mossaic/sdk`](./sdk/README.md)**) that any Cloudflare Worker can consume to get a Node-`fs/promises`-shaped, isomorphic-git-compatible filesystem with content-addressed dedup, multi-tenancy, streaming, and typed errors.
+Mossaic's storage layer is packaged as an npm SDK (**[`@mossaic/sdk`](./sdk/README.md)**) that any Cloudflare Worker can consume to get a Node-`fs/promises`-shaped, isomorphic-git-compatible filesystem with content-addressed dedup, multi-tenancy, streaming, and typed errors.
+
+### Quick start
+
+```bash
+pnpm add @mossaic/sdk
+```
 
 ```ts
 // src/index.ts
 import { UserDO, ShardDO, SearchDO, createVFS } from "@mossaic/sdk";
+
+// wrangler discovers DO classes from the Worker's main-module exports.
 export { UserDO, ShardDO, SearchDO };
 
+export interface Env {
+  MOSSAIC_USER:   DurableObjectNamespace<UserDO>;
+  MOSSAIC_SHARD:  DurableObjectNamespace<ShardDO>;
+  MOSSAIC_SEARCH: DurableObjectNamespace<SearchDO>;
+}
+
 export default {
-  async fetch(req, env) {
+  async fetch(req: Request, env: Env) {
     const vfs = createVFS(env, { tenant: "acme-corp" });
     await vfs.writeFile("/hello.txt", "world");
-    return new Response(await vfs.readFile("/hello.txt"));
+    return new Response(await vfs.readFile("/hello.txt", { encoding: "utf8" }));
   },
 };
 ```
 
-One outbound DO RPC per VFS call regardless of internal chunk fan-out; isomorphic-git plugs in directly via `vfs.promises === vfs`. Multi-tenant via `vfs:${ns}:${tenant}[:${sub}]` DO naming; per-tenant rate limits; HTTP fallback for non-Worker consumers; auto-batched `lstat` for git-style workloads. See **[`sdk/README.md`](./sdk/README.md)** for the full DX walkthrough.
+```jsonc
+// wrangler.jsonc
+{
+  "name": "my-app",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-03-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "durable_objects": {
+    "bindings": [
+      { "name": "MOSSAIC_USER",   "class_name": "UserDO" },
+      { "name": "MOSSAIC_SHARD",  "class_name": "ShardDO" },
+      { "name": "MOSSAIC_SEARCH", "class_name": "SearchDO" }
+    ]
+  },
+  "migrations": [
+    { "tag": "mossaic-v1", "new_sqlite_classes": ["UserDO", "ShardDO", "SearchDO"] }
+  ]
+}
+```
+
+That's the entire integration. One outbound DO RPC per VFS call regardless of internal chunk fan-out; isomorphic-git plugs in directly via `vfs.promises === vfs`. Multi-tenant via `vfs:${ns}:${tenant}[:${sub}]` DO naming; per-tenant rate limits; HTTP fallback for non-Worker consumers; auto-batched `lstat` for git-style workloads. See **[`sdk/README.md`](./sdk/README.md)** for the full DX walkthrough.
 
 ---
 
@@ -54,16 +102,30 @@ flowchart LR
     Worker --> Sn
 ```
 
-Each user gets their own **UserDO** (auth, file manifests, folder hierarchy, quota tracking) and a **dynamic pool of ShardDOs** that store the actual chunk data. Chunks are placed deterministically — both client and server can independently compute which shard holds any chunk with zero coordination.
+Each user (or SDK tenant) gets their own **UserDO** (auth, file manifests, folder hierarchy, quota, versioning) and a **dynamic pool of ShardDOs** that store the actual chunk data. Chunks are placed deterministically — both client and server can independently compute which shard holds any chunk with zero coordination. Files **≤16 KB** skip chunking entirely and inline directly into the UserDO row (the inline tier); everything larger flows through the chunked path. Chunks are **content-addressed and refcounted** — identical bytes within a tenant are stored once, and a 30s-grace alarm sweeper hard-deletes chunks whose refcount has reached zero.
 
 ---
 
 ## Features
 
-- **Chunked parallel uploads & downloads** — files are split into 1 MB chunks and transferred with up to 6 concurrent streams, with exponential-backoff retry and real-time throughput/ETA tracking
-- **Content-addressed deduplication** — every chunk is SHA-256 hashed; duplicate chunks are reference-counted, never stored twice
+**Storage core (used by both products)**
+
+- **`fs/promises` surface** — readFile / writeFile / stat / readdir / mkdir / rmdir / unlink / rename / chmod / symlink / readlink / lstat / exists, plus streaming via `createReadStream` / `createWriteStream` and batched `readManyStat` for git-style workloads
+- **Multi-tenant by construction** — DO instances named `vfs:${ns}:${tenant}[:${sub}]`; cross-tenant data is unreachable, cross-tenant chunk dedup is impossible
+- **Content-addressed deduplication** — every chunk is SHA-256 hashed; duplicate chunks within a tenant are reference-counted, never stored twice
+- **Inline tier** — files ≤16 KB skip chunking entirely and inline into the UserDO row; everything larger flows through the chunked path
+- **Atomic writes** — `writeFile` and `createWriteStream` use temp-id-then-rename two-phase commit; partial writes are never visible to readers
+- **Refcounted GC** — alarm-driven sweeper hard-deletes chunks whose refcount has reached zero, with a 30s grace window for resurrection
+- **File-level versioning** (opt-in) — every overwrite creates an immutable `version_id`; `listVersions` / `restoreVersion` / `dropVersions` retention policies; tombstone-on-`unlink`; cross-version dedup keeps storage bounded
+- **Chunked parallel uploads & downloads** — 1 MB chunks transferred with up to 6 concurrent streams, exponential-backoff retry, real-time throughput/ETA tracking
 - **Rendezvous hashing placement** — deterministic, coordination-free chunk-to-shard mapping via MurmurHash3; adding shards causes minimal redistribution
-- **Dynamic shard pool** — starts at 32 shards per user, grows by 1 shard for every 5 GB stored
+- **Dynamic shard pool** — starts at 32 shards per tenant, grows by 1 shard per 5 GB stored
+- **isomorphic-git compatible** — `vfs.promises === vfs`; `git.init` / `add` / `commit` / `log` round-trip cleanly; opt-in batched `lstat` coalesces `git status` bursts into one RPC
+- **Formal Lean 4 proofs** — refcount well-formedness, tenant isolation, GC safety, versioning monotonicity (V3) machine-checked; see [`lean/`](./lean/)
+- **Typed errors** — `ENOENT`, `EEXIST`, `EISDIR`, `ENOTDIR`, `EFBIG`, `ELOOP`, `EBUSY`, `EINVAL`, `EACCES`, `EROFS`, `ENOTEMPTY`, `EAGAIN`, plus `MossaicUnavailableError` for transport-level soft-fail
+
+**Storage app UI** (the [live demo](https://mossaic.ashishkumarsingh.com))
+
 - **JWT authentication** — PBKDF2-hashed passwords (100k iterations), HS256 JWTs via `jose`, 30-day sessions
 - **File manager** — drag-and-drop uploads, nested folder hierarchy, breadcrumb navigation, search-param-driven routing
 - **Photo gallery** — justified grid layout (Google Photos-style), full-screen lightbox with zoom/pan/swipe, keyboard navigation, filmstrip scrubber
@@ -295,6 +357,18 @@ npx wrangler deploy
 ```
 
 The first deploy provisions the Durable Object namespaces and applies the migrations declared in `wrangler.jsonc`.
+
+---
+
+## Formal verification
+
+Critical correctness invariants are formally proved in Lean 4 — **refcount validity**, **tenant isolation**, **garbage-collection safety**, and **versioning monotonicity (V3)**. The proofs are plain Lean 4 (no Mathlib), build cold-cache in ~30 seconds, and run in CI on every push touching `lean/`, `worker/`, or `shared/`.
+
+```bash
+pnpm lean:build
+```
+
+See **[`lean/README.md`](./lean/README.md)** for theorem names, what is and isn't proved (the must-have set is `sorry`-free; one declared axiom for the numerical refcount equality, documented in `Gc.lean`), and the TS↔Lean cross-reference protocol.
 
 ---
 
