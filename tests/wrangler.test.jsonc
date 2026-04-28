@@ -1,0 +1,15 @@
+{
+  "name": "mossaic-tests",
+  "main": "./test-worker.ts",
+  "compatibility_date": "2025-09-06",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": {
+    "bindings": [
+      { "name": "USER_DO", "class_name": "UserDO" },
+      { "name": "SHARD_DO", "class_name": "ShardDO" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["UserDO", "ShardDO"] }
+  ]
+}

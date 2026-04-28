@@ -40,6 +40,26 @@ export class ShardDO extends DurableObject<Env> {
         value         INTEGER NOT NULL
       )
     `);
+
+    // ── VFS GC bookkeeping (sdk-impl-plan §3.2, §8.3) ──────────────────────
+    // deleted_at marks chunks pending hard-delete. Set when ref_count first
+    // hits 0; the alarm sweeper (Phase 3) hard-deletes after a grace
+    // period. NULL = live. Idempotent ALTER guarded by try/catch like
+    // search-do.ts:59-68.
+    try {
+      this.sql.exec("ALTER TABLE chunks ADD COLUMN deleted_at INTEGER");
+    } catch {
+      // column already exists
+    }
+    this.sql.exec(`
+      CREATE INDEX IF NOT EXISTS idx_chunks_deleted
+        ON chunks(deleted_at)
+        WHERE deleted_at IS NOT NULL
+    `);
+    this.sql.exec(`
+      CREATE INDEX IF NOT EXISTS idx_chunk_refs_file
+        ON chunk_refs(file_id)
+    `);
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -66,11 +86,11 @@ export class ShardDO extends DurableObject<Env> {
           .toArray();
 
         if (existing.length > 0) {
-          // Chunk exists — add reference only
-          this.sql.exec(
-            "UPDATE chunks SET ref_count = ref_count + 1 WHERE hash = ?",
-            chunkHash
-          );
+          // Chunk exists — add a ref ONLY if this (file_id, chunk_index)
+          // slot didn't already reference it. This fixes the refcount
+          // drift bug (sdk-impl-plan §0, §8.1) where retried PUTs of the
+          // same chunk slot bumped ref_count without inserting a new ref
+          // row, causing unlinks to never reach 0.
           this.sql.exec(
             `INSERT OR IGNORE INTO chunk_refs (chunk_hash, file_id, chunk_index, user_id)
              VALUES (?, ?, ?, ?)`,
@@ -78,6 +98,24 @@ export class ShardDO extends DurableObject<Env> {
             fileId,
             chunkIndex,
             userId
+          );
+          const inserted = (
+            this.sql.exec("SELECT changes() AS n").toArray()[0] as {
+              n: number;
+            }
+          ).n > 0;
+          if (inserted) {
+            this.sql.exec(
+              "UPDATE chunks SET ref_count = ref_count + 1 WHERE hash = ?",
+              chunkHash
+            );
+          }
+          // If a previous unlink soft-marked this chunk for GC and we're
+          // resurrecting it, clear deleted_at so the alarm sweeper skips
+          // it.
+          this.sql.exec(
+            "UPDATE chunks SET deleted_at = NULL WHERE hash = ? AND deleted_at IS NOT NULL",
+            chunkHash
           );
           return Response.json({
             status: "deduplicated",
