@@ -79,76 +79,14 @@ export class ShardDO extends DurableObject<Env> {
         const userId = request.headers.get("X-User-Id") || "";
 
         const data = await request.arrayBuffer();
-
-        // Check for dedup
-        const existing = this.sql
-          .exec("SELECT hash, ref_count FROM chunks WHERE hash = ?", chunkHash)
-          .toArray();
-
-        if (existing.length > 0) {
-          // Chunk exists — add a ref ONLY if this (file_id, chunk_index)
-          // slot didn't already reference it. This fixes the refcount
-          // drift bug (sdk-impl-plan §0, §8.1) where retried PUTs of the
-          // same chunk slot bumped ref_count without inserting a new ref
-          // row, causing unlinks to never reach 0.
-          this.sql.exec(
-            `INSERT OR IGNORE INTO chunk_refs (chunk_hash, file_id, chunk_index, user_id)
-             VALUES (?, ?, ?, ?)`,
-            chunkHash,
-            fileId,
-            chunkIndex,
-            userId
-          );
-          const inserted = (
-            this.sql.exec("SELECT changes() AS n").toArray()[0] as {
-              n: number;
-            }
-          ).n > 0;
-          if (inserted) {
-            this.sql.exec(
-              "UPDATE chunks SET ref_count = ref_count + 1 WHERE hash = ?",
-              chunkHash
-            );
-          }
-          // If a previous unlink soft-marked this chunk for GC and we're
-          // resurrecting it, clear deleted_at so the alarm sweeper skips
-          // it.
-          this.sql.exec(
-            "UPDATE chunks SET deleted_at = NULL WHERE hash = ? AND deleted_at IS NOT NULL",
-            chunkHash
-          );
-          return Response.json({
-            status: "deduplicated",
-            bytesStored: 0,
-          });
-        }
-
-        // New chunk — store it with parameterized BLOB binding
-        this.sql.exec(
-          `INSERT INTO chunks (hash, data, size, ref_count, created_at)
-           VALUES (?, ?, ?, 1, ?)`,
+        const result = this.writeChunkInternal(
           chunkHash,
-          data,
-          data.byteLength,
-          Date.now()
-        );
-
-        this.sql.exec(
-          `INSERT INTO chunk_refs (chunk_hash, file_id, chunk_index, user_id)
-           VALUES (?, ?, ?, ?)`,
-          chunkHash,
+          new Uint8Array(data),
           fileId,
           chunkIndex,
           userId
         );
-
-        // Update capacity tracking
-        this.updateCapacity(data.byteLength);
-
-        return Response.json({
-          status: "created",
-          bytesStored: data.byteLength,
-        });
+        return Response.json(result);
       }
 
       // Read a chunk: GET /chunk/:hash
@@ -182,10 +120,17 @@ export class ShardDO extends DurableObject<Env> {
       }
 
       // Delete file refs: DELETE /refs/:fileId
+      // Legacy HTTP shape — kept for back-compat. The body now reflects
+      // soft-mark semantics: bytes are not freed synchronously, they are
+      // marked for the alarm sweeper. No current route actually invokes
+      // this endpoint (verified Phase 1); the public DO RPC is preferred.
       if (path.startsWith("/refs/") && request.method === "DELETE") {
         const fileId = path.split("/")[2];
-        const freed = this.removeFileRefs(fileId);
-        return Response.json({ freedBytes: freed });
+        const result = await this.removeFileRefs(fileId);
+        return Response.json({
+          freedBytes: 0,
+          markedChunks: result.marked,
+        });
       }
 
       return new Response("Not found", { status: 404 });
@@ -195,45 +140,239 @@ export class ShardDO extends DurableObject<Env> {
     }
   }
 
-  private removeFileRefs(fileId: string): number {
-    let freedBytes = 0;
+  // ── VFS write RPC surface (sdk-impl-plan §7) ───────────────────────────
+  //
+  // putChunk is the typed RPC counterpart to the legacy
+  // PUT /chunk HTTP route. UserDO's vfsWriteFile path calls this
+  // directly via the typed DO stub: no JSON marshalling, no headers,
+  // typed return.
+  //
+  // Refcount semantics are identical to the HTTP route — they share
+  // writeChunkInternal so the dedup-drift fix (Phase 1) applies to
+  // both paths.
+  async putChunk(
+    chunkHash: string,
+    data: Uint8Array,
+    fileId: string,
+    chunkIndex: number,
+    userId: string
+  ): Promise<{ status: "created" | "deduplicated"; bytesStored: number }> {
+    this.ensureInit();
+    return this.writeChunkInternal(
+      chunkHash,
+      data,
+      fileId,
+      chunkIndex,
+      userId
+    );
+  }
+
+  /**
+   * Shared write path used by both the legacy HTTP PUT /chunk route and
+   * the new putChunk RPC. Implements:
+   *   - dedup: existing hash → INSERT OR IGNORE chunk_refs, conditional
+   *     ref_count++ via SELECT changes() (Phase 1 fix), clear deleted_at
+   *     on resurrection
+   *   - cold path: INSERT INTO chunks + chunk_refs, update capacity
+   *
+   * Returns the same shape as the HTTP route's JSON body.
+   */
+  private writeChunkInternal(
+    chunkHash: string,
+    data: Uint8Array,
+    fileId: string,
+    chunkIndex: number,
+    userId: string
+  ): { status: "created" | "deduplicated"; bytesStored: number } {
+    const existing = this.sql
+      .exec("SELECT hash FROM chunks WHERE hash = ?", chunkHash)
+      .toArray();
+
+    if (existing.length > 0) {
+      this.sql.exec(
+        `INSERT OR IGNORE INTO chunk_refs (chunk_hash, file_id, chunk_index, user_id)
+         VALUES (?, ?, ?, ?)`,
+        chunkHash,
+        fileId,
+        chunkIndex,
+        userId
+      );
+      const inserted =
+        (
+          this.sql.exec("SELECT changes() AS n").toArray()[0] as {
+            n: number;
+          }
+        ).n > 0;
+      if (inserted) {
+        this.sql.exec(
+          "UPDATE chunks SET ref_count = ref_count + 1 WHERE hash = ?",
+          chunkHash
+        );
+      }
+      // Resurrection: a previous unlink may have soft-marked this chunk;
+      // a fresh write/dedup cancels the GC.
+      this.sql.exec(
+        "UPDATE chunks SET deleted_at = NULL WHERE hash = ? AND deleted_at IS NOT NULL",
+        chunkHash
+      );
+      return { status: "deduplicated", bytesStored: 0 };
+    }
+
+    this.sql.exec(
+      `INSERT INTO chunks (hash, data, size, ref_count, created_at)
+       VALUES (?, ?, ?, 1, ?)`,
+      chunkHash,
+      data,
+      data.byteLength,
+      Date.now()
+    );
+    this.sql.exec(
+      `INSERT INTO chunk_refs (chunk_hash, file_id, chunk_index, user_id)
+       VALUES (?, ?, ?, ?)`,
+      chunkHash,
+      fileId,
+      chunkIndex,
+      userId
+    );
+    this.updateCapacity(data.byteLength);
+    return { status: "created", bytesStored: data.byteLength };
+  }
+
+  // ── VFS GC RPC surface (sdk-impl-plan §8.2) ────────────────────────────
+  //
+  // Public DO RPC. Called from UserDO's vfsUnlink / vfsCommitWrite /
+  // vfsRename overwrite path. Drops one (chunk_hash, file_id) ref per
+  // chunk_refs row; decrements `ref_count` on chunks; soft-marks any
+  // chunk that hits ref_count=0 by setting `deleted_at`. The alarm
+  // sweeper (alarm() handler) hard-deletes after a 30s grace window,
+  // re-checking ref_count to absorb resurrection races where a
+  // concurrent dedup PUT re-references the chunk.
+  //
+  // Returns `{ marked }` — number of chunks newly marked deleted_at on
+  // this call. Callers don't need this for correctness; it's
+  // observability for tests + future quota reconciliation.
+  async deleteChunks(fileId: string): Promise<{ marked: number }> {
+    this.ensureInit();
+    return this.removeFileRefs(fileId);
+  }
+
+  /**
+   * Drop refs for a fileId. For each ref: delete the chunk_refs row,
+   * decrement ref_count, soft-mark with `deleted_at` if it hit 0. The
+   * alarm handler does the actual hard-delete after a grace period.
+   *
+   * Per-call observable side-effects:
+   *   - chunk_refs rows for this fileId removed
+   *   - chunks.ref_count decremented
+   *   - chunks.deleted_at set on rows that hit 0
+   *   - alarm scheduled if any chunk was marked
+   */
+  private async removeFileRefs(fileId: string): Promise<{ marked: number }> {
+    let marked = 0;
 
     const refs = this.sql
       .exec("SELECT chunk_hash FROM chunk_refs WHERE file_id = ?", fileId)
-      .toArray();
+      .toArray() as { chunk_hash: string }[];
 
-    for (const ref of refs) {
-      const chunkHash = (ref as { chunk_hash: string }).chunk_hash;
-
+    for (const { chunk_hash } of refs) {
       this.sql.exec(
         "DELETE FROM chunk_refs WHERE chunk_hash = ? AND file_id = ?",
-        chunkHash,
+        chunk_hash,
         fileId
       );
 
       this.sql.exec(
-        "UPDATE chunks SET ref_count = ref_count - 1 WHERE hash = ?",
-        chunkHash
+        "UPDATE chunks SET ref_count = MAX(0, ref_count - 1) WHERE hash = ?",
+        chunk_hash
       );
 
-      const chunk = this.sql
-        .exec(
-          "SELECT size FROM chunks WHERE hash = ? AND ref_count <= 0",
-          chunkHash
-        )
-        .toArray();
+      const r = this.sql
+        .exec("SELECT ref_count FROM chunks WHERE hash = ?", chunk_hash)
+        .toArray()[0] as { ref_count: number } | undefined;
 
-      if (chunk.length > 0) {
-        this.sql.exec("DELETE FROM chunks WHERE hash = ?", chunkHash);
-        freedBytes += (chunk[0] as { size: number }).size;
+      if (r && r.ref_count === 0) {
+        // First-to-zero wins the soft-mark. The `deleted_at IS NULL`
+        // guard means a chunk already marked (e.g. in a prior unlink
+        // that didn't fully sweep yet) keeps its earlier timestamp,
+        // which is fine — the grace window is measured from that.
+        this.sql.exec(
+          "UPDATE chunks SET deleted_at = ? WHERE hash = ? AND deleted_at IS NULL",
+          Date.now(),
+          chunk_hash
+        );
+        marked++;
       }
     }
 
-    if (freedBytes > 0) {
-      this.updateCapacity(-freedBytes);
+    if (marked > 0) {
+      await this.scheduleSweep();
     }
+    return { marked };
+  }
 
-    return freedBytes;
+  /**
+   * Ensure an alarm is scheduled for the next sweep. If one is already
+   * set sooner than our target, leave it alone — single alarm per DO.
+   */
+  private async scheduleSweep(): Promise<void> {
+    const cur = await this.ctx.storage.getAlarm();
+    const next = Date.now() + 5 * 60 * 1000; // 5 min default cadence
+    if (cur === null || cur > next) {
+      await this.ctx.storage.setAlarm(next);
+    }
+  }
+
+  /**
+   * Alarm handler — hard-deletes chunks soft-marked for >= 30s and
+   * still at ref_count=0. Resurrected chunks (ref_count went back up
+   * via a concurrent dedup PUT, with the deleted_at clear handled in
+   * the PUT path) need the un-mark belt-and-suspenders here too.
+   *
+   * Reschedules itself if more rows remain past this batch's LIMIT 500.
+   * Cloudflare alarms have at-least-once semantics with exponential
+   * backoff retry on throw, so this handler is idempotent — re-running
+   * the same batch is a no-op (the rows are already deleted).
+   */
+  async alarm(): Promise<void> {
+    this.ensureInit();
+    const cutoff = Date.now() - 30_000; // 30s grace
+    const rows = this.sql
+      .exec(
+        "SELECT hash, size FROM chunks WHERE deleted_at IS NOT NULL AND deleted_at < ? LIMIT 500",
+        cutoff
+      )
+      .toArray() as { hash: string; size: number }[];
+
+    let freed = 0;
+    for (const { hash, size } of rows) {
+      // Re-check ref_count under the same single-threaded fetch to
+      // catch a resurrection-by-PUT that happened after the
+      // chunk_refs DELETE but before the sweeper saw it.
+      const live = this.sql
+        .exec("SELECT ref_count FROM chunks WHERE hash = ?", hash)
+        .toArray()[0] as { ref_count: number } | undefined;
+
+      if (!live || live.ref_count > 0) {
+        // Resurrected; un-mark and skip the delete.
+        this.sql.exec(
+          "UPDATE chunks SET deleted_at = NULL WHERE hash = ?",
+          hash
+        );
+        continue;
+      }
+
+      this.sql.exec("DELETE FROM chunks WHERE hash = ?", hash);
+      freed += size;
+    }
+    if (freed > 0) this.updateCapacity(-freed);
+
+    // Reschedule if the sweep was capped at LIMIT 500.
+    const more = this.sql
+      .exec("SELECT 1 FROM chunks WHERE deleted_at IS NOT NULL LIMIT 1")
+      .toArray();
+    if (more.length > 0) {
+      await this.ctx.storage.setAlarm(Date.now() + 60_000);
+    }
   }
 
   private getStats(): {
