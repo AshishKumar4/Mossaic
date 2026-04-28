@@ -2,9 +2,9 @@
 
 **Horizontally-scalable chunked filesystem on Cloudflare Durable Objects.** &nbsp;·&nbsp; [**Live Demo →**](https://mossaic.ashishkumarsingh.com)
 
-Mossaic exposes a Node `fs/promises`-shaped API over a content-addressed, deduplicating, parallel-chunked storage layer that runs entirely on the Cloudflare edge — no origin servers, no S3 buckets, no external databases. Use it for: photo libraries, ML datasets, build artifacts, isomorphic-git filesystem layer, container layers, attachments — anything that needs real filesystem semantics with content-addressed dedup and parallel chunked streaming.
+Mossaic exposes a Node `fs/promises`-shaped API over a content-addressed, deduplicating, parallel-chunked storage layer that runs entirely on the Cloudflare edge — no origin servers, no S3 buckets, no external databases. Use it for: photo libraries, ML datasets, build artifacts, isomorphic-git filesystem layer, container layers, attachments, **live collaborative documents** (per-file Yjs CRDT mode) — anything that needs real filesystem semantics with content-addressed dedup and parallel chunked streaming.
 
-Files are split into 1 MB chunks, SHA-256 hashed, distributed across a dynamic pool of Durable Object shards via rendezvous hashing, and transferred in parallel. Identical bytes are stored once per tenant; tenants are isolated by construction; critical correctness invariants are formally proved in Lean 4.
+Files are split into 1 MB chunks, SHA-256 hashed, distributed across a dynamic pool of Durable Object shards via rendezvous hashing, and transferred in parallel. Identical bytes are stored once per tenant; tenants are isolated by construction; per-file CRDT mode runs over a Hibernation-API WebSocket at $0 idle cost; critical correctness invariants are formally proved in Lean 4 with Mathlib.
 
 ---
 
@@ -13,7 +13,7 @@ Files are split into 1 MB chunks, SHA-256 hashed, distributed across a dynamic p
 | | What | Where |
 |---|---|---|
 | **Storage app** | A runnable photo library / file manager — drag-and-drop uploads, justified-grid gallery, lightbox, albums, analytics dashboard. Live at [mossaic.ashishkumarsingh.com](https://mossaic.ashishkumarsingh.com). | `src/` (React SPA) + `worker/` (Hono router + DOs) |
-| **`@mossaic/sdk`** | An npm package any Cloudflare Worker can consume to embed Mossaic as a `fs/promises`-shaped VFS. Multi-tenant scoping, streaming, isomorphic-git compatible, typed errors, HTTP fallback for non-Worker consumers. | `sdk/` — see **[`sdk/README.md`](./sdk/README.md)** for the full DX walkthrough |
+| **`@mossaic/sdk`** | An npm package any Cloudflare Worker can consume to embed Mossaic as a `fs/promises`-shaped VFS. Multi-tenant scoping, streaming, isomorphic-git compatible, per-file Yjs CRDT mode, typed errors, HTTP fallback for non-Worker consumers. | `sdk/` — see **[`sdk/README.md`](./sdk/README.md)** for the full DX walkthrough |
 
 Both share the same Durable Object backend (`UserDO`, `ShardDO`, `SearchDO`) and the same chunking / placement primitives in `shared/`.
 
@@ -72,37 +72,130 @@ export default {
 }
 ```
 
-That's the entire integration. One outbound DO RPC per VFS call regardless of internal chunk fan-out; isomorphic-git plugs in directly via `vfs.promises === vfs`. Multi-tenant via `vfs:${ns}:${tenant}[:${sub}]` DO naming; per-tenant rate limits; HTTP fallback for non-Worker consumers; auto-batched `lstat` for git-style workloads. See **[`sdk/README.md`](./sdk/README.md)** for the full DX walkthrough.
+That's the entire integration. One outbound DO RPC per VFS call regardless of internal chunk fan-out; isomorphic-git plugs in directly via `vfs.promises === vfs`. Multi-tenant via `vfs:${ns}:${tenant}[:${sub}]` DO naming; per-tenant rate limits; HTTP fallback for non-Worker consumers; auto-batched `lstat` for git-style workloads.
+
+For **live collaborative editing**, promote any file to Yjs-mode and open a CRDT handle:
+
+```ts
+import { openYDoc } from "@mossaic/sdk/yjs";
+
+await vfs.setYjsMode("/notes/today.md", true);  // or vfs.chmod(p, { yjs: true })
+const handle = await openYDoc(vfs, "/notes/today.md");
+await handle.synced;                            // initial round-trip complete
+handle.doc.getText("content").insert(0, "DRAFT — ");
+await handle.close();
+```
+
+`yjs` is an optional peer dep; importing from `@mossaic/sdk/yjs` is the opt-in. See the [Live editing with Yjs](#live-editing-with-yjs) section below and **[`sdk/README.md`](./sdk/README.md)** for the full DX walkthrough.
 
 ---
 
 ## Architecture
 
-```mermaid
-flowchart LR
-    Client["Client (React SPA)"]
+```
+                   ┌─────────────────────────────────────────────────────┐
+                   │  DO instance ID  =  vfs:${ns}:${tenant}[:${sub}]    │
+                   │  (per-tenant scoping; cross-tenant data unreachable)│
+                   └─────────────────────────────────────────────────────┘
 
-    subgraph CF["Cloudflare Workers"]
-        Worker["Hono Worker Router"]
-        UserDO["UserDO\n(Auth, Files, Quota)"]
-
-        subgraph Shards["ShardDO Pool (n shards)"]
-            S0["ShardDO 0"]
-            S1["ShardDO 1"]
-            S2["ShardDO 2"]
-            Sn["ShardDO n..."]
-        end
-    end
-
-    Client -- "parallel chunk\nupload / download" --> Worker
-    Worker -- "auth, manifest,\nquota" --> UserDO
-    Worker -- "fan-out via\nrendezvous hash" --> S0
-    Worker --> S1
-    Worker --> S2
-    Worker --> Sn
+  Consumer Worker / SPA                  Cloudflare Workers runtime
+  ─────────────────────                  ─────────────────────────────────
+                          DO RPC
+   createVFS(env, opts) ─────────────►  ┌──────────────────────────┐
+   vfs.readFile / writeFile / ...       │         UserDO           │
+   vfs.stat / readdir / unlink          │  (per-tenant)            │
+                                        │                          │
+                                        │  • auth, manifests,      │
+                                        │    folders, quota        │
+                                        │  • file-level versioning │
+                                        │  • inline tier (≤16 KB)  │  ◄── tier 1
+                                        │    stays in UserDO row   │      no fanout
+                                        │  • atomic temp→commit    │
+                                        │  • Yjs runtime (per-file)│
+                                        └────┬───────────┬─────────┘
+                                             │           │
+   Live editor client                        │           │
+   (browser / Worker)                        │           │
+        │                                    │           │
+        │   WebSocket upgrade                │           │  DO RPC: rendezvous-
+        │   (Hibernation API,                │           │  hashed chunk fanout
+        │    $0 idle, binary frames,         │           │
+        │    Yjs sync protocol)              │           ▼
+        └────────────────────────────────►   │  ┌──────────────────────────┐
+                                             │  │  ShardDO pool (n shards) │
+                                             │  │                          │
+                                             │  │  • normal chunks         │  ◄── tier 2
+                                             │  │    (1 MB, content-       │      blob storage
+                                             │  │     addressed, refct'd)  │
+                                             │  │  • Yjs op-log + check-   │  ◄── tier 3
+                                             │  │    point chunks (mode_   │      live CRDT
+                                             │  │     yjs files)           │
+                                             │  │  • 30s-grace alarm GC    │
+                                             │  └──────────────────────────┘
+                                             │
+                                             ▼
+                                     ┌────────────────┐
+                                     │   SearchDO     │  (optional, per-tenant
+                                     │ (per-tenant)   │   semantic-search index)
+                                     └────────────────┘
 ```
 
-Each user (or SDK tenant) gets their own **UserDO** (auth, file manifests, folder hierarchy, quota, versioning) and a **dynamic pool of ShardDOs** that store the actual chunk data. Chunks are placed deterministically — both client and server can independently compute which shard holds any chunk with zero coordination. Files **≤16 KB** skip chunking entirely and inline directly into the UserDO row (the inline tier); everything larger flows through the chunked path. Chunks are **content-addressed and refcounted** — identical bytes within a tenant are stored once, and a 30s-grace alarm sweeper hard-deletes chunks whose refcount has reached zero.
+Each tenant gets their own **UserDO** (auth, file manifests, folder hierarchy, quota, versioning, Yjs runtime) and a **dynamic pool of ShardDOs** that store the actual chunk data. Chunks are placed deterministically via rendezvous hashing — both client and server can independently compute which shard holds any chunk with zero coordination.
+
+**Three storage tiers**:
+1. **Inline** (≤16 KB) — the file body lives in the UserDO row itself; no ShardDO fanout, no chunk RPC.
+2. **Normal chunks** — 1 MB content-addressed blobs in ShardDOs, refcounted, deduplicated within the tenant, swept by a 30s-grace alarm GC.
+3. **Yjs op-log + checkpoint chunks** — for files in CRDT mode, every Yjs update is a content-hashed op-log row and periodic compactions emit `Y.Doc` state snapshots. Both reuse the chunk fabric (rendezvous placement, refcount, GC).
+
+**Two transports** out of UserDO:
+- **DO RPC** — `vfs.*` calls dispatch over the `MOSSAIC_USER` binding; one outbound RPC per VFS call regardless of internal chunk fanout.
+- **WebSocket upgrade** — live Yjs sessions speak the standard sync protocol over Cloudflare's [Hibernation API](https://developers.cloudflare.com/durable-objects/api/websockets/#hibernation-api). Idle connections cost **$0** — workerd evicts the DO between frames and rehydrates per message; per-socket state survives via `serializeAttachment`.
+
+---
+
+## Live editing with Yjs
+
+Mossaic ships **per-file CRDT mode** (Phase 10). Any file can be promoted to "yjs-mode" with a one-line `setYjsMode` call; from then on, every `writeFile` becomes a CRDT transaction, `readFile` materialises the current state, and any number of clients can co-edit live over a WebSocket. CRDT and plain files coexist in the same filesystem, the same tenant, the same directory.
+
+**Opt-in via mode bit.** A file is plain until you toggle it. Two equivalent forms:
+
+```ts
+await vfs.setYjsMode("/notes/today.md", true);
+// or
+await vfs.chmod("/notes/today.md", { yjs: true });
+```
+
+Stat surfaces the bit on `mode` (`VFS_MODE_YJS_BIT === 0o4000`).
+
+**`openYDoc` API.** From `@mossaic/sdk/yjs` (a subpath export so the main bundle stays Yjs-free):
+
+```ts
+import { openYDoc } from "@mossaic/sdk/yjs";
+
+const handle = await openYDoc(vfs, "/notes/today.md");
+await handle.synced;                                  // initial round-trip complete
+handle.doc.getText("content").insert(0, "DRAFT — "); // standard Y.Doc mutations
+handle.doc.on("update", (update, origin) => { /* … */ });
+await handle.close();
+```
+
+`yjs` is an **optional peer dependency** — bring your own version (tested against `yjs >=13.6.0`).
+
+**Wire protocol & transport.** The standard Yjs sync protocol (`sync_step_1` / `sync_step_2` / `update`) tagged with a single byte, transported as **binary WebSocket frames** end-to-end — no JSON, no base64, no envelope overhead. The WebSocket terminates inside the tenant's UserDO via Cloudflare's Hibernation API: idle connections cost **$0**, per-socket state survives eviction via `serializeAttachment`. Awareness (cursors, selections, presence) ships on a separate channel in a follow-up minor; the v1 wire carries sync only.
+
+**Storage model.** Every Yjs update lands in a `yjs_oplog` row keyed by `(path_id, seq)`. The update bytes are content-hashed and pushed into Mossaic's existing chunk fabric — same rendezvous-hashed shard placement, same refcounted GC, same per-tenant isolation that ordinary blobs use. Periodic **compaction** (every N ops or T minutes) emits a `Y.Doc` state snapshot as a checkpoint chunk and reaps the prior op-log chunks via the standard alarm sweeper.
+
+**Versioning interop.** When both versioning and yjs-mode are on, **compaction snapshots** create Mossaic version rows — you get a version row per checkpoint, not per keystroke. Live ops between snapshots are NOT versioned: the Yjs op log IS the live history.
+
+**isomorphic-git interop.** Yjs-mode files appear as **normal files** to non-collab tools — `readFile` returns the materialised content, so `git add` / `git commit` / `git diff` see it as bytes like any other file. A `writeFile` issued by Git tooling on a yjs-mode file becomes a CRDT replacement transaction, which means concurrent live editors see the Git write as a merge rather than a clobber. **Caveat**: blob hashes change every transaction (the underlying chunks are Yjs updates, not the file content), so don't expect Git-friendly diffs against earlier commits — promote a file when you want CRDT semantics, not on the source you want Git to track.
+
+**Demoting back to plain mode is rejected** (`EINVAL`) — it would silently lose CRDT history. To get a plain copy, `readFile` and `writeFile` to a different path.
+
+> **Why this matters.** `fs/promises` + content-addressed dedup + per-file live CRDT collab in one filesystem doesn't exist anywhere else in the Cloudflare ecosystem. R2 is bulk object storage, no filesystem semantics; Artifacts is Git-shaped, not fs-shaped, no live collab; bring-your-own Yjs servers don't share storage with your blobs and don't dedup. Use Mossaic when you want all three.
+
+The 10 Yjs invariants (schema migration, promotion semantics, write/read round-trip, stat bit, unlink purge, compaction, tenant isolation, igit interop, two-client live round-trip) are pinned by `tests/integration/yjs.test.ts` (218/218 tests passing). Lean 4 formalization of those invariants is future work — see [Formal verification](#formal-verification) for what's currently machine-checked.
+
+For the full DX (`chmod` overload, `setYjsMode` on freshly-created files, error codes, peer-dep matrix, more examples), see the **[Live editing with Yjs section in `sdk/README.md`](./sdk/README.md#live-editing-with-yjs-per-file-crdt-mode)**.
 
 ---
 
@@ -117,6 +210,7 @@ Each user (or SDK tenant) gets their own **UserDO** (auth, file manifests, folde
 - **Atomic writes** — `writeFile` and `createWriteStream` use temp-id-then-rename two-phase commit; partial writes are never visible to readers
 - **Refcounted GC** — alarm-driven sweeper hard-deletes chunks whose refcount has reached zero, with a 30s grace window for resurrection
 - **File-level versioning** (opt-in) — every overwrite creates an immutable `version_id`; `listVersions` / `restoreVersion` / `dropVersions` retention policies; tombstone-on-`unlink`; cross-version dedup keeps storage bounded
+- **Per-file Yjs CRDT mode** (opt-in) — promote any file to live-collab via `setYjsMode` or `chmod(p, { yjs: true })`; clients co-edit over a Hibernation-API WebSocket ($0 idle billing) speaking the standard binary Yjs sync protocol; periodic compaction snapshots the `Y.Doc` and reaps the op log; isomorphic-git sees yjs-mode files as plain bytes; `openYDoc(vfs, path) → YDocHandle` from the `@mossaic/sdk/yjs` subpath export (yjs is an optional peer dep)
 - **Chunked parallel uploads & downloads** — 1 MB chunks transferred with up to 6 concurrent streams, exponential-backoff retry, real-time throughput/ETA tracking
 - **Rendezvous hashing placement** — deterministic, coordination-free chunk-to-shard mapping via MurmurHash3; adding shards causes minimal redistribution
 - **Dynamic shard pool** — starts at 32 shards per tenant, grows by 1 shard per 5 GB stored
@@ -362,13 +456,21 @@ The first deploy provisions the Durable Object namespaces and applies the migrat
 
 ## Formal verification
 
-Critical correctness invariants are formally proved in Lean 4 — **refcount validity**, **tenant isolation**, **garbage-collection safety**, and **versioning monotonicity (V3)**. The proofs are plain Lean 4 (no Mathlib), build cold-cache in ~30 seconds, and run in CI on every push touching `lean/`, `worker/`, or `shared/`.
+Critical correctness invariants are formally proved in **Lean 4 with Mathlib** — **zero `sorry`, zero project `axiom`** (only Lean's three kernel axioms `propext` / `Classical.choice` / `Quot.sound` are transitively in scope, via Mathlib). Currently machine-checked:
+
+- **I1 — Refcount validity** including the full numerical equality `refCount = countP (·.hash = c.hash) refs` over all reachable shard states (was axiom-conditional in v1; Mathlib's `List.countP` lemmas discharge it directly).
+- **I2 — Atomic-write linearizability** for the temp-id-then-rename two-phase `writeFile` commit, including no-torn-state during in-flight writes.
+- **I3 — Tenant isolation** — `vfsUserDOName` and `vfsShardDOName` are injective on valid scopes; cross-tenant DO-instance collision is impossible.
+- **I4 — Versioning sortedness & monotonicity** — `listVersions` is `Pairwise (mtimeMs ≥)`; `insertVersion mtime ⇒ maxMtime ≥ mtime`.
+- **I5 — GC safety** — the alarm sweeper only deletes chunks with `refCount = 0`, preserves `validState`, and clears `deletedAt` on resurrected chunks. Now **unconditional** (no axiom).
 
 ```bash
 pnpm lean:build
 ```
 
-See **[`lean/README.md`](./lean/README.md)** for theorem names, what is and isn't proved (the must-have set is `sorry`-free; one declared axiom for the numerical refcount equality, documented in `Gc.lean`), and the TS↔Lean cross-reference protocol.
+See **[`lean/README.md`](./lean/README.md)** for theorem names, the TS↔Lean cross-reference protocol (`@lean-invariant` JSDoc tags pinned by CI), and documented limitations (SHA-256 collision-resistance, SQLite UNIQUE-INDEX semantics, and wall-clock alarm timeliness are out of scope).
+
+The **10 Yjs invariants** added in Phase 10 (schema migration, promotion semantics, write/read round-trip, stat bit, unlink purge, compaction, tenant isolation, igit interop, two-client live round-trip) are currently **test-pinned** by `tests/integration/yjs.test.ts` (218/218 tests passing). Lean formalization of those invariants is future work.
 
 ---
 
