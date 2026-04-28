@@ -46,7 +46,9 @@ export {
   EACCES,
   EROFS,
   ENOTEMPTY,
+  EAGAIN,
   MossaicUnavailableError,
+  isLikelyUnavailable,
   type VFSErrorCode,
 } from "./errors";
 export type {
@@ -77,6 +79,11 @@ export {
   type CreateMossaicHttpClientOptions,
   type VFSClient,
 } from "./http";
+
+// isomorphic-git adapter (Phase 8: optional batched-lstat). Re-exported
+// from the root for ergonomic single-import use; also available via
+// the explicit `@mossaic/sdk/fs` subpath.
+export { createIgitFs, type CreateIgitFsOptions } from "./igit";
 
 import { VFS, type CreateVFSOptions, type MossaicEnv } from "./vfs";
 
