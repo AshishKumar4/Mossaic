@@ -5,7 +5,7 @@ import {
   verifyJWT,
   verifyVFSToken,
   VFSConfigError,
-} from "../../worker/lib/auth";
+} from "@core/lib/auth";
 import type { Env } from "@shared/types";
 
 /**

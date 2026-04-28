@@ -3,7 +3,7 @@ import type { Env } from "@shared/types";
 import type { MiddlewareHandler } from "hono";
 import { verifyVFSToken, VFSConfigError } from "../lib/auth";
 import { vfsUserDOName } from "../lib/utils";
-import type { UserDO } from "../objects/user/user-do";
+import type { UserDOCore } from "../objects/user/user-do-core";
 import type { VFSScope } from "@shared/vfs-types";
 
 /**
@@ -93,11 +93,11 @@ const vfsAuth = (): MiddlewareHandler<{
 vfs.use("*", vfsAuth());
 
 /** Resolve the typed UserDO stub for the verified scope. */
-function userStub(c: { env: Env; var: { scope: VFSScope } }): UserDO {
+function userStub(c: { env: Env; var: { scope: VFSScope } }): UserDOCore {
   const scope = c.var.scope;
   const name = vfsUserDOName(scope.ns, scope.tenant, scope.sub);
   const id = c.env.USER_DO.idFromName(name);
-  return c.env.USER_DO.get(id) as unknown as UserDO;
+  return c.env.USER_DO.get(id) as unknown as UserDOCore;
 }
 
 /** Map a thrown error to (status, body) for JSON responses. */

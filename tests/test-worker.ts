@@ -14,8 +14,14 @@
  * The Worker-boot smoke test (tests/integration/worker-smoke.test.ts)
  * uses `SELF.fetch("https://test/api/...")` to exercise the real route
  * handlers, providing an end-to-end regression gate.
+ *
+ * Phase 11: the worker entry now lives at `worker/app/index.ts` (the
+ * App-mode bundle). DO re-exports point to the new layout: `UserDO`
+ * (App subclass) from worker/app, `ShardDO` + `SearchDO` from
+ * worker/core. Class names are unchanged so existing test bindings
+ * (`class_name: "UserDO"`) continue to resolve.
  */
-export { default } from "../worker/index";
-export { UserDO } from "../worker/objects/user/index";
-export { ShardDO } from "../worker/objects/shard/index";
-export { SearchDO } from "../worker/objects/search/index";
+export { default } from "../worker/app/index";
+export { UserDO } from "../worker/app/objects/user/index";
+export { ShardDO } from "../worker/core/objects/shard/index";
+export { SearchDO } from "../worker/core/objects/search/index";

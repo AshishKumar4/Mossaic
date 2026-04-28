@@ -66,9 +66,14 @@ export type {
 // Re-export the DO classes so consumer Workers can re-export them in
 // their own entry module — wrangler resolves DO bindings via the
 // consumer's main module's exports, not via npm dep graph.
-export { UserDO } from "../../worker/objects/user/index";
-export { ShardDO } from "../../worker/objects/shard/index";
-export { SearchDO } from "../../worker/objects/search/index";
+// Phase 11: re-export the Core class as `UserDO` so consumer Workers
+// can continue to declare `class_name: "UserDO"` in their wrangler
+// without any change. The class itself is `UserDOCore` in the
+// production tree (worker/core/objects/user/user-do-core.ts);
+// aliasing on export preserves the SDK's public API contract.
+export { UserDOCore as UserDO } from "../../worker/core/objects/user/index";
+export { ShardDO } from "../../worker/core/objects/shard/index";
+export { SearchDO } from "../../worker/core/objects/search/index";
 
 // VFSScope is the wire shape of the multi-tenant scope; consumers
 // rarely need it directly but isomorphic-git plugins or HTTP fallback

@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import type { Env } from "@shared/types";
-import { authMiddleware } from "../lib/auth";
-import { shardDOName, userDOName } from "../lib/utils";
+import { authMiddleware } from "@core/lib/auth";
+import { shardDOName, userDOName } from "@core/lib/utils";
 import { placeChunk } from "@shared/placement";
 import { indexFile } from "./search";
 

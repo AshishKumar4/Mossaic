@@ -44,7 +44,7 @@
  * MVP we report-but-skip duped folders that have children.
  */
 
-import type { UserDO } from "./user-do";
+import type { UserDOCore as UserDO } from "./user-do-core";
 import type { ShardDO } from "../shard/shard-do";
 import { vfsShardDOName } from "../../lib/utils";
 import type { VFSScope } from "@shared/vfs-types";

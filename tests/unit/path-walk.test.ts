@@ -148,7 +148,7 @@ describe("resolvePath inside the DO", () => {
     // Now drive resolvePath via runInDurableObject.
     await runInDurableObject(stub, async (instance) => {
       const { resolvePath } = await import(
-        "../../worker/objects/user/path-walk"
+        "@core/objects/user/path-walk"
       );
 
       // root
@@ -237,7 +237,7 @@ describe("resolvePath inside the DO", () => {
 
     await runInDurableObject(stub, async (instance) => {
       const { resolvePath, resolvePathFollow } = await import(
-        "../../worker/objects/user/path-walk"
+        "@core/objects/user/path-walk"
       );
 
       // lstat-style: returns the symlink

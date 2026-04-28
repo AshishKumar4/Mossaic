@@ -1,6 +1,6 @@
 import type { UserDO } from "./user-do";
 import type { UserFile, FileManifest, ChunkSpec } from "@shared/types";
-import { generateId } from "../../lib/utils";
+import { generateId } from "@core/lib/utils";
 import { computeChunkSpec } from "@shared/chunking";
 import { placeChunk } from "@shared/placement";
 

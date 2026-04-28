@@ -1,6 +1,6 @@
 import type { UserDO } from "./user-do";
 import type { Folder } from "@shared/types";
-import { generateId } from "../../lib/utils";
+import { generateId } from "@core/lib/utils";
 
 /**
  * Create a new folder.

@@ -16,10 +16,10 @@ import { env, runInDurableObject } from "cloudflare:test";
  * the scope the tests pass to the RPC methods.
  */
 
-import type { UserDO } from "../../worker/objects/user/user-do";
-import type { ShardDO } from "../../worker/objects/shard/shard-do";
+import type { UserDOCore as UserDO } from "@core/objects/user/user-do-core";
+import type { ShardDO } from "@core/objects/shard/shard-do";
 import { INLINE_LIMIT } from "@shared/inline";
-import { vfsShardDOName } from "../../worker/lib/utils";
+import { vfsShardDOName } from "@core/lib/utils";
 
 interface E {
   USER_DO: DurableObjectNamespace<UserDO>;

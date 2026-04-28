@@ -12,7 +12,7 @@ import { env, runInDurableObject } from "cloudflare:test";
  */
 
 import { createVFS, type MossaicEnv, EAGAIN, VFSFsError } from "../../sdk/src/index";
-import { vfsUserDOName } from "../../worker/lib/utils";
+import { vfsUserDOName } from "@core/lib/utils";
 
 interface E {
   USER_DO: DurableObjectNamespace;
