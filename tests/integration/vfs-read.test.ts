@@ -10,15 +10,16 @@ import { env, runInDurableObject } from "cloudflare:test";
  * test fixture pretends to be the SDK: gets a stub via
  * `env.USER_DO.get(idFromName(...))` and calls the methods.
  *
- * Phase 4 will switch to vfs:ns:tenant DO names; for now the test
- * binds to a tenant-named DO directly. The legacy /signup creates a
- * userId that we pass as scope.tenant so the DO's SQL filters match
- * (Phase 2 maps scope.tenant → user_id 1:1).
+ * Phase 4 wires shard naming through `vfsShardDOName(ns, tenant, sub, idx)`,
+ * so seed steps that pre-populate ShardDO state must use the same
+ * derivation. We hard-code namespace="default" + sub=undefined to match
+ * the scope the tests pass to the RPC methods.
  */
 
 import type { UserDO } from "../../worker/objects/user/user-do";
 import type { ShardDO } from "../../worker/objects/shard/shard-do";
 import { INLINE_LIMIT } from "@shared/inline";
+import { vfsShardDOName } from "../../worker/lib/utils";
 
 interface E {
   USER_DO: DurableObjectNamespace<UserDO>;
@@ -292,7 +293,7 @@ describe("vfsReadFile (inline tier + chunked path)", () => {
     const userId = await seedUser(stub, "ch@e.com");
     const shardIdx = 0;
     const shardDO = E.SHARD_DO.get(
-      E.SHARD_DO.idFromName(`shard:${userId}:${shardIdx}`)
+      E.SHARD_DO.idFromName(vfsShardDOName("default", userId, undefined, shardIdx))
     );
 
     // Two-chunk file. We use the legacy upload protocol since vfsWriteFile
@@ -427,7 +428,7 @@ describe("vfsOpenManifest / vfsReadChunk", () => {
     const userId = await seedUser(stub, "mf@e.com");
     const shardIdx = 0;
     const shardDO = E.SHARD_DO.get(
-      E.SHARD_DO.idFromName(`shard:${userId}:${shardIdx}`)
+      E.SHARD_DO.idFromName(vfsShardDOName("default", userId, undefined, shardIdx))
     );
 
     const part = new TextEncoder().encode("just-one-chunk");

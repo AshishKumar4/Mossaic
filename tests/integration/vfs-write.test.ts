@@ -29,6 +29,7 @@ import {
 import type { UserDO } from "../../worker/objects/user/user-do";
 import type { ShardDO } from "../../worker/objects/shard/shard-do";
 import { INLINE_LIMIT } from "@shared/inline";
+import { vfsShardDOName } from "../../worker/lib/utils";
 
 interface E {
   USER_DO: DurableObjectNamespace<UserDO>;
@@ -332,7 +333,7 @@ describe("vfsWriteFile (chunked tier) + ShardDO refcount", () => {
     // ref_count=1.
     const oldShardIdx = meta.chunks[0].shard_index;
     const oldShard = E.SHARD_DO.get(
-      E.SHARD_DO.idFromName(`shard:${userId}:${oldShardIdx}`)
+      E.SHARD_DO.idFromName(vfsShardDOName("default", userId, undefined, oldShardIdx))
     );
     const oldHashes = (await readShardSnapshot(oldShard)).hashes.map(
       (h) => h.hash
@@ -361,7 +362,7 @@ describe("vfsWriteFile (chunked tier) + ShardDO refcount", () => {
     let markedCount = 0;
     for (const idx of shardIdxsToCheck) {
       const ss = E.SHARD_DO.get(
-        E.SHARD_DO.idFromName(`shard:${userId}:${idx}`)
+        E.SHARD_DO.idFromName(vfsShardDOName("default", userId, undefined, idx))
       );
       const snap = await readShardSnapshot(ss);
       for (const h of snap.hashes) {
@@ -404,7 +405,7 @@ describe("vfsUnlink + ShardDO chunk GC alarm sweeper", () => {
       return r.shard_index;
     });
     const shardStub = E.SHARD_DO.get(
-      E.SHARD_DO.idFromName(`shard:${userId}:${shardIdx}`)
+      E.SHARD_DO.idFromName(vfsShardDOName("default", userId, undefined, shardIdx))
     );
 
     // Pre-unlink: ref_count=1 on each hash, no deleted_at.
@@ -569,7 +570,7 @@ describe("vfsRename", () => {
     );
 
     const shardStubs = allShardIdxs.map((idx) =>
-      E.SHARD_DO.get(E.SHARD_DO.idFromName(`shard:${userId}:${idx}`))
+      E.SHARD_DO.get(E.SHARD_DO.idFromName(vfsShardDOName("default", userId, undefined, idx)))
     );
 
     // Pre-rename: every chunk has ref_count=1.
@@ -811,7 +812,7 @@ describe("vfsRemoveRecursive", () => {
       }
     );
     const shardStubs = allShardIdxs.map((idx) =>
-      E.SHARD_DO.get(E.SHARD_DO.idFromName(`shard:${userId}:${idx}`))
+      E.SHARD_DO.get(E.SHARD_DO.idFromName(vfsShardDOName("default", userId, undefined, idx)))
     );
 
     // rm -rf the tree.
@@ -897,7 +898,7 @@ describe("end-to-end VFS lifecycle", () => {
       return r.shard_index;
     });
     const shardStub = E.SHARD_DO.get(
-      E.SHARD_DO.idFromName(`shard:${userId}:${shardIdx}`)
+      E.SHARD_DO.idFromName(vfsShardDOName("default", userId, undefined, shardIdx))
     );
     let snap = await readShardSnapshot(shardStub);
     expect(snap.hashes.length).toBeGreaterThan(0);
