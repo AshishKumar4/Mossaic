@@ -20,15 +20,23 @@ import {
 import { createFolder, listFolders, getFolder, getFolderPath } from "./folders";
 import { getQuota, checkQuota, updateUsage } from "./quota";
 import {
+  vfsChmod,
   vfsExists,
   vfsLstat,
+  vfsMkdir,
   vfsOpenManifest,
   vfsReadChunk,
   vfsReadFile,
   vfsReadlink,
   vfsReadManyStat,
   vfsReaddir,
+  vfsRemoveRecursive,
+  vfsRename,
+  vfsRmdir,
   vfsStat,
+  vfsSymlink,
+  vfsUnlink,
+  vfsWriteFile,
 } from "./vfs-ops";
 import type {
   OpenManifestResult,
@@ -570,5 +578,91 @@ export class UserDO extends DurableObject<Env> {
   ): Promise<Uint8Array> {
     this.ensureInit();
     return vfsReadChunk(this, scope, path, chunkIndex);
+  }
+
+  // ── VFS RPC surface (Phase 3: write-side) ──────────────────────────────
+  //
+  // Atomic writes (temp-id-then-rename), hard delete with chunk GC fan-out,
+  // and the supporting mutating ops. Each method runs inside a single
+  // single-threaded DO invocation, so the supersede + rename sequence in
+  // commitRename is atomic against concurrent reads/writes (sdk-impl-plan
+  // §7). Chunks are reaped via ShardDO.deleteChunks RPC, which soft-marks
+  // and lets the alarm-driven sweeper hard-delete after a 30s grace
+  // (sdk-impl-plan §8.3).
+  //
+  // Inline tier (≤ INLINE_LIMIT) writes never touch ShardDO — the data
+  // lives in files.inline_data and the entire write is one INSERT.
+
+  /** writeFile() — atomic, last-writer-wins. Inline tier ≤16KB; chunked otherwise. */
+  async vfsWriteFile(
+    scope: VFSScope,
+    path: string,
+    data: Uint8Array,
+    opts?: { mode?: number; mimeType?: string }
+  ): Promise<void> {
+    this.ensureInit();
+    return vfsWriteFile(this, scope, path, data, opts);
+  }
+
+  /** unlink() — hard-delete file/symlink + dispatch chunk GC. EISDIR for dirs. */
+  async vfsUnlink(scope: VFSScope, path: string): Promise<void> {
+    this.ensureInit();
+    return vfsUnlink(this, scope, path);
+  }
+
+  /** mkdir() — create folder; recursive flag walks intermediates. */
+  async vfsMkdir(
+    scope: VFSScope,
+    path: string,
+    opts?: { recursive?: boolean; mode?: number }
+  ): Promise<void> {
+    this.ensureInit();
+    vfsMkdir(this, scope, path, opts);
+  }
+
+  /** rmdir() — remove empty directory. ENOTEMPTY/ENOTDIR/ENOENT. */
+  async vfsRmdir(scope: VFSScope, path: string): Promise<void> {
+    this.ensureInit();
+    vfsRmdir(this, scope, path);
+  }
+
+  /** rename() — atomic move/rename. Replace semantics for files, EEXIST for dirs. */
+  async vfsRename(
+    scope: VFSScope,
+    src: string,
+    dst: string
+  ): Promise<void> {
+    this.ensureInit();
+    return vfsRename(this, scope, src, dst);
+  }
+
+  /** chmod() — update mode bits on a file/symlink/dir. */
+  async vfsChmod(
+    scope: VFSScope,
+    path: string,
+    mode: number
+  ): Promise<void> {
+    this.ensureInit();
+    vfsChmod(this, scope, path, mode);
+  }
+
+  /** symlink() — create a symlink at linkPath pointing to target. */
+  async vfsSymlink(
+    scope: VFSScope,
+    target: string,
+    linkPath: string
+  ): Promise<void> {
+    this.ensureInit();
+    vfsSymlink(this, scope, target, linkPath);
+  }
+
+  /** removeRecursive() — paginated rm -rf on a directory subtree. */
+  async vfsRemoveRecursive(
+    scope: VFSScope,
+    path: string,
+    cursor?: string
+  ): Promise<{ done: boolean; cursor?: string }> {
+    this.ensureInit();
+    return vfsRemoveRecursive(this, scope, path, cursor);
   }
 }
