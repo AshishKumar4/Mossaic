@@ -93,6 +93,84 @@ export class UserDO extends DurableObject<Env> {
         pool_size     INTEGER NOT NULL DEFAULT 32
       )
     `);
+
+    // ── VFS schema migrations (sdk-impl-plan §3.1) ─────────────────────────
+    // Each ALTER is idempotent via try/catch: SQLite throws "duplicate
+    // column name" if the column already exists. The pattern matches
+    // search-do.ts:59-68. CREATE TABLE/INDEX IF NOT EXISTS is naturally
+    // idempotent.
+    //
+    // Backward compatibility: existing rows get default mode, NULL inline
+    // data, node_kind='file'. The legacy app's reads keep working because
+    // (a) new columns have defaults, (b) the manifest reader (files.ts)
+    // continues to fall through to file_chunks when inline_data IS NULL.
+
+    // file mode (POSIX), inline tier, symlink kind
+    try {
+      this.sql.exec(
+        "ALTER TABLE files ADD COLUMN mode INTEGER NOT NULL DEFAULT 420"
+      ); // 0o644
+    } catch {
+      // column already exists
+    }
+    try {
+      this.sql.exec("ALTER TABLE files ADD COLUMN inline_data BLOB");
+    } catch {
+      // column already exists
+    }
+    try {
+      this.sql.exec("ALTER TABLE files ADD COLUMN symlink_target TEXT");
+    } catch {
+      // column already exists
+    }
+    try {
+      this.sql.exec(
+        "ALTER TABLE files ADD COLUMN node_kind TEXT NOT NULL DEFAULT 'file'"
+      );
+    } catch {
+      // column already exists
+    }
+    try {
+      this.sql.exec(
+        "ALTER TABLE folders ADD COLUMN mode INTEGER NOT NULL DEFAULT 493"
+      ); // 0o755
+    } catch {
+      // column already exists
+    }
+
+    // POSIX uniqueness via partial indexes (SQLite cannot ALTER TABLE ADD
+    // UNIQUE on existing tables). Scoped to non-deleted rows so prior
+    // soft-deleted duplicates don't block migration.
+    //
+    // If existing data has live duplicates, this CREATE throws and is
+    // swallowed; the admin dedupe route (Phase 6) resolves them later.
+    try {
+      this.sql.exec(`
+        CREATE UNIQUE INDEX IF NOT EXISTS uniq_files_parent_name
+          ON files(user_id, IFNULL(parent_id, ''), file_name)
+          WHERE status != 'deleted'
+      `);
+    } catch {
+      // dupe live rows exist; admin dedupe is required before re-running
+    }
+    try {
+      this.sql.exec(`
+        CREATE UNIQUE INDEX IF NOT EXISTS uniq_folders_parent_name
+          ON folders(user_id, IFNULL(parent_id, ''), name)
+      `);
+    } catch {
+      // dupe folder rows exist; admin dedupe is required before re-running
+    }
+
+    // Lookup indexes (overdue per study §4)
+    this.sql.exec(`
+      CREATE INDEX IF NOT EXISTS idx_files_parent
+        ON files(user_id, parent_id, status)
+    `);
+    this.sql.exec(`
+      CREATE INDEX IF NOT EXISTS idx_folders_parent
+        ON folders(user_id, parent_id)
+    `);
   }
 
   async fetch(request: Request): Promise<Response> {
