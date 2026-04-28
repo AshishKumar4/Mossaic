@@ -1,0 +1,7 @@
+name = "Mossaic"
+version = "0.1.0"
+defaultTargets = ["Mossaic"]
+
+[[lean_lib]]
+name = "Mossaic"
+roots = ["Mossaic"]

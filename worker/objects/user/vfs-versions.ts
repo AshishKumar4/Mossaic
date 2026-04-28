@@ -172,6 +172,14 @@ export function shardRefId(pathId: string, versionId: string): string {
  * For the inline tier, pass `inlineData` (Uint8Array); chunks are
  * empty. For chunked, pass `inlineData=null` and ensure
  * version_chunks rows have already been inserted.
+ *
+ * @lean-invariant Mossaic.Generated.UserDO.insertVersion_advances
+ *   Lean proves that under monotonic clock (Date.now() non-decreasing),
+ *   inserting a new version advances `maxMtime` for the path. This is
+ *   the algebraic core of versioning monotonicity. See
+ *   `lean/Mossaic/Vfs/Versioning.lean :: insertVersion_max_ge`. The
+ *   stretch goal proof is partial; the structural sub-property is
+ *   unconditional.
  */
 export function commitVersion(
   durableObject: UserDO,

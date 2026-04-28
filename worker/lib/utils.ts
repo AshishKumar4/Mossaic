@@ -78,6 +78,11 @@ function validateVfsToken(label: string, value: string): void {
  * Each component must match `[A-Za-z0-9._-]{1,128}`. Cross-tenant
  * collisions are impossible by construction because no character in the
  * allowed class is `:`.
+ *
+ * @lean-invariant Mossaic.Generated.UserDO.cross_tenant_user_isolation
+ *   Lean proves that distinct tenants under valid scope produce distinct
+ *   UserDO names. See `lean/Mossaic/Vfs/Tenant.lean :: userName_inj` and
+ *   the corollary `cross_tenant_user_isolation`.
  */
 export function vfsUserDOName(
   ns: string,
@@ -102,6 +107,12 @@ export function vfsUserDOName(
  * shardIndex must be a non-negative finite integer. The leading "s"
  * disambiguates the shard suffix from a sub-tenant whose name happens
  * to be a number.
+ *
+ * @lean-invariant Mossaic.Generated.UserDO.cross_tenant_shard_isolation
+ *   Lean proves that, at any fixed shard index, distinct tenants under
+ *   valid scope produce distinct ShardDO names. See
+ *   `lean/Mossaic/Vfs/Tenant.lean :: shardName_inj_fixed_idx` and the
+ *   corollary `cross_tenant_isolation`.
  */
 export function vfsShardDOName(
   ns: string,

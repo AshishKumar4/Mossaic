@@ -1,0 +1,53 @@
+name: Lean Proofs
+
+on:
+  pull_request:
+    paths:
+      - 'lean/**'
+      - 'worker/**'
+      - 'shared/**'
+      - '.github/workflows/lean.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'lean/**'
+      - 'worker/**'
+      - 'shared/**'
+      - '.github/workflows/lean.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install elan (Lean toolchain manager)
+        run: |
+          curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
+            | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> $GITHUB_PATH
+
+      - name: Cache Lean toolchain + build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.elan
+            lean/.lake
+          key: lean-${{ runner.os }}-${{ hashFiles('lean/lean-toolchain', 'lean/lakefile.toml') }}
+          restore-keys: |
+            lean-${{ runner.os }}-
+
+      - name: Install toolchain (warm cache will skip download)
+        working-directory: lean
+        run: lean --version
+
+      - name: lake build
+        working-directory: lean
+        run: lake build
+
+      - name: Verify zero sorrys in must-have proofs
+        run: bash lean/scripts/check-no-sorry.sh
+
+      - name: Verify TS↔Lean cross-references
+        run: bash lean/scripts/check-xrefs.sh
