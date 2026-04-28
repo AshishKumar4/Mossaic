@@ -1,0 +1,26 @@
+{
+  // Reference consumer wrangler — what a real customer adopting
+  // @mossaic/sdk would put in their wrangler.jsonc. Used by tests
+  // for documentation; not loaded by the test harness directly
+  // (the harness mounts the fixture via main-export).
+  "name": "mossaic-consumer-fixture",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-09-06",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": {
+    "bindings": [
+      { "name": "MOSSAIC_USER", "class_name": "UserDO" },
+      { "name": "MOSSAIC_SHARD", "class_name": "ShardDO" },
+      { "name": "MOSSAIC_SEARCH", "class_name": "SearchDO" }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["UserDO", "ShardDO", "SearchDO"]
+    }
+  ],
+  "vars": {
+    "JWT_SECRET": "test-secret-for-vitest-only"
+  }
+}

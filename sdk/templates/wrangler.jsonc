@@ -1,0 +1,31 @@
+{
+  // Copy this into your consumer Worker's wrangler.jsonc. Adjust
+  // `name`, `main`, and route/custom_domain as appropriate. The DO
+  // bindings + migrations block is what wrangler needs to discover
+  // and instantiate Mossaic's UserDO/ShardDO/SearchDO classes.
+  "name": "my-app",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-03-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "durable_objects": {
+    "bindings": [
+      { "name": "MOSSAIC_USER", "class_name": "UserDO" },
+      { "name": "MOSSAIC_SHARD", "class_name": "ShardDO" },
+      { "name": "MOSSAIC_SEARCH", "class_name": "SearchDO" }
+    ]
+  },
+
+  "migrations": [
+    {
+      "tag": "mossaic-v1",
+      "new_sqlite_classes": ["UserDO", "ShardDO", "SearchDO"]
+    }
+  ],
+
+  "vars": {
+    // Required: signing secret for VFS tokens. In production set via
+    // `wrangler secret put JWT_SECRET` instead of `vars`.
+    "JWT_SECRET": "change-me-in-production"
+  }
+}
