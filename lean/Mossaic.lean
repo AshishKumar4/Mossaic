@@ -1,0 +1,11 @@
+-- Mossaic root module. Re-exports every namespace under Mossaic.Vfs and
+-- Mossaic.Generated so `lake build` builds them all by default.
+import Mossaic.Vfs.Common
+import Mossaic.Vfs.Tenant
+import Mossaic.Vfs.Refcount
+import Mossaic.Vfs.Gc
+import Mossaic.Vfs.AtomicWrite
+import Mossaic.Vfs.Versioning
+import Mossaic.Generated.ShardDO
+import Mossaic.Generated.UserDO
+import Mossaic.Generated.Placement

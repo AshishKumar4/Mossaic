@@ -176,6 +176,13 @@ export class ShardDO extends DurableObject<Env> {
    *   - cold path: INSERT INTO chunks + chunk_refs, update capacity
    *
    * Returns the same shape as the HTTP route's JSON body.
+   *
+   * @lean-invariant Mossaic.Generated.ShardDO.chunk_invariant_preserved
+   *   The Lean state-machine model proves that this operation preserves
+   *   the structural invariant on (chunks, chunk_refs): chunks are
+   *   unique by hash, chunk_refs are unique by composite key, and every
+   *   chunk_refs row has a backing chunks row. See
+   *   `lean/Mossaic/Vfs/Refcount.lean :: putChunk_preserves_invariant`.
    */
   private writeChunkInternal(
     chunkHash: string,
@@ -320,6 +327,11 @@ export class ShardDO extends DurableObject<Env> {
    *   - chunks.ref_count decremented
    *   - chunks.deleted_at set on rows that hit 0
    *   - alarm scheduled if any chunk was marked
+   *
+   * @lean-invariant Mossaic.Generated.ShardDO.chunk_invariant_preserved
+   *   The Lean state-machine model proves that `deleteChunks` preserves
+   *   the structural invariant on (chunks, chunk_refs). See
+   *   `lean/Mossaic/Vfs/Refcount.lean :: deleteChunks_preserves_invariant`.
    */
   private async removeFileRefs(fileId: string): Promise<{ marked: number }> {
     let marked = 0;
@@ -386,6 +398,19 @@ export class ShardDO extends DurableObject<Env> {
    * Cloudflare alarms have at-least-once semantics with exponential
    * backoff retry on throw, so this handler is idempotent — re-running
    * the same batch is a no-op (the rows are already deleted).
+   *
+   * @lean-invariant Mossaic.Generated.ShardDO.alarm_safe
+   *   The Lean model proves that `alarm` preserves `validState` (chunk
+   *   uniqueness, ref uniqueness, ref→chunk existence). The proof is
+   *   conditional on the `numerical_refcount_dangling_axiom` for the
+   *   case where a swept chunk's hash had live refs — operationally
+   *   ruled out by `writeChunkInternal` / `removeFileRefs` invariants.
+   *   See `lean/Mossaic/Vfs/Gc.lean :: alarm_preserves_validState`.
+   *
+   * @lean-invariant Mossaic.Generated.ShardDO.alarm_only_deletes_zero
+   *   Unconditional: `alarm` only hard-deletes chunks whose `refCount`
+   *   was 0 at the time of the sweep, AND past the grace window. See
+   *   `lean/Mossaic/Vfs/Gc.lean :: alarm_only_deletes_zero_refCount`.
    */
   async alarm(): Promise<void> {
     this.ensureInit();

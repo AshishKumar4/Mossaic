@@ -226,6 +226,8 @@ Batched mode preserves the `lstat` contract — successful resolutions return id
 
 DO instances are named `vfs:${ns}:${tenant}[:${sub}]`. Different triples → different DO instances → different SQLite databases. No cross-tenant data is reachable, ever. Cross-tenant chunk dedup is impossible by construction (chunks live on per-tenant `vfs:...:s${idx}` ShardDOs).
 
+> **Formal proofs.** Mossaic ships Lean 4 formal proofs of the refcount well-formedness, tenant isolation, and GC safety invariants. See [`lean/`](../lean/) for theorem names and `lean/README.md` for what is and isn't proved (zero `sorry` in the must-have set; one declared axiom for the numerical refcount equality, documented in `Gc.lean`). Run `pnpm lean:build` to verify.
+
 ```ts
 // Production
 const acme = createVFS(env, { tenant: "acme-corp", namespace: "prod" });
