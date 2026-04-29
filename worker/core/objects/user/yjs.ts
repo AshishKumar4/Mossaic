@@ -525,8 +525,13 @@ export class YjsRuntime {
     scope: VFSScope,
     userId: string,
     pathId: string,
-    poolSize: number
-  ): Promise<{ checkpointSeq: number; opsReaped: number }> {
+    poolSize: number,
+    opts: { userVisible?: boolean; label?: string } = {}
+  ): Promise<{
+    checkpointSeq: number;
+    opsReaped: number;
+    versionId?: string;
+  }> {
     const doc = await this.getDoc(scope, pathId);
     const stateBytes = Y.encodeStateAsUpdate(doc);
     const ckSeq = await appendUpdate(
@@ -544,7 +549,58 @@ export class YjsRuntime {
       pathId,
       ckSeq
     );
-    return { checkpointSeq: ckSeq, opsReaped: r.dropped };
+    // Phase 12: when versioning is enabled for the tenant AND this
+    // compaction is a user-visible flush, emit a Mossaic version row.
+    // Opportunistic compactions (userVisible:false) skip this — the
+    // op log itself is the live history.
+    let versionId: string | undefined;
+    if (opts.userVisible) {
+      const { isVersioningEnabled, commitVersion } = await import(
+        "./vfs-versions"
+      );
+      if (isVersioningEnabled(this.durableObject, userId)) {
+        // Snapshot the materialized text as inline_data on the
+        // version row. CompactlyBA the chunked machinery would
+        // require splitting the snapshot into chunks; for v1 we
+        // inline. Yjs-mode files are typically text; the 64KB cap
+        // matches the inline tier.
+        const text = doc.getText("content").toString();
+        const bytes = new TextEncoder().encode(text);
+        const { generateId } = await import("../../lib/utils");
+        versionId = generateId();
+        const now = Date.now();
+        // Snapshot current files.metadata for the version row.
+        const metaRow = this.durableObject.sql
+          .exec(
+            "SELECT metadata FROM files WHERE file_id = ?",
+            pathId
+          )
+          .toArray()[0] as { metadata: ArrayBuffer | null } | undefined;
+        commitVersion(this.durableObject, {
+          pathId,
+          versionId,
+          userId,
+          size: bytes.byteLength,
+          mode: 0o644,
+          mtimeMs: now,
+          chunkSize: 0,
+          chunkCount: 0,
+          fileHash: "",
+          mimeType: "text/plain",
+          inlineData: bytes,
+          userVisible: true,
+          label: opts.label,
+          metadata: metaRow?.metadata
+            ? new Uint8Array(metaRow.metadata)
+            : null,
+        });
+      }
+    }
+    return {
+      checkpointSeq: ckSeq,
+      opsReaped: r.dropped,
+      versionId,
+    };
   }
 
   /** Materialise → encode → return current doc state as bytes. */

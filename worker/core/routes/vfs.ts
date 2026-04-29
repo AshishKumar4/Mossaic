@@ -527,6 +527,119 @@ vfs.post("/dropVersions", async (c) => {
   }
 });
 
+// ── Phase 12: copyFile, metadata, listFiles, version-mark ──────────────
+
+const copyFileHandler = async (
+  c: import("hono").Context<{ Bindings: Env; Variables: { scope: VFSScope } }>
+) => {
+  try {
+    const body = await c.req.json<{
+      src: string;
+      dest: string;
+      opts?: {
+        metadata?: Record<string, unknown> | null;
+        tags?: readonly string[];
+        version?: { label?: string; userVisible?: boolean };
+        overwrite?: boolean;
+      };
+    }>();
+    if (typeof body.src !== "string" || typeof body.dest !== "string") {
+      return c.json(
+        { code: "EINVAL", message: "body.src and body.dest must be strings" },
+        400
+      );
+    }
+    await userStub(c).vfsCopyFile(c.var.scope, body.src, body.dest, body.opts);
+    return c.json({ ok: true });
+  } catch (err) {
+    const r = errToResponse(err);
+    return c.json(r.body, r.status as 400);
+  }
+};
+vfs.post("/copy", copyFileHandler);
+vfs.post("/copyFile", copyFileHandler);
+
+// PATCH is the RESTful verb for partial-update; we ALSO accept POST
+// so the HttpVFS client (which uses a single POST helper) can call
+// the same handler.
+const patchMetadataHandler = async (
+  c: import("hono").Context<{ Bindings: Env; Variables: { scope: VFSScope } }>
+) => {
+  try {
+    const body = await c.req.json<{
+      path: string;
+      patch: Record<string, unknown> | null;
+      opts?: { addTags?: readonly string[]; removeTags?: readonly string[] };
+    }>();
+    const path = expectPath(body);
+    await userStub(c).vfsPatchMetadata(c.var.scope, path, body.patch, body.opts);
+    return c.json({ ok: true });
+  } catch (err) {
+    const r = errToResponse(err);
+    return c.json(r.body, r.status as 400);
+  }
+};
+vfs.patch("/metadata", patchMetadataHandler);
+vfs.post("/patchMetadata", patchMetadataHandler);
+
+const listFilesHandler = async (
+  c: import("hono").Context<{ Bindings: Env; Variables: { scope: VFSScope } }>
+) => {
+  try {
+    // Use POST for /list so callers can pass complex `metadata`
+    // filter objects without URL-encoding gymnastics. The HTTP
+    // route's JSON body mirrors the typed RPC surface 1:1.
+    const body = await c.req.json<{
+      prefix?: string;
+      tags?: readonly string[];
+      metadata?: Record<string, unknown>;
+      limit?: number;
+      cursor?: string;
+      orderBy?: "mtime" | "name" | "size";
+      direction?: "asc" | "desc";
+      includeStat?: boolean;
+      includeMetadata?: boolean;
+    }>();
+    const r = await userStub(c).vfsListFiles(c.var.scope, body);
+    return c.json(r);
+  } catch (err) {
+    const r = errToResponse(err);
+    return c.json(r.body, r.status as 400);
+  }
+};
+vfs.post("/list", listFilesHandler);
+vfs.post("/listFiles", listFilesHandler);
+
+const markVersionHandler = async (
+  c: import("hono").Context<{ Bindings: Env; Variables: { scope: VFSScope } }>
+) => {
+  try {
+    const body = await c.req.json<{
+      path: string;
+      versionId: string;
+      label?: string;
+      userVisible?: boolean;
+    }>();
+    const path = expectPath(body);
+    if (typeof body.versionId !== "string") {
+      return c.json(
+        { code: "EINVAL", message: "body.versionId must be a string" },
+        400
+      );
+    }
+    await userStub(c).vfsMarkVersion(c.var.scope, path, body.versionId, {
+      label: body.label,
+      userVisible: body.userVisible,
+    });
+    return c.json({ ok: true });
+  } catch (err) {
+    const r = errToResponse(err);
+    return c.json(r.body, r.status as 400);
+  }
+};
+vfs.put("/version-mark", markVersionHandler);
+vfs.post("/markVersion", markVersionHandler);
+
 // Catch-all 404 for unknown /api/vfs/<method> paths. Without this,
 // the parent app's wildcard route would forward to ASSETS (or
 // wherever) and clients would see weird 500s instead of a clean 404.

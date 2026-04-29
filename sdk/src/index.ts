@@ -37,7 +37,26 @@ export {
   type MossaicEnv,
   type VersionInfo,
   type DropVersionsPolicy,
+  type WriteFileOpts,
+  type CopyFileOpts,
+  type PatchMetadataOpts,
+  type ListFilesOpts,
+  type ListFilesItem,
+  type ListFilesPage,
+  type ListVersionsOpts,
+  type VersionMarkOpts,
 } from "./vfs";
+
+// Phase 12: cap constants — surfaced for client-side pre-validation
+// + so consumers know the limits without reading the README.
+export {
+  METADATA_MAX_BYTES,
+  TAGS_MAX_PER_FILE,
+  TAG_MAX_LEN,
+  TAGS_MAX_PER_LIST_QUERY,
+  LIST_LIMIT_MAX,
+  LIST_LIMIT_DEFAULT,
+} from "../../shared/metadata-caps";
 export { VFSStat } from "./stats";
 export {
   VFSFsError,

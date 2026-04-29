@@ -238,4 +238,149 @@ theorem listVersions_sorted_nonvacuous :
     decide
   · exact listVersions_sorted _ _ _
 
+-- ─── Phase 12: per-version user_visible monotonicity ────────────────────
+--
+-- `markVersion` is the only mutator of `user_visible`. The worker
+-- rejects `userVisible: false` with EINVAL, so the only legitimate
+-- transition is `false → true`. Once a version is user-visible, it
+-- stays user-visible across all subsequent operations on the
+-- versioning state.
+--
+-- Modelled minimally: a Boolean "user_visible" flag on a
+-- `VersionMeta` row, paired with a `markUserVisible` mutator that
+-- only sets to `true`. We prove:
+--
+--   (T7.5)  markUserVisible_monotonic
+--           If a (pathId, versionId) was user_visible BEFORE the
+--           mutation, it remains user_visible AFTER.
+
+/-- Per-version metadata: the boolean flag we care about for T7.5.
+The label and metadata fields are opaque to this model. -/
+structure VersionMeta where
+  versionId   : String
+  pathId      : PathId
+  userVisible : Bool
+  deriving DecidableEq, Repr
+
+structure VersionMetaState where
+  rows : List VersionMeta
+  deriving Repr
+
+/-- Look up the user_visible flag for a (pathId, versionId). Returns
+`false` if no such row exists (matches the worker's behaviour for
+missing rows being non-visible). -/
+def VersionMetaState.userVisible
+    (s : VersionMetaState) (pid : PathId) (vid : String) : Bool :=
+  match s.rows.find? (fun r => r.pathId = pid ∧ r.versionId = vid) with
+  | some r => r.userVisible
+  | none => false
+
+/-- Set user_visible=true for a (pathId, versionId). If the row
+doesn't exist, the state is unchanged (the worker raises ENOENT in
+that case; the model captures the no-op aspect of the mutation). -/
+def VersionMetaState.markUserVisible
+    (s : VersionMetaState) (pid : PathId) (vid : String) :
+    VersionMetaState :=
+  { s with
+    rows := s.rows.map (fun r =>
+      if r.pathId = pid ∧ r.versionId = vid then
+        { r with userVisible := true }
+      else
+        r) }
+
+/-- A direct query function: scan the rows list and return `true` if
+the target (pathId, versionId) is present and userVisible. This is
+the same observation as `userVisible` but in a form that's easier
+to induct over (linear scan, not find?). -/
+def VersionMetaState.userVisibleScan
+    (rows : List VersionMeta) (pid : PathId) (vid : String) : Bool :=
+  rows.any (fun r => decide (r.pathId = pid ∧ r.versionId = vid) && r.userVisible)
+
+/-- The scan-form is monotonic under markUserVisible by direct
+induction on the row list. The map only ever sets `userVisible :=
+true`, so it cannot turn a `true` outcome into `false`.
+
+The proof is purely propositional: simp normalizes the cons form
+to a disjunction, the head case splits on whether `hd` is the
+target (the map's mutator only flips `userVisible := true`, never
+to `false`), and the tail case follows by IH. -/
+theorem userVisibleScan_monotonic_under_map
+    (rows : List VersionMeta) (pidT : PathId) (vidT : String)
+    (pidQ : PathId) (vidQ : String) :
+    VersionMetaState.userVisibleScan rows pidQ vidQ = true →
+      VersionMetaState.userVisibleScan
+        (rows.map (fun x =>
+          if x.pathId = pidT ∧ x.versionId = vidT then
+            { x with userVisible := true }
+          else x)) pidQ vidQ = true := by
+  induction rows with
+  | nil =>
+    intro h
+    simp [VersionMetaState.userVisibleScan] at h
+  | cons hd tl ih =>
+    intro hpre
+    -- The mapped image of `hd`: either flipped to userVisible=true
+    -- (if it was the target) or unchanged.
+    let hd' : VersionMeta :=
+      if hd.pathId = pidT ∧ hd.versionId = vidT then
+        { hd with userVisible := true }
+      else hd
+    -- Unfold scan-cons on both sides.
+    show (((hd' :: tl.map (fun x =>
+        if x.pathId = pidT ∧ x.versionId = vidT then
+          { x with userVisible := true } else x)).any
+       (fun r => decide (r.pathId = pidQ ∧ r.versionId = vidQ) &&
+                 r.userVisible)) = true)
+    simp only [List.map, List.any_cons, Bool.or_eq_true]
+    -- hpre splits on whether the head matched.
+    have hpre' : (decide (hd.pathId = pidQ ∧ hd.versionId = vidQ) &&
+                   hd.userVisible) = true ∨
+                 tl.any (fun r =>
+                   decide (r.pathId = pidQ ∧ r.versionId = vidQ) &&
+                   r.userVisible) = true := by
+      have := hpre
+      unfold VersionMetaState.userVisibleScan at this
+      simpa [List.any_cons] using this
+    rcases hpre' with hhd | htl
+    · -- Head matched + was userVisible. Show the mapped head still
+      -- matches + is userVisible.
+      left
+      have hand : decide (hd.pathId = pidQ ∧ hd.versionId = vidQ) = true ∧
+                  hd.userVisible = true := by
+        rwa [Bool.and_eq_true] at hhd
+      have hpred : decide (hd.pathId = pidQ ∧ hd.versionId = vidQ) = true := hand.left
+      have huv : hd.userVisible = true := hand.right
+      by_cases htgt : hd.pathId = pidT ∧ hd.versionId = vidT
+      · -- hd' has userVisible=true (set by the map).
+        -- The remaining goal is the predicate on hd', which after
+        -- the if-true reduces to pidT = pidQ ∧ vidT = vidQ. Derive
+        -- this via the equality chain hd.pathId = pidT and
+        -- hd.pathId = pidQ.
+        have hpred' : hd.pathId = pidQ ∧ hd.versionId = vidQ :=
+          of_decide_eq_true hpred
+        simp [hd', htgt]
+        exact ⟨htgt.left ▸ hpred'.left, htgt.right ▸ hpred'.right⟩
+      · -- hd' = hd; predicate + userVisible carry over.
+        simp [hd', htgt, hpred, huv]
+    · -- Tail witness; IH.
+      right
+      have htl_scan : VersionMetaState.userVisibleScan tl pidQ vidQ = true := by
+        unfold VersionMetaState.userVisibleScan
+        exact htl
+      have ih_app := ih htl_scan
+      unfold VersionMetaState.userVisibleScan at ih_app
+      exact ih_app
+
+/-- T7.5 (in scan form): markUserVisible never demotes any row
+from user-visible to non-visible. This is the actual monotonicity
+property the worker's contract requires. -/
+theorem markUserVisible_scan_monotonic
+    (s : VersionMetaState) (pidT : PathId) (vidT : String)
+    (pidQ : PathId) (vidQ : String) :
+    VersionMetaState.userVisibleScan s.rows pidQ vidQ = true →
+      VersionMetaState.userVisibleScan
+        (s.markUserVisible pidT vidT).rows pidQ vidQ = true := by
+  unfold VersionMetaState.markUserVisible
+  exact userVisibleScan_monotonic_under_map s.rows pidT vidT pidQ vidQ
+
 end Mossaic.Vfs.Versioning

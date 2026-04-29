@@ -1122,6 +1122,35 @@ export async function hardDeleteFileRowExternal(
   return hardDeleteFileRow(durableObject, userId, scope, fileId);
 }
 
+/**
+ * Phase 12: external wrapper around `commitRename` for use by the
+ * copyFile primitive in `copy-file.ts`. Same semantics as the
+ * private function used internally by writeFile.
+ */
+export async function commitRenameExternal(
+  durableObject: UserDO,
+  userId: string,
+  scope: VFSScope,
+  tmpId: string,
+  parentId: string | null,
+  leaf: string
+): Promise<void> {
+  return commitRename(durableObject, userId, scope, tmpId, parentId, leaf);
+}
+
+/**
+ * Phase 12: external wrapper around `abortTempFile` for copy-file's
+ * fan-out failure path. Same semantics as the private wrapper.
+ */
+export async function abortTempFileExternal(
+  durableObject: UserDO,
+  userId: string,
+  scope: VFSScope,
+  tmpId: string
+): Promise<void> {
+  return abortTempFile(durableObject, userId, scope, tmpId);
+}
+
 async function hardDeleteFileRow(
   durableObject: UserDO,
   userId: string,
@@ -1146,6 +1175,13 @@ async function hardDeleteFileRow(
   // surface is a transient ShardDO error, retried by the worker
   // runtime.)
   durableObject.sql.exec("DELETE FROM file_chunks WHERE file_id = ?", fileId);
+  // Phase 12: drop any tags + version rows still referencing this
+  // file_id. Tags are per-pathId; for non-versioning tenants, hard
+  // delete also reaps the path identity, so the tags must go too.
+  // For versioning-on tenants, hardDeleteFileRow is reachable only
+  // when versioning is OFF (it's the non-versioned write supersede
+  // path); the versioning path uses dropVersions for its own GC.
+  durableObject.sql.exec("DELETE FROM file_tags WHERE path_id = ?", fileId);
   durableObject.sql.exec("DELETE FROM files WHERE file_id = ?", fileId);
 
   // Then dispatch one deleteChunks RPC per touched shard.
@@ -1228,7 +1264,19 @@ async function vfsWriteFileVersioned(
   data: Uint8Array,
   mode: number,
   mimeType: string,
-  now: number
+  now: number,
+  /**
+   * Phase 12: optional metadata + tags + version flags. Applied
+   * BEFORE commitVersion so the snapshot captures them. Caller is
+   * responsible for validation against the caps in
+   * `shared/metadata-caps.ts`.
+   */
+  phase12: {
+    metadataEncoded?: Uint8Array | null | undefined;
+    tags?: readonly string[] | undefined;
+    versionUserVisible?: boolean;
+    versionLabel?: string;
+  } = {}
 ): Promise<void> {
   // 1. Ensure a stable `files` row exists at (parent_id, leaf).
   //    Either reuse an existing one (path already has versions) or
@@ -1266,6 +1314,36 @@ async function vfsWriteFileVersioned(
 
   const versionId = generateId();
 
+  // Phase 12: resolve metadata snapshot. Three sources, in order:
+  //   1. caller passed `metadataEncoded === null` → CLEAR (NULL blob,
+  //      both on the files row and the version snapshot).
+  //   2. caller passed `metadataEncoded` Uint8Array → SET (writeMetadata
+  //      below + version snapshot uses these bytes).
+  //   3. caller passed nothing → KEEP existing files.metadata
+  //      (read once, used for the version snapshot only).
+  let metadataForVersion: Uint8Array | null = null;
+  if (phase12.metadataEncoded === null) {
+    // Explicit clear: write NULL on files; snapshot is also NULL.
+    durableObject.sql.exec(
+      "UPDATE files SET metadata = NULL WHERE file_id = ?",
+      pathId
+    );
+    metadataForVersion = null;
+  } else if (phase12.metadataEncoded !== undefined) {
+    durableObject.sql.exec(
+      "UPDATE files SET metadata = ? WHERE file_id = ?",
+      phase12.metadataEncoded,
+      pathId
+    );
+    metadataForVersion = phase12.metadataEncoded;
+  } else {
+    // Read existing for snapshot only.
+    const row = durableObject.sql
+      .exec("SELECT metadata FROM files WHERE file_id = ?", pathId)
+      .toArray()[0] as { metadata: ArrayBuffer | null } | undefined;
+    metadataForVersion = row?.metadata ? new Uint8Array(row.metadata) : null;
+  }
+
   // 2a. Inline tier — no shards, no chunk_refs. Just insert the
   //     file_versions row and flip the head pointer.
   if (data.byteLength <= INLINE_LIMIT) {
@@ -1281,7 +1359,18 @@ async function vfsWriteFileVersioned(
       fileHash: "",
       mimeType,
       inlineData: data,
+      userVisible: phase12.versionUserVisible ?? true,
+      label: phase12.versionLabel,
+      metadata: metadataForVersion,
     });
+    if (phase12.tags !== undefined) {
+      const { replaceTags } = await import("./metadata-tags");
+      replaceTags(durableObject, userId, pathId, phase12.tags);
+    } else {
+      // Bump tag mtimes so list-by-tag reflects this write's recency.
+      const { bumpTagMtimes } = await import("./metadata-tags");
+      bumpTagMtimes(durableObject, pathId, now);
+    }
     return;
   }
 
@@ -1383,7 +1472,36 @@ async function vfsWriteFileVersioned(
     fileHash,
     mimeType,
     inlineData: null,
+    userVisible: phase12.versionUserVisible ?? true,
+    label: phase12.versionLabel,
+    metadata: metadataForVersion,
   });
+  if (phase12.tags !== undefined) {
+    const { replaceTags } = await import("./metadata-tags");
+    replaceTags(durableObject, userId, pathId, phase12.tags);
+  } else {
+    const { bumpTagMtimes } = await import("./metadata-tags");
+    bumpTagMtimes(durableObject, pathId, now);
+  }
+}
+
+/**
+ * Phase 12: extended writeFile options. All fields are optional and
+ * default to behavior bit-identical to Phase 11.
+ *
+ * - `metadata`: undefined → no change; null → CLEAR; object → SET.
+ * - `tags`: undefined → no change; [] → drop all; [...] → REPLACE.
+ * - `version.label`: optional ≤128-char human-readable label.
+ * - `version.userVisible`: defaults to true for explicit writes.
+ *   YjsRuntime opportunistic compactions pass false; explicit
+ *   flush() passes true.
+ */
+export interface VFSWriteFileOpts {
+  mode?: number;
+  mimeType?: string;
+  metadata?: Record<string, unknown> | null;
+  tags?: readonly string[];
+  version?: { label?: string; userVisible?: boolean };
 }
 
 export async function vfsWriteFile(
@@ -1391,7 +1509,7 @@ export async function vfsWriteFile(
   scope: VFSScope,
   path: string,
   data: Uint8Array,
-  opts: { mode?: number; mimeType?: string } = {}
+  opts: VFSWriteFileOpts = {}
 ): Promise<void> {
   const userId = userIdFor(scope);
   const { parentId, leaf } = resolveParent(durableObject, userId, path);
@@ -1404,6 +1522,26 @@ export async function vfsWriteFile(
   }
   if (folderExists(durableObject, userId, parentId, leaf)) {
     throw new VFSError("EISDIR", `writeFile: target is a directory: ${path}`);
+  }
+
+  // Phase 12: validate metadata + tags BEFORE any SQL touches the
+  // row. Validators throw VFSError("EINVAL", ...) on cap violation.
+  let metadataEncoded: Uint8Array | null | undefined;
+  if (opts.metadata === null) {
+    metadataEncoded = null; // explicit clear
+  } else if (opts.metadata !== undefined) {
+    const { validateMetadata } = await import(
+      "@shared/metadata-validate"
+    );
+    metadataEncoded = validateMetadata(opts.metadata).encoded;
+  }
+  if (opts.tags !== undefined) {
+    const { validateTags } = await import("@shared/metadata-validate");
+    validateTags(opts.tags);
+  }
+  if (opts.version?.label !== undefined) {
+    const { validateLabel } = await import("@shared/metadata-validate");
+    validateLabel(opts.version.label);
   }
 
   const mode = opts.mode ?? 0o644;
@@ -1446,6 +1584,17 @@ export async function vfsWriteFile(
         poolSizeFor(durableObject, userId),
         data
       );
+      // Phase 12: apply metadata/tags to the yjs-mode file. Version
+      // opts are ignored on yjs files — the op log IS the history;
+      // explicit checkpoints come from `flush()` (Phase 10/12).
+      await applyPhase12SideEffects(
+        durableObject,
+        userId,
+        existing.file_id,
+        metadataEncoded,
+        opts.tags,
+        Date.now()
+      );
       return;
     }
   }
@@ -1466,7 +1615,13 @@ export async function vfsWriteFile(
       data,
       mode,
       mimeType,
-      now
+      now,
+      {
+        metadataEncoded,
+        tags: opts.tags,
+        versionUserVisible: opts.version?.userVisible ?? true,
+        versionLabel: opts.version?.label,
+      }
     );
   }
 
@@ -1498,6 +1653,18 @@ export async function vfsWriteFile(
     // even if commitRename never runs (DO crash mid-method).
     await durableObject.scheduleStaleUploadSweep();
     await commitRename(durableObject, userId, scope, tmpId, parentId, leaf);
+    // Phase 12: post-commit side effects. The canonical pathId after
+    // commitRename is `tmpId` (the row was renamed in-place; the
+    // file_id stayed the same — see commitRename UPDATE). Apply
+    // metadata + tags now.
+    await applyPhase12SideEffects(
+      durableObject,
+      userId,
+      tmpId,
+      metadataEncoded,
+      opts.tags,
+      now
+    );
     return;
   }
 
@@ -1602,6 +1769,57 @@ export async function vfsWriteFile(
   );
 
   await commitRename(durableObject, userId, scope, tmpId, parentId, leaf);
+  // Phase 12: post-commit side effects on the chunked-tier write.
+  await applyPhase12SideEffects(
+    durableObject,
+    userId,
+    tmpId,
+    metadataEncoded,
+    opts.tags,
+    now
+  );
+}
+
+/**
+ * Phase 12: apply metadata + tag side-effects to a freshly-committed
+ * file. Called from the inline / chunked / yjs branches of
+ * `vfsWriteFile` AFTER the canonical files row exists. Pure SQL,
+ * no shard work — the caller has already done that.
+ *
+ * - metadataEncoded === undefined: no change.
+ * - metadataEncoded === null: clear (UPDATE files SET metadata=NULL).
+ * - metadataEncoded === bytes: set.
+ * - tags === undefined: bump existing tag mtimes only (so list-by-tag
+ *   reflects the new write recency).
+ * - tags === []: drop all tags.
+ * - tags === [...]: replace the entire tag set.
+ *
+ * The versioned write path bakes these into commitVersion and is
+ * NOT routed through here.
+ */
+async function applyPhase12SideEffects(
+  durableObject: UserDO,
+  userId: string,
+  pathId: string,
+  metadataEncoded: Uint8Array | null | undefined,
+  tags: readonly string[] | undefined,
+  mtimeMs: number
+): Promise<void> {
+  if (metadataEncoded !== undefined) {
+    durableObject.sql.exec(
+      "UPDATE files SET metadata = ?, updated_at = ? WHERE file_id = ?",
+      metadataEncoded,
+      mtimeMs,
+      pathId
+    );
+  }
+  if (tags !== undefined) {
+    const { replaceTags } = await import("./metadata-tags");
+    replaceTags(durableObject, userId, pathId, tags);
+  } else {
+    const { bumpTagMtimes } = await import("./metadata-tags");
+    bumpTagMtimes(durableObject, pathId, mtimeMs);
+  }
 }
 
 /**
@@ -1670,6 +1888,56 @@ async function commitRename(
         now,
         tmpId
       );
+      // Phase 12: carry forward metadata + tags from the youngest
+      // superseded row IFF the new tmp row hasn't already had them
+      // set explicitly. This makes tags + metadata behave like
+      // `mode` — properties of the path, not bound to the file_id.
+      // Without this, a `writeFile(path, bytes)` call (no opts) on
+      // a path that previously had tags would silently lose them
+      // because the new tmp row's file_id is fresh.
+      //
+      // The youngest superseded row is the LAST entry in
+      // supersededIds (the loop pushes in iteration order; under
+      // contention the last attempt's `live` is freshest).
+      if (supersededIds.length > 0) {
+        const fromId = supersededIds[supersededIds.length - 1];
+        // Copy metadata only if tmp doesn't already have one. The
+        // writeFile happy-path applies metadata AFTER commitRename,
+        // so the tmp row's metadata is NULL here unless an explicit
+        // versioned-write (which routes through vfsWriteFileVersioned
+        // and bypasses commitRename) populated it.
+        const tmpMeta = durableObject.sql
+          .exec("SELECT metadata FROM files WHERE file_id=?", tmpId)
+          .toArray()[0] as { metadata: ArrayBuffer | null } | undefined;
+        if (!tmpMeta || tmpMeta.metadata === null) {
+          durableObject.sql.exec(
+            `UPDATE files SET metadata = (SELECT metadata FROM files WHERE file_id=?)
+              WHERE file_id=?`,
+            fromId,
+            tmpId
+          );
+        }
+        // Copy tags from the superseded row to the tmp row — only
+        // if the tmp row has no tags yet (i.e. the writer didn't
+        // explicitly pass tags=[] or tags=[...]).
+        const tmpTagCount = (
+          durableObject.sql
+            .exec(
+              "SELECT COUNT(*) AS n FROM file_tags WHERE path_id=?",
+              tmpId
+            )
+            .toArray()[0] as { n: number }
+        ).n;
+        if (tmpTagCount === 0) {
+          durableObject.sql.exec(
+            `INSERT OR IGNORE INTO file_tags (path_id, tag, user_id, mtime_ms)
+             SELECT ?, tag, user_id, ? FROM file_tags WHERE path_id=?`,
+            tmpId,
+            now,
+            fromId
+          );
+        }
+      }
       // Hard-delete the superseded row + queue chunk GC. Drain ALL
       // supersede ids the loop accumulated (normally just one — `live`
       // for this iteration — but >1 if we retried).
@@ -2121,6 +2389,81 @@ export function vfsChmod(
       r.leafId,
       userId
     );
+  }
+}
+
+/**
+ * Phase 12: deep-merge a metadata patch into an existing path's
+ * `files.metadata` blob, optionally adding/removing tags in the
+ * same atomic DO invocation.
+ *
+ * Semantics:
+ *   - patch === null: clear metadata (UPDATE files SET metadata=NULL).
+ *   - patch === {...}: deep-merge with existing metadata; null leaves
+ *     in the patch DELETE keys (tombstone). Validators in
+ *     `@shared/metadata-validate` enforce caps on the MERGED result.
+ *   - opts.addTags: idempotent INSERT OR IGNORE per tag.
+ *   - opts.removeTags: DELETE WHERE tag IN (...).
+ *
+ * Atomic per DO single-thread. No shard work — pure UserDO SQL.
+ *
+ * Throws:
+ *   - VFSError("EINVAL", ...) on cap violation (post-merge size,
+ *     tag charset, etc.).
+ *   - VFSError("ENOENT", ...) if the path doesn't resolve.
+ *   - VFSError("EISDIR", ...) for directories — metadata is a
+ *     file-only property in v3.
+ */
+export async function vfsPatchMetadata(
+  durableObject: UserDO,
+  scope: VFSScope,
+  path: string,
+  patch: Record<string, unknown> | null,
+  opts: { addTags?: readonly string[]; removeTags?: readonly string[] } = {}
+): Promise<void> {
+  const userId = userIdFor(scope);
+  const r = resolveOrThrow(durableObject, userId, path, /*follow*/ true);
+  if (r.kind === "dir") {
+    throw new VFSError(
+      "EISDIR",
+      `patchMetadata: target is a directory: ${path}`
+    );
+  }
+  if (r.kind !== "file") {
+    throw new VFSError(
+      "EINVAL",
+      `patchMetadata: not a regular file: ${path}`
+    );
+  }
+  const pathId = r.leafId;
+  const {
+    validateMetadata,
+    validateTags,
+  } = await import("@shared/metadata-validate");
+  const { deepMerge } = await import("@shared/metadata-merge");
+  const {
+    addTags: addTagsHelper,
+    removeTags: removeTagsHelper,
+    readMetadata,
+    writeMetadata,
+  } = await import("./metadata-tags");
+
+  if (opts.addTags !== undefined) validateTags(opts.addTags);
+  if (opts.removeTags !== undefined) validateTags(opts.removeTags);
+
+  if (patch === null) {
+    writeMetadata(durableObject, pathId, null);
+  } else if (patch !== undefined) {
+    const merged = deepMerge(readMetadata(durableObject, pathId), patch);
+    const { encoded } = validateMetadata(merged);
+    writeMetadata(durableObject, pathId, encoded);
+  }
+
+  if (opts.addTags && opts.addTags.length > 0) {
+    addTagsHelper(durableObject, userId, pathId, opts.addTags);
+  }
+  if (opts.removeTags && opts.removeTags.length > 0) {
+    removeTagsHelper(durableObject, pathId, opts.removeTags);
   }
 }
 
