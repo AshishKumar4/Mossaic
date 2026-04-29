@@ -98,11 +98,11 @@ export interface VFSClient {
   ): Promise<ReadableStream<Uint8Array>>;
   createWriteStream(
     p: string,
-    opts?: { mode?: number; mimeType?: string }
+    opts?: WriteFileOpts
   ): Promise<WritableStream<Uint8Array>>;
   createWriteStreamWithHandle(
     p: string,
-    opts?: { mode?: number; mimeType?: string }
+    opts?: WriteFileOpts
   ): Promise<{
     stream: WritableStream<Uint8Array>;
     handle: WriteHandle;
@@ -246,7 +246,7 @@ export interface UserDOClient {
   vfsCreateWriteStream(
     scope: VFSScope,
     path: string,
-    opts?: { mode?: number; mimeType?: string }
+    opts?: WriteFileOpts
   ): Promise<{ stream: WritableStream<Uint8Array>; handle: WriteHandle }>;
   vfsOpenReadStream(
     scope: VFSScope,
@@ -1000,9 +1000,15 @@ export class VFS implements VFSClient {
     return createReadStreamRpc(this.user(), this.scope(), p, opts);
   }
 
+  /**
+   * Phase 13: createWriteStream accepts the same `WriteFileOpts` shape
+   * as `writeFile` — including `metadata`, `tags`, and `version`. The
+   * fields are validated at begin-time (caller fails fast on cap
+   * violations) and applied at commit-time.
+   */
   async createWriteStream(
     p: string,
-    opts?: { mode?: number; mimeType?: string }
+    opts?: WriteFileOpts
   ): Promise<WritableStream<Uint8Array>> {
     return createWriteStreamRpc(this.user(), this.scope(), p, opts);
   }
@@ -1010,7 +1016,7 @@ export class VFS implements VFSClient {
   /** Variant that surfaces the underlying write handle for resumable use cases. */
   async createWriteStreamWithHandle(
     p: string,
-    opts?: { mode?: number; mimeType?: string }
+    opts?: WriteFileOpts
   ): Promise<{ stream: WritableStream<Uint8Array>; handle: WriteHandle }> {
     return createWriteStreamWithHandleRpc(this.user(), this.scope(), p, opts);
   }

@@ -717,3 +717,150 @@ describe("Phase 4 shard naming wired through stream paths", () => {
     expect(legacyStats.uniqueChunks).toBe(0);
   });
 });
+
+// ── Phase 13 — stream commit accepts metadata/tags/version ─────────────
+describe("Phase 13 — createWriteStream applies metadata + tags + version at commit", () => {
+  it("createWriteStream applies metadata + tags at commit", async () => {
+    const tenant = "p13-stream-meta";
+    const stub = userStubFor(tenant);
+    const scope = { ns: NS, tenant };
+    const { stream, handle } = await stub.vfsCreateWriteStream(
+      scope,
+      "/notes.bin",
+      {
+        metadata: { project: "alpha", priority: 5 },
+        tags: ["draft", "v0"],
+      }
+    );
+    // Pump multi-chunk payload so commit fires in the chunked path.
+    const cs = handle.chunkSize;
+    const total = cs * 2 + 17;
+    const buf = new Uint8Array(total);
+    for (let i = 0; i < total; i++) buf[i] = i & 0xff;
+    const writer = stream.getWriter();
+    await writer.write(buf);
+    await writer.close();
+    writer.releaseLock();
+
+    // Inspect the metadata + tags via raw SQL.
+    const got = await runInDurableObject(stub, async (_inst, state) => {
+      const file = state.storage.sql
+        .exec(
+          "SELECT file_id, metadata FROM files WHERE file_name = 'notes.bin' AND status='complete'"
+        )
+        .toArray()[0] as { file_id: string; metadata: ArrayBuffer | null };
+      const tags = state.storage.sql
+        .exec(
+          "SELECT tag FROM file_tags WHERE path_id = ? ORDER BY tag",
+          file.file_id
+        )
+        .toArray() as { tag: string }[];
+      return {
+        meta:
+          file.metadata !== null
+            ? new TextDecoder().decode(new Uint8Array(file.metadata))
+            : null,
+        tags: tags.map((t) => t.tag),
+      };
+    });
+    expect(got.meta).not.toBeNull();
+    const parsed = JSON.parse(got.meta!);
+    expect(parsed).toEqual({ project: "alpha", priority: 5 });
+    expect(got.tags).toEqual(["draft", "v0"]);
+  });
+
+  it("createWriteStream applies version label at commit (versioning enabled)", async () => {
+    const tenant = "p13-stream-version";
+    const stub = userStubFor(tenant);
+    const scope = { ns: NS, tenant };
+    // Enable versioning for this tenant. The DO derives userId from
+    // scope.tenant, so the admin call uses that exact string.
+    await stub.adminSetVersioning(tenant, true);
+
+    const wrapped = await stub.vfsCreateWriteStream(scope, "/v.bin", {
+      version: { label: "initial-stream", userVisible: true },
+    });
+    const cs = wrapped.handle.chunkSize;
+    const buf = new Uint8Array(cs + 7);
+    for (let i = 0; i < buf.length; i++) buf[i] = (i * 7) & 0xff;
+    const writer = wrapped.stream.getWriter();
+    await writer.write(buf);
+    await writer.close();
+    writer.releaseLock();
+
+    // Confirm a version row was created with the label.
+    const versionRow = await runInDurableObject(stub, async (_inst, state) => {
+      return state.storage.sql
+        .exec(
+          "SELECT label, user_visible FROM file_versions WHERE label = 'initial-stream'"
+        )
+        .toArray()[0] as { label: string; user_visible: number } | undefined;
+    });
+    expect(versionRow).toBeDefined();
+    expect(versionRow!.label).toBe("initial-stream");
+    expect(versionRow!.user_visible).toBe(1);
+  });
+
+  it("createWriteStream rejects oversize metadata at begin (fails fast)", async () => {
+    const tenant = "p13-stream-cap";
+    const stub = userStubFor(tenant);
+    const scope = { ns: NS, tenant };
+    // METADATA_MAX_BYTES is 64KB; create a payload well over.
+    const oversize: Record<string, string> = {};
+    const big = "x".repeat(1024);
+    for (let i = 0; i < 80; i++) oversize[`k${i}`] = big;
+    await expect(
+      stub.vfsCreateWriteStream(scope, "/cap.bin", {
+        metadata: oversize,
+      })
+    ).rejects.toThrow(/EINVAL/);
+
+    // The tmp row must NOT have been inserted (begin failed before INSERT).
+    const tmpCount = await runInDurableObject(stub, async (_inst, state) => {
+      return (
+        state.storage.sql
+          .exec(
+            "SELECT COUNT(*) AS n FROM files WHERE file_name LIKE '_vfs_tmp_%'"
+          )
+          .toArray()[0] as { n: number }
+      ).n;
+    });
+    expect(tmpCount).toBe(0);
+  });
+
+  it("createWriteStream abort drops tmp row + metadata never lands", async () => {
+    const tenant = "p13-stream-abort";
+    const stub = userStubFor(tenant);
+    const scope = { ns: NS, tenant };
+    const { stream } = await stub.vfsCreateWriteStream(scope, "/abort.bin", {
+      metadata: { will: "never-land" },
+      tags: ["should-not-stick"],
+    });
+    const writer = stream.getWriter();
+    await writer.write(new TextEncoder().encode("partial"));
+    await writer.abort("nope");
+    writer.releaseLock();
+
+    // No file at the path; no tag rows; no orphan tmp.
+    await expect(stub.vfsReadFile(scope, "/abort.bin")).rejects.toThrow(
+      /ENOENT/
+    );
+    const counts = await runInDurableObject(stub, async (_inst, state) => {
+      const tmp = (
+        state.storage.sql
+          .exec(
+            "SELECT COUNT(*) AS n FROM files WHERE file_name LIKE '_vfs_tmp_%'"
+          )
+          .toArray()[0] as { n: number }
+      ).n;
+      const tags = (
+        state.storage.sql
+          .exec("SELECT COUNT(*) AS n FROM file_tags")
+          .toArray()[0] as { n: number }
+      ).n;
+      return { tmp, tags };
+    });
+    expect(counts.tmp).toBe(0);
+    expect(counts.tags).toBe(0);
+  });
+});
