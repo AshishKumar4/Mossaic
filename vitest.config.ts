@@ -3,8 +3,8 @@ import { defineWorkersConfig } from "@cloudflare/vitest-pool-workers/config";
 /**
  * Vitest config using @cloudflare/vitest-pool-workers (v0.8.x for vitest 2.x).
  *
- * Tests run inside a Miniflare-spawned Worker isolate with USER_DO and
- * SHARD_DO bindings.
+ * Tests run inside a Miniflare-spawned Worker isolate with MOSSAIC_USER and
+ * MOSSAIC_SHARD bindings.
  *
  * - `isolatedStorage: false` because our tests use distinct DO names per
  *   test (e.g. "migration:fresh", "refcount:retry-same-slot"), so we don't

@@ -206,7 +206,7 @@ async function appendUpdate(
   const refId = yjsShardRefId(pathId, seq);
 
   const env = durableObject.envPublic;
-  const shardNs = env.SHARD_DO as unknown as DurableObjectNamespace<ShardDO>;
+  const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
   const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, sIdx);
   const stub = shardNs.get(shardNs.idFromName(shardName));
   await stub.putChunk(hash, bytes, refId, 0, userId);
@@ -277,7 +277,7 @@ async function dropOpsBefore(
   );
 
   const env = durableObject.envPublic;
-  const shardNs = env.SHARD_DO as unknown as DurableObjectNamespace<ShardDO>;
+  const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
   for (const { seq, shard_index } of rows) {
     const refId = yjsShardRefId(pathId, seq);
     const shardName = vfsShardDOName(
@@ -335,7 +335,7 @@ async function loadDoc(
         scope.sub,
         ck.shard_index
       );
-      const stub = env.SHARD_DO.get(env.SHARD_DO.idFromName(shardName));
+      const stub = env.MOSSAIC_SHARD.get(env.MOSSAIC_SHARD.idFromName(shardName));
       const res = await stub.fetch(
         new Request(`http://internal/chunk/${ck.chunk_hash}`)
       );
@@ -368,7 +368,7 @@ async function loadDoc(
       scope.sub,
       op.shard_index
     );
-    const stub = env.SHARD_DO.get(env.SHARD_DO.idFromName(shardName));
+    const stub = env.MOSSAIC_SHARD.get(env.MOSSAIC_SHARD.idFromName(shardName));
     const res = await stub.fetch(
       new Request(`http://internal/chunk/${op.chunk_hash}`)
     );

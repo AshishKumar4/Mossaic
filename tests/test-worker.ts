@@ -8,7 +8,7 @@
  * matching bindings.
  *
  * Existing DO-direct tests (vfs-read, vfs-write, streaming, etc.) drive
- * the DOs via `env.USER_DO.get(idFromName(...))` and never go through
+ * the DOs via `env.MOSSAIC_USER.get(idFromName(...))` and never go through
  * SELF.fetch — those tests are unaffected by the entrypoint change.
  *
  * The Worker-boot smoke test (tests/integration/worker-smoke.test.ts)

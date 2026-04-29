@@ -18,8 +18,8 @@ files.get("/", async (c) => {
   const userId = c.get("userId");
   const parentId = c.req.query("parentId") || null;
 
-  const doId = c.env.USER_DO.idFromName(userDOName(userId));
-  const stub = c.env.USER_DO.get(doId);
+  const doId = c.env.MOSSAIC_USER.idFromName(userDOName(userId));
+  const stub = c.env.MOSSAIC_USER.get(doId);
 
   const res = await stub.fetch(
     new Request("http://internal/files/list", {
@@ -39,8 +39,8 @@ files.delete("/:fileId", async (c) => {
   const userId = c.get("userId");
   const fileId = c.req.param("fileId");
 
-  const doId = c.env.USER_DO.idFromName(userDOName(userId));
-  const stub = c.env.USER_DO.get(doId);
+  const doId = c.env.MOSSAIC_USER.idFromName(userDOName(userId));
+  const stub = c.env.MOSSAIC_USER.get(doId);
 
   const res = await stub.fetch(
     new Request(`http://internal/files/delete/${fileId}`, {

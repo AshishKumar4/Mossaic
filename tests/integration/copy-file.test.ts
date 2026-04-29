@@ -29,21 +29,21 @@ import { vfsUserDOName, vfsShardDOName } from "@core/lib/utils";
 import type { ShardDO } from "@core/objects/shard/shard-do";
 
 interface E {
-  USER_DO: DurableObjectNamespace<UserDO>;
-  SHARD_DO: DurableObjectNamespace<ShardDO>;
+  MOSSAIC_USER: DurableObjectNamespace<UserDO>;
+  MOSSAIC_SHARD: DurableObjectNamespace<ShardDO>;
 }
 const E = env as unknown as E;
 const NS = "default";
 
 function envFor(): MossaicEnv {
-  return { MOSSAIC_USER: E.USER_DO as MossaicEnv["MOSSAIC_USER"] };
+  return { MOSSAIC_USER: E.MOSSAIC_USER as MossaicEnv["MOSSAIC_USER"] };
 }
 function userStub(tenant: string) {
-  return E.USER_DO.get(E.USER_DO.idFromName(vfsUserDOName(NS, tenant)));
+  return E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName(vfsUserDOName(NS, tenant)));
 }
 function shardStub(tenant: string, idx: number) {
-  return E.SHARD_DO.get(
-    E.SHARD_DO.idFromName(vfsShardDOName(NS, tenant, undefined, idx))
+  return E.MOSSAIC_SHARD.get(
+    E.MOSSAIC_SHARD.idFromName(vfsShardDOName(NS, tenant, undefined, idx))
   );
 }
 

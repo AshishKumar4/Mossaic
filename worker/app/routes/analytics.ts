@@ -23,8 +23,8 @@ analytics.get("/overview", async (c) => {
   const userId = c.get("userId");
 
   // 1. Get user stats from UserDO
-  const userDoId = c.env.USER_DO.idFromName(userDOName(userId));
-  const userStub = c.env.USER_DO.get(userDoId);
+  const userDoId = c.env.MOSSAIC_USER.idFromName(userDOName(userId));
+  const userStub = c.env.MOSSAIC_USER.get(userDoId);
 
   const userRes = await userStub.fetch(
     new Request("http://internal/stats", {
@@ -72,8 +72,8 @@ analytics.get("/overview", async (c) => {
     const shardPromises: Promise<ShardStats | null>[] = indicesToQuery.map(
       (i) => {
         const doName = shardDOName(userId, i);
-        const shardId = c.env.SHARD_DO.idFromName(doName);
-        const shardStub = c.env.SHARD_DO.get(shardId);
+        const shardId = c.env.MOSSAIC_SHARD.idFromName(doName);
+        const shardStub = c.env.MOSSAIC_SHARD.get(shardId);
 
         return shardStub
           .fetch(new Request("http://internal/stats", { method: "GET" }))

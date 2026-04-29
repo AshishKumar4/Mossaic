@@ -20,16 +20,16 @@ import { env } from "cloudflare:test";
 import { createVFS, type MossaicEnv, VFSStat } from "../../sdk/src/index";
 
 interface E {
-  USER_DO: DurableObjectNamespace;
+  MOSSAIC_USER: DurableObjectNamespace;
 }
 const E = env as unknown as E;
 
 // The SDK uses MOSSAIC_USER as the canonical binding name. Our test
-// harness binds USER_DO; we synthesise the consumer-side env that
+// harness binds MOSSAIC_USER; we synthesise the consumer-side env that
 // createVFS expects by aliasing the bindings.
 function makeEnv(): MossaicEnv {
   return {
-    MOSSAIC_USER: E.USER_DO as MossaicEnv["MOSSAIC_USER"],
+    MOSSAIC_USER: E.MOSSAIC_USER as MossaicEnv["MOSSAIC_USER"],
   };
 }
 

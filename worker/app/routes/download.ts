@@ -18,8 +18,8 @@ download.get("/manifest/:fileId", async (c) => {
   const userId = c.get("userId");
   const fileId = c.req.param("fileId");
 
-  const doId = c.env.USER_DO.idFromName(userDOName(userId));
-  const stub = c.env.USER_DO.get(doId);
+  const doId = c.env.MOSSAIC_USER.idFromName(userDOName(userId));
+  const stub = c.env.MOSSAIC_USER.get(doId);
 
   const res = await stub.fetch(
     new Request(`http://internal/files/manifest/${fileId}`)
@@ -42,8 +42,8 @@ download.get("/chunk/:fileId/:chunkIndex", async (c) => {
   const chunkIndex = parseInt(c.req.param("chunkIndex"));
 
   // Get manifest to find chunk hash and shard
-  const doId = c.env.USER_DO.idFromName(userDOName(userId));
-  const stub = c.env.USER_DO.get(doId);
+  const doId = c.env.MOSSAIC_USER.idFromName(userDOName(userId));
+  const stub = c.env.MOSSAIC_USER.get(doId);
 
   const manifestRes = await stub.fetch(
     new Request(`http://internal/files/manifest/${fileId}`)
@@ -64,10 +64,10 @@ download.get("/chunk/:fileId/:chunkIndex", async (c) => {
   }
 
   // Fetch chunk from ShardDO — stream it directly
-  const shardId = c.env.SHARD_DO.idFromName(
+  const shardId = c.env.MOSSAIC_SHARD.idFromName(
     shardDOName(userId, chunk.shardIndex)
   );
-  const shardStub = c.env.SHARD_DO.get(shardId);
+  const shardStub = c.env.MOSSAIC_SHARD.get(shardId);
 
   const chunkRes = await shardStub.fetch(
     new Request(`http://internal/chunk/${chunk.hash}`)

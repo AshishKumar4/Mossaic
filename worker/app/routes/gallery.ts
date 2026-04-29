@@ -17,8 +17,8 @@ gallery.use("*", authMiddleware());
 gallery.get("/photos", async (c) => {
   const userId = c.get("userId");
 
-  const doId = c.env.USER_DO.idFromName(userDOName(userId));
-  const stub = c.env.USER_DO.get(doId);
+  const doId = c.env.MOSSAIC_USER.idFromName(userDOName(userId));
+  const stub = c.env.MOSSAIC_USER.get(doId);
 
   const res = await stub.fetch(
     new Request("http://internal/gallery/photos", {
@@ -39,8 +39,8 @@ gallery.get("/image/:fileId", async (c) => {
   const userId = c.get("userId");
   const fileId = c.req.param("fileId");
 
-  const doId = c.env.USER_DO.idFromName(userDOName(userId));
-  const stub = c.env.USER_DO.get(doId);
+  const doId = c.env.MOSSAIC_USER.idFromName(userDOName(userId));
+  const stub = c.env.MOSSAIC_USER.get(doId);
 
   // Get manifest
   const manifestRes = await stub.fetch(
@@ -65,10 +65,10 @@ gallery.get("/image/:fileId", async (c) => {
   // For small images (single chunk), stream directly
   if (manifest.chunks.length === 1) {
     const chunk = manifest.chunks[0];
-    const shardId = c.env.SHARD_DO.idFromName(
+    const shardId = c.env.MOSSAIC_SHARD.idFromName(
       shardDOName(userId, chunk.shardIndex)
     );
-    const shardStub = c.env.SHARD_DO.get(shardId);
+    const shardStub = c.env.MOSSAIC_SHARD.get(shardId);
     const chunkRes = await shardStub.fetch(
       new Request(`http://internal/chunk/${chunk.hash}`)
     );
@@ -89,10 +89,10 @@ gallery.get("/image/:fileId", async (c) => {
   // For multi-chunk images, fetch all chunks and concatenate
   const chunkBuffers: ArrayBuffer[] = [];
   for (const chunk of manifest.chunks.sort((a, b) => a.index - b.index)) {
-    const shardId = c.env.SHARD_DO.idFromName(
+    const shardId = c.env.MOSSAIC_SHARD.idFromName(
       shardDOName(userId, chunk.shardIndex)
     );
-    const shardStub = c.env.SHARD_DO.get(shardId);
+    const shardStub = c.env.MOSSAIC_SHARD.get(shardId);
     const chunkRes = await shardStub.fetch(
       new Request(`http://internal/chunk/${chunk.hash}`)
     );
@@ -129,8 +129,8 @@ gallery.get("/thumbnail/:fileId", async (c) => {
   const userId = c.get("userId");
   const fileId = c.req.param("fileId");
 
-  const doId = c.env.USER_DO.idFromName(userDOName(userId));
-  const stub = c.env.USER_DO.get(doId);
+  const doId = c.env.MOSSAIC_USER.idFromName(userDOName(userId));
+  const stub = c.env.MOSSAIC_USER.get(doId);
 
   const manifestRes = await stub.fetch(
     new Request(`http://internal/files/manifest/${fileId}`)
@@ -155,10 +155,10 @@ gallery.get("/thumbnail/:fileId", async (c) => {
   // For small images (<=1MB), just serve the single chunk
   if (manifest.chunks.length === 1) {
     const chunk = manifest.chunks[0];
-    const shardId = c.env.SHARD_DO.idFromName(
+    const shardId = c.env.MOSSAIC_SHARD.idFromName(
       shardDOName(userId, chunk.shardIndex)
     );
-    const shardStub = c.env.SHARD_DO.get(shardId);
+    const shardStub = c.env.MOSSAIC_SHARD.get(shardId);
     const chunkRes = await shardStub.fetch(
       new Request(`http://internal/chunk/${chunk.hash}`)
     );
@@ -179,10 +179,10 @@ gallery.get("/thumbnail/:fileId", async (c) => {
   // Multi-chunk: assemble
   const chunkBuffers: ArrayBuffer[] = [];
   for (const chunk of manifest.chunks.sort((a, b) => a.index - b.index)) {
-    const shardId = c.env.SHARD_DO.idFromName(
+    const shardId = c.env.MOSSAIC_SHARD.idFromName(
       shardDOName(userId, chunk.shardIndex)
     );
-    const shardStub = c.env.SHARD_DO.get(shardId);
+    const shardStub = c.env.MOSSAIC_SHARD.get(shardId);
     const chunkRes = await shardStub.fetch(
       new Request(`http://internal/chunk/${chunk.hash}`)
     );

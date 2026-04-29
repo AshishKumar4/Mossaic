@@ -120,6 +120,9 @@ importers:
       isomorphic-git:
         specifier: '>=1.25.0'
         version: 1.37.6
+      yjs:
+        specifier: '>=13.6.0'
+        version: 13.6.30
     devDependencies:
       '@cloudflare/workers-types':
         specifier: ^4.20250224.0

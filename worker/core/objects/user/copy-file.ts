@@ -402,7 +402,7 @@ async function copyChunked(
   }[];
 
   const env = durableObject.envPublic;
-  const shardNs = env.SHARD_DO as unknown as DurableObjectNamespace<ShardDO>;
+  const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
 
   try {
     await preflightChunksAlive(shardNs, scope, srcChunks);
@@ -566,7 +566,7 @@ async function copyVersioned(
   }[];
 
   const env = durableObject.envPublic;
-  const shardNs = env.SHARD_DO as unknown as DurableObjectNamespace<ShardDO>;
+  const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
   const newRefId = shardRefId(tmpId, newVersionId);
 
   try {

@@ -5,8 +5,8 @@
   "compatibility_flags": ["nodejs_compat"],
   "durable_objects": {
     "bindings": [
-      { "name": "USER_DO", "class_name": "UserDO" },
-      { "name": "SHARD_DO", "class_name": "ShardDO" },
+      { "name": "MOSSAIC_USER", "class_name": "UserDO" },
+      { "name": "MOSSAIC_SHARD", "class_name": "ShardDO" },
       { "name": "SEARCH_DO", "class_name": "SearchDO" }
     ]
   },

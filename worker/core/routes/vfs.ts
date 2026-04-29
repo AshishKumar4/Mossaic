@@ -96,8 +96,8 @@ vfs.use("*", vfsAuth());
 function userStub(c: { env: Env; var: { scope: VFSScope } }): UserDOCore {
   const scope = c.var.scope;
   const name = vfsUserDOName(scope.ns, scope.tenant, scope.sub);
-  const id = c.env.USER_DO.idFromName(name);
-  return c.env.USER_DO.get(id) as unknown as UserDOCore;
+  const id = c.env.MOSSAIC_USER.idFromName(name);
+  return c.env.MOSSAIC_USER.get(id) as unknown as UserDOCore;
 }
 
 /** Map a thrown error to (status, body) for JSON responses. */

@@ -8,7 +8,7 @@ import { env, runInDurableObject } from "cloudflare:test";
  * vfsReadlink / vfsReaddir / vfsReadManyStat / vfsReadFile /
  * vfsOpenManifest / vfsReadChunk) directly through DO RPC. The consumer
  * test fixture pretends to be the SDK: gets a stub via
- * `env.USER_DO.get(idFromName(...))` and calls the methods.
+ * `env.MOSSAIC_USER.get(idFromName(...))` and calls the methods.
  *
  * Phase 4 wires shard naming through `vfsShardDOName(ns, tenant, sub, idx)`,
  * so seed steps that pre-populate ShardDO state must use the same
@@ -22,8 +22,8 @@ import { INLINE_LIMIT } from "@shared/inline";
 import { vfsShardDOName } from "@core/lib/utils";
 
 interface E {
-  USER_DO: DurableObjectNamespace<UserDO>;
-  SHARD_DO: DurableObjectNamespace<ShardDO>;
+  MOSSAIC_USER: DurableObjectNamespace<UserDO>;
+  MOSSAIC_SHARD: DurableObjectNamespace<ShardDO>;
 }
 const E = env as unknown as E;
 
@@ -58,7 +58,7 @@ async function seedUser(
 
 describe("vfsStat / vfsLstat / vfsExists", () => {
   it("stats a file at the root after legacy upload", async () => {
-    const stub = E.USER_DO.get(E.USER_DO.idFromName("vfs-read:stat"));
+    const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-read:stat"));
     const userId = await seedUser(stub, "stat@e.com");
 
     const fr = await stub.fetch(
@@ -99,14 +99,14 @@ describe("vfsStat / vfsLstat / vfsExists", () => {
   });
 
   it("ENOENT when the path doesn't exist", async () => {
-    const stub = E.USER_DO.get(E.USER_DO.idFromName("vfs-read:enoent"));
+    const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-read:enoent"));
     const userId = await seedUser(stub, "enoent@e.com");
     const scope = { ns: "default", tenant: userId };
     await expect(stub.vfsStat(scope, "/nope")).rejects.toThrow(/ENOENT/);
   });
 
   it("EISDIR-like for stat on a directory returns dir kind, readFile throws EISDIR", async () => {
-    const stub = E.USER_DO.get(E.USER_DO.idFromName("vfs-read:isdir"));
+    const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-read:isdir"));
     const userId = await seedUser(stub, "isdir@e.com");
     await stub.fetch(
       new Request("http://internal/folders/create", {
@@ -124,7 +124,7 @@ describe("vfsStat / vfsLstat / vfsExists", () => {
   });
 
   it("lstat returns the symlink; stat follows it", async () => {
-    const stub = E.USER_DO.get(E.USER_DO.idFromName("vfs-read:symlink"));
+    const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-read:symlink"));
     const userId = await seedUser(stub, "ln@e.com");
 
     // Seed a real file + a symlink pointing at it.
@@ -165,7 +165,7 @@ describe("vfsStat / vfsLstat / vfsExists", () => {
 
 describe("vfsReaddir", () => {
   it("lists files and folders, sorted", async () => {
-    const stub = E.USER_DO.get(E.USER_DO.idFromName("vfs-read:readdir"));
+    const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-read:readdir"));
     const userId = await seedUser(stub, "rd@e.com");
 
     // Create /a (dir), /b (dir), /c.txt, /d.txt — at root.
@@ -213,7 +213,7 @@ describe("vfsReaddir", () => {
   });
 
   it("ENOTDIR when path resolves to a file", async () => {
-    const stub = E.USER_DO.get(E.USER_DO.idFromName("vfs-read:enotdir"));
+    const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-read:enotdir"));
     const userId = await seedUser(stub, "ntd@e.com");
     const fr = await stub.fetch(
       new Request("http://internal/files/create", {
@@ -246,7 +246,7 @@ describe("vfsReaddir", () => {
 
 describe("vfsReadFile (inline tier + chunked path)", () => {
   it("reads inlined file with ZERO ShardDO subrequests", async () => {
-    const stub = E.USER_DO.get(E.USER_DO.idFromName("vfs-read:inline"));
+    const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-read:inline"));
     const userId = await seedUser(stub, "il@e.com");
 
     // Manually insert an inlined file (Phase 3 will write this via
@@ -289,11 +289,11 @@ describe("vfsReadFile (inline tier + chunked path)", () => {
   });
 
   it("reads a chunked file by fanning out ShardDO subrequests", async () => {
-    const stub = E.USER_DO.get(E.USER_DO.idFromName("vfs-read:chunked-user"));
+    const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-read:chunked-user"));
     const userId = await seedUser(stub, "ch@e.com");
     const shardIdx = 0;
-    const shardDO = E.SHARD_DO.get(
-      E.SHARD_DO.idFromName(vfsShardDOName("default", userId, undefined, shardIdx))
+    const shardDO = E.MOSSAIC_SHARD.get(
+      E.MOSSAIC_SHARD.idFromName(vfsShardDOName("default", userId, undefined, shardIdx))
     );
 
     // Two-chunk file. We use the legacy upload protocol since vfsWriteFile
@@ -379,7 +379,7 @@ describe("vfsReadFile (inline tier + chunked path)", () => {
 
 describe("vfsReadManyStat", () => {
   it("returns one stat per path, null for misses", async () => {
-    const stub = E.USER_DO.get(E.USER_DO.idFromName("vfs-read:many"));
+    const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-read:many"));
     const userId = await seedUser(stub, "many@e.com");
 
     for (const name of ["a.txt", "b.txt"]) {
@@ -424,11 +424,11 @@ describe("vfsReadManyStat", () => {
 
 describe("vfsOpenManifest / vfsReadChunk", () => {
   it("openManifest hides shardIndex; readChunk serves bytes", async () => {
-    const stub = E.USER_DO.get(E.USER_DO.idFromName("vfs-read:manifest-u"));
+    const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-read:manifest-u"));
     const userId = await seedUser(stub, "mf@e.com");
     const shardIdx = 0;
-    const shardDO = E.SHARD_DO.get(
-      E.SHARD_DO.idFromName(vfsShardDOName("default", userId, undefined, shardIdx))
+    const shardDO = E.MOSSAIC_SHARD.get(
+      E.MOSSAIC_SHARD.idFromName(vfsShardDOName("default", userId, undefined, shardIdx))
     );
 
     const part = new TextEncoder().encode("just-one-chunk");
@@ -496,7 +496,7 @@ describe("vfsOpenManifest / vfsReadChunk", () => {
   });
 
   it("openManifest reports inlined=true for inlined files", async () => {
-    const stub = E.USER_DO.get(E.USER_DO.idFromName("vfs-read:manifest-il"));
+    const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-read:manifest-il"));
     const userId = await seedUser(stub, "mfil@e.com");
     const payload = new TextEncoder().encode("inline-only");
     await runInDurableObject(stub, async (_instance, state) => {
@@ -526,14 +526,14 @@ describe("vfsOpenManifest / vfsReadChunk", () => {
 
 describe("scope handling", () => {
   it("rejects empty tenant", async () => {
-    const stub = E.USER_DO.get(E.USER_DO.idFromName("vfs-read:bad-scope"));
+    const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-read:bad-scope"));
     await expect(
       stub.vfsStat({ ns: "default", tenant: "" }, "/")
     ).rejects.toThrow(/EINVAL/);
   });
 
   it("isolates tenants by user_id (sub composes into the user_id key)", async () => {
-    const stub = E.USER_DO.get(E.USER_DO.idFromName("vfs-read:tenant-iso"));
+    const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-read:tenant-iso"));
     const userId = await seedUser(stub, "iso@e.com");
 
     // Insert a file under tenant=userId, sub=undefined.

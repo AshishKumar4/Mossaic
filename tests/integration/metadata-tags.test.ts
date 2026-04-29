@@ -25,17 +25,17 @@ import { createVFS, type MossaicEnv, type UserDO, EINVAL } from "../../sdk/src/i
 import { vfsUserDOName } from "@core/lib/utils";
 
 interface E {
-  USER_DO: DurableObjectNamespace<UserDO>;
-  SHARD_DO: DurableObjectNamespace;
+  MOSSAIC_USER: DurableObjectNamespace<UserDO>;
+  MOSSAIC_SHARD: DurableObjectNamespace;
 }
 const E = env as unknown as E;
 const NS = "default";
 
 function envFor(): MossaicEnv {
-  return { MOSSAIC_USER: E.USER_DO as MossaicEnv["MOSSAIC_USER"] };
+  return { MOSSAIC_USER: E.MOSSAIC_USER as MossaicEnv["MOSSAIC_USER"] };
 }
 function userStub(tenant: string) {
-  return E.USER_DO.get(E.USER_DO.idFromName(vfsUserDOName(NS, tenant)));
+  return E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName(vfsUserDOName(NS, tenant)));
 }
 
 describe("Phase 12 — writeFile metadata + tags (M1, M5, M6)", () => {

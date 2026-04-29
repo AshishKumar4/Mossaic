@@ -28,12 +28,12 @@ import git from "isomorphic-git";
 import { createVFS, type MossaicEnv } from "../../sdk/src/index";
 
 interface E {
-  USER_DO: DurableObjectNamespace;
+  MOSSAIC_USER: DurableObjectNamespace;
 }
 const E = env as unknown as E;
 
 function makeEnv(): MossaicEnv {
-  return { MOSSAIC_USER: E.USER_DO as MossaicEnv["MOSSAIC_USER"] };
+  return { MOSSAIC_USER: E.MOSSAIC_USER as MossaicEnv["MOSSAIC_USER"] };
 }
 
 describe("isomorphic-git end-to-end against @mossaic/sdk VFS", () => {
