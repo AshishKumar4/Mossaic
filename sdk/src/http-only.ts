@@ -72,7 +72,7 @@ export {
 } from "../../shared/metadata-caps";
 
 // Yjs-mode bit constant — pure value, no Yjs runtime needed.
-export { VFS_MODE_YJS_BIT } from "./yjs-mode-bit";
+export { VFS_MODE_YJS_BIT } from "../../shared/constants";
 
 // Token issuance helpers (operator-side; needs JWT_SECRET in env).
 export { issueVFSToken, verifyVFSToken, type VFSTokenPayload } from "./auth";

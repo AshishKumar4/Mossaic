@@ -32,7 +32,15 @@ import {
   validateMetadata,
   validateTags,
 } from "../../../../shared/metadata-validate";
-import { replaceTags } from "./metadata-tags";
+import {
+  addTags as addTagsHelper,
+  bumpTagMtimes,
+  readMetadata,
+  removeTags as removeTagsHelper,
+  replaceTags,
+  writeMetadata,
+} from "./metadata-tags";
+import { deepMerge } from "../../../../shared/metadata-merge";
 
 /**
  * Read-side VFS operations.
@@ -1365,11 +1373,9 @@ async function vfsWriteFileVersioned(
       encryption: meta.encryption,
     });
     if (meta.tags !== undefined) {
-      const { replaceTags } = await import("./metadata-tags");
       replaceTags(durableObject, userId, pathId, meta.tags);
     } else {
       // Bump tag mtimes so list-by-tag reflects this write's recency.
-      const { bumpTagMtimes } = await import("./metadata-tags");
       bumpTagMtimes(durableObject, pathId, now);
     }
     return;
@@ -1479,10 +1485,8 @@ async function vfsWriteFileVersioned(
     encryption: meta.encryption,
   });
   if (meta.tags !== undefined) {
-    const { replaceTags } = await import("./metadata-tags");
     replaceTags(durableObject, userId, pathId, meta.tags);
   } else {
-    const { bumpTagMtimes } = await import("./metadata-tags");
     bumpTagMtimes(durableObject, pathId, now);
   }
 }
@@ -1545,15 +1549,12 @@ export async function vfsWriteFile(
   if (opts.metadata === null) {
     metadataEncoded = null; // explicit clear
   } else if (opts.metadata !== undefined) {
-    const { validateMetadata } = await import("../../../../shared/metadata-validate");
     metadataEncoded = validateMetadata(opts.metadata).encoded;
   }
   if (opts.tags !== undefined) {
-    const { validateTags } = await import("../../../../shared/metadata-validate");
     validateTags(opts.tags);
   }
   if (opts.version?.label !== undefined) {
-    const { validateLabel } = await import("../../../../shared/metadata-validate");
     validateLabel(opts.version.label);
   }
 
@@ -1862,10 +1863,8 @@ async function applyPhase12SideEffects(
     );
   }
   if (tags !== undefined) {
-    const { replaceTags } = await import("./metadata-tags");
     replaceTags(durableObject, userId, pathId, tags);
   } else {
-    const { bumpTagMtimes } = await import("./metadata-tags");
     bumpTagMtimes(durableObject, pathId, mtimeMs);
   }
   if (encryption !== undefined) {
@@ -2489,18 +2488,6 @@ export async function vfsPatchMetadata(
     );
   }
   const pathId = r.leafId;
-  const {
-    validateMetadata,
-    validateTags,
-  } = await import("../../../../shared/metadata-validate");
-  const { deepMerge } = await import("../../../../shared/metadata-merge");
-  const {
-    addTags: addTagsHelper,
-    removeTags: removeTagsHelper,
-    readMetadata,
-    writeMetadata,
-  } = await import("./metadata-tags");
-
   if (opts.addTags !== undefined) validateTags(opts.addTags);
   if (opts.removeTags !== undefined) validateTags(opts.removeTags);
 

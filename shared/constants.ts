@@ -54,3 +54,13 @@ export const RETRY_BASE_DELAY = 500;
 
 /** Retry max delay in ms */
 export const RETRY_MAX_DELAY = 5000;
+
+/**
+ * Bit set on `stat.mode` for files in yjs-mode (per-file CRDT mode).
+ *
+ * Repurposes POSIX S_ISUID (0o4000) since the VFS doesn't enforce
+ * setuid semantics. This is the canonical definition consumed by
+ * worker/core/objects/user/yjs.ts (server-side mode flag) and
+ * surfaced via the SDK at sdk/src/yjs.ts and sdk/src/index.ts.
+ */
+export const VFS_MODE_YJS_BIT = 0o4000;

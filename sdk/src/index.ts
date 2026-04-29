@@ -177,7 +177,7 @@ export { createIgitFs, type CreateIgitFsOptions } from "./igit";
 // YDocHandle) lives at the `@mossaic/sdk/yjs` subpath so the main
 // bundle stays free of the optional `yjs` peer dep — only consumers
 // that import `@mossaic/sdk/yjs` pay for the runtime.
-export { VFS_MODE_YJS_BIT } from "./yjs-mode-bit";
+export { VFS_MODE_YJS_BIT } from "../../shared/constants";
 
 import { VFS, type CreateVFSOptions, type MossaicEnv } from "./vfs";
 

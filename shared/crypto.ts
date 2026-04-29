@@ -16,7 +16,7 @@ export async function hashChunk(data: Uint8Array): Promise<ChunkHash> {
     data.byteLength
   );
   const digest = await crypto.subtle.digest("SHA-256", view);
-  return bufferToHex(digest);
+  return bytesToHex(new Uint8Array(digest));
 }
 
 /**
@@ -29,16 +29,28 @@ export async function computeFileHash(
   const concat = chunkHashes.join("");
   const data = new TextEncoder().encode(concat);
   const digest = await crypto.subtle.digest("SHA-256", data);
-  return bufferToHex(digest);
+  return bytesToHex(new Uint8Array(digest));
 }
 
-/**
- * Convert an ArrayBuffer to hex string.
- */
-export function bufferToHex(buffer: ArrayBuffer): string {
-  return Array.from(new Uint8Array(buffer))
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
+/** Hex-encode a byte array. */
+export function bytesToHex(bytes: Uint8Array): string {
+  let out = "";
+  for (let i = 0; i < bytes.byteLength; i++) {
+    out += (bytes[i] ?? 0).toString(16).padStart(2, "0");
+  }
+  return out;
+}
+
+/** Hex-decode (lowercase or uppercase). */
+export function hexToBytes(hex: string): Uint8Array {
+  if (hex.length % 2 !== 0) throw new Error("hexToBytes: odd-length hex");
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.byteLength; i++) {
+    const v = parseInt(hex.substr(i * 2, 2), 16);
+    if (Number.isNaN(v)) throw new Error("hexToBytes: invalid hex");
+    out[i] = v;
+  }
+  return out;
 }
 
 /**
@@ -47,5 +59,5 @@ export function bufferToHex(buffer: ArrayBuffer): string {
 export function randomHex(byteLength: number): string {
   const bytes = new Uint8Array(byteLength);
   crypto.getRandomValues(bytes);
-  return bufferToHex(bytes.buffer);
+  return bytesToHex(bytes);
 }

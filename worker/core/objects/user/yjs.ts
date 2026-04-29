@@ -61,9 +61,11 @@ import { VFSError, type VFSScope } from "../../../../shared/vfs-types";
 import { hashChunk } from "../../../../shared/crypto";
 import { vfsShardDOName } from "../../lib/utils";
 import { placeChunkForVersion } from "./vfs-versions";
+import { VFS_MODE_YJS_BIT } from "../../../../shared/constants";
 
-/** POSIX-style mode bit reused as the SDK-facing yjs flag. */
-export const VFS_MODE_YJS_BIT = 0o4000; // S_ISUID — repurposed since we don't enforce setuid
+// Re-exported so existing internal imports of VFS_MODE_YJS_BIT from
+// this module keep working.
+export { VFS_MODE_YJS_BIT };
 
 /**
  * Compaction thresholds. Tunable knobs.

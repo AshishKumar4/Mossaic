@@ -42,15 +42,14 @@ import {
   encodeAwarenessUpdate,
 } from "y-protocols/awareness";
 import type { VFS } from "./vfs";
-import { VFS_MODE_YJS_BIT as _VFS_MODE_YJS_BIT } from "./yjs-mode-bit";
+import { VFS_MODE_YJS_BIT } from "../../shared/constants";
 
 /**
- * Bit set on `stat.mode` for files in yjs-mode. Re-exported from
- * `./yjs-mode-bit` so consumers can pull it from EITHER the main
- * `@mossaic/sdk` import OR `@mossaic/sdk/yjs`. The two re-exports
- * share a single source-of-truth definition.
+ * Bit set on `stat.mode` for files in yjs-mode. Re-exported here so
+ * consumers can pull it from EITHER the main `@mossaic/sdk` import
+ * OR `@mossaic/sdk/yjs`. Single source-of-truth: shared/constants.ts.
  */
-export const VFS_MODE_YJS_BIT = _VFS_MODE_YJS_BIT;
+export { VFS_MODE_YJS_BIT };
 
 // ── Wire protocol tags (mirror worker/objects/user/yjs.ts) ─────────────
 const YJS_SYNC_STEP_1 = 0;

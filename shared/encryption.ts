@@ -25,6 +25,7 @@ import {
   SHA256_LENGTH,
   WRAPPED_KEY_LENGTH,
 } from "./encryption-types";
+import { bytesToHex } from "./crypto";
 
 // ─── Internal byte helpers ────────────────────────────────────────────────
 
@@ -592,26 +593,10 @@ export async function envelopeHeaderHash(envelope: Uint8Array): Promise<string> 
   return bytesToHex(digest);
 }
 
-/** Hex-encode a byte array. */
-export function bytesToHex(bytes: Uint8Array): string {
-  let out = "";
-  for (let i = 0; i < bytes.byteLength; i++) {
-    out += (bytes[i] ?? 0).toString(16).padStart(2, "0");
-  }
-  return out;
-}
-
-/** Hex-decode (lowercase or uppercase). */
-export function hexToBytes(hex: string): Uint8Array {
-  if (hex.length % 2 !== 0) throw new Error("hexToBytes: odd-length hex");
-  const out = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < out.byteLength; i++) {
-    const v = parseInt(hex.substr(i * 2, 2), 16);
-    if (Number.isNaN(v)) throw new Error("hexToBytes: invalid hex");
-    out[i] = v;
-  }
-  return out;
-}
+// Hex helpers live in `./crypto` (single source of truth).
+// Re-exported here so consumers of `@mossaic/sdk/encryption` can keep
+// `import { bytesToHex, hexToBytes } from "@mossaic/sdk/encryption"`.
+export { bytesToHex, hexToBytes } from "./crypto";
 
 // ─── Encrypt / decrypt one chunk → one envelope ───────────────────────────
 
