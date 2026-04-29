@@ -18,7 +18,7 @@
     "build:watch": "tsup --watch",
     "typecheck": "tsc --noEmit",
     "test": "vitest run tests/unit",
-    "test:e2e": "pnpm -w -F @mossaic/sdk build && vitest run tests/e2e --reporter=verbose"
+    "test:e2e": "pnpm -w -F @mossaic/sdk build && pnpm -F @mossaic/cli build && vitest run tests/e2e --reporter=verbose"
   },
   "dependencies": {
     "@mossaic/sdk": "workspace:*",
