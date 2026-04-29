@@ -36,7 +36,7 @@
  * window).
  */
 
-import type { VFS, VFSClient } from "./vfs";
+import type { VFS, VFSClient, WriteFileOpts } from "./vfs";
 import type { VFSStat } from "./stats";
 import { ENOENT } from "./errors";
 
@@ -216,11 +216,11 @@ class BatchedLstatFs implements VFSClient {
   ) { return this.inner.createReadStream(p, opts); }
   createWriteStream(
     p: string,
-    opts?: { mode?: number; mimeType?: string }
+    opts?: WriteFileOpts
   ) { return this.inner.createWriteStream(p, opts); }
   createWriteStreamWithHandle(
     p: string,
-    opts?: { mode?: number; mimeType?: string }
+    opts?: WriteFileOpts
   ) { return this.inner.createWriteStreamWithHandle(p, opts); }
   openManifest(p: string) { return this.inner.openManifest(p); }
   readChunk(p: string, idx: number) {

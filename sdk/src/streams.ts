@@ -15,7 +15,7 @@
 
 import { mapServerError } from "./errors";
 import type { VFSScope } from "../../shared/vfs-types";
-import type { UserDOClient } from "./vfs";
+import type { UserDOClient, WriteFileOpts } from "./vfs";
 
 export interface ReadStreamOptions {
   /** Inclusive starting byte offset. */
@@ -23,6 +23,14 @@ export interface ReadStreamOptions {
   /** Exclusive ending byte offset. */
   end?: number;
 }
+
+/**
+ * Phase 13: streaming writes accept the same opts shape as `writeFile`,
+ * including `metadata`, `tags`, and `version`. The opts are validated
+ * at begin-time (caller fails fast on cap violations) and applied at
+ * commit-time (rename-from-tmp).
+ */
+export type WriteStreamOpts = WriteFileOpts;
 
 export async function createReadStreamRpc(
   user: UserDOClient,
@@ -41,7 +49,7 @@ export async function createWriteStreamRpc(
   user: UserDOClient,
   scope: VFSScope,
   path: string,
-  opts?: { mode?: number; mimeType?: string }
+  opts?: WriteStreamOpts
 ): Promise<WritableStream<Uint8Array>> {
   try {
     const res = await user.vfsCreateWriteStream(scope, path, opts);
@@ -61,7 +69,7 @@ export async function createWriteStreamWithHandleRpc(
   user: UserDOClient,
   scope: VFSScope,
   path: string,
-  opts?: { mode?: number; mimeType?: string }
+  opts?: WriteStreamOpts
 ): Promise<{ stream: WritableStream<Uint8Array>; handle: WriteHandle }> {
   try {
     return await user.vfsCreateWriteStream(scope, path, opts);
