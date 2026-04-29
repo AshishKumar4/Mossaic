@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "verbatimModuleSyntax": true,
+    "erasableSyntaxOnly": true,
+    "isolatedDeclarations": false
+  },
+  "include": ["src", "../shared", "../worker/core"]
+}

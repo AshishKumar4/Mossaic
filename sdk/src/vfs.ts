@@ -570,11 +570,14 @@ export class VFS implements VFSClient {
    * is a no-op server-side.
    */
   private versioningLatched = false;
+  // Phase 14: explicit fields instead of constructor parameter
+  // properties — `erasableSyntaxOnly` rejects the shorthand.
+  private readonly env: MossaicEnv;
+  private readonly opts: CreateVFSOptions;
 
-  constructor(
-    private readonly env: MossaicEnv,
-    private readonly opts: CreateVFSOptions
-  ) {
+  constructor(env: MossaicEnv, opts: CreateVFSOptions) {
+    this.env = env;
+    this.opts = opts;
     if (
       !opts ||
       typeof opts.tenant !== "string" ||

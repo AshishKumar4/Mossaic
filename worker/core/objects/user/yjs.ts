@@ -57,8 +57,8 @@ import {
 } from "y-protocols/awareness";
 import type { UserDOCore as UserDO } from "./user-do-core";
 import type { ShardDO } from "../shard/shard-do";
-import { VFSError, type VFSScope } from "@shared/vfs-types";
-import { hashChunk } from "@shared/crypto";
+import { VFSError, type VFSScope } from "../../../../shared/vfs-types";
+import { hashChunk } from "../../../../shared/crypto";
 import { vfsShardDOName } from "../../lib/utils";
 import { placeChunkForVersion } from "./vfs-versions";
 
@@ -953,7 +953,8 @@ export async function readYjsAsBytes(
   scope: VFSScope,
   pathId: string
 ): Promise<Uint8Array> {
-  return durableObject.yjsRuntime.readMaterialised(scope, pathId);
+  // Phase 14: yjsRuntime is now an async lazy accessor.
+  return (await durableObject.getYjsRuntime()).readMaterialised(scope, pathId);
 }
 
 /**
@@ -968,7 +969,8 @@ export async function writeYjsBytes(
   poolSize: number,
   bytes: Uint8Array
 ): Promise<void> {
-  return durableObject.yjsRuntime.writeMaterialised(
+  // Phase 14: yjsRuntime is now an async lazy accessor.
+  return (await durableObject.getYjsRuntime()).writeMaterialised(
     scope,
     userId,
     pathId,

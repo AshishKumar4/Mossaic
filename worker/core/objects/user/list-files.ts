@@ -16,7 +16,7 @@
  */
 
 import type { UserDOCore as UserDO } from "./user-do-core";
-import { VFSError, type VFSScope } from "@shared/vfs-types";
+import { VFSError, type VFSScope } from "../../../../shared/vfs-types";
 import {
   decodeCursor,
   encodeCursor,
@@ -29,11 +29,11 @@ import {
   LIST_LIMIT_DEFAULT,
   LIST_LIMIT_MAX,
   TAGS_MAX_PER_LIST_QUERY,
-} from "@shared/metadata-caps";
+} from "../../../../shared/metadata-caps";
 
 // Stat raw shape; mirrors VFSStatRaw fields we surface.
-import type { VFSStatRaw } from "@shared/vfs-types";
-import { gidFromTenant, inoFromId, uidFromTenant } from "@shared/ino";
+import type { VFSStatRaw } from "../../../../shared/vfs-types";
+import { gidFromTenant, inoFromId, uidFromTenant } from "../../../../shared/ino";
 
 export interface ListFilesItemRaw {
   path: string;

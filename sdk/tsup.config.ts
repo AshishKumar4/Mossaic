@@ -25,15 +25,29 @@ export default defineConfig({
   dts: true,
   sourcemap: true,
   clean: true,
-  splitting: false,
+  // Phase 14: code-splitting on so the dynamic
+  // `await import("./yjs")` inside `user-do-core.ts:getYjsRuntime()`
+  // becomes a real lazy chunk. Without splitting, esbuild inlines
+  // the dynamic import into index.js and `import { Awareness, ... }
+  // from "y-protocols/awareness"` at the top of the file forces
+  // every consumer's bundler to eagerly pull y-protocols, even
+  // non-collab consumers. With splitting, yjs.ts lives in its own
+  // chunk that's only fetched when a tenant uses yjs-mode.
+  splitting: true,
   bundle: true,
   treeshake: true,
-  // `yjs` and `isomorphic-git` are peer deps — the consumer brings them.
-  // If we bundled `yjs` into our dist we'd ship two copies of the
-  // CRDT runtime alongside the consumer's Y.Doc imports, which would
-  // silently break edits (the two `Y.Doc` constructors wouldn't be
-  // identity-compatible). Mark external.
-  external: ["cloudflare:workers", "isomorphic-git", "yjs"],
+  // `yjs` and `isomorphic-git` and `y-protocols` are peer deps —
+  // the consumer brings them. If we bundled them, we'd ship two
+  // copies of the CRDT runtime alongside the consumer's; two
+  // `Y.Doc` constructors with different module identities silently
+  // break edits. Mark external.
+  external: [
+    "cloudflare:workers",
+    "isomorphic-git",
+    "yjs",
+    "y-protocols",
+    "y-protocols/awareness",
+  ],
   target: "es2022",
   esbuildOptions(options) {
     options.alias = {

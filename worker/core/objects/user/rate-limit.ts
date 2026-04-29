@@ -1,5 +1,5 @@
 import type { UserDOCore as UserDO } from "./user-do-core";
-import { VFSError, type VFSScope } from "@shared/vfs-types";
+import { VFSError, type VFSScope } from "../../../../shared/vfs-types";
 
 /**
  * Token-bucket rate limiter, per-tenant.

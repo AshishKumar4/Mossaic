@@ -47,7 +47,7 @@
 import type { UserDOCore as UserDO } from "./user-do-core";
 import type { ShardDO } from "../shard/shard-do";
 import { vfsShardDOName } from "../../lib/utils";
-import type { VFSScope } from "@shared/vfs-types";
+import type { VFSScope } from "../../../../shared/vfs-types";
 
 export interface DedupeResult {
   /** Number of duplicate file rows hard-deleted. */

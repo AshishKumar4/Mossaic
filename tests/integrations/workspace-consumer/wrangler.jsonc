@@ -1,0 +1,28 @@
+// Phase 14 workspace-consumer fixture wrangler.
+//
+// Demonstrates the canonical naming for new SDK consumers:
+// `class_name: "MossaicUserDO"` matches the export name produced
+// by `export { MossaicUserDO } from "@mossaic/sdk"` in src/index.ts.
+//
+// This fixture is NOT deployed to production — it exists only to
+// gate the SDK's source-export contract via `wrangler dry-run`.
+{
+  "name": "mossaic-workspace-consumer",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-04-28",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "durable_objects": {
+    "bindings": [
+      { "name": "MOSSAIC_USER", "class_name": "MossaicUserDO" },
+      { "name": "MOSSAIC_SHARD", "class_name": "MossaicShardDO" }
+    ]
+  },
+
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["MossaicUserDO", "MossaicShardDO"]
+    }
+  ]
+}

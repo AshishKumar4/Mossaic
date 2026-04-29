@@ -315,8 +315,11 @@ describe("Phase 10 — compaction (I7)", () => {
         .exec("SELECT pool_size FROM quota WHERE user_id = ?", userId)
         .toArray()[0] as { pool_size: number } | undefined;
       const poolSize = poolRow ? poolRow.pool_size : 32;
+      // Phase 14: yjsRuntime is now an async lazy accessor —
+      // `getYjsRuntime()` returns Promise<YjsRuntime>.
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const out = await (inst as any).yjsRuntime.compact(
+      const runtime = await (inst as any).getYjsRuntime();
+      const out = await runtime.compact(
         { ns: NS_DEFAULT, tenant },
         userId,
         fileId,

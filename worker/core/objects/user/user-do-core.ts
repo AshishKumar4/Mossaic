@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import type { Env } from "@shared/types";
+import type { Env } from "../../../../shared/types";
 import {
   hardDeleteFileRowExternal,
   vfsAbortWriteStream,
@@ -35,10 +35,15 @@ import type {
   OpenManifestResult,
   VFSScope,
   VFSStatRaw,
-} from "@shared/vfs-types";
-import { VFSError } from "@shared/vfs-types";
+} from "../../../../shared/vfs-types";
+import { VFSError } from "../../../../shared/vfs-types";
 import { dedupePaths, type DedupeResult } from "./admin";
-import { YjsRuntime } from "./yjs";
+// Phase 14: type-only import. The YjsRuntime class is loaded
+// lazily via `await import("./yjs")` inside `getYjsRuntime()` so
+// non-collab consumers don't pay the ~250 KB yjs + y-protocols
+// type-erase tax in the main bundle. The static type import is
+// erased at runtime under `verbatimModuleSyntax`.
+import type { YjsRuntime } from "./yjs";
 import { enforceRateLimit } from "./rate-limit";
 import {
   dropVersions,
@@ -77,9 +82,20 @@ export class UserDOCore extends DurableObject<Env> {
     this.envPublic = env;
   }
 
-  /** Phase 10: lazy YjsRuntime accessor. */
-  get yjsRuntime(): YjsRuntime {
+  /**
+   * Phase 14: lazy YjsRuntime accessor — async because the class
+   * itself is loaded via dynamic `import("./yjs")`. Non-collab
+   * tenants never call this method; the entire yjs/y-protocols
+   * graph is dead-code-eliminated from the consumer's bundle.
+   *
+   * On collab paths (`vfsOpenYjsSocket`, `vfsFlushYjs`,
+   * `webSocketMessage` / `webSocketClose` / `webSocketError`) the
+   * dynamic import resolves once per DO instance — subsequent
+   * calls hit the in-memory cache.
+   */
+  async getYjsRuntime(): Promise<YjsRuntime> {
     if (this._yjsRuntime === undefined) {
+      const { YjsRuntime } = await import("./yjs");
       this._yjsRuntime = new YjsRuntime(this);
     }
     return this._yjsRuntime;
@@ -1156,7 +1172,7 @@ export class UserDOCore extends DurableObject<Env> {
       // Match the rest of the API: path-not-found surfaces as ENOENT
       // through mapServerError on the consumer side. We throw the
       // server-side VFSError shape directly here.
-      const { VFSError } = await import("@shared/vfs-types");
+      const { VFSError } = await import("../../../../shared/vfs-types");
       throw new VFSError("ENOENT", `listVersions: path not found: ${path}`);
     }
     return listVersions(this, pathId, opts);
@@ -1178,11 +1194,11 @@ export class UserDOCore extends DurableObject<Env> {
       : scope.tenant;
     const pathId = resolvePathId(this, userId, path);
     if (!pathId) {
-      const { VFSError } = await import("@shared/vfs-types");
+      const { VFSError } = await import("../../../../shared/vfs-types");
       throw new VFSError("ENOENT", `markVersion: path not found: ${path}`);
     }
     if (opts.label !== undefined) {
-      const { validateLabel } = await import("@shared/metadata-validate");
+      const { validateLabel } = await import("../../../../shared/metadata-validate");
       validateLabel(opts.label);
     }
     const { markVersion } = await import("./vfs-versions");
@@ -1204,7 +1220,7 @@ export class UserDOCore extends DurableObject<Env> {
   ): Promise<{ versionId: string | null; checkpointSeq: number }> {
     this.gateVfsWrite(scope);
     if (opts?.label !== undefined) {
-      const { validateLabel } = await import("@shared/metadata-validate");
+      const { validateLabel } = await import("../../../../shared/metadata-validate");
       validateLabel(opts.label);
     }
     const userId = scope.sub
@@ -1213,7 +1229,7 @@ export class UserDOCore extends DurableObject<Env> {
     const { resolvePathFollow } = await import("./path-walk");
     const r = resolvePathFollow(this, userId, path);
     if (r.kind !== "file") {
-      const { VFSError } = await import("@shared/vfs-types");
+      const { VFSError } = await import("../../../../shared/vfs-types");
       throw new VFSError(
         "EINVAL",
         `flushYjs: not a regular file: ${path}`
@@ -1221,7 +1237,7 @@ export class UserDOCore extends DurableObject<Env> {
     }
     const { isYjsMode } = await import("./vfs-ops");
     if (!isYjsMode(this, userId, r.leafId)) {
-      const { VFSError } = await import("@shared/vfs-types");
+      const { VFSError } = await import("../../../../shared/vfs-types");
       throw new VFSError(
         "EINVAL",
         `flushYjs: file is not in yjs mode: ${path}`
@@ -1231,7 +1247,7 @@ export class UserDOCore extends DurableObject<Env> {
       .exec("SELECT pool_size FROM quota WHERE user_id = ?", userId)
       .toArray()[0] as { pool_size: number } | undefined;
     const poolSize = poolRow ? poolRow.pool_size : 32;
-    const result = await this.yjsRuntime.compact(
+    const result = await (await this.getYjsRuntime()).compact(
       scope,
       userId,
       r.leafId,
@@ -1259,7 +1275,7 @@ export class UserDOCore extends DurableObject<Env> {
       : scope.tenant;
     const pathId = resolvePathId(this, userId, path);
     if (!pathId) {
-      const { VFSError } = await import("@shared/vfs-types");
+      const { VFSError } = await import("../../../../shared/vfs-types");
       throw new VFSError(
         "ENOENT",
         `restoreVersion: path not found: ${path}`
@@ -1289,7 +1305,7 @@ export class UserDOCore extends DurableObject<Env> {
       : scope.tenant;
     const pathId = resolvePathId(this, userId, path);
     if (!pathId) {
-      const { VFSError } = await import("@shared/vfs-types");
+      const { VFSError } = await import("../../../../shared/vfs-types");
       throw new VFSError(
         "ENOENT",
         `dropVersions: path not found: ${path}`
@@ -1485,7 +1501,7 @@ export class UserDOCore extends DurableObject<Env> {
       pathId: r.leafId,
       poolSize,
     });
-    this.yjsRuntime.registerSocket(r.leafId, server);
+    (await this.getYjsRuntime()).registerSocket(r.leafId, server);
 
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -1542,7 +1558,7 @@ export class UserDOCore extends DurableObject<Env> {
     // Re-register the socket in the live map (no-op if already
     // present; idempotent set add). Cheap and keeps broadcast paths
     // correct after wake.
-    this.yjsRuntime.registerSocket(att.pathId, ws);
+    (await this.getYjsRuntime()).registerSocket(att.pathId, ws);
 
     const bytes = new Uint8Array(message);
     const { decodeYjsMessage, encodeSyncStep2 } = await import("./yjs");
@@ -1555,12 +1571,12 @@ export class UserDOCore extends DurableObject<Env> {
           // they need (sync-step-2) AND prompt them with our own
           // state vector (sync-step-1) for full bidirectional sync.
           const Y = await import("yjs");
-          const doc = await this.yjsRuntime.getDoc(att.scope, att.pathId);
+          const doc = await (await this.getYjsRuntime()).getDoc(att.scope, att.pathId);
           const diff = Y.encodeStateAsUpdate(doc, decoded.stateVector);
           ws.send(encodeSyncStep2(diff));
           // Also send our state vector so they reciprocate (the
           // standard Yjs sync handshake is symmetric).
-          const reply = await this.yjsRuntime.syncStep1Reply(
+          const reply = await (await this.getYjsRuntime()).syncStep1Reply(
             att.scope,
             att.pathId
           );
@@ -1568,7 +1584,7 @@ export class UserDOCore extends DurableObject<Env> {
           return;
         }
         case "syncStep2": {
-          await this.yjsRuntime.applyRemoteUpdate(
+          await (await this.getYjsRuntime()).applyRemoteUpdate(
             att.scope,
             att.userId,
             att.pathId,
@@ -1579,7 +1595,7 @@ export class UserDOCore extends DurableObject<Env> {
           return;
         }
         case "update": {
-          await this.yjsRuntime.applyRemoteUpdate(
+          await (await this.getYjsRuntime()).applyRemoteUpdate(
             att.scope,
             att.userId,
             att.pathId,
@@ -1591,7 +1607,7 @@ export class UserDOCore extends DurableObject<Env> {
         }
         case "awareness": {
           // Phase 13 — relay awareness frames; never persisted.
-          await this.yjsRuntime.relayAwareness(
+          await (await this.getYjsRuntime()).relayAwareness(
             att.scope,
             att.pathId,
             decoded.update,
@@ -1630,7 +1646,7 @@ export class UserDOCore extends DurableObject<Env> {
     const att = ws.deserializeAttachment() as
       | { pathId: string }
       | null;
-    if (att) this.yjsRuntime.removeSocket(att.pathId, ws);
+    if (att) (await this.getYjsRuntime()).removeSocket(att.pathId, ws);
   }
 
   /**
@@ -1641,6 +1657,6 @@ export class UserDOCore extends DurableObject<Env> {
     const att = ws.deserializeAttachment() as
       | { pathId: string }
       | null;
-    if (att) this.yjsRuntime.removeSocket(att.pathId, ws);
+    if (att) (await this.getYjsRuntime()).removeSocket(att.pathId, ws);
   }
 }

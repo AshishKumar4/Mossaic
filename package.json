@@ -12,6 +12,8 @@
     "test:watch": "vitest",
     "typecheck": "tsc -b",
     "build:sdk": "pnpm -F @mossaic/sdk build",
+    "phase14:codemod": "node scripts/phase14-codemod.mjs",
+    "phase14:codemod:dry": "node scripts/phase14-codemod.mjs --dry-run",
     "lean:build": "bash -c 'export PATH=$HOME/.elan/bin:$PATH; cd lean && lake build'",
     "verify:proofs": "bash -c 'export PATH=$HOME/.elan/bin:$PATH; cd lean && lake build && bash scripts/check-no-sorry.sh && cd .. && bash lean/scripts/check-xrefs.sh'"
   },
