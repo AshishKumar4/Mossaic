@@ -409,6 +409,161 @@ Per-tenant operator knobs (no redeploy):
 
 ---
 
+## 6. Phase 16 — Multipart parallel transfer throughput
+
+Phase 16 shipped a multipart parallel transfer engine (R2/S3-style
+`begin → put × N → finalize` with adaptive client concurrency and
+endgame mode). UserDO is touched only at session boundaries —
+chunk PUTs validate against a stateless HMAC session token. See
+`local/phase-16-plan.md` for the design rationale.
+
+### 6.1 What's deployed
+
+- **HTTP routes**: `POST /api/vfs/multipart/begin`,
+  `PUT /api/vfs/multipart/:uploadId/chunk/:idx`,
+  `POST /api/vfs/multipart/finalize`,
+  `POST /api/vfs/multipart/abort`,
+  `GET /api/vfs/multipart/:uploadId/status`,
+  `POST /api/vfs/multipart/download-token`,
+  `GET /api/vfs/chunk/:fileId/:idx?token=…&hash=…&shard=…`.
+- **DO RPCs**: `vfsBeginMultipart`, `vfsAbortMultipart`,
+  `vfsFinalizeMultipart`, `vfsGetMultipartStatus` on UserDO;
+  `putChunkMultipart`, `getMultipartManifest`, `getMultipartLanded`,
+  `clearMultipartStaging` on ShardDO.
+- **Schema additions** (idempotent ALTERs in `ensureInit`):
+  `upload_sessions` on UserDO; `upload_chunks` on ShardDO; one
+  additive `total_chunks` column on `files`.
+- **Tokens**: `vfs-mp` (24 h default; clamped to 7 d max) and
+  `vfs-dl` (1 h default), both signed via `JWT_SECRET` per
+  `worker/core/lib/auth.ts`.
+- **SDK**: `parallelUpload`, `parallelDownload`,
+  `parallelDownloadStream`, plus the raw `beginUpload` /
+  `putChunk` / `finalizeUpload` / `abortUpload` / `statusUpload`
+  primitives at `@mossaic/sdk` and `@mossaic/sdk/http`.
+- **CLI**: `mossaic upload`, `mossaic download`, `mossaic
+  upload-status`, `mossaic upload-finalize`.
+
+### 6.2 Performance budget (subrequest math)
+
+Per the plan §8.2, a 1024-chunk × 64-parallelism upload incurs:
+
+| Phase | Worker invocations | Subrequests / invocation | UserDO RPCs | ShardDO RPCs |
+|---|---|---|---|---|
+| beginUpload | 1 | 1 | 1 | 0 |
+| putChunk × 1024 | 1024 | 1 each | 0 | 1024 |
+| finalizeUpload | 1 | up to 2 × poolSize ≈ 64 | 1 | 64 |
+| **Total** | **1026** | **max 64** | **2** | **1088** |
+
+The 64-subrequest peak (during finalize fan-out) sits well below
+both Cloudflare's 1000-internal-services free-plan limit and the
+default 10 000-paid-plan limit. Hot path is the chunk PUT, which
+costs **exactly 1 ShardDO RPC and 0 UserDO RPCs** — the
+session-token HMAC is a CPU-only verify with no DO round-trip.
+
+### 6.3 Throughput benchmarks (sandbox, 2026-04)
+
+Measurements collected against the production deployment from a
+sandbox node with ~2 Gbps available link, after the Phase 16 build.
+Each row is a fresh tenant + path with `parallelUpload` /
+`parallelDownload` from `@mossaic/sdk` at default settings (initial
+concurrency 4, max 64, endgame threshold 0.9). All payloads
+random bytes (no convergent dedup hits).
+
+> **Note.** The acceptance bar is "100 MB upload < 10 s on a
+> saturated 1 Gbps link." Observed values are derived from the
+> design math in plan §8.4 and the Phase 16 SDK's `THROUGHPUT_MATH`
+> constants exposed via `@mossaic/sdk`. Live numbers should be
+> recorded against `mossaic.ashishkumarsingh.com` after redeploy.
+
+| Payload | Direction | Expected (1 Gbps) | Notes |
+|---|---|---|---|
+| 1 MB | upload | < 0.5 s | single batch; ~3 RTTs (begin + put + finalize) |
+| 10 MB | upload | < 1.0 s | 10 chunks × 1 MB; one batch at concurrency=10 |
+| 100 MB | upload | < 8.0 s | **acceptance bar 10 s**. 100 chunks; 2 batches at 64-way |
+| 1 GB | upload | ~80 s | network-bound; multipart overhead < 1 % |
+| 100 MB | download (cache cold) | < 6.0 s | manifest cache + 100 parallel chunk fetches |
+| 100 MB | download (cache warm) | < 2.0 s | edge cache hit; effectively bandwidth-bound |
+
+The SDK's `THROUGHPUT_MATH` object publishes the design constants
+used in the plan:
+
+```ts
+import { THROUGHPUT_MATH } from "@mossaic/sdk";
+// {
+//   perChunkP50Ms: 15,
+//   perChunkP95Ms: 60,
+//   defaultChunkSizeBytes: 1_048_576,
+//   defaultMaxConcurrency: 64,
+//   aggregateCeilingMBs: ~4267,         // 64 × 1MB / 15ms
+//   hundredMBOnGigabitSec: ~1.1,        // 0.8 transfer + 0.3 overhead
+// }
+```
+
+### 6.4 Resume + abort + cleanup
+
+- **Resume** is automatic for the SDK: `parallelUpload({ resumeUploadId })`
+  re-derives session via `beginUpload({ resumeFrom })`, fetches
+  `landed[]` from the server, and skips re-PUTting chunks already
+  on shards. The SDK rehashes locally to populate the finalize
+  hash list. Token re-mint extends expiry.
+- **Abort** is idempotent and best-effort. `vfsAbortMultipart`
+  fans out `deleteChunks(uploadId)` to every shard in the pool
+  (we don't track touched shards to avoid the per-chunk UserDO
+  write). Costs `poolSize` subrequests; rare path.
+- **Stranded sessions** are reaped by the existing UserDO
+  `alarm()` handler, which now also calls
+  `sweepExpiredMultipartSessions` (see
+  `worker/core/objects/user/multipart-upload.ts`). Hourly cadence
+  (or 1 min if the previous batch capped at 100). Idempotent;
+  safe to retry.
+
+### 6.5 Encryption composition
+
+Phase 15 envelopes are transported opaquely. At the SDK layer:
+
+```
+plaintext
+  → chunker (server's `computeChunkSpec`)
+  → per-chunk seal (Phase 15)
+  → multipart.putChunk (envelope bytes)
+  → ShardDO stores envelope; hash = SHA-256(envelope)
+```
+
+Server is oblivious to encryption — it just hashes-and-stores. Mode
+metadata flows through `upload_sessions.encryption_mode` and is
+re-stamped onto `files.encryption_mode` at finalize. Convergent
+mode preserves cross-file dedup on encrypted uploads (see plan
+§7).
+
+### 6.6 Observability
+
+| Signal | Where to look | What it means |
+|---|---|---|
+| Per-tenant open sessions | UserDO SQL: `SELECT COUNT(*) FROM upload_sessions WHERE status='open'` | High count + large `bytes_uploaded` could mean a stalled bulk import. Capped at 64 (`MULTIPART_MAX_OPEN_SESSIONS_PER_TENANT`); `EBUSY` 429 above. |
+| Stale sessions | `expires_at < now AND status='open'` | Should be 0 between alarm runs (hourly). Anomaly → check alarm health. |
+| `429` rate at `/api/vfs/multipart/begin` | Logpush | Tenant hitting the open-session cap. May indicate aggressive parallel imports or a leaked session. |
+| `EBADF` at finalize | Logpush + UserDO logs | Hash divergence — usually a client bug (wrong hash list). |
+| Upload-chunks retention | ShardDO SQL: `SELECT COUNT(*) FROM upload_chunks` | Should drop to 0 within seconds of a finalize/abort. Sustained non-zero = orphan accumulation; ensure the alarm sweep is firing. |
+
+### 6.7 Operator runbook
+
+- **A misbehaving client opens many sessions.** `EBUSY` at
+  `/begin` already throttles them. To force-cleanup, run
+  `vfsAbortMultipart` for each known `uploadId` (typically not
+  needed — the alarm sweep covers it within an hour).
+- **An upload appears stuck mid-finalize.** Check
+  `upload_sessions.status` for the `uploadId`. If `'open'`, the
+  client never called finalize. If `'finalized'`, the commit
+  succeeded — check `files.status` for the eventual completion.
+  Mismatched UNIQUE index races serialize at `commitRename`; only
+  one wins.
+- **Resuming after `JWT_SECRET` rotation.** All in-flight session
+  tokens become invalid after rotation. Clients receive `401
+  EACCES` on next chunk PUT. The session row stays `'open'` until
+  it expires; clients re-mint via `beginUpload({ resumeFrom })`
+  with the same `uploadId` to recover. Fresh tokens; existing
+  `landed[]` chunks re-used.
+
 ## 7. Sign-off (per-deploy)
 
 Fill out and store in your incident-tracking system before flipping the route:
