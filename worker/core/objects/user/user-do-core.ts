@@ -1589,6 +1589,16 @@ export class UserDOCore extends DurableObject<Env> {
           );
           return;
         }
+        case "awareness": {
+          // Phase 13 — relay awareness frames; never persisted.
+          await this.yjsRuntime.relayAwareness(
+            att.scope,
+            att.pathId,
+            decoded.update,
+            ws
+          );
+          return;
+        }
         case "unknown":
         default: {
           // Unknown tag — ignore for forward compat.
