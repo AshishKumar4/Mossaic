@@ -224,7 +224,7 @@ export async function verifyVFSToken(
   }
 }
 
-// ── Phase 16: multipart session + download tokens ──────────────────────
+// ── multipart session + download tokens ──────────────────────
 //
 // Two new HMAC token shapes layered onto the same `JWT_SECRET` via
 // scope-discrimination claims:

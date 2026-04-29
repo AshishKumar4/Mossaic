@@ -1,7 +1,7 @@
 /**
- * Public Yjs WebSocket upgrade route — Phase 13.5.
+ * Public Yjs WebSocket upgrade route —.
  *
- * Background: Phase 10 added a per-file CRDT mode reachable via the
+ * Background: added a per-file CRDT mode reachable via the
  * UserDOCore method `_fetchWebSocketUpgrade(request)` at the synthetic
  * URL `/yjs/ws?path=...&ns=...&tenant=...[&sub=...]`. That handler
  * was reachable only from a sibling Worker calling `stub.fetch(req)`

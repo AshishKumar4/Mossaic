@@ -1,5 +1,5 @@
 /**
- * Phase 16 — Multipart parallel transfer engine, HTTP routes.
+ * Multipart parallel transfer engine, HTTP routes.
  *
  * Mounted at `/api/vfs/multipart/*` from `worker/core/index.ts`.
  *

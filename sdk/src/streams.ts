@@ -25,7 +25,7 @@ export interface ReadStreamOptions {
 }
 
 /**
- * Phase 13: streaming writes accept the same opts shape as `writeFile`,
+ * streaming writes accept the same opts shape as `writeFile`,
  * including `metadata`, `tags`, and `version`. The opts are validated
  * at begin-time (caller fails fast on cap violations) and applied at
  * commit-time (rename-from-tmp).

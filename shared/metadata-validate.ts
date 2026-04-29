@@ -1,5 +1,5 @@
 /**
- * Phase 12: pure validators for metadata + tags.
+ * pure validators for metadata + tags.
  *
  * Both functions throw `VFSError("EINVAL", message)` on violation —
  * wired such that the SDK can pre-validate without a round-trip,

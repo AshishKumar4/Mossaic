@@ -1,5 +1,5 @@
 /**
- * Phase 12: server-side metadata + tags primitives.
+ * server-side metadata + tags primitives.
  *
  * These helpers run inside the UserDO single-thread, so every
  * mutation is atomic with respect to concurrent VFS RPCs on the

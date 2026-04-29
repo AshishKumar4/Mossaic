@@ -1,5 +1,5 @@
 /**
- * E2E D — Phase 12 metadata/tags/copyFile/listFiles + cursor pagination
+ * E2E D — metadata/tags/copyFile/listFiles + cursor pagination
  * + tampering + caps (12 cases).
  */
 
@@ -8,7 +8,7 @@ import { freshTenant, type TenantCtx } from "./helpers/tenant.js";
 import { hasSecret, requireSecret } from "./helpers/env.js";
 import { METADATA_MAX_BYTES, TAGS_MAX_PER_FILE } from "@mossaic/sdk/http";
 
-describe.skipIf(!hasSecret())("D — Phase 12 metadata/tags/copyFile/listFiles", () => {
+describe.skipIf(!hasSecret())("D — metadata/tags/copyFile/listFiles", () => {
   beforeAll(() => requireSecret());
 
   let ctx: TenantCtx;

@@ -1,5 +1,5 @@
 /**
- * Phase 16 — Multipart parallel transfer engine.
+ * Multipart parallel transfer engine.
  *
  * Shared types and constants used across worker (UserDO + ShardDO +
  * routes) and SDK (transfer.ts). Carrying these in a single shared
@@ -11,7 +11,7 @@
  * this file is safe to import from both worker and browser bundles.
  */
 
-/** Sentinel for the upload-session HMAC token. Distinct from "vfs" (Phase 13) and "vfs-dl" (§4). */
+/** Sentinel for the upload-session HMAC token. Distinct from "vfs" and "vfs-dl" (§4). */
 export const VFS_MP_SCOPE = "vfs-mp" as const;
 
 /** Sentinel for the cacheable-chunk download HMAC token. */

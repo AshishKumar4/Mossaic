@@ -21,7 +21,7 @@ import {
   shardRefId,
 } from "./vfs-versions";
 import { resolvePath, resolvePathFollow } from "./path-walk";
-// Phase 14: yjs.ts is loaded via dynamic `await import("./yjs")` at
+// yjs.ts is loaded via dynamic `await import("./yjs")` at
 // each yjs-mode call site below (search for `await import("./yjs")`
 // in this file). Static imports were pulling the yjs + y-protocols
 // runtime into every non-collab consumer's bundle through tsup's
@@ -35,29 +35,28 @@ import {
 import { replaceTags } from "./metadata-tags";
 
 /**
- * Phase 2 read-side VFS operations.
+ * Read-side VFS operations.
  *
- * All functions are pure SQL on the UserDO's storage. They do NOT do any
- * cross-DO subrequests (those are deferred to Phase 4 streaming and to
- * the unlink/write sides). The intent is that read-side ops cost zero
- * UserDO subrequests and 0 or N ShardDO subrequests (only readFile of a
- * non-inlined file fans out).
+ * All functions are pure SQL on the UserDO's storage. They do NOT do
+ * cross-DO subrequests (those are deferred to streaming and the
+ * unlink/write sides). The intent is that read-side ops cost zero
+ * UserDO subrequests and 0 or N ShardDO subrequests (only readFile
+ * of a non-inlined file fans out).
  *
- * Multi-tenant scoping (Phase 4): for now we map `scope.tenant` directly
- * to `files.user_id`. Phase 4 will introduce `vfsUserDOName(ns, tenant,
- * sub)` and pass an opaque "user_id-equivalent" string here so the DO
- * itself can stay scope-agnostic. The shape of these signatures does not
- * change between phases.
+ * Multi-tenant scoping: `scope.tenant` maps directly to
+ * `files.user_id` for SQL filtering inside the DO. The
+ * `vfsUserDOName(ns, tenant, sub)` helper produces the opaque
+ * DO-instance name; the DO itself stays scope-agnostic.
  */
 
 /**
  * Resolve the SQL `user_id` for a given scope.
  *
- * Phase 4: the scope identifies the DO instance via vfsUserDOName, but
- * we *also* use a derived `user_id` for SQL filtering inside the DO so
- * that a single DO instance can host multiple sub-tenants without
- * leakage if the binding layer ever consolidates them. The composed
- * form `${tenant}::${sub}` and the same-tenant-no-sub form `${tenant}`
+ * The scope identifies the DO instance via vfsUserDOName, but we
+ * *also* use a derived `user_id` for SQL filtering inside the DO so
+ * a single DO instance can host multiple sub-tenants without leakage
+ * if the binding layer ever consolidates them. The composed form
+ * `${tenant}::${sub}` and the same-tenant-no-sub form `${tenant}`
  * are intentionally distinct.
  *
  * Each component is validated against the same character class as
@@ -209,7 +208,7 @@ function statForResolved(
   if (!row) {
     throw new VFSError("ENOENT", "stat: file vanished");
   }
-  // Phase 15: project encryption columns into the SDK-facing shape.
+  // project encryption columns into the SDK-facing shape.
   // Defined inline so both file-return branches can call it; symlinks
   // ignore encryption (the target string is plaintext metadata).
   const projectEnc = ():
@@ -241,7 +240,7 @@ function statForResolved(
       ino: inoFromId(row.file_id),
     };
   }
-  // Phase 9: if a head_version_id exists, the truth-of-record is in
+  // if a head_version_id exists, the truth-of-record is in
   // file_versions, not in `files`. We consult the head version row
   // for size/mode/mtime AND tombstone status. If the head is a
   // tombstone, the path appears ENOENT — same semantics as readFile.
@@ -277,7 +276,7 @@ function statForResolved(
       const vsize = head.inline_data ? head.inline_data.byteLength : head.size;
       const out: VFSStatRaw = {
         type: "file",
-        // Phase 10: surface the yjs-mode bit on stat.mode. The
+        // surface the yjs-mode bit on stat.mode. The
         // mode_yjs flag lives on the `files` row (not the version
         // row) so it's invariant across versions of the same path.
         mode: head.mode | (row.mode_yjs === 1 ? 0o4000 : 0),
@@ -287,7 +286,7 @@ function statForResolved(
         gid,
         ino: inoFromId(row.file_id),
       };
-      // Phase 15: encryption stamp from the head row on `files`. The
+      // encryption stamp from the head row on `files`. The
       // versioned write path keeps `files.encryption_*` in sync with
       // the head version's columns (see commitVersion), so reading
       // from `files` here is correct.
@@ -297,16 +296,16 @@ function statForResolved(
     }
   }
 
-  // Regular file (Phase 8 path). If inlined, size still reflects
+  // Regular file (path). If inlined, size still reflects
   // file_size (which equals inline_data byteLength by construction
-  // in the Phase 3 write path; for legacy / non-inlined rows it's
+  // in the write path; for legacy / non-inlined rows it's
   // the chunked total).
   const size = row.inline_data
     ? row.inline_data.byteLength
     : row.file_size;
   const out: VFSStatRaw = {
     type: "file",
-    // Phase 10: surface the yjs-mode bit on stat.mode (0o4000).
+    // surface the yjs-mode bit on stat.mode (0o4000).
     mode: (row.mode ?? 0o644) | (row.mode_yjs === 1 ? 0o4000 : 0),
     size,
     mtimeMs: row.updated_at,
@@ -314,7 +313,7 @@ function statForResolved(
     gid,
     ino: inoFromId(row.file_id),
   };
-  // Phase 15: encryption stamp.
+  // encryption stamp.
   const enc = projectEnc();
   if (enc) out.encryption = enc;
   return out;
@@ -369,7 +368,7 @@ export function vfsExists(
   }
   if (r.kind === "dir" || r.kind === "symlink") return true;
   if (r.kind !== "file") return false;
-  // Phase 9: when versioning is enabled and the head is a tombstone,
+  // when versioning is enabled and the head is a tombstone,
   // exists() returns false to match readFile/stat semantics.
   const headRow = durableObject.sql
     .exec(
@@ -513,8 +512,8 @@ export function vfsReadManyStat(
  *   1. If the resolved row has `inline_data` set, return it directly (zero
  *      ShardDO subrequests; the §2.4(i) unlock for tiny git objects).
  *   2. Otherwise, walk `file_chunks` and fetch each chunk from the
- *      recorded ShardDO via `vfsShardDOName(scope.ns, tenant, sub, idx)`
- *      (Phase 4). The recorded `shard_index` is unchanged from what
+ *      recorded ShardDO via `vfsShardDOName(scope.ns, tenant, sub, idx)`.
+ *      The recorded `shard_index` is unchanged from what
  *      `placeChunk` returned at write time, so reads remain
  *      deterministic across pool growth.
  *   3. Cap at READFILE_MAX (default 100 MB; configurable) — beyond
@@ -528,7 +527,7 @@ export function vfsReadManyStat(
  * still pays exactly 1 subrequest for the entire readFile.
  */
 /**
- * Phase 9 versioned read path.
+ * versioned read path.
  *
  * Resolution order:
  *   - explicit versionId → that exact row (ENOENT if missing,
@@ -635,7 +634,7 @@ async function readFileVersioned(
   const out = new Uint8Array(size);
 
   // H3: parallel chunk fetches with bounded concurrency (mirrors the
-  // Phase 8 read path). Per-chunk destination offset is precomputed
+  // read path). Per-chunk destination offset is precomputed
   // from chunk_size so order doesn't depend on arrival.
   const offsets = new Array<number>(chunkRows.length);
   {
@@ -705,7 +704,7 @@ export async function vfsReadFile(
     throw new VFSError("EINVAL", `readFile: not a regular file: ${path}`);
   }
 
-  // Phase 10: yjs-mode fork. If the file has mode_yjs=1 we MUST
+  // yjs-mode fork. If the file has mode_yjs=1 we MUST
   // materialize from the op log + checkpoint instead of file_chunks
   // / file_versions. Even if a head_version_id exists (compaction
   // snapshots ALSO emit Mossaic versions when versioning is on),
@@ -717,9 +716,9 @@ export async function vfsReadFile(
     return readYjsAsBytes(durableObject, scope, r.leafId);
   }
 
-  // Phase 9: versioning fork. If the path has a head_version_id, OR
+  // versioning fork. If the path has a head_version_id, OR
   // an explicit versionId was passed, route through file_versions.
-  // Otherwise fall through to the Phase 8 file_chunks-based path
+  // Otherwise fall through to the file_chunks-based path
   // (preserves byte-equivalence for versioning-OFF tenants and for
   // legacy data written before versioning was ever enabled).
   const headRow = durableObject.sql
@@ -1010,7 +1009,7 @@ export async function vfsReadChunk(
 }
 
 // ───────────────────────────────────────────────────────────────────────
-// Phase 3 — Write-side VFS operations.
+// Write-side VFS operations.
 //
 // All writes go through one of three shapes:
 //   1. Inline: file ≤ INLINE_LIMIT → single UPDATE on `files`, no shards.
@@ -1032,7 +1031,7 @@ export async function vfsReadChunk(
 // GC: hard-delete files+file_chunks rows in the UserDO; queue chunk
 // reference decrements on each touched ShardDO via the typed deleteChunks
 // RPC. ShardDO's alarm sweeper performs the actual blob delete after the
-// 30s grace window (Phase 1 + Phase 3 plumbing).
+// 30s grace window (+ plumbing).
 // ───────────────────────────────────────────────────────────────────────
 
 /**
@@ -1167,7 +1166,7 @@ export async function hardDeleteFileRowExternal(
 }
 
 /**
- * Phase 12: external wrapper around `commitRename` for use by the
+ * external wrapper around `commitRename` for use by the
  * copyFile primitive in `copy-file.ts`. Same semantics as the
  * private function used internally by writeFile.
  */
@@ -1183,7 +1182,7 @@ export async function commitRenameExternal(
 }
 
 /**
- * Phase 12: external wrapper around `abortTempFile` for copy-file's
+ * external wrapper around `abortTempFile` for copy-file's
  * fan-out failure path. Same semantics as the private wrapper.
  */
 export async function abortTempFileExternal(
@@ -1219,7 +1218,7 @@ async function hardDeleteFileRow(
   // surface is a transient ShardDO error, retried by the worker
   // runtime.)
   durableObject.sql.exec("DELETE FROM file_chunks WHERE file_id = ?", fileId);
-  // Phase 12: drop any tags + version rows still referencing this
+  // drop any tags + version rows still referencing this
   // file_id. Tags are per-pathId; for non-versioning tenants, hard
   // delete also reaps the path identity, so the tags must go too.
   // For versioning-on tenants, hardDeleteFileRow is reachable only
@@ -1290,7 +1289,7 @@ async function hardDeleteFileRow(
  * last-writer-wins, POSIX-correct).
  */
 /**
- * Phase 9 versioning-ON write path.
+ * versioning-ON write path.
  *
  * Pure-function-ish (depends on durableObject + ShardDO env, but no
  * cross-method state). Invariant we want a future TSLean proof to
@@ -1310,17 +1309,16 @@ async function vfsWriteFileVersioned(
   mimeType: string,
   now: number,
   /**
-   * Phase 12: optional metadata + tags + version flags. Applied
-   * BEFORE commitVersion so the snapshot captures them. Caller is
-   * responsible for validation against the caps in
-   * `shared/metadata-caps.ts`.
+   * Optional metadata + tags + version flags. Applied BEFORE
+   * commitVersion so the snapshot captures them. Caller is responsible
+   * for validation against the caps in `shared/metadata-caps.ts`.
    */
-  phase12: {
+  meta: {
     metadataEncoded?: Uint8Array | null | undefined;
     tags?: readonly string[] | undefined;
     versionUserVisible?: boolean;
     versionLabel?: string;
-    /** Phase 15: encryption stamp for this version. */
+    /** Encryption stamp for this version. */
     encryption?: { mode: "convergent" | "random"; keyId?: string };
   } = {}
 ): Promise<void> {
@@ -1360,7 +1358,7 @@ async function vfsWriteFileVersioned(
 
   const versionId = generateId();
 
-  // Phase 12: resolve metadata snapshot. Three sources, in order:
+  // resolve metadata snapshot. Three sources, in order:
   //   1. caller passed `metadataEncoded === null` → CLEAR (NULL blob,
   //      both on the files row and the version snapshot).
   //   2. caller passed `metadataEncoded` Uint8Array → SET (writeMetadata
@@ -1368,20 +1366,20 @@ async function vfsWriteFileVersioned(
   //   3. caller passed nothing → KEEP existing files.metadata
   //      (read once, used for the version snapshot only).
   let metadataForVersion: Uint8Array | null = null;
-  if (phase12.metadataEncoded === null) {
+  if (meta.metadataEncoded === null) {
     // Explicit clear: write NULL on files; snapshot is also NULL.
     durableObject.sql.exec(
       "UPDATE files SET metadata = NULL WHERE file_id = ?",
       pathId
     );
     metadataForVersion = null;
-  } else if (phase12.metadataEncoded !== undefined) {
+  } else if (meta.metadataEncoded !== undefined) {
     durableObject.sql.exec(
       "UPDATE files SET metadata = ? WHERE file_id = ?",
-      phase12.metadataEncoded,
+      meta.metadataEncoded,
       pathId
     );
-    metadataForVersion = phase12.metadataEncoded;
+    metadataForVersion = meta.metadataEncoded;
   } else {
     // Read existing for snapshot only.
     const row = durableObject.sql
@@ -1405,14 +1403,14 @@ async function vfsWriteFileVersioned(
       fileHash: "",
       mimeType,
       inlineData: data,
-      userVisible: phase12.versionUserVisible ?? true,
-      label: phase12.versionLabel,
+      userVisible: meta.versionUserVisible ?? true,
+      label: meta.versionLabel,
       metadata: metadataForVersion,
-      encryption: phase12.encryption,
+      encryption: meta.encryption,
     });
-    if (phase12.tags !== undefined) {
+    if (meta.tags !== undefined) {
       const { replaceTags } = await import("./metadata-tags");
-      replaceTags(durableObject, userId, pathId, phase12.tags);
+      replaceTags(durableObject, userId, pathId, meta.tags);
     } else {
       // Bump tag mtimes so list-by-tag reflects this write's recency.
       const { bumpTagMtimes } = await import("./metadata-tags");
@@ -1433,7 +1431,7 @@ async function vfsWriteFileVersioned(
   const touchedShards = new Set<number>();
 
   // H3: parallel chunk PUTs with bounded concurrency, mirroring the
-  // Phase 8 path. Each lane processes one chunk at a time; chunks
+  // path. Each lane processes one chunk at a time; chunks
   // are independent so up to CONCURRENCY can be in flight.
   const fileHashByIdx = new Array<string>(chunkCount);
   try {
@@ -1444,13 +1442,13 @@ async function vfsWriteFileVersioned(
       const end = Math.min(start + chunkSize, data.byteLength);
       const slice = data.subarray(start, end);
       const hash = await hashChunk(slice);
-      // Phase 9 invariant: place by CONTENT-HASH (not by
+      // invariant: place by CONTENT-HASH (not by
       // (fileId, chunkIndex)). Same hash → same shard, every time.
       // This is what makes cross-version dedup actually work — two
       // versions with identical content land on the same ShardDO,
       // hit the dedup branch, and share one chunk row with
       // refcount = (number of versions referencing it).
-      // The Phase 8 / non-versioning path still uses (fileId, idx)
+      // The / non-versioning path still uses (fileId, idx)
       // placement for spread across shards on a single file.
       // (H4 freezes poolSize at the chunk's first-write so pool
       //  growth never re-routes a hash to a different shard.)
@@ -1519,14 +1517,14 @@ async function vfsWriteFileVersioned(
     fileHash,
     mimeType,
     inlineData: null,
-    userVisible: phase12.versionUserVisible ?? true,
-    label: phase12.versionLabel,
+    userVisible: meta.versionUserVisible ?? true,
+    label: meta.versionLabel,
     metadata: metadataForVersion,
-    encryption: phase12.encryption,
+    encryption: meta.encryption,
   });
-  if (phase12.tags !== undefined) {
+  if (meta.tags !== undefined) {
     const { replaceTags } = await import("./metadata-tags");
-    replaceTags(durableObject, userId, pathId, phase12.tags);
+    replaceTags(durableObject, userId, pathId, meta.tags);
   } else {
     const { bumpTagMtimes } = await import("./metadata-tags");
     bumpTagMtimes(durableObject, pathId, now);
@@ -1534,8 +1532,8 @@ async function vfsWriteFileVersioned(
 }
 
 /**
- * Phase 12: extended writeFile options. All fields are optional and
- * default to behavior bit-identical to Phase 11.
+ * Extended writeFile options. All fields are optional and default
+ * to behavior bit-identical to a plain `writeFile` call.
  *
  * - `metadata`: undefined → no change; null → CLEAR; object → SET.
  * - `tags`: undefined → no change; [] → drop all; [...] → REPLACE.
@@ -1551,7 +1549,7 @@ export interface VFSWriteFileOpts {
   tags?: readonly string[];
   version?: { label?: string; userVisible?: boolean };
   /**
-   * Phase 15: opt-in end-to-end encryption.
+   * opt-in end-to-end encryption.
    *
    * When set, the worker stamps `files.encryption_mode` and
    * `files.encryption_key_id` (and the corresponding `file_versions`
@@ -1585,7 +1583,7 @@ export async function vfsWriteFile(
     throw new VFSError("EISDIR", `writeFile: target is a directory: ${path}`);
   }
 
-  // Phase 12: validate metadata + tags BEFORE any SQL touches the
+  // validate metadata + tags BEFORE any SQL touches the
   // row. Validators throw VFSError("EINVAL", ...) on cap violation.
   let metadataEncoded: Uint8Array | null | undefined;
   if (opts.metadata === null) {
@@ -1603,7 +1601,7 @@ export async function vfsWriteFile(
     validateLabel(opts.version.label);
   }
 
-  // Phase 15: validate encryption opts shape and enforce mode-history
+  // validate encryption opts shape and enforce mode-history
   // monotonicity. Both checks throw VFSError before any SQL touches
   // the row, so a rejected write leaves the existing path untouched.
   if (opts.encryption) {
@@ -1623,7 +1621,7 @@ export async function vfsWriteFile(
   const mimeType = opts.mimeType ?? "application/octet-stream";
   const now = Date.now();
 
-  // Phase 10: yjs-mode fork. If the target file already exists
+  // yjs-mode fork. If the target file already exists
   // and has mode_yjs=1, route the bytes through the YjsRuntime.
   // Semantics (Option A): the `data` Uint8Array becomes the new
   // value of the Y.Text("content") inside the doc, emitted as a
@@ -1660,10 +1658,10 @@ export async function vfsWriteFile(
         poolSizeFor(durableObject, userId),
         data
       );
-      // Phase 12: apply metadata/tags to the yjs-mode file. Version
+      // apply metadata/tags to the yjs-mode file. Version
       // opts are ignored on yjs files — the op log IS the history;
-      // explicit checkpoints come from `flush()` (Phase 10/12).
-      // Phase 15: stamp encryption columns if opts.encryption is set.
+      // explicit checkpoints come from `flush()` ().
+      // stamp encryption columns if opts.encryption is set.
       await applyPhase12SideEffects(
         durableObject,
         userId,
@@ -1677,11 +1675,11 @@ export async function vfsWriteFile(
     }
   }
 
-  // Phase 9: versioning fork. When the tenant has versioning ON,
+  // versioning fork. When the tenant has versioning ON,
   // every writeFile creates a new file_versions row referenced by
   // a per-version synthetic shard key, and the `files` row is just
   // the stable identity that holds the head pointer. When OFF,
-  // behavior is byte-equivalent to Phase 8 (no version rows
+  // behavior is byte-equivalent to (no version rows
   // touched, no head pointer used).
   if (isVersioningEnabled(durableObject, userId)) {
     return vfsWriteFileVersioned(
@@ -1732,7 +1730,7 @@ export async function vfsWriteFile(
     // even if commitRename never runs (DO crash mid-method).
     await durableObject.scheduleStaleUploadSweep();
     await commitRename(durableObject, userId, scope, tmpId, parentId, leaf);
-    // Phase 12: post-commit side effects. The canonical pathId after
+    // post-commit side effects. The canonical pathId after
     // commitRename is `tmpId` (the row was renamed in-place; the
     // file_id stayed the same — see commitRename UPDATE). Apply
     // metadata + tags now.
@@ -1849,8 +1847,8 @@ export async function vfsWriteFile(
   );
 
   await commitRename(durableObject, userId, scope, tmpId, parentId, leaf);
-  // Phase 12: post-commit side effects on the chunked-tier write.
-  // Phase 15: stamp encryption columns when present.
+  // post-commit side effects on the chunked-tier write.
+  // stamp encryption columns when present.
   await applyPhase12SideEffects(
     durableObject,
     userId,
@@ -1863,7 +1861,7 @@ export async function vfsWriteFile(
 }
 
 /**
- * Phase 12: apply metadata + tag side-effects to a freshly-committed
+ * apply metadata + tag side-effects to a freshly-committed
  * file. Called from the inline / chunked / yjs branches of
  * `vfsWriteFile` AFTER the canonical files row exists. Pure SQL,
  * no shard work — the caller has already done that.
@@ -1887,7 +1885,7 @@ async function applyPhase12SideEffects(
   tags: readonly string[] | undefined,
   mtimeMs: number,
   /**
-   * Phase 15: optional encryption stamp. Mode-history-monotonicity
+   * optional encryption stamp. Mode-history-monotonicity
    * was already enforced at the top of `vfsWriteFile`; this just
    * applies the column UPDATE to the freshly-committed row.
    *
@@ -1986,7 +1984,7 @@ async function commitRename(
         now,
         tmpId
       );
-      // Phase 12: carry forward metadata + tags from the youngest
+      // carry forward metadata + tags from the youngest
       // superseded row IFF the new tmp row hasn't already had them
       // set explicitly. This makes tags + metadata behave like
       // `mode` — properties of the path, not bound to the file_id.
@@ -2094,7 +2092,7 @@ async function abortTempFile(
  * unlink — hard-delete a regular file or symlink. Throws EISDIR for
  * directories (callers should use rmdir / removeRecursive). Plan §8.4.
  *
- * Phase 9: when versioning is enabled, unlink writes a TOMBSTONE
+ * when versioning is enabled, unlink writes a TOMBSTONE
  * version (deleted=1, no chunks) instead of hard-deleting. The
  * existing version rows + their chunks remain intact; the path
  * appears ENOENT to readFile but listVersions still surfaces history.
@@ -2115,7 +2113,7 @@ export async function vfsUnlink(
     throw new VFSError("EINVAL", `unlink: not a regular file: ${path}`);
   }
 
-  // Phase 9 versioning fork.
+  // versioning fork.
   if (isVersioningEnabled(durableObject, userId)) {
     const tombId = generateId();
     const now = Date.now();
@@ -2136,7 +2134,7 @@ export async function vfsUnlink(
     return;
   }
 
-  // Phase 10: yjs-mode files have their content in yjs_oplog +
+  // yjs-mode files have their content in yjs_oplog +
   // shard chunks under refs `${pathId}#yjs#${seq}`, NOT in
   // file_chunks. We must drop those refs (so chunk_refs / refcount
   // gives the alarm sweeper a chance to free shard storage) and
@@ -2492,7 +2490,7 @@ export function vfsChmod(
 }
 
 /**
- * Phase 12: deep-merge a metadata patch into an existing path's
+ * deep-merge a metadata patch into an existing path's
  * `files.metadata` blob, optionally adding/removing tags in the
  * same atomic DO invocation.
  *
@@ -2567,7 +2565,7 @@ export async function vfsPatchMetadata(
 }
 
 /**
- * Phase 10: toggle the per-file `mode_yjs` bit. Separate from
+ * toggle the per-file `mode_yjs` bit. Separate from
  * `vfsChmod(path, mode: number)` because the wire shape is a
  * boolean, not a POSIX mode number. Setting from 0 → 1 promotes
  * a regular file into yjs mode; the existing bytes (if any) are
@@ -2785,7 +2783,7 @@ export async function vfsRemoveRecursive(
 }
 
 // ───────────────────────────────────────────────────────────────────────
-// Phase 4 — Streams + low-level escape hatch.
+// Streams + low-level escape hatch.
 //
 // Two shapes ship together because they cover different consumer needs:
 //
@@ -2799,7 +2797,7 @@ export async function vfsRemoveRecursive(
 //      / commitWriteStream / abortWriteStream; vfsOpenReadStream /
 //      pullReadStream / closeReadStream). These work from non-Worker
 //      consumers (browsers, third-party clouds calling the HTTP fallback
-//      from Phase 7) and are the spine that the Worker-side stream
+//     from) and are the spine that the Worker-side stream
 //      wrappers reuse internally. They also let callers resume a stream
 //      across separate consumer invocations — important when a single
 //      invocation can't fan out enough chunk fetches to read a 10 GB
@@ -2826,7 +2824,7 @@ export interface VFSWriteHandle {
   /** server-authoritative pool size for placement */
   poolSize: number;
   /**
-   * Phase 13: metadata/tags/version snapshot captured at begin-time and
+   * metadata/tags/version snapshot captured at begin-time and
    * applied at commit-time. Internal-only; not surfaced to SDK consumers
    * (the SDK's `WriteHandle` interface is a structural subset that omits
    * this field). Validated at begin so the caller fails fast — commit
@@ -3109,7 +3107,7 @@ export function vfsBeginWriteStream(
     );
   }
 
-  // Phase 13: validate metadata + tags + version label up front so the
+  // validate metadata + tags + version label up front so the
   // caller fails fast rather than late-at-commit. Validated payload is
   // stashed on the handle and re-applied at commit.
   let metadataEncoded: Uint8Array | null | undefined;
@@ -3272,7 +3270,7 @@ export async function vfsAppendWriteStream(
  * same supersede protocol as vfsWriteFile. The displaced row (if any)
  * is hard-deleted and its chunks are queued for GC.
  *
- * Phase 13: when the handle carries `commitOpts` (metadata/tags/version
+ * when the handle carries `commitOpts` (metadata/tags/version
  * captured at begin-time, validated then), apply them to the tmp row
  * BEFORE commitRename. metadata is written to `files.metadata`; tags
  * are recorded via `replaceTags` (which uses path_id == tmpId, and
@@ -3318,7 +3316,7 @@ export async function vfsCommitWriteStream(
     handle.tmpId
   );
 
-  // Phase 13: apply metadata + tags BEFORE commitRename. The opts
+  // apply metadata + tags BEFORE commitRename. The opts
   // were validated at begin-time so we can write directly.
   const co = handle.commitOpts;
   if (co) {
@@ -3348,7 +3346,7 @@ export async function vfsCommitWriteStream(
     handle.leaf
   );
 
-  // Phase 13: version row creation. Streaming writes don't go through
+  // version row creation. Streaming writes don't go through
   // commitVersion (the versioned write path is content-addressed by
   // hash; streaming uses tmp-file-id refs). For tenants with versioning
   // enabled, we add a post-commit version row capturing the file_hash
@@ -3483,17 +3481,17 @@ export async function vfsCreateWriteStream(
   return { stream, handle };
 }
 
-// ── Phase 16: helper exports for the multipart-upload module ──────────
+// ── helper exports for the multipart-upload module ──────────
 //
 // The multipart upload code in `multipart-upload.ts` shares the same
 // path-resolution + supersede protocol as the streaming-write path
 // (`commitRename`, `hardDeleteFileRow`). Rather than duplicate the
 // logic, we expose a tiny set of named exports the multipart module
 // imports.  Naming follows the existing `*External` pattern from
-// Phase 12 (commitRenameExternal etc).
+// (commitRenameExternal etc).
 
 /**
- * Phase 16: external accessor for `userIdFor`. Same validation, same
+ * external accessor for `userIdFor`. Same validation, same
  * `${tenant}::${sub}` composition.
  */
 export function userIdForExternal(scope: VFSScope): string {
@@ -3501,7 +3499,7 @@ export function userIdForExternal(scope: VFSScope): string {
 }
 
 /**
- * Phase 16: external accessor for `resolveParent`. Returns
+ * external accessor for `resolveParent`. Returns
  * `(parentId, leaf)` tuple for a path's would-be parent.
  */
 export function resolveParentExternal(
@@ -3512,7 +3510,7 @@ export function resolveParentExternal(
   return resolveParent(durableObject, userId, path);
 }
 
-/** Phase 16: external accessor for `poolSizeFor`. */
+/** external accessor for `poolSizeFor`. */
 export function poolSizeForExternal(
   durableObject: UserDO,
   userId: string
@@ -3520,7 +3518,7 @@ export function poolSizeForExternal(
   return poolSizeFor(durableObject, userId);
 }
 
-/** Phase 16: external accessor for `folderExists`. */
+/** external accessor for `folderExists`. */
 export function folderExistsExternal(
   durableObject: UserDO,
   userId: string,
@@ -3530,7 +3528,7 @@ export function folderExistsExternal(
   return folderExists(durableObject, userId, parentId, name);
 }
 
-/** Phase 16: external accessor for `findLiveFile`. */
+/** external accessor for `findLiveFile`. */
 export function findLiveFileExternal(
   durableObject: UserDO,
   userId: string,

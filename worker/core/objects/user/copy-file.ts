@@ -1,5 +1,5 @@
 /**
- * Phase 12: server-side copyFile primitive.
+ * server-side copyFile primitive.
  *
  * Three-tier impl mirrors writeFile:
  *   - Inline-tier: src has `inline_data`. Bytes-only copy. ZERO
@@ -88,7 +88,7 @@ export async function vfsCopyFile(
     );
   }
 
-  // Phase 12 cap pre-validation (mirrors writeFile).
+  // cap pre-validation (mirrors writeFile).
   const validateMod = await import("../../../../shared/metadata-validate");
   let metadataEncoded: Uint8Array | null | undefined;
   if (opts.metadata === null) {
@@ -537,7 +537,7 @@ async function copyVersioned(
       userVisible: opts.versionUserVisible ?? true,
       label: opts.versionLabel,
       metadata: opts.metadataEncoded ?? null,
-      // Phase 15: copy preserves the source's encryption mode + keyId.
+      // copy preserves the source's encryption mode + keyId.
       // The bytes are envelope-stream verbatim; the dest must report
       // the same mode so SDK readFile knows to decrypt.
       encryption: srcHead.encryption,
@@ -630,7 +630,7 @@ async function copyVersioned(
     userVisible: opts.versionUserVisible ?? true,
     label: opts.versionLabel,
     metadata: opts.metadataEncoded ?? null,
-    // Phase 15: see inline branch above. Chunked copy preserves source mode.
+    // see inline branch above. Chunked copy preserves source mode.
     encryption: srcHead.encryption,
   });
   await opsMod.commitRenameExternal(
@@ -686,7 +686,7 @@ async function applyCopySideEffects(
   opts: CopyOpts,
   mtimeMs: number,
   /**
-   * Phase 15: source `files.file_id`. When set, the destination
+   * source `files.file_id`. When set, the destination
    * inherits the source's `(encryption_mode, encryption_key_id)`
    * columns via {@link copyEncryptionStamp}. The bytes were already
    * copied opaquely (envelopes are byte-identical between src and

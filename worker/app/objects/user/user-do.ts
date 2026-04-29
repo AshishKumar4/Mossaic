@@ -22,7 +22,7 @@ import { getQuota, checkQuota, updateUsage } from "./quota";
 import { UserDOCore } from "@core/objects/user/user-do-core";
 
 /**
- * Phase 11: `UserDO` is the App-side subclass of `UserDOCore`. It
+ * `UserDO` is the App-side subclass of `UserDOCore`. It
  * inherits the entire VFS RPC surface (vfsReadFile/Write/Stat/...,
  * versioning, Yjs WebSocket, alarm sweep, rate-limit gates, schema
  * migrations) from Core and ADDS the legacy photo-app HTTP routes
@@ -34,8 +34,8 @@ import { UserDOCore } from "@core/objects/user/user-do-core";
  * keyed by class name so storage on the existing app at
  * mossaic.ashishkumarsingh.com is untouched.
  *
- * The `_legacyFetch` body bytes are byte-identical to the Phase 10
- * pin — see the docstring on the function for the audit hash.
+ * The `_legacyFetch` body bytes are byte-pinned to a sha256 hash
+ * — see the docstring on the function for the audit hash.
  */
 export class UserDO extends UserDOCore {
   /**
@@ -51,7 +51,7 @@ export class UserDO extends UserDOCore {
   }
 
   /**
-   * Phase 10 + 11: legacy photo-app HTTP handler. The BODY bytes
+   * Legacy photo-app HTTP handler. The BODY bytes
    * (lines 70..263 inclusive — between the opening `{` and the
    * closing `}` of `_legacyFetch`) are byte-pinned at sha256
    * `4c6eb84925cd8b34298aa92a5201c6e8074defb4527c3bbb1d2c677f9f2c8e70`.

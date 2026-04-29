@@ -1,5 +1,5 @@
 /**
- * Phase 16 — multipart parallel transfer CLI commands.
+ * multipart parallel transfer CLI commands.
  *
  *   mossaic upload <local> <remote> [--concurrency=N] [--no-endgame]
  *     Streams a local file to the remote VFS path via the
@@ -22,7 +22,7 @@
  * All commands route through the shared `withClient` helper so they
  * speak the same Bearer-token-auth + endpoint resolution as the
  * existing `put`/`get` verbs. The HTTP client (`HttpVFS`) already
- * implements the Phase 16 wire calls — we just reach into it.
+ * implements the wire calls — we just reach into it.
  */
 
 import type { Command } from "commander";
@@ -113,7 +113,7 @@ export function registerTransfer(program: Command): void {
   const up = program
     .command("upload <local> <remote>")
     .description(
-      "parallel multipart upload of a local file to a remote VFS path (Phase 16)"
+      "parallel multipart upload of a local file to a remote VFS path"
     )
     .option("--concurrency <n|MIN:INIT:MAX>", "parallelism budget (default 4:64:64)")
     .option("--initial-concurrency <n>", "initial lane count")
@@ -197,7 +197,7 @@ export function registerTransfer(program: Command): void {
   const dn = program
     .command("download <remote> <local>")
     .description(
-      "parallel multipart download of a remote VFS path to a local file (Phase 16). Use '-' for stdout."
+      "parallel multipart download of a remote VFS path to a local file. Use '-' for stdout."
     )
     .option("--concurrency <n|MIN:INIT:MAX>", "parallelism budget (default 4:64:64)")
     .option("--initial-concurrency <n>", "initial lane count")

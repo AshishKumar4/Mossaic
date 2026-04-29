@@ -2,20 +2,20 @@ import { describe, it, expect } from "vitest";
 import { env } from "cloudflare:test";
 
 /**
- * Phase 1 — Legacy round-trip smoke.
+ * App-mode round-trip smoke.
  *
- * Drives the existing pre-VFS flow end-to-end through UserDO + ShardDO
- * after the schema migrations have been applied:
+ * Drives the photo-app upload/download flow end-to-end through UserDO +
+ * ShardDO:
  *   1. signup → user
  *   2. /files/create → fileId
  *   3. ShardDO PUT /chunk
  *   4. /files/chunk (record)
  *   5. /files/complete
- *   6. /files/manifest → assert chunks + new optional fields default safely
+ *   6. /files/manifest → assert chunks + optional fields default safely
  *   7. ShardDO GET /chunk/<hash> → assert original bytes
  *
- * This proves the Phase 1 schema additions do not break the existing
- * upload/download pipeline that the user-facing app depends on.
+ * Smoke test that the photo-app upload/download pipeline through
+ * UserDO + ShardDO is functional.
  */
 
 interface Env {
@@ -34,7 +34,7 @@ async function sha256Hex(data: Uint8Array): Promise<string> {
     .join("");
 }
 
-describe("Legacy upload/download round-trip after Phase 1 migrations", () => {
+describe("App-mode upload/download round-trip", () => {
   it("uploads a single-chunk file and reads it back via manifest + ShardDO", async () => {
     const userId = "smoke-user";
     const shardIdx = 0;

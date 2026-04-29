@@ -1,5 +1,5 @@
 /**
- * Phase 12: HMAC-signed opaque cursor codec for listFiles
+ * HMAC-signed opaque cursor codec for listFiles
  * pagination.
  *
  * Wire shape (post base64-url decode):

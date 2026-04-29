@@ -1,5 +1,5 @@
 /**
- * Phase 15 — opt-in end-to-end encryption primitives.
+ * opt-in end-to-end encryption primitives.
  *
  * Pure WebCrypto. NO userspace crypto libraries (no crypto-js, tweetnacl,
  * libsodium, node-forge, node:crypto). Every primitive is a thin wrapper

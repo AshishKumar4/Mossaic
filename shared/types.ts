@@ -24,7 +24,7 @@ export interface FileManifest {
   chunks: ChunkSpec[];
   createdAt: number;
   // ── VFS additions (sdk-impl-plan §3.1, §11) ──
-  // All optional and absent on legacy rows / legacy clients. Phase 2 read
+  // All optional and absent on legacy rows / legacy clients. read
   // paths consult these to short-circuit on inlined files and surface
   // symlinks. Existing consumers (download.ts, gallery.ts) ignore them.
   /** POSIX file mode (defaults to 0o644 / 420 in the schema). */
@@ -276,7 +276,7 @@ export interface SharedAlbumPhotosResponse {
 
 // ── Env Bindings (Worker) ──
 //
-// Phase 13: canonical binding names are `MOSSAIC_USER` and `MOSSAIC_SHARD`
+// canonical binding names are `MOSSAIC_USER` and `MOSSAIC_SHARD`
 // (prefixed for consumer-env safety). `SEARCH_DO` is App-mode only and not
 // part of the SDK contract — consumers in library mode never see it.
 //

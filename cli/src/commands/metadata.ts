@@ -1,5 +1,6 @@
 /**
- * Phase 12 commands: meta patch, find (listFiles).
+ * Metadata operations: `meta patch` (vfs.patchMetadata) and `find`
+ * (vfs.listFiles indexed query). Both surfaces are metadata-driven.
  */
 
 import type { Command } from "commander";
@@ -8,7 +9,7 @@ import { formatFindItems, parseMetadataFlag } from "../format.js";
 import { TAGS_MAX_PER_LIST_QUERY, LIST_LIMIT_MAX } from "@mossaic/sdk/http";
 import { readFile as fsReadFile } from "node:fs/promises";
 
-export function registerPhase12(program: Command): void {
+export function registerMetadata(program: Command): void {
   // meta patch
   const meta = program.command("meta").description("metadata + tag operations");
   const patch = meta

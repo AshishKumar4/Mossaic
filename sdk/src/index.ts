@@ -47,7 +47,7 @@ export {
   type VersionMarkOpts,
 } from "./vfs";
 
-// Phase 12: cap constants — surfaced for client-side pre-validation
+// cap constants — surfaced for client-side pre-validation
 // + so consumers know the limits without reading the README.
 export {
   METADATA_MAX_BYTES,
@@ -72,7 +72,7 @@ export {
   EROFS,
   ENOTEMPTY,
   EAGAIN,
-  // Phase 15: encryption-surface error classes.
+  // encryption-surface error classes.
   EBADF,
   ENOTSUP,
   MossaicUnavailableError,
@@ -80,7 +80,7 @@ export {
   type VFSErrorCode,
 } from "./errors";
 
-// Phase 15: encryption types are re-exported from the main entry for
+// encryption types are re-exported from the main entry for
 // convenient `import { type EncryptionConfig } from "@mossaic/sdk"`.
 // The runtime helpers (encrypt/decrypt) stay on the `/encryption` lazy
 // chunk to avoid pulling crypto code into bundles that don't need it.
@@ -100,19 +100,19 @@ export type {
 // their own entry module — wrangler resolves DO bindings via the
 // consumer's main module's exports, not via npm dep graph.
 //
-// Phase 11: re-export the Core class as `UserDO` so consumer Workers
+// re-export the Core class as `UserDO` so consumer Workers
 // can continue to declare `class_name: "UserDO"` in their wrangler
 // without any change. The class itself is `UserDOCore` in the
 // production tree (worker/core/objects/user/user-do-core.ts);
 // aliasing on export preserves the SDK's public API contract.
 //
-// Phase 11.1: SearchDO is intentionally NOT re-exported. It backed
+// SearchDO is intentionally NOT re-exported. It backed
 // the photo-library's CLIP/BGE vector search, which is not part of
 // the SDK's pure-VFS contract. Consumers who need semantic search
 // should run their own Vectorize index or DO; nothing in the VFS
 // surface (UserDO + ShardDO) depends on SearchDO.
 //
-// Phase 14: ALSO re-export under the canonical `MossaicUserDO` /
+// ALSO re-export under the canonical `MossaicUserDO` /
 // `MossaicShardDO` names. Both pairs reach the same underlying
 // class; new workspace consumers should prefer the canonical
 // names so their wrangler `class_name` strings clearly identify
@@ -137,7 +137,7 @@ export type { VFSScope } from "../../shared/vfs-types";
 // Token issuance helpers (operator-side; needs JWT_SECRET in env).
 export { issueVFSToken, verifyVFSToken, type VFSTokenPayload } from "./auth";
 
-// HTTP fallback for non-Worker consumers (Phase 7).
+// HTTP fallback for non-Worker consumers.
 export {
   createMossaicHttpClient,
   HttpVFS,
@@ -145,7 +145,7 @@ export {
   type VFSClient,
 } from "./http";
 
-// Phase 16: parallel multipart transfer engine. Built on top of the
+// parallel multipart transfer engine. Built on top of the
 // HTTP client; saturates user bandwidth via N-way parallel chunk
 // uploads/downloads while keeping UserDO touches limited to session
 // boundaries (begin + finalize).
@@ -168,12 +168,12 @@ export {
   type MossaicHttpClient,
 } from "./transfer";
 
-// isomorphic-git adapter (Phase 8: optional batched-lstat). Re-exported
+// isomorphic-git adapter (optional batched-lstat). Re-exported
 // from the root for ergonomic single-import use; also available via
 // the explicit `@mossaic/sdk/fs` subpath.
 export { createIgitFs, type CreateIgitFsOptions } from "./igit";
 
-// Phase 10: yjs-mode bit constant. The runtime adapter (openYDoc,
+// yjs-mode bit constant. The runtime adapter (openYDoc,
 // YDocHandle) lives at the `@mossaic/sdk/yjs` subpath so the main
 // bundle stays free of the optional `yjs` peer dep — only consumers
 // that import `@mossaic/sdk/yjs` pay for the runtime.

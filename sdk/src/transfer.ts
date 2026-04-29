@@ -1,5 +1,5 @@
 /**
- * @mossaic/sdk — Phase 16 multipart parallel transfer engine.
+ * @mossaic/sdk — multipart parallel transfer engine.
  *
  * BitTorrent-class throughput for VFS uploads & downloads. Splits a
  * source file into adaptive chunks, hashes each, and PUTs them in
@@ -10,7 +10,7 @@
  * Design invariants (preserved from server-side plan §1):
  *   1. UserDO touched only at session boundaries (`begin` + `finalize`).
  *   2. Per-chunk PUT does ONE ShardDO RPC; no UserDO involvement.
- *   3. Phase 15 encryption composes per-chunk: each plaintext chunk is
+ *  3. encryption composes per-chunk: each plaintext chunk is
  *      sealed independently and the envelope is what the server hashes.
  *   4. Backward-compatible: existing `writeFile`/`readFile` are
  *      preserved; this module is additive.
@@ -29,7 +29,7 @@ import type { HttpVFS } from "./http";
 import { mapServerError, MossaicUnavailableError } from "./errors";
 
 /**
- * Public client alias. The Phase 16 transfer engine is a method
+ * Public client alias. The transfer engine is a method
  * surface on top of `HttpVFS`; the alias makes the binding shape
  * intent clearer at call sites.
  */
@@ -78,7 +78,7 @@ export interface ParallelUploadOpts extends Omit<BeginUploadOpts, "size" | "sign
   /** Cancel the in-flight upload. Triggers `abortUpload` on the server. */
   signal?: AbortSignal;
   /**
-   * Optional per-chunk transformer. Phase 15 encryption uses this to
+   * Optional per-chunk transformer. encryption uses this to
    * seal each plaintext chunk into an envelope BEFORE the engine
    * hashes and PUTs it. Called once per chunk index, in arbitrary
    * order; must be deterministic given (idx, plaintext) — the same
@@ -108,7 +108,7 @@ export interface ParallelDownloadOpts {
   endgameMaxFanout?: number;
   signal?: AbortSignal;
   onProgress?: (e: ProgressEvent) => void;
-  /** Optional per-chunk transformer (e.g. Phase 15 unseal). */
+  /** Optional per-chunk transformer (e.g. unseal). */
   chunkTransform?: (
     envelope: Uint8Array,
     idx: number
@@ -230,7 +230,7 @@ function quantile(arr: number[], q: number): number {
 /**
  * High-level parallel upload. Splits `source` into chunks of the
  * server-authoritative size, runs an adaptive concurrency engine,
- * and triggers endgame mode in the tail. Phase 15 encryption is
+ * and triggers endgame mode in the tail. encryption is
  * supported via `opts.chunkTransform` (apply seal per-chunk) — the
  * engine treats the transformed bytes as opaque and the server
  * hashes whatever arrives, exactly as the plan §7 specifies.
@@ -543,7 +543,7 @@ function sleep(ms: number): Promise<void> {
 
 /**
  * Download a file in parallel, hash-verifying each chunk against the
- * server-supplied manifest. Phase 15 decryption flows via
+ * server-supplied manifest. decryption flows via
  * `opts.chunkTransform` (unseal per-chunk envelope).
  *
  * Strategy:
@@ -605,7 +605,7 @@ export async function parallelDownload(
   };
 
   // Pre-allocate per-chunk slots. When `chunkTransform` is used (e.g.
-  // Phase 15 unseal), each chunk's POST-transform size is unknown
+  // unseal), each chunk's POST-transform size is unknown
   // until the transform runs — envelopes are larger than plaintext.
   // We collect transformed-bytes into a per-index slot and concat at
   // the end. Without `chunkTransform`, we still concat per-index for
@@ -779,7 +779,7 @@ export async function parallelDownload(
  *    contiguous bytes.
  *  - Hash verification per chunk happens server-on-receive, exactly
  *    as in `parallelDownload`. A divergence aborts the stream.
- *  - Phase 15 encryption: `opts.chunkTransform` runs on every
+ * - encryption: `opts.chunkTransform` runs on every
  *    chunk before emit. Decryption is therefore concurrent with
  *    further downloads.
  *  - Backpressure: if the consumer reads slowly, the reorder

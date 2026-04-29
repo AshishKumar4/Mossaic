@@ -227,7 +227,7 @@ export class HttpVFS implements VFSClient {
       );
       return;
     }
-    // Bytes path — Phase 13: when opts include metadata/tags/version,
+    // Bytes path — when opts include metadata/tags/version,
     // switch to multipart/form-data so the meta payload rides along
     // with the binary bytes. Without those opts we keep the legacy
     // octet-stream envelope (smaller, no FormData allocation).
@@ -407,7 +407,7 @@ export class HttpVFS implements VFSClient {
     return new Uint8Array(await res.arrayBuffer());
   }
 
-  // ── Phase 9: versioning ───────────────────────────────────────────────
+  // ── versioning ───────────────────────────────────────────────
   // The HTTP fallback router (worker/routes/vfs.ts) gains matching
   // POST endpoints. Wire-shape mirrors the binding-client surface:
   // listVersions returns VersionInfo[] with `id`; restoreVersion
@@ -462,7 +462,7 @@ export class HttpVFS implements VFSClient {
     return (await res.json()) as { dropped: number; kept: number };
   }
 
-  // ── Phase 12 ──────────────────────────────────────────────────────────
+  // ── ──────────────────────────────────────────────────────────
 
   async patchMetadata(
     p: string,
@@ -538,7 +538,7 @@ export class HttpVFS implements VFSClient {
     );
   }
 
-  // ── Phase 16: multipart parallel transfer ───────────────────────────
+  // ── multipart parallel transfer ───────────────────────────
   //
   // Thin wire helpers used by `sdk/src/transfer.ts`. They speak the
   // shapes declared in `shared/multipart.ts`. Each method maps 1:1 to

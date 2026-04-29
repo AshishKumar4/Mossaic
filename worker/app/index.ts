@@ -14,13 +14,13 @@ import vfsRoutes from "@core/routes/vfs";
 import yjsWsRoutes from "@core/routes/vfs-yjs-ws";
 import multipartRoutes, { chunkDownload } from "@core/routes/multipart-routes";
 
-// Phase 11: UserDO is the App-side subclass that adds the legacy
+// UserDO is the App-side subclass that adds the legacy
 // photo-app HTTP routes on top of UserDOCore. Production wrangler
 // binds class_name: "UserDO" — the class name preserved verbatim
-// from Phase 10. ShardDO is a pure-Core class re-exported through
+// from. ShardDO is a pure-Core class re-exported through
 // this entry so wrangler can resolve both from one main file.
 //
-// Phase 11.1: SearchDO is App-only (CLIP/BGE vector store backing
+// SearchDO is App-only (CLIP/BGE vector store backing
 // the photo-library's /api/search route). It moved from
 // `worker/core/objects/search/` to `worker/app/objects/search/`
 // and is no longer re-exported from `@mossaic/sdk` — SDK consumers
@@ -46,7 +46,7 @@ app.use(
       "X-Chunk-Index",
       "X-Shard-Index",
       "X-User-Id",
-      // Phase 16
+      //
       "X-Session-Token",
     ],
   })
@@ -62,18 +62,18 @@ app.route("/api/analytics", analyticsRoutes);
 app.route("/api/gallery", galleryRoutes);
 app.route("/api/shared", sharedRoutes);
 app.route("/api/search", searchRoutes);
-// Phase 13.5: public Yjs WebSocket upgrade. Mounted BEFORE
+// public Yjs WebSocket upgrade. Mounted BEFORE
 // /api/vfs so the more-specific path wins. Bearer-auth gated;
 // the photo-app's /api/upload, /api/download, etc. are unaffected.
 app.route("/api/vfs/yjs", yjsWsRoutes);
-// Phase 16: multipart parallel transfer engine. Mounted BEFORE the
+// multipart parallel transfer engine. Mounted BEFORE the
 // general /api/vfs HTTP fallback so /api/vfs/multipart/* takes
 // precedence.
 app.route("/api/vfs/multipart", multipartRoutes);
-// Phase 16: cacheable per-chunk download endpoint at
+// cacheable per-chunk download endpoint at
 // /api/vfs/chunk/:fileId/:idx — token-auth, immutable cache.
 app.route("/api/vfs", chunkDownload);
-// Phase 7: HTTP fallback for non-Worker consumers of the @mossaic/sdk.
+// HTTP fallback for non-Worker consumers of the @mossaic/sdk.
 // Auth via Bearer VFS token (signVFSToken / verifyVFSToken). Routes
 // translate HTTP → typed UserDO RPC. The legacy app's /api/* surface
 // above is unaffected.

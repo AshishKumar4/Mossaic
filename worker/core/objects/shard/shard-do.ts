@@ -43,7 +43,7 @@ export class ShardDO extends DurableObject<Env> {
 
     // ── VFS GC bookkeeping (sdk-impl-plan §3.2, §8.3) ──────────────────────
     // deleted_at marks chunks pending hard-delete. Set when ref_count first
-    // hits 0; the alarm sweeper (Phase 3) hard-deletes after a grace
+    // hits 0; the alarm sweeper hard-deletes after a grace
     // period. NULL = live. Idempotent ALTER guarded by try/catch like
     // search-do.ts:59-68.
     try {
@@ -61,7 +61,7 @@ export class ShardDO extends DurableObject<Env> {
         ON chunk_refs(file_id)
     `);
 
-    // ── Phase 16: multipart staging table ───────────────────────────────
+    // ── multipart staging table ───────────────────────────────
     //
     // Records `(upload_id, chunk_index)` → `chunk_hash` for each chunk
     // landed during a multipart upload. The chunk bytes themselves
@@ -156,7 +156,7 @@ export class ShardDO extends DurableObject<Env> {
       // Legacy HTTP shape — kept for back-compat. The body now reflects
       // soft-mark semantics: bytes are not freed synchronously, they are
       // marked for the alarm sweeper. No current route actually invokes
-      // this endpoint (verified Phase 1); the public DO RPC is preferred.
+      // this endpoint (verified); the public DO RPC is preferred.
       if (path.startsWith("/refs/") && request.method === "DELETE") {
         const fileId = path.split("/")[2];
         const result = await this.removeFileRefs(fileId);
@@ -166,7 +166,7 @@ export class ShardDO extends DurableObject<Env> {
         });
       }
 
-      // ── Phase 16: multipart staging endpoints ─────────────────────────
+      // ── multipart staging endpoints ─────────────────────────
       //
       // Internal HTTP shapes used by UserDO finalize/abort to query
       // the staging table this shard accumulated during the upload.
@@ -236,7 +236,7 @@ export class ShardDO extends DurableObject<Env> {
   // typed return.
   //
   // Refcount semantics are identical to the HTTP route — they share
-  // writeChunkInternal so the dedup-drift fix (Phase 1) applies to
+  // writeChunkInternal so the dedup-drift fix applies to
   // both paths.
   async putChunk(
     chunkHash: string,
@@ -255,7 +255,7 @@ export class ShardDO extends DurableObject<Env> {
     );
   }
 
-  // ── Phase 16: multipart staging-aware put ────────────────────────────
+  // ── multipart staging-aware put ────────────────────────────
   //
   // Same semantics as `putChunk` PLUS:
   //   - records `(upload_id, chunk_index)` → hash in `upload_chunks` so
@@ -374,7 +374,7 @@ export class ShardDO extends DurableObject<Env> {
   }
 
   /**
-   * Phase 16: read the staging manifest for a given upload_id. Used by
+   * read the staging manifest for a given upload_id. Used by
    * UserDO finalize to verify chunk completeness across all touched
    * shards. Read-only; never mutates state.
    */
@@ -392,7 +392,7 @@ export class ShardDO extends DurableObject<Env> {
   }
 
   /**
-   * Phase 16: read just the landed-chunk indices. Cheaper than the
+   * read just the landed-chunk indices. Cheaper than the
    * full manifest — used by status / resume probe.
    */
   async getMultipartLanded(
@@ -409,7 +409,7 @@ export class ShardDO extends DurableObject<Env> {
   }
 
   /**
-   * Phase 16: drop staging rows for an upload_id. DOES NOT touch
+   * drop staging rows for an upload_id. DOES NOT touch
    * `chunk_refs` — that's the finalize/abort caller's job (finalize
    * keeps refs alive; abort calls `deleteChunks(uploadId)`).
    */
@@ -434,7 +434,7 @@ export class ShardDO extends DurableObject<Env> {
    * Shared write path used by both the legacy HTTP PUT /chunk route and
    * the new putChunk RPC. Implements:
    *   - dedup: existing hash → INSERT OR IGNORE chunk_refs, conditional
-   *     ref_count++ via SELECT changes() (Phase 1 fix), clear deleted_at
+   *    ref_count++ via SELECT changes() (fix), clear deleted_at
    *     on resurrection
    *   - cold path: INSERT INTO chunks + chunk_refs, update capacity
    *

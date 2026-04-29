@@ -111,7 +111,7 @@ class BatchedLstatFs implements VFSClient {
     }>
   > = new Map();
   private timer: ReturnType<typeof setTimeout> | null = null;
-  // Phase 14: explicit fields instead of constructor parameter
+  // explicit fields instead of constructor parameter
   // properties — `erasableSyntaxOnly` (TS 5.8+) rejects the
   // shorthand because `private readonly foo: T` in a constructor
   // signature emits runtime field initializers.
@@ -237,7 +237,7 @@ class BatchedLstatFs implements VFSClient {
     chunkIndex: number,
     range?: { start?: number; end?: number }
   ) { return this.inner.pullReadStream(handle, chunkIndex, range); }
-  // Phase 9 versioning pass-through.
+  // versioning pass-through.
   listVersions(p: string, opts?: Parameters<VFSClient["listVersions"]>[1]) {
     return this.inner.listVersions(p, opts);
   }
@@ -250,7 +250,7 @@ class BatchedLstatFs implements VFSClient {
   ) {
     return this.inner.dropVersions(p, policy);
   }
-  // Phase 12 pass-throughs.
+  // pass-throughs.
   patchMetadata(
     p: string,
     patch: Parameters<VFSClient["patchMetadata"]>[1],

@@ -61,7 +61,7 @@ export type {
   DropVersionsPolicy,
 } from "./vfs";
 
-// Phase 12 cap constants — surfaced for client-side pre-validation.
+// cap constants — surfaced for client-side pre-validation.
 export {
   METADATA_MAX_BYTES,
   TAGS_MAX_PER_FILE,
@@ -80,7 +80,7 @@ export { issueVFSToken, verifyVFSToken, type VFSTokenPayload } from "./auth";
 // Re-export shared scope shape for typed scopes in client code.
 export type { VFSScope } from "../../shared/vfs-types";
 
-// Phase 16: parallel multipart transfer engine.
+// parallel multipart transfer engine.
 export {
   parallelUpload,
   parallelDownload,

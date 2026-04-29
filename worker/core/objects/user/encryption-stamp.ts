@@ -1,5 +1,5 @@
 /**
- * Phase 15: server-side encryption metadata helpers.
+ * server-side encryption metadata helpers.
  *
  * The Mossaic server NEVER decrypts user data. These helpers manage the
  * `encryption_mode` + `encryption_key_id` columns on `files` and
@@ -35,7 +35,7 @@ export interface EncryptionStampOpts {
 
 /**
  * Per-row encryption columns, as read from the `files` table.
- * NULL `mode` means plaintext (Pre-Phase-15 default).
+ * NULL `mode` means plaintext (pre-encryption default).
  */
 export interface FileEncryptionRow {
   encryption_mode: string | null;
@@ -69,7 +69,7 @@ export function validateEncryptionOpts(
 
 /**
  * Read existing encryption columns for a file row. Returns NULL columns
- * when the file pre-dates Phase 15 (plaintext).
+ * when the file pre-dates (plaintext).
  */
 export function readEncryptionRow(
   durableObject: UserDO,

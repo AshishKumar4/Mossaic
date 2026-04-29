@@ -1,5 +1,5 @@
 /**
- * Phase 15 — opt-in end-to-end encryption (SDK-side).
+ * opt-in end-to-end encryption (SDK-side).
  *
  * This module is loaded LAZILY via `await import("./encryption")` from
  * vfs.ts. Consumers who never set `encryption` on createVFS pay zero
@@ -23,7 +23,7 @@ import {
   hexToBytes,
 } from "@shared/encryption";
 
-// Phase 15: re-export the pure WebCrypto primitives so consumers
+// re-export the pure WebCrypto primitives so consumers
 // (notably `@mossaic/cli`) can build envelopes directly without
 // going through the VFS surface. These are the same functions used
 // by `encryptPayload` / `decryptPayload` below.

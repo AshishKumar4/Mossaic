@@ -134,7 +134,7 @@ function errToResponse(err: unknown): { status: number; body: { code: string; me
     EINVAL: 400,
     EMOSSAIC_UNAVAILABLE: 503,
     EAGAIN: 429,
-    // Phase 15 — encryption error surface.
+    // encryption error surface.
     // EBADF: writeFile attempted to mix encryption modes within a
     //   single path's history, OR write plaintext to an encrypted
     //   path. 409 (Conflict) matches the EISDIR / EEXIST family.
@@ -184,12 +184,12 @@ vfs.post("/readFile", async (c) => {
     const body = await c.req.json<{
       path: string;
       encoding?: "utf8";
-      // Phase 13.5: optional historical-version selector. Pairs with
+      // optional historical-version selector. Pairs with
       // CLI `cat --version <id>`.
       versionId?: string;
     }>();
     const path = expectPath(body);
-    // Phase 15: surface encryption metadata via response header so the
+    // surface encryption metadata via response header so the
     // HTTP-fallback consumer knows whether to decrypt the bytes. The
     // server NEVER decrypts; it just reports the per-file
     // encryption_mode + encryption_key_id from `stat`.
@@ -312,7 +312,7 @@ vfs.post("/readManyStat", async (c) => {
 
 vfs.post("/writeFile", async (c) => {
   try {
-    // Three body shapes (Phase 13):
+    // Three body shapes:
     //   - application/json: { path, encoding: "utf8", data: <string>,
     //                         mode?, mimeType?, metadata?, tags?, version? }
     //   - application/octet-stream + ?path=...: raw bytes; path comes
@@ -324,7 +324,7 @@ vfs.post("/writeFile", async (c) => {
     //                          { mode?, mimeType?, metadata?, tags?, version? }.
     //     This is the parity path with the binding-mode `writeFile`.
     const ct = c.req.header("Content-Type") ?? "";
-    // Phase 15: parse `X-Mossaic-Encryption` header, applies to all
+    // parse `X-Mossaic-Encryption` header, applies to all
     // body-shape branches (octet-stream / multipart / json). The
     // header value is JSON `{ mode, keyId? }`.
     const encryptionHeader = c.req.header("X-Mossaic-Encryption");
@@ -455,7 +455,7 @@ vfs.post("/writeFile", async (c) => {
       metadata: body.metadata,
       tags: body.tags,
       version: body.version,
-      // Phase 15: header > body precedence (no body field for JSON path
+      // header > body precedence (no body field for JSON path
       // — JSON writeFile is for plaintext text only; encryption uses
       // the header).
       ...(httpEncryption !== undefined
@@ -564,7 +564,7 @@ vfs.post("/symlink", async (c) => {
   }
 });
 
-// Phase 13.5 — setYjsMode HTTP endpoint. Required by the @mossaic/cli
+// setYjsMode HTTP endpoint. Required by the @mossaic/cli
 // `yjs init` command. The DO method is binding-only by default; we
 // surface it here so external clients (Node CLI, scripts) can promote
 // a file to yjs-mode without holding a DO stub. Demoting back to plain
@@ -588,7 +588,7 @@ vfs.post("/setYjsMode", async (c) => {
   }
 });
 
-// Phase 13.5 — admin: enable/disable per-tenant versioning. Operator-
+// admin: enable/disable per-tenant versioning. Operator-
 // class RPC; Bearer-gated like the rest of /api/vfs/*. The userId
 // argument is derived from the verified scope (tenant + optional sub),
 // not from the request body — cross-tenant manipulation is impossible.
@@ -616,7 +616,7 @@ vfs.post("/admin/setVersioning", async (c) => {
   }
 });
 
-// Phase 13.5 — flushYjs HTTP endpoint. Triggers a Yjs compaction
+// flushYjs HTTP endpoint. Triggers a Yjs compaction
 // whose checkpoint emits a USER-VISIBLE Mossaic version row (when
 // versioning is enabled). Symmetric with the binding-mode
 // `YDocHandle.flush({ label })` surface.
@@ -634,7 +634,7 @@ vfs.post("/flushYjs", async (c) => {
   }
 });
 
-// Phase 13.5 — patchMetadata HTTP endpoint already exists above (PATCH
+// patchMetadata HTTP endpoint already exists above (PATCH
 // /metadata + POST /patchMetadata). Kept here as a comment for grep
 // continuity.
 
@@ -693,7 +693,7 @@ vfs.post("/readChunk", async (c) => {
   }
 });
 
-// ── Phase 9: versioning ────────────────────────────────────────────────
+// ── versioning ────────────────────────────────────────────────
 
 vfs.post("/listVersions", async (c) => {
   try {
@@ -709,8 +709,8 @@ vfs.post("/listVersions", async (c) => {
       userVisibleOnly: body.userVisibleOnly,
       includeMetadata: body.includeMetadata,
     });
-    // Map server VersionRow → public VersionInfo. Phase 12 surfaces
-    // label + userVisible; Phase 13.5 propagates them through the
+    // Map server VersionRow → public VersionInfo. surfaces
+    // label + userVisible; propagates them through the
     // HTTP fallback so external consumers (CLI, etc.) see the same
     // shape as binding-mode callers.
     const versions = rows.map((r) => ({
@@ -781,7 +781,7 @@ vfs.post("/dropVersions", async (c) => {
   }
 });
 
-// ── Phase 12: copyFile, metadata, listFiles, version-mark ──────────────
+// ── copyFile, metadata, listFiles, version-mark ──────────────
 
 const copyFileHandler = async (
   c: import("hono").Context<{ Bindings: Env; Variables: { scope: VFSScope } }>

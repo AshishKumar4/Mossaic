@@ -1,5 +1,5 @@
 /**
- * Phase 16 — Multipart parallel transfer engine, server-side.
+ * Multipart parallel transfer engine, server-side.
  *
  * This module implements three UserDO RPCs:
  *
@@ -162,7 +162,7 @@ export async function vfsBeginMultipart(
       `beginMultipart: target is a directory: ${path}`
     );
   }
-  // Phase 15: enforce mode-history-monotonic across multipart writes,
+  // enforce mode-history-monotonic across multipart writes,
   // exactly as `vfsWriteFile` does.
   const incomingEncryption: EncryptionStampOpts | undefined = opts.encryption
     ? { mode: opts.encryption.mode, keyId: opts.encryption.keyId }
