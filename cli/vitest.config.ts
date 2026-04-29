@@ -6,6 +6,13 @@ import { defineConfig } from "vitest/config";
  * HTTP/WSS to a real deployed Mossaic Service worker.
  */
 export default defineConfig({
+  // Resolve @mossaic/sdk subpaths via the "workspace" condition (TS source)
+  // — matches the SDK's package.json conditional exports added in Phase 14.
+  // Without this, Vite falls through to ./dist/*.js which doesn't exist
+  // until `pnpm -F @mossaic/sdk build` has been run.
+  resolve: {
+    conditions: ["workspace", "import", "module", "browser", "default"],
+  },
   test: {
     include: ["tests/**/*.test.ts"],
     testTimeout: 60_000,
