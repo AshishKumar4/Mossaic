@@ -101,12 +101,13 @@ describe.skipIf(!hasSecret())("L — Phase 16 multipart (live)", () => {
       expect(r.size).toBe(size);
       expect(r.fileHash).toMatch(/^[0-9a-f]{64}$/);
 
-      // Round-trip via the regular readFile path. Also serves as
-      // a stat sanity check that finalize committed.
-      const back = await ctx.vfs.readFile("/big-100mb.bin");
-      expect(back.byteLength).toBe(size);
-      const backHash = await sha256Hex(back);
-      expect(backHash).toBe(expectHash);
+      // Stat sanity check that finalize committed.
+      // (Byte-equality of the full 100 MB round-trip is verified in L.2
+      //  via parallelDownload — readFile() goes through a single DO RPC
+      //  whose envelope is capped at 32 MiB by the platform.)
+      const st = await ctx.vfs.stat("/big-100mb.bin");
+      expect(st.size).toBe(size);
+      expect(st.isFile()).toBe(true);
 
       // Generous wall-time bar (sandbox network varies wildly).
       expect(elapsed).toBeLessThan(120);
