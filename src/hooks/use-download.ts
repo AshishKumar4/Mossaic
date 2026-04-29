@@ -1,14 +1,38 @@
 import { useState, useCallback } from "react";
-import { api } from "@/lib/api";
-// Phase 17: import the AIMD primitive from `@mossaic/sdk/http` (the
-// browser-safe entry — omits Worker-only DO classes). Same
-// implementation as before; the SDK re-exports `AIMDController` for
-// consumers who can't reach into `@shared/*` directly.
-import { AIMDController } from "@mossaic/sdk/http";
-import { MAX_RETRIES, RETRY_BASE_DELAY } from "@shared/constants";
+import {
+  parallelDownload,
+  type ChunkEvent,
+  type ManifestEvent,
+  type TransferProgressEvent,
+} from "@mossaic/sdk/http";
+import { getTransferClient } from "@/lib/transfer-client";
+import { pathFromFileId } from "@/lib/path-utils";
 import { addTransferStats } from "@/lib/transfer-stats";
-import type { TransferProgress, ChunkProgress, ChunkStatus, CompletedTransferStats } from "@app/types";
+import type {
+  TransferProgress,
+  ChunkProgress,
+  ChunkStatus,
+  CompletedTransferStats,
+} from "@app/types";
 
+/**
+ * Phase 17.6 — SPA download hook.
+ *
+ * Collapsed onto `@mossaic/sdk` 's `parallelDownload`. The previous
+ * implementation (~205 LoC of AIMD/processChunk/worker/scaleInterval/
+ * endgame/blob-reassembly machinery) is replaced by:
+ *
+ *  1. `parallelDownload(client, fileId, opts)` — drives the entire
+ *     transfer; returns a `Uint8Array` of the full file content.
+ *  2. `onManifest` → seeds `ChunkProgress[]` UI state + captures
+ *     `mimeType` for the eventual `Blob` construction.
+ *  3. `onChunkEvent` → maps SDK lifecycle events to `ChunkProgress`
+ *     state flips (per-chunk grid).
+ *  4. `onProgress` → maps to bytesTransferred/throughputBps/
+ *     activeConcurrency aggregate counters.
+ *
+ * The hook's external surface is preserved 1:1.
+ */
 export function useDownload() {
   const [transfers, setTransfers] = useState<Map<string, TransferProgress>>(
     new Map()
@@ -33,253 +57,148 @@ export function useDownload() {
 
   const downloadFile = useCallback(
     async (fileId: string, fileName: string) => {
-      const manifest = await api.getManifest(fileId);
-      const chunkCount = manifest.chunks.length;
-
-      const chunks: ChunkProgress[] = manifest.chunks.map((c) => ({
-        index: c.index,
-        status: "pending" as ChunkStatus,
-        bytesTransferred: 0,
-        size: c.size,
-      }));
-
       const startedAt = Date.now();
-      const progress: TransferProgress = {
-        fileId,
-        fileName,
-        direction: "download",
-        totalChunks: chunkCount,
-        completedChunks: 0,
-        failedChunks: 0,
-        bytesTransferred: 0,
-        bytesTotal: manifest.fileSize,
-        activeConcurrency: 0,
-        throughputBps: 0,
-        estimatedRemainingMs: 0,
-        chunks,
-        startedAt,
-      };
-
-      setTransfers((prev) => new Map(prev).set(fileId, progress));
-
-      // -- AIMD-controlled download --
-      const controller = new AIMDController();
-      const buffers: ArrayBuffer[] = new Array(chunkCount);
-      const chunkDone: boolean[] = new Array(chunkCount).fill(false);
-      let nextChunk = 0;
-      let completedCount = 0;
-      let failedCount = 0;
-      let totalBytes = 0;
       let peakBps = 0;
-      let activeWorkers = 0;
-      let endgameActive = false;
+      let mimeType = "application/octet-stream";
 
-      /**
-       * Process a single chunk: download with retry, feed RTT to AIMD.
-       */
-      const processChunk = async (idx: number): Promise<boolean> => {
-        if (chunkDone[idx]) return true;
-
-        updateTransfer(fileId, (p) => {
-          const c = [...p.chunks];
-          c[idx] = { ...c[idx], status: "uploading" }; // "uploading" = "transferring" in the progress UI
-          return {
-            ...p,
-            chunks: c,
-            activeConcurrency: p.activeConcurrency + 1,
-          };
-        });
-
-        let success = false;
-        for (let attempt = 0; attempt < MAX_RETRIES && !success; attempt++) {
-          if (chunkDone[idx]) {
-            updateTransfer(fileId, (p) => ({
-              ...p,
-              activeConcurrency: Math.max(0, p.activeConcurrency - 1),
-            }));
-            return true;
-          }
-
-          const t0 = performance.now();
-          try {
-            buffers[idx] = await api.downloadChunk(fileId, idx);
-            const rtt = performance.now() - t0;
-            controller.onSuccess(rtt);
-            success = true;
-          } catch {
-            controller.onFailure();
-            if (attempt < MAX_RETRIES - 1) {
-              const backoff = Math.min(
-                RETRY_BASE_DELAY * Math.pow(2, attempt),
-                controller.getRTO()
-              );
-              await new Promise((r) => setTimeout(r, backoff));
-            }
-          }
-        }
-
-        if (success && !chunkDone[idx]) {
-          chunkDone[idx] = true;
-          completedCount++;
-          totalBytes += buffers[idx].byteLength;
-          const elapsed = Date.now() - startedAt;
-          const bps = elapsed > 0 ? (totalBytes / elapsed) * 1000 : 0;
-          const remaining =
-            bps > 0
-              ? ((manifest.fileSize - totalBytes) / bps) * 1000
-              : 0;
-          if (bps > peakBps) peakBps = bps;
-
-          updateTransfer(fileId, (p) => {
-            const c = [...p.chunks];
-            c[idx] = {
-              ...c[idx],
-              status: "complete",
-              bytesTransferred: buffers[idx].byteLength,
-            };
-            return {
-              ...p,
-              chunks: c,
-              completedChunks: completedCount,
-              bytesTransferred: totalBytes,
-              activeConcurrency: Math.max(0, p.activeConcurrency - 1),
-              throughputBps: bps,
-              peakThroughputBps: peakBps,
-              estimatedRemainingMs: remaining,
-            };
-          });
-          return true;
-        } else if (chunkDone[idx]) {
-          updateTransfer(fileId, (p) => ({
-            ...p,
-            activeConcurrency: Math.max(0, p.activeConcurrency - 1),
-          }));
-          return true;
-        } else {
-          failedCount++;
-          updateTransfer(fileId, (p) => {
-            const c = [...p.chunks];
-            c[idx] = { ...c[idx], status: "failed" };
-            return {
-              ...p,
-              chunks: c,
-              failedChunks: p.failedChunks + 1,
-              activeConcurrency: Math.max(0, p.activeConcurrency - 1),
-            };
-          });
-          return false;
-        }
-      };
-
-      /**
-       * Dynamic worker: pulls chunks, adjusts to AIMD window,
-       * enters endgame mode for the tail.
-       */
-      const worker = async (): Promise<void> => {
-        activeWorkers++;
-        try {
-          while (nextChunk < chunkCount || endgameActive) {
-            if (nextChunk < chunkCount) {
-              const idx = nextChunk++;
-              await processChunk(idx);
-            } else if (endgameActive) {
-              const remaining = chunkDone
-                .map((done, i) => (done ? -1 : i))
-                .filter((i) => i >= 0);
-              if (remaining.length === 0) break;
-              const idx =
-                remaining[Math.floor(Math.random() * remaining.length)];
-              await processChunk(idx);
-            } else {
-              break;
-            }
-
-            if (completedCount + failedCount >= chunkCount) break;
-          }
-        } finally {
-          activeWorkers--;
-        }
-      };
-
-      // Start initial workers
-      const initialConcurrency = Math.min(
-        controller.getMaxConcurrency(),
-        chunkCount
+      // Seed initial UI state. `chunks[]` and `bytesTotal` are
+      // populated by `onManifest`.
+      setTransfers(
+        (prev) =>
+          new Map(prev).set(fileId, {
+            fileId,
+            fileName,
+            direction: "download",
+            totalChunks: 0,
+            completedChunks: 0,
+            failedChunks: 0,
+            bytesTransferred: 0,
+            bytesTotal: 0,
+            activeConcurrency: 0,
+            throughputBps: 0,
+            estimatedRemainingMs: 0,
+            chunks: [],
+            startedAt,
+          })
       );
-      const workerPromises: Promise<void>[] = [];
 
-      for (let i = 0; i < initialConcurrency; i++) {
-        workerPromises.push(worker());
-      }
-
-      // Scale workers as AIMD window grows
-      const scaleInterval = setInterval(() => {
-        if (completedCount + failedCount >= chunkCount) {
-          clearInterval(scaleInterval);
-          return;
-        }
-
-        const target = Math.min(
-          controller.getMaxConcurrency(),
-          chunkCount - completedCount - failedCount
+      try {
+        const bytes = await parallelDownload(
+          getTransferClient(),
+          pathFromFileId(fileId),
+          {
+            onManifest: (m: ManifestEvent) => {
+              mimeType = m.mimeType;
+              const chunks: ChunkProgress[] = m.chunks.map((c) => ({
+                index: c.index,
+                status: "pending" as ChunkStatus,
+                bytesTransferred: 0,
+                size: c.size,
+              }));
+              updateTransfer(fileId, (p) => ({
+                ...p,
+                totalChunks: m.chunkCount,
+                bytesTotal: m.size,
+                chunks,
+              }));
+            },
+            onChunkEvent: (e: ChunkEvent) => {
+              updateTransfer(fileId, (p) => {
+                const chunks = [...p.chunks];
+                if (chunks[e.index] === undefined) {
+                  chunks[e.index] = {
+                    index: e.index,
+                    status: "pending" as ChunkStatus,
+                    bytesTransferred: 0,
+                    size: 0,
+                  };
+                }
+                if (e.state === "started") {
+                  chunks[e.index] = {
+                    ...chunks[e.index]!,
+                    status: "uploading" as ChunkStatus,
+                  };
+                  return { ...p, chunks };
+                }
+                if (e.state === "completed") {
+                  chunks[e.index] = {
+                    ...chunks[e.index]!,
+                    status: "complete" as ChunkStatus,
+                    bytesTransferred:
+                      e.bytesAccepted ?? chunks[e.index]!.size ?? 0,
+                  };
+                  return { ...p, chunks };
+                }
+                if (e.state === "failed") {
+                  chunks[e.index] = {
+                    ...chunks[e.index]!,
+                    status: "failed" as ChunkStatus,
+                  };
+                  return { ...p, chunks, failedChunks: p.failedChunks + 1 };
+                }
+                return p;
+              });
+            },
+            onProgress: (e: TransferProgressEvent) => {
+              const elapsed = Date.now() - startedAt;
+              const bps = elapsed > 0 ? (e.uploaded / elapsed) * 1000 : 0;
+              if (bps > peakBps) peakBps = bps;
+              const remaining =
+                bps > 0 ? ((e.total - e.uploaded) / bps) * 1000 : 0;
+              updateTransfer(fileId, (p) => ({
+                ...p,
+                completedChunks: e.chunksDone,
+                bytesTransferred: e.uploaded,
+                throughputBps: bps,
+                peakThroughputBps: peakBps,
+                estimatedRemainingMs: remaining,
+                activeConcurrency: e.currentParallelism,
+              }));
+            },
+          }
         );
-
-        // Endgame: >90% done AND total > 10 chunks
-        if (
-          !endgameActive &&
-          chunkCount > 10 &&
-          completedCount > chunkCount * 0.9
-        ) {
-          endgameActive = true;
-        }
-
-        while (activeWorkers < target) {
-          workerPromises.push(worker());
-        }
-      }, 100);
-
-      await Promise.all(workerPromises);
-      clearInterval(scaleInterval);
-
-      // -- Reassemble and trigger browser download --
-      if (completedCount === chunkCount) {
         const completedAt = Date.now();
         const durationMs = completedAt - startedAt;
-        const avgBps =
-          durationMs > 0
-            ? (manifest.fileSize / durationMs) * 1000
-            : 0;
-
+        const avgBps = durationMs > 0 ? (bytes.byteLength / durationMs) * 1000 : 0;
         updateTransfer(fileId, (p) => ({
           ...p,
           completedAt,
           averageThroughputBps: avgBps,
           peakThroughputBps: peakBps,
         }));
-
         const statsEntry: CompletedTransferStats = {
           fileId,
           fileName,
           direction: "download" as const,
-          fileSize: manifest.fileSize,
+          fileSize: bytes.byteLength,
           durationMs,
           averageThroughputBps: avgBps,
           peakThroughputBps: peakBps,
           completedAt,
         };
-
         setCompletedStats((prev) => [statsEntry, ...prev.slice(0, 19)]);
         addTransferStats(statsEntry);
 
-        const blob = new Blob(buffers, {
-          type: manifest.mimeType,
-        });
+        // Trigger browser download via Blob + anchor click. The cast
+        // narrows `Uint8Array<ArrayBufferLike>` to a `BlobPart`-compatible
+        // shape under strict workers-types — same pattern as
+        // `shared/crypto.ts:hashChunk`'s buffer narrowing.
+        const blob = new Blob(
+          [bytes as Uint8Array<ArrayBuffer>],
+          { type: mimeType }
+        );
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
         a.href = url;
         a.download = fileName;
         a.click();
         URL.revokeObjectURL(url);
+      } catch (err) {
+        updateTransfer(fileId, (p) => ({
+          ...p,
+          failedChunks: p.failedChunks + 1,
+        }));
+        throw err;
       }
     },
     [updateTransfer]

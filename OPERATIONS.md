@@ -564,6 +564,84 @@ mode preserves cross-file dedup on encrypted uploads (see plan
   with the same `uploadId` to recover. Fresh tokens; existing
   `landed[]` chunks re-used.
 
+## 6.8 SPA on SDK transfer engine (Phase 17.6)
+
+The SPA at `mossaic.ashishkumarsingh.com` was migrated from a
+hand-rolled chunked transfer engine (~395 LoC of AIMD/processChunk/
+worker/scaleInterval/endgame across `src/hooks/use-upload.ts` +
+`src/hooks/use-download.ts` + `src/lib/api.ts`) onto
+`@mossaic/sdk` 's `parallelUpload` / `parallelDownload`. Audit S1 #4
+closed.
+
+### 6.8.1 Wire surface
+
+The SPA constructs an `HttpVFS` via
+`src/lib/transfer-client.ts:getTransferClient()` configured with:
+
+- `multipartBaseOverride: "/api/upload/multipart"` — routes SDK
+  multipart calls to the App-pinned bridge.
+- `chunkFetchBaseOverride: "/api/download"` — routes cacheable chunk
+  GETs to the App's existing legacy chunk download endpoint.
+- `apiKey: api.getToken()` — the App's JWT (App's `authMiddleware`
+  validates this, NOT a VFS Bearer token).
+
+Endpoint inventory:
+
+| Direction | SDK call | HTTP route | Backed by |
+|---|---|---|---|
+| Upload begin | `multipartBegin` | `POST /api/upload/multipart/begin` | `UserDO.appBeginMultipart` |
+| Upload chunk PUT | `multipartPutChunk` | `PUT /api/upload/multipart/:uploadId/chunk/:idx` | `ShardDO.putChunkMultipart` (legacy `shard:<userId>:<idx>`) |
+| Upload finalize | `multipartFinalize` | `POST /api/upload/multipart/finalize` | `UserDO.appFinalizeMultipart` |
+| Upload abort | `multipartAbort` | `POST /api/upload/multipart/abort` | `UserDO.appAbortMultipart` |
+| Upload status | `multipartStatus` | `GET /api/upload/multipart/:uploadId/status` | `UserDO.appGetMultipartStatus` |
+| Download manifest | `multipartDownloadToken` | `POST /api/upload/multipart/download-token` | `UserDO.appOpenManifest` |
+| Download chunk | `fetchChunkByHash` | `GET /api/download/chunk/:fileId/:idx` | App's existing legacy download route |
+
+### 6.8.2 Feature flag — rollback procedure
+
+`FEATURE_VFS_UPLOAD_MULTIPART` (App env binding). Default ON
+(undefined or any value other than `"false"`/`"0"`/`"off"` enables).
+
+To roll back:
+
+```bash
+wrangler secret put FEATURE_VFS_UPLOAD_MULTIPART  # value: false
+```
+
+The `/api/upload/multipart/*` route returns 404 ENOENT when the
+flag is off. The SPA does NOT auto-fall-back in v1 — uploads will
+fail with a typed network error from `parallelUpload`. To restore
+the legacy single-chunk path during rollback, also revert
+`src/hooks/use-upload.ts` to call `api.uploadInit/uploadChunk/uploadComplete`
+(the legacy methods on `api.ts` are deferred-deletion, scheduled
+for Phase 17.6.1 cleanup).
+
+### 6.8.3 Score-template invariance — production data integrity
+
+The new App-pinned multipart route uses `legacyAppPlacement.placeChunk`
+(Phase 17.5) which keys the rendezvous score on
+`shard:${userId}:${idx}` — IDENTICAL to the legacy single-chunk
+upload route's score. **Every existing photo's chunk addressing is
+preserved.** Migration-safety integration test
+`tests/integration/spa-roundtrip-live.test.ts:S2` verifies the
+invariant: bytes uploaded via the new path are byte-equal when
+read back via the legacy `/api/download/chunk/*` endpoint.
+
+### 6.8.4 Per-chunk progress UI
+
+The SDK extensions added in Phase 17.6 (`onChunkEvent` +
+`onManifest`) drive the SPA's per-chunk status grid. Every chunk
+emits `started → completed` (or `→ failed`) events; the SPA hooks
+map these to `ChunkProgress` state flips. Across chunks, ordering
+is non-deterministic (concurrent lanes); per-index ordering is
+preserved.
+
+`onProgress` (10 Hz throttled) drives aggregate counters:
+`bytesTransferred`, `throughputBps`, `activeConcurrency`. The SPA
+displays the AIMD scaling visible on the active-concurrency
+counter — when the SDK's adaptive engine scales up from 4 → 8 →
+12 → … 64 lanes, the SPA UI animates the count.
+
 ## 7. Sign-off (per-deploy)
 
 Fill out and store in your incident-tracking system before flipping the route:

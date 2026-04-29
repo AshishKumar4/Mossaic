@@ -75,6 +75,12 @@ export interface ParallelUploadOpts extends Omit<BeginUploadOpts, "size" | "sign
   resumeUploadId?: string;
   /** Progress callback (throttled to ~10 Hz). */
   onProgress?: (e: ProgressEvent) => void;
+  /**
+   * Phase 17.6 — per-chunk lifecycle event callback. Optional.
+   * When undefined, the engine is byte-equivalent to the pre-17.6
+   * implementation (zero overhead).
+   */
+  onChunkEvent?: (e: ChunkEvent) => void;
   /** Cancel the in-flight upload. Triggers `abortUpload` on the server. */
   signal?: AbortSignal;
   /**
@@ -102,12 +108,69 @@ export interface ProgressEvent {
   errorsRecovered: number;
 }
 
+/**
+ * Phase 17.6 — per-chunk lifecycle event.
+ *
+ * Emitted from `parallelUpload` / `parallelDownload` (and the
+ * streaming download variant). Consumers (e.g. the photo-library
+ * SPA) drive a per-chunk status grid from these events.
+ *
+ * **Per-index ordering guarantee.** Within a single chunk index:
+ *   `started` → (`retrying`)* → (`completed` | `failed`)
+ *
+ * **Cross-index ordering.** Non-deterministic across indices because
+ * concurrent lanes process them in parallel. Within a lane, work is
+ * serialized by `await` so per-index ordering holds.
+ */
+export interface ChunkEvent {
+  /** Chunk index, 0-based. */
+  index: number;
+  /** Lifecycle phase. */
+  state: "started" | "completed" | "failed" | "retrying";
+  /** SHA-256 hex of the chunk; present on `completed`. */
+  hash?: string;
+  /** Bytes the server accepted; present on `completed`. */
+  bytesAccepted?: number;
+  /** Retry attempt number (1-indexed); present on `retrying` / `failed`. */
+  attempt?: number;
+  /** Error message; present on `failed`. */
+  error?: string;
+}
+
+/**
+ * Phase 17.6 — manifest delivered before any chunk download.
+ *
+ * Fired exactly once by `parallelDownload` / `parallelDownloadStream`
+ * after `multipartDownloadToken` returns. Lets consumers seed their
+ * per-chunk progress UI state (and capture `mimeType` for Blob
+ * construction) before a single chunk arrives.
+ */
+export interface ManifestEvent {
+  fileId: string;
+  mimeType: string;
+  size: number;
+  chunkCount: number;
+  chunks: ReadonlyArray<{ index: number; size: number; hash: string }>;
+}
+
 export interface ParallelDownloadOpts {
   concurrency?: { min?: number; max?: number; initial?: number };
   endgameThreshold?: number;
   endgameMaxFanout?: number;
   signal?: AbortSignal;
   onProgress?: (e: ProgressEvent) => void;
+  /**
+   * Phase 17.6 — per-chunk lifecycle event callback. Optional.
+   * When undefined, the engine is byte-equivalent to the pre-17.6
+   * implementation (zero overhead).
+   */
+  onChunkEvent?: (e: ChunkEvent) => void;
+  /**
+   * Phase 17.6 — fired exactly once after the download token returns,
+   * before any `onChunkEvent`. Carries the manifest (mimeType, size,
+   * chunk index/hash/size triples) for UI seeding.
+   */
+  onManifest?: (m: ManifestEvent) => void;
   /** Optional per-chunk transformer (e.g. unseal). */
   chunkTransform?: (
     envelope: Uint8Array,
@@ -330,6 +393,8 @@ export async function parallelUpload(
   let chunksDone = landed.size;
 
   const onProgress = opts.onProgress;
+  // Phase 17.6: hoist per-chunk event callback (zero-overhead when undefined).
+  const onChunkEvent = opts.onChunkEvent;
   let lastProgressTs = 0;
   function maybeProgress() {
     if (!onProgress) return;
@@ -357,15 +422,26 @@ export async function parallelUpload(
 
   // Upload one chunk with retry. Returns hash on success.
   const MAX_RETRIES = 5;
-  async function uploadOne(idx: number, signal?: AbortSignal): Promise<string> {
+  async function uploadOne(
+    idx: number,
+    signal?: AbortSignal
+  ): Promise<{ hash: string; bytesAccepted: number }> {
     let attempt = 0;
     let backoff = 0;
+    let startedEmitted = false;
     while (true) {
       if (signal?.aborted) {
         throw new DOMException("aborted", "AbortError");
       }
       try {
         const bytes = await chunkBytes(idx);
+        // Phase 17.6: emit `started` exactly once per index, on first
+        // attempt (post-bytes-prep so zero-byte/range errors still
+        // fire `failed`). Retries do not re-emit `started`.
+        if (!startedEmitted && onChunkEvent) {
+          onChunkEvent({ index: idx, state: "started" });
+          startedEmitted = true;
+        }
         const t0 = performance.now();
         const r = await putChunk(client, session, idx, bytes, signal);
         const elapsed = performance.now() - t0;
@@ -382,7 +458,7 @@ export async function parallelUpload(
           state.successWindow = 0;
         }
         state.errorBackoffMs = 0;
-        return r.hash;
+        return { hash: r.hash, bytesAccepted: r.bytesAccepted };
       } catch (err) {
         attempt++;
         const msg = (err as Error)?.message ?? String(err);
@@ -392,7 +468,26 @@ export async function parallelUpload(
           throw err;
         }
         if (attempt >= MAX_RETRIES) {
+          // Phase 17.6: surface the terminal error to consumers.
+          if (onChunkEvent) {
+            onChunkEvent({
+              index: idx,
+              state: "failed",
+              attempt,
+              error: msg,
+            });
+          }
           throw err;
+        }
+        // Phase 17.6: emit `retrying` before backoff so consumers
+        // can update UI optimistically.
+        if (onChunkEvent) {
+          onChunkEvent({
+            index: idx,
+            state: "retrying",
+            attempt,
+            error: msg,
+          });
         }
         // Map status hints from msg — rate-limit / unavail → bigger
         // backoff; transient network → smaller.
@@ -437,16 +532,26 @@ export async function parallelUpload(
       if (pick === undefined) return; // nothing left
       pending.delete(pick);
       try {
-        const hash = await uploadOne(pick, opts.signal);
-        chunkHashList[pick] = hash;
+        const r = await uploadOne(pick, opts.signal);
+        chunkHashList[pick] = r.hash;
         chunksDone++;
         const start = pick * chunkSize;
         const end = Math.min(start + chunkSize, totalSize);
         uploaded += end - start;
+        // Phase 17.6: per-chunk `completed` event after success.
+        if (onChunkEvent) {
+          onChunkEvent({
+            index: pick,
+            state: "completed",
+            hash: r.hash,
+            bytesAccepted: r.bytesAccepted,
+          });
+        }
         maybeProgress();
       } catch (err) {
         // Re-add so endgame can pick it up; if we're going to throw,
-        // throw after re-adding.
+        // throw after re-adding. (`uploadOne` already emitted `failed`
+        // on terminal-retry; aborts propagate without an event.)
         pending.add(pick);
         throw err;
       }
@@ -564,6 +669,20 @@ export async function parallelDownload(
   const totalSize = manifest.size;
   const totalChunks = manifest.chunkCount;
 
+  // Phase 17.6: emit `onManifest` exactly once, before any chunk
+  // events. SPA uses this to seed per-chunk progress UI and capture
+  // mimeType for Blob construction. Inlined / empty files still get
+  // the manifest event before short-circuit returns.
+  if (opts.onManifest) {
+    opts.onManifest({
+      fileId: manifest.fileId,
+      mimeType: manifest.mimeType ?? "application/octet-stream",
+      size: totalSize,
+      chunkCount: totalChunks,
+      chunks: manifest.chunks,
+    });
+  }
+
   if (manifest.inlined) {
     // Inlined files — single read via the regular HttpVFS.readFile.
     // Multipart download isn't useful for sub-INLINE_LIMIT files.
@@ -614,6 +733,8 @@ export async function parallelDownload(
   let chunksDone = 0;
 
   const onProgress = opts.onProgress;
+  // Phase 17.6: hoist per-chunk event callback (zero-overhead when undefined).
+  const onChunkEvent = opts.onChunkEvent;
   let lastProgressTs = 0;
   function maybeProgress() {
     if (!onProgress) return;
@@ -636,9 +757,15 @@ export async function parallelDownload(
   const MAX_RETRIES = 5;
   async function downloadOne(idx: number, signal?: AbortSignal): Promise<void> {
     let attempt = 0;
+    let startedEmitted = false;
     while (true) {
       if (signal?.aborted) throw new DOMException("aborted", "AbortError");
       try {
+        // Phase 17.6: emit `started` once per index on first attempt.
+        if (!startedEmitted && onChunkEvent) {
+          onChunkEvent({ index: idx, state: "started" });
+          startedEmitted = true;
+        }
         const t0 = performance.now();
         const ch = manifest.chunks[idx];
         const bytes = await client.fetchChunkByHash(
@@ -676,14 +803,44 @@ export async function parallelDownload(
           }
           state.successWindow = 0;
         }
+        // Phase 17.6: per-chunk `completed` event after success.
+        if (onChunkEvent) {
+          onChunkEvent({
+            index: idx,
+            state: "completed",
+            hash: ch.hash,
+            bytesAccepted: ch.size,
+          });
+        }
         maybeProgress();
         return;
       } catch (err) {
         attempt++;
-        if (attempt >= MAX_RETRIES) throw err;
+        const msg = (err as Error)?.message ?? String(err);
         const aborted =
           (err as Error)?.name === "AbortError" || signal?.aborted;
         if (aborted) throw err;
+        if (attempt >= MAX_RETRIES) {
+          // Phase 17.6: terminal failure event.
+          if (onChunkEvent) {
+            onChunkEvent({
+              index: idx,
+              state: "failed",
+              attempt,
+              error: msg,
+            });
+          }
+          throw err;
+        }
+        // Phase 17.6: retrying notification.
+        if (onChunkEvent) {
+          onChunkEvent({
+            index: idx,
+            state: "retrying",
+            attempt,
+            error: msg,
+          });
+        }
         state.errorsRecovered++;
         await sleep(50 + attempt * 100 + Math.random() * 50);
       }
@@ -787,6 +944,18 @@ export async function parallelDownloadStream(
   const manifest = dl.manifest;
   const totalChunks = manifest.chunkCount;
 
+  // Phase 17.6: emit `onManifest` exactly once before any chunk
+  // events. Mirrors `parallelDownload`.
+  if (opts.onManifest) {
+    opts.onManifest({
+      fileId: manifest.fileId,
+      mimeType: manifest.mimeType ?? "application/octet-stream",
+      size: manifest.size,
+      chunkCount: totalChunks,
+      chunks: manifest.chunks,
+    });
+  }
+
   if (manifest.inlined || totalChunks === 0) {
     // Inlined or empty — short-circuit to a single-shot readFile so
     // the stream API stays consistent. `manifest.inlined` covers the
@@ -833,6 +1002,8 @@ export async function parallelDownloadStream(
   let aborted = false;
 
   const onProgress = opts.onProgress;
+  // Phase 17.6: hoist per-chunk event callback (zero-overhead when undefined).
+  const onChunkEvent = opts.onChunkEvent;
   let lastProgressTs = 0;
   function maybeProgress() {
     if (!onProgress) return;
@@ -874,11 +1045,17 @@ export async function parallelDownloadStream(
   const MAX_RETRIES = 5;
   async function downloadOne(idx: number, signal?: AbortSignal): Promise<void> {
     let attempt = 0;
+    let startedEmitted = false;
     while (true) {
       if (signal?.aborted || aborted) {
         throw new DOMException("aborted", "AbortError");
       }
       try {
+        // Phase 17.6: emit `started` once per index on first attempt.
+        if (!startedEmitted && onChunkEvent) {
+          onChunkEvent({ index: idx, state: "started" });
+          startedEmitted = true;
+        }
         const t0 = performance.now();
         const ch = manifest.chunks[idx];
         const bytes = await client.fetchChunkByHash(
@@ -913,15 +1090,43 @@ export async function parallelDownloadStream(
           }
           state.successWindow = 0;
         }
+        // Phase 17.6: per-chunk `completed` event after success.
+        if (onChunkEvent) {
+          onChunkEvent({
+            index: idx,
+            state: "completed",
+            hash: ch.hash,
+            bytesAccepted: ch.size,
+          });
+        }
         maybeProgress();
         emitContiguous();
         return;
       } catch (err) {
         attempt++;
-        if (attempt >= MAX_RETRIES) throw err;
+        const msg = (err as Error)?.message ?? String(err);
         const isAborted =
           (err as Error)?.name === "AbortError" || signal?.aborted;
         if (isAborted) throw err;
+        if (attempt >= MAX_RETRIES) {
+          if (onChunkEvent) {
+            onChunkEvent({
+              index: idx,
+              state: "failed",
+              attempt,
+              error: msg,
+            });
+          }
+          throw err;
+        }
+        if (onChunkEvent) {
+          onChunkEvent({
+            index: idx,
+            state: "retrying",
+            attempt,
+            error: msg,
+          });
+        }
         state.errorsRecovered++;
         await sleep(50 + attempt * 100 + Math.random() * 50);
       }

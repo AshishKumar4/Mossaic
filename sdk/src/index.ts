@@ -175,6 +175,8 @@ export {
   type ParallelUploadOpts,
   type ParallelDownloadOpts,
   type ProgressEvent as TransferProgressEvent,
+  type ChunkEvent,
+  type ManifestEvent,
   type MossaicHttpClient,
 } from "./transfer";
 

@@ -260,6 +260,89 @@ const chunk1 = await vfs.readChunk("/huge.tar", 1);
 
 Note: `chunks[].shardIndex` is intentionally hidden — it's an internal placement detail, not a stable identifier.
 
+### Parallel multipart transfer (Phase 16/17.6)
+
+For high-throughput uploads/downloads, use the `parallelUpload` / `parallelDownload` engine. It drives R2/S3-style multipart sessions with adaptive concurrency (1 → 64 lanes) and endgame mode for tail-latency reduction.
+
+```ts
+import {
+  parallelUpload,
+  parallelDownload,
+  type ChunkEvent,
+  type ManifestEvent,
+  type TransferProgressEvent,
+} from "@mossaic/sdk/http";
+import { createMossaicHttpClient } from "@mossaic/sdk/http";
+
+const client = createMossaicHttpClient({
+  url: "https://api.example.com",
+  apiKey: token,
+});
+
+// Upload — `file` can be Uint8Array or Blob.
+const result = await parallelUpload(client, "/photo.jpg", file, {
+  mimeType: "image/jpeg",
+  metadata: { tags: ["sunset", "beach"] },
+  onProgress: (e: TransferProgressEvent) => {
+    console.log(`${e.uploaded}/${e.total} bytes, ${e.currentParallelism} lanes`);
+  },
+  onChunkEvent: (e: ChunkEvent) => {
+    // e.state ∈ {"started", "completed", "failed", "retrying"}
+    // e.index is the chunk index
+    // e.hash + e.bytesAccepted on `completed`
+  },
+});
+console.log(`uploaded ${result.size} bytes; fileId = ${result.fileId}`);
+
+// Download — returns Uint8Array.
+const bytes = await parallelDownload(client, "/photo.jpg", {
+  onManifest: (m: ManifestEvent) => {
+    // Fired once before any chunk fetch.
+    // m = { fileId, mimeType, size, chunkCount, chunks }
+  },
+  onChunkEvent: (e: ChunkEvent) => {
+    // Same shape as upload.
+  },
+});
+```
+
+#### Per-chunk events (Phase 17.6)
+
+`onChunkEvent` fires for every chunk's lifecycle:
+- `started` — chunk pulled from queue, hashing begins.
+- `completed` — server accepted the chunk; `e.hash` and `e.bytesAccepted` are populated.
+- `failed` — terminal failure after `MAX_RETRIES`; `e.error` populated.
+- `retrying` — transient failure; `e.attempt` (1-indexed) populated.
+
+**Per-index ordering**: `started → (retrying)* → (completed | failed)`. **Cross-index ordering**: non-deterministic (concurrent lanes).
+
+#### Manifest event (download only)
+
+`onManifest` fires exactly once after the download token returns, before any `onChunkEvent`. Use it to seed per-chunk UI state and capture `mimeType` for `Blob` construction.
+
+#### `multipartBaseOverride` / `chunkFetchBaseOverride`
+
+Advanced consumers (e.g. a custom App on top of Mossaic) can route SDK multipart calls to a different endpoint base:
+
+```ts
+const client = createMossaicHttpClient({
+  url: "https://app.example.com",
+  apiKey: appJWT,                         // App-issued JWT, not VFS token
+  multipartBaseOverride: "/api/upload/multipart",  // App-pinned multipart bridge
+  chunkFetchBaseOverride: "/api/download",         // App's chunk download endpoint
+});
+```
+
+When set, SDK multipart calls land at:
+- `${url}${multipartBaseOverride}/begin`
+- `${url}${multipartBaseOverride}/${uploadId}/chunk/${idx}`
+- `${url}${multipartBaseOverride}/finalize`
+- `${url}${multipartBaseOverride}/abort`
+- `${url}${multipartBaseOverride}/${uploadId}/status`
+- `${url}${multipartBaseOverride}/download-token`
+
+And `fetchChunkByHash` switches from the canonical `POST /api/vfs/readChunk` to a `GET ${chunkFetchBaseOverride}/chunk/${fileId}/${idx}` request. The Mossaic photo-library SPA uses both overrides to route through legacy DO instances; see `OPERATIONS.md` §6.8 for the full architecture.
+
 ---
 
 ## isomorphic-git

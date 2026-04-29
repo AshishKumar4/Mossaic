@@ -1,9 +1,7 @@
-import type { Folder, FileManifest, ApiError as ApiErrorResponse, UserFile } from "@shared/types";
+import type { Folder, ApiError as ApiErrorResponse, UserFile } from "@shared/types";
 import type {
   AuthResponse,
   FileListResponse,
-  UploadInitRequest,
-  UploadInitResponse,
   CreateFolderRequest,
   AnalyticsOverview,
   GalleryPhotosResponse,
@@ -106,72 +104,24 @@ class ApiClient {
     );
   }
 
-  // Upload
-  async uploadInit(data: UploadInitRequest): Promise<UploadInitResponse> {
-    return this.request<UploadInitResponse>("/upload/init", {
-      method: "POST",
-      body: JSON.stringify(data),
-    });
-  }
-
-  async uploadChunk(
-    fileId: string,
-    chunkIndex: number,
-    data: ArrayBuffer,
-    chunkHash: string,
-    poolSize: number
-  ): Promise<{ status: string; bytesStored: number }> {
-    const res = await fetch(
-      `${API_BASE}/upload/chunk/${fileId}/${chunkIndex}`,
-      {
-        method: "PUT",
-        headers: {
-          Authorization: `Bearer ${this.token}`,
-          "X-Chunk-Hash": chunkHash,
-          "X-Pool-Size": poolSize.toString(),
-          "Content-Type": "application/octet-stream",
-        },
-        body: data,
-      }
-    );
-    if (!res.ok) {
-      throw new ApiError("Chunk upload failed", res.status);
-    }
-    return res.json();
-  }
-
-  async uploadComplete(
-    fileId: string,
-    fileHash: string
-  ): Promise<{ ok: boolean; fileId: string }> {
-    return this.request<{ ok: boolean; fileId: string }>(
-      `/upload/complete/${fileId}`,
-      {
-        method: "POST",
-        body: JSON.stringify({ fileHash }),
-      }
-    );
-  }
-
-  // Download
-  async getManifest(fileId: string): Promise<FileManifest> {
-    return this.request<FileManifest>(`/download/manifest/${fileId}`);
-  }
-
-  async downloadChunk(fileId: string, chunkIndex: number): Promise<ArrayBuffer> {
-    const res = await fetch(
-      `${API_BASE}/download/chunk/${fileId}/${chunkIndex}`,
-      {
-        headers: {
-          Authorization: `Bearer ${this.token}`,
-        },
-      }
-    );
-    if (!res.ok) {
-      throw new ApiError("Chunk download failed", res.status);
-    }
-    return res.arrayBuffer();
-  }
+  // Upload + Download
+  //
+  // Phase 17.6: the SPA's chunked transfer pipeline collapsed onto
+  // `@mossaic/sdk` 's `parallelUpload` / `parallelDownload` (see
+  // `src/hooks/use-upload.ts` + `src/hooks/use-download.ts`). The
+  // `uploadInit` / `uploadChunk` / `uploadComplete` / `getManifest` /
+  // `downloadChunk` methods are gone — the SDK drives the
+  // entire transfer through `/api/upload/multipart/*` (App-pinned
+  // bridge) and `/api/download/chunk/*` (legacy chunk download
+  // endpoint, addressed via `chunkFetchBaseOverride`).
+  //
+  // The legacy single-chunk routes on the App
+  // (`/api/upload/init`, `/api/upload/chunk/*`,
+  // `/api/upload/complete/*`, `/api/download/manifest/*`,
+  // `/api/download/chunk/*`) remain mounted on the worker for
+  // back-compat during the rollout window. Phase 17.6.1 cleanup
+  // (deferred 1–2 weeks post-stability) deletes the unused legacy
+  // upload routes and their typed RPCs.
 
   // Analytics
   async getAnalytics(): Promise<AnalyticsOverview> {
