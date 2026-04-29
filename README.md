@@ -31,7 +31,7 @@ flowchart LR
     UserDO --> Sn
 ```
 
-> See **[Detailed architecture](#detailed-architecture)** below for the full Phase 14 surface — Service-mode vs App-mode split, Phase 12 metadata + tags + indexed listFiles, Phase 13 Yjs awareness relay, copyFile chunk-refcount semantics, and the three storage tiers.
+> See **[Detailed architecture](#detailed-architecture)** below for the full surface — Service-mode vs App-mode split, metadata + tags + indexed listFiles, Yjs awareness relay, copyFile chunk-refcount semantics, and the three storage tiers.
 
 ---
 
@@ -149,7 +149,7 @@ The Service worker exposes a public Yjs WebSocket upgrade route at `/api/vfs/yjs
 
 ## Live editing with Yjs
 
-Mossaic ships **per-file CRDT mode** (Phase 10). Any file can be promoted to "yjs-mode" with a one-line `setYjsMode` call; from then on, every `writeFile` becomes a CRDT transaction, `readFile` materialises the current state, and any number of clients can co-edit live over a WebSocket. CRDT and plain files coexist in the same filesystem, the same tenant, the same directory.
+Mossaic ships **per-file CRDT mode**. Any file can be promoted to "yjs-mode" with a one-line `setYjsMode` call; from then on, every `writeFile` becomes a CRDT transaction, `readFile` materialises the current state, and any number of clients can co-edit live over a WebSocket. CRDT and plain files coexist in the same filesystem, the same tenant, the same directory.
 
 **Opt-in via mode bit.** A file is plain until you toggle it. Two equivalent forms:
 
@@ -191,7 +191,7 @@ The `YDocHandle` shape: `{ doc: Y.Doc; awareness: Awareness; synced: Promise<voi
 
 > **Why this matters.** `fs/promises` + content-addressed dedup + per-file live CRDT collab in one filesystem doesn't exist anywhere else in the Cloudflare ecosystem. R2 is bulk object storage, no filesystem semantics; Artifacts is Git-shaped, not fs-shaped, no live collab; bring-your-own Yjs servers don't share storage with your blobs and don't dedup. Use Mossaic when you want all three.
 
-The 10 Yjs invariants (schema migration, promotion semantics, write/read round-trip, stat bit, unlink purge, compaction, tenant isolation, igit interop, two-client live round-trip) are pinned by `tests/integration/yjs.test.ts` (218/218 tests passing). Lean 4 formalization of those invariants is future work — see [Formal verification](#formal-verification) for what's currently machine-checked.
+The 10 Yjs invariants (schema migration, promotion semantics, write/read round-trip, stat bit, unlink purge, compaction, tenant isolation, igit interop, two-client live round-trip) are pinned by `tests/integration/yjs.test.ts` (14 yjs-specific cases of 418 total worker tests). Lean 4 formalization of those invariants is future work — see [Formal verification](#formal-verification) for what's currently machine-checked.
 
 For the full DX (`chmod` overload, `setYjsMode` on freshly-created files, error codes, peer-dep matrix, more examples), see the **[Live editing with Yjs section in `sdk/README.md`](./sdk/README.md#live-editing-with-yjs-per-file-crdt-mode)**.
 
@@ -550,7 +550,7 @@ pnpm lean:build
 
 See **[`lean/README.md`](./lean/README.md)** for theorem names, the TS↔Lean cross-reference protocol (`@lean-invariant` JSDoc tags pinned by CI), and documented limitations (SHA-256 collision-resistance, SQLite UNIQUE-INDEX semantics, and wall-clock alarm timeliness are out of scope).
 
-The **10 Yjs invariants** added in Phase 10 (schema migration, promotion semantics, write/read round-trip, stat bit, unlink purge, compaction, tenant isolation, igit interop, two-client live round-trip) are currently **test-pinned** by `tests/integration/yjs.test.ts` (218/218 tests passing). Lean formalization of those invariants is future work.
+The **10 Yjs invariants** (schema migration, promotion semantics, write/read round-trip, stat bit, unlink purge, compaction, tenant isolation, igit interop, two-client live round-trip) are currently **test-pinned** by `tests/integration/yjs.test.ts` (14 yjs-specific cases of 418 total worker tests). Lean formalization of those invariants is future work.
 
 ---
 

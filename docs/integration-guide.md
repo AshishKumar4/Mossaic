@@ -2,7 +2,7 @@
 
 The single source of truth for Mossaic's external surface. README and `sdk/README.md` link here; if a claim in those documents drifts from this file, this file is correct.
 
-> **Phase 13** — DO bindings prefixed (`MOSSAIC_USER` / `MOSSAIC_SHARD`); `createWriteStream` accepts metadata/tags/version; HTTP `writeFile` multipart envelope; Yjs awareness relay; YDocHandle shape locked.
+> **Feature surface** — DO bindings prefixed (`MOSSAIC_USER` / `MOSSAIC_SHARD`); `createWriteStream` accepts metadata, tags, and version options; HTTP `writeFile` uses a multipart envelope; Yjs awareness relays presence/cursors; opt-in end-to-end encryption (`createVFS({ encryption: { masterKey, tenantSalt, mode } })`); parallel multipart transfer via `parallelUpload` / `parallelDownload`. The integration-guide is the canonical reference for every feature listed here.
 
 ---
 
@@ -76,7 +76,7 @@ That is the entire integration. Multi-tenant via `vfs:${ns}:${tenant}[:${sub}]` 
 
 ---
 
-## 2. `writeFile` and `createWriteStream` parity (Phase 13)
+## 2. `writeFile` and `createWriteStream` parity
 
 Both calls accept the same `WriteFileOpts`:
 
@@ -140,7 +140,7 @@ console.log(handle.tmpId, handle.chunkSize, handle.poolSize);
 
 ---
 
-## 3. HTTP fallback envelope (Phase 13)
+## 3. HTTP fallback envelope
 
 For non-Worker consumers (native apps, scripts, browsers without a worker hop), the HTTP fallback at `/api/vfs` reaches **parity** with binding mode. `writeFile` accepts three body shapes; the SDK's `createMossaicHttpClient` picks the right one for you.
 
@@ -185,7 +185,7 @@ await vfs.writeFile("/photo.bin", bytes, {
 
 ---
 
-## 4. Live editing with Yjs (Phase 13)
+## 4. Live editing with Yjs
 
 ### 4.1 Promote a file to yjs-mode
 
@@ -301,7 +301,7 @@ Sync frames (`0`/`1`/`2`) are persisted as `yjs_oplog` rows. Awareness frames (`
 
 ## 5. Command-line interface (`@mossaic/cli`)
 
-Phase 13.5 adds a Node 20+ CLI (`mossaic` / `mscli`) that drives a deployed Mossaic Service worker over HTTP + WSS. It is intended for operators and scripting workflows that don't run inside a Cloudflare Worker.
+adds a Node 20+ CLI (`mossaic` / `mscli`) that drives a deployed Mossaic Service worker over HTTP + WSS. It is intended for operators and scripting workflows that don't run inside a Cloudflare Worker.
 
 ### 5.1 Auth
 
@@ -338,7 +338,7 @@ The same Service worker also exposes:
 Every public SDK method is exposed as a CLI verb. See [`cli/README.md`](../cli/README.md) for the full table. Highlights:
 
 - File ops: `ls`, `cat`, `write`, `put`, `get`, `stream-put`, `stream-get`, `rm`, `mv`, `cp`, `mkdir`, `rmdir`, `rm-rf`, `stat`, `ln`, `readlink`, `chmod`, `exists`.
-- Phase 12: `meta patch`, `find` (`listFiles`).
+- `meta patch`, `find` (`listFiles`).
 - Versioning: `versions ls | restore | drop | mark`.
 - Yjs: `yjs init | edit | awareness | flush`.
 - Token utility: `token mint`.
@@ -351,14 +351,14 @@ The CLI ships with `≥58` live E2E test cases (categories A–I) plus `≥10` f
 
 ---
 
-## 6. Operations checklist for a Phase 13 deploy
+## 6. Operations checklist for a deploy
 
 1. `npx tsc -b` — exit 0.
-2. `pnpm test` — all green (≥ 290 cases at Phase 13).
+2. `pnpm test` — all green (418 worker tests + 44 cli unit + 92 cli e2e).
 3. `npx wrangler deploy --dry-run` (App mode) — bindings list shows `MOSSAIC_USER`, `MOSSAIC_SHARD`, `SEARCH_DO`.
 4. `npx wrangler deploy --dry-run -c deployments/service/wrangler.jsonc` (Service mode) — bindings show `MOSSAIC_USER`, `MOSSAIC_SHARD` only.
 5. Verify the legacy fetch hash on `worker/app/objects/user/user-do.ts:70..263` is unchanged (`4c6eb84925cd8b34298aa92a5201c6e8074defb4527c3bbb1d2c677f9f2c8e70`).
 6. `pnpm lean:build` — proofs green; no new `sorry`s, no new project-level axioms.
 7. Final grep for the legacy binding-name tokens (whole-word match) returns zero hits outside `local/` (plans), `lean/` (proofs), and audit/history files such as `OPERATIONS.md` and this guide's migration-safety callout.
 
-That is the full Phase 13 contract.
+That is the full contract.
