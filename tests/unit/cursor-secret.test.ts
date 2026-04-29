@@ -98,7 +98,7 @@ describe("cursor codec encode/decode (positive control)", () => {
 });
 
 interface E {
-  USER_DO: DurableObjectNamespace;
+  MOSSAIC_USER: DurableObjectNamespace;
 }
 const E = env as unknown as E;
 
@@ -108,8 +108,8 @@ describe("vfsListFiles refuses cursor ops when JWT_SECRET unset (B-1)", () => {
     // wipe it on this DO instance to simulate a deploy where the
     // operator forgot to run `wrangler secret put JWT_SECRET`.
     const tenant = "b1-jwt-secret-missing";
-    const stub = E.USER_DO.get(
-      E.USER_DO.idFromName(vfsUserDOName("default", tenant))
+    const stub = E.MOSSAIC_USER.get(
+      E.MOSSAIC_USER.idFromName(vfsUserDOName("default", tenant))
     );
 
     // Trigger ensureInit + record scope so vfsListFiles reaches the
@@ -142,8 +142,8 @@ describe("vfsListFiles refuses cursor ops when JWT_SECRET unset (B-1)", () => {
 
   it("with JWT_SECRET configured, vfsListFiles succeeds (positive control)", async () => {
     const tenant = "b1-jwt-secret-present";
-    const stub = E.USER_DO.get(
-      E.USER_DO.idFromName(vfsUserDOName("default", tenant))
+    const stub = E.MOSSAIC_USER.get(
+      E.MOSSAIC_USER.idFromName(vfsUserDOName("default", tenant))
     );
     // Default test env DOES set JWT_SECRET, so this should just work.
     const r = await stub.vfsListFiles({ ns: "default", tenant }, { limit: 5 });

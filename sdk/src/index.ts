@@ -134,9 +134,12 @@ import { VFS, type CreateVFSOptions, type MossaicEnv } from "./vfs";
  * are cheap (no I/O happens until a method is invoked) so the typical
  * pattern is to construct one per request.
  *
- * The consumer's wrangler.jsonc must declare a Durable Object binding
- * named `MOSSAIC_USER` pointing at the re-exported `UserDO` class.
- * (See `@mossaic/sdk/templates/wrangler.jsonc` for the template.)
+ * The consumer's wrangler.jsonc must declare TWO Durable Object
+ * bindings — `MOSSAIC_USER` (pointing at the re-exported `UserDO` class)
+ * and `MOSSAIC_SHARD` (pointing at `ShardDO`). The SDK only addresses
+ * `MOSSAIC_USER` directly; `MOSSAIC_SHARD` is consumed internally by
+ * the bundled UserDO code from its own env. (See
+ * `@mossaic/sdk/templates/wrangler.jsonc` for the template.)
  */
 export function createVFS(env: MossaicEnv, opts: CreateVFSOptions): VFS {
   return new VFS(env, opts);

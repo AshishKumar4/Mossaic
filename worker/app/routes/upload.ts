@@ -29,8 +29,8 @@ upload.post("/init", async (c) => {
     return c.json({ error: "fileName, fileSize, and mimeType are required" }, 400);
   }
 
-  const doId = c.env.USER_DO.idFromName(userDOName(userId));
-  const stub = c.env.USER_DO.get(doId);
+  const doId = c.env.MOSSAIC_USER.idFromName(userDOName(userId));
+  const stub = c.env.MOSSAIC_USER.get(doId);
 
   const res = await stub.fetch(
     new Request("http://internal/files/create", {
@@ -84,8 +84,8 @@ upload.put("/chunk/:fileId/:chunkIndex", async (c) => {
 
   // Stream chunk data to ShardDO (never buffer fully in worker)
   const body = await c.req.arrayBuffer();
-  const shardId = c.env.SHARD_DO.idFromName(doName);
-  const shardStub = c.env.SHARD_DO.get(shardId);
+  const shardId = c.env.MOSSAIC_SHARD.idFromName(doName);
+  const shardStub = c.env.MOSSAIC_SHARD.get(shardId);
 
   const shardRes = await shardStub.fetch(
     new Request("http://internal/chunk", {
@@ -105,8 +105,8 @@ upload.put("/chunk/:fileId/:chunkIndex", async (c) => {
   }
 
   // Record chunk in UserDO
-  const userDoId = c.env.USER_DO.idFromName(userDOName(userId));
-  const userStub = c.env.USER_DO.get(userDoId);
+  const userDoId = c.env.MOSSAIC_USER.idFromName(userDOName(userId));
+  const userStub = c.env.MOSSAIC_USER.get(userDoId);
 
   await userStub.fetch(
     new Request("http://internal/files/chunk", {
@@ -139,8 +139,8 @@ upload.post("/complete/:fileId", async (c) => {
   }
 
   // Get file info from UserDO
-  const userDoId = c.env.USER_DO.idFromName(userDOName(userId));
-  const userStub = c.env.USER_DO.get(userDoId);
+  const userDoId = c.env.MOSSAIC_USER.idFromName(userDOName(userId));
+  const userStub = c.env.MOSSAIC_USER.get(userDoId);
 
   const fileRes = await userStub.fetch(
     new Request(`http://internal/files/get/${fileId}`)

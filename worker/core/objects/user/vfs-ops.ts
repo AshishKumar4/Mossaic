@@ -612,7 +612,7 @@ async function readFileVersioned(
       scope.sub,
       c.shard_index
     );
-    const stub = env.SHARD_DO.get(env.SHARD_DO.idFromName(shardName));
+    const stub = env.MOSSAIC_SHARD.get(env.MOSSAIC_SHARD.idFromName(shardName));
     const res = await stub.fetch(
       new Request(`http://internal/chunk/${c.chunk_hash}`)
     );
@@ -784,7 +784,7 @@ export async function vfsReadFile(
       scope.sub,
       c.shard_index
     );
-    const stub = env.SHARD_DO.get(env.SHARD_DO.idFromName(shardName));
+    const stub = env.MOSSAIC_SHARD.get(env.MOSSAIC_SHARD.idFromName(shardName));
     const res = await stub.fetch(
       new Request(`http://internal/chunk/${c.chunk_hash}`)
     );
@@ -952,7 +952,7 @@ export async function vfsReadChunk(
     scope.sub,
     chunkRow.shard_index
   );
-  const stub = env.SHARD_DO.get(env.SHARD_DO.idFromName(shardName));
+  const stub = env.MOSSAIC_SHARD.get(env.MOSSAIC_SHARD.idFromName(shardName));
   const res = await stub.fetch(
     new Request(`http://internal/chunk/${chunkRow.chunk_hash}`)
   );
@@ -1186,12 +1186,12 @@ async function hardDeleteFileRow(
 
   // Then dispatch one deleteChunks RPC per touched shard.
   const env = durableObject.envPublic;
-  // Env.SHARD_DO is the un-parameterized DurableObjectNamespace; cast to
+  // Env.MOSSAIC_SHARD is the un-parameterized DurableObjectNamespace; cast to
   // the typed namespace so the .deleteChunks RPC method is visible.
   // Double cast (via `unknown`) because TS treats the un-parameterized
   // form as DurableObjectNamespace<undefined> which doesn't structurally
   // overlap with the typed form.
-  const shardNs = env.SHARD_DO as unknown as DurableObjectNamespace<ShardDO>;
+  const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
   for (const { shard_index } of shardRows) {
     const shardName = vfsShardDOName(
       scope.ns,
@@ -1381,7 +1381,7 @@ async function vfsWriteFileVersioned(
   const { chunkSize, chunkCount } = computeChunkSpec(data.byteLength);
   const poolSize = poolSizeFor(durableObject, userId);
   const env = durableObject.envPublic;
-  const shardNs = env.SHARD_DO as unknown as DurableObjectNamespace<ShardDO>;
+  const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
   const refId = shardRefId(pathId, versionId);
   const touchedShards = new Set<number>();
 
@@ -1715,7 +1715,7 @@ export async function vfsWriteFile(
   const env = durableObject.envPublic;
   // Cast the un-parameterized namespace to the typed one so .putChunk RPC
   // resolves. (See hardDeleteFileRow for the same pattern on deleteChunks.)
-  const shardNs = env.SHARD_DO as unknown as DurableObjectNamespace<ShardDO>;
+  const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
   const fileHashParts = new Array<string>(chunkCount);
   try {
     const CONCURRENCY = 8;
@@ -2858,7 +2858,7 @@ export async function vfsPullReadStream(
     scope.sub,
     chunkRow.shard_index
   );
-  const stub = env.SHARD_DO.get(env.SHARD_DO.idFromName(shardName));
+  const stub = env.MOSSAIC_SHARD.get(env.MOSSAIC_SHARD.idFromName(shardName));
   const res = await stub.fetch(
     new Request(`http://internal/chunk/${chunkRow.chunk_hash}`)
   );
@@ -3089,7 +3089,7 @@ export async function vfsAppendWriteStream(
   const hash = await hashChunk(data);
   const sIdx = placeChunk(userId, handle.tmpId, chunkIndex, handle.poolSize);
   const env = durableObject.envPublic;
-  const shardNs = env.SHARD_DO as unknown as DurableObjectNamespace<ShardDO>;
+  const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
   const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, sIdx);
   const stub = shardNs.get(shardNs.idFromName(shardName));
   await stub.putChunk(hash, data, handle.tmpId, chunkIndex, userId);

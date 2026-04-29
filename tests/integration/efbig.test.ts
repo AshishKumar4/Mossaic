@@ -39,12 +39,12 @@ import { createVFS, type MossaicEnv, EFBIG, VFSFsError } from "../../sdk/src/ind
 import { READFILE_MAX, WRITEFILE_MAX } from "@shared/inline";
 
 interface E {
-  USER_DO: DurableObjectNamespace;
+  MOSSAIC_USER: DurableObjectNamespace;
 }
 const E = env as unknown as E;
 
 function makeEnv(): MossaicEnv {
-  return { MOSSAIC_USER: E.USER_DO as MossaicEnv["MOSSAIC_USER"] };
+  return { MOSSAIC_USER: E.MOSSAIC_USER as MossaicEnv["MOSSAIC_USER"] };
 }
 
 describe("EFBIG enforcement", () => {
@@ -65,8 +65,8 @@ describe("EFBIG enforcement", () => {
     // Now pump file_size past the cap via direct DO state mutation.
     // The actual chunk stays tiny — vfs-ops checks file_size before
     // fanning out chunk fetches, so it errors before any I/O.
-    const stub = E.USER_DO.get(
-      E.USER_DO.idFromName("vfs:default:efbig-readfile")
+    const stub = E.MOSSAIC_USER.get(
+      E.MOSSAIC_USER.idFromName("vfs:default:efbig-readfile")
     );
     await runInDurableObject(stub, async (_inst, state) => {
       state.storage.sql.exec(
@@ -151,8 +151,8 @@ describe("EFBIG enforcement", () => {
     const vfs = createVFS(makeEnv(), { tenant: "efbig-stream" });
     const { handle } = await vfs.createWriteStreamWithHandle("/stream.bin");
 
-    const stub = E.USER_DO.get(
-      E.USER_DO.idFromName("vfs:default:efbig-stream")
+    const stub = E.MOSSAIC_USER.get(
+      E.MOSSAIC_USER.idFromName("vfs:default:efbig-stream")
     );
     await runInDurableObject(stub, async (_inst, state) => {
       state.storage.sql.exec(
@@ -167,8 +167,8 @@ describe("EFBIG enforcement", () => {
     // VFS class doesn't expose append directly — that's intentional
     // (consumers stream via WritableStream). For the test we go
     // direct.
-    const userStub = E.USER_DO.get(
-      E.USER_DO.idFromName("vfs:default:efbig-stream")
+    const userStub = E.MOSSAIC_USER.get(
+      E.MOSSAIC_USER.idFromName("vfs:default:efbig-stream")
     ) as DurableObjectStub & {
       vfsAppendWriteStream(
         scope: { ns: string; tenant: string },

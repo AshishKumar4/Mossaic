@@ -55,8 +55,8 @@
 
   "durable_objects": {
     "bindings": [
-      { "name": "USER_DO", "class_name": "UserDOCore" },
-      { "name": "SHARD_DO", "class_name": "ShardDO" }
+      { "name": "MOSSAIC_USER", "class_name": "UserDOCore" },
+      { "name": "MOSSAIC_SHARD", "class_name": "ShardDO" }
     ]
   },
 

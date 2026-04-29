@@ -251,7 +251,7 @@ async function hardDeleteLoser(
   durableObject.sql.exec("DELETE FROM files WHERE file_id = ?", fileId);
 
   const env = durableObject.envPublic;
-  const shardNs = env.SHARD_DO as unknown as DurableObjectNamespace<ShardDO>;
+  const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
   for (const { shard_index } of shardRows) {
     const shardName = scope
       ? vfsShardDOName(scope.ns, scope.tenant, scope.sub, shard_index)

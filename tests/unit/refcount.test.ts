@@ -14,12 +14,12 @@ import { env, runInDurableObject } from "cloudflare:test";
  */
 
 interface Env {
-  SHARD_DO: DurableObjectNamespace;
+  MOSSAIC_SHARD: DurableObjectNamespace;
 }
 
 const E = env as unknown as Env;
 const stubFor = (name: string) =>
-  E.SHARD_DO.get(E.SHARD_DO.idFromName(name));
+  E.MOSSAIC_SHARD.get(E.MOSSAIC_SHARD.idFromName(name));
 
 async function putChunk(
   stub: DurableObjectStub,

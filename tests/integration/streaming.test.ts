@@ -21,7 +21,7 @@ import { env, runInDurableObject } from "cloudflare:test";
  *
  * All tests use the new vfs:default:<userId> DO naming pattern that
  * Phase 4 introduced. Direct DO RPC: tests grab a stub via
- * env.USER_DO.idFromName(vfsUserDOName(...)) and call the new methods.
+ * env.MOSSAIC_USER.idFromName(vfsUserDOName(...)) and call the new methods.
  */
 
 import type { UserDOCore as UserDO } from "@core/objects/user/user-do-core";
@@ -30,8 +30,8 @@ import { vfsShardDOName, vfsUserDOName } from "@core/lib/utils";
 import { INLINE_LIMIT } from "@shared/inline";
 
 interface E {
-  USER_DO: DurableObjectNamespace<UserDO>;
-  SHARD_DO: DurableObjectNamespace<ShardDO>;
+  MOSSAIC_USER: DurableObjectNamespace<UserDO>;
+  MOSSAIC_SHARD: DurableObjectNamespace<ShardDO>;
 }
 const E = env as unknown as E;
 
@@ -43,8 +43,8 @@ const NS = "default";
  * consumer's createVFS({ tenant }) would do.
  */
 function userStubFor(tenant: string, sub?: string) {
-  return E.USER_DO.get(
-    E.USER_DO.idFromName(vfsUserDOName(NS, tenant, sub))
+  return E.MOSSAIC_USER.get(
+    E.MOSSAIC_USER.idFromName(vfsUserDOName(NS, tenant, sub))
   );
 }
 
@@ -54,8 +54,8 @@ function shardStubFor(
   shardIdx: number,
   sub?: string
 ): DurableObjectStub<ShardDO> {
-  return E.SHARD_DO.get(
-    E.SHARD_DO.idFromName(vfsShardDOName(NS, tenant, sub, shardIdx))
+  return E.MOSSAIC_SHARD.get(
+    E.MOSSAIC_SHARD.idFromName(vfsShardDOName(NS, tenant, sub, shardIdx))
   );
 }
 
@@ -708,8 +708,8 @@ describe("Phase 4 shard naming wired through stream paths", () => {
     expect(stats.uniqueChunks).toBeGreaterThan(0);
 
     // ...and not on the legacy-name shard.
-    const legacyShard = E.SHARD_DO.get(
-      E.SHARD_DO.idFromName(`shard:${tenant}:${recordedIdx}`)
+    const legacyShard = E.MOSSAIC_SHARD.get(
+      E.MOSSAIC_SHARD.idFromName(`shard:${tenant}:${recordedIdx}`)
     );
     const legacyStats = (await (
       await legacyShard.fetch(new Request("http://internal/stats"))

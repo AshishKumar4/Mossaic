@@ -19,13 +19,13 @@ import { env } from "cloudflare:test";
  */
 
 interface Env {
-  USER_DO: DurableObjectNamespace;
-  SHARD_DO: DurableObjectNamespace;
+  MOSSAIC_USER: DurableObjectNamespace;
+  MOSSAIC_SHARD: DurableObjectNamespace;
 }
 
 const E = env as unknown as Env;
-const userStub = (n: string) => E.USER_DO.get(E.USER_DO.idFromName(n));
-const shardStub = (n: string) => E.SHARD_DO.get(E.SHARD_DO.idFromName(n));
+const userStub = (n: string) => E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName(n));
+const shardStub = (n: string) => E.MOSSAIC_SHARD.get(E.MOSSAIC_SHARD.idFromName(n));
 
 async function sha256Hex(data: Uint8Array): Promise<string> {
   const buf = await crypto.subtle.digest("SHA-256", data);

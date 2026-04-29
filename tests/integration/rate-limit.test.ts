@@ -15,12 +15,12 @@ import { createVFS, type MossaicEnv, EAGAIN, VFSFsError } from "../../sdk/src/in
 import { vfsUserDOName } from "@core/lib/utils";
 
 interface E {
-  USER_DO: DurableObjectNamespace;
+  MOSSAIC_USER: DurableObjectNamespace;
 }
 const E = env as unknown as E;
 
 function envFor(): MossaicEnv {
-  return { MOSSAIC_USER: E.USER_DO as MossaicEnv["MOSSAIC_USER"] };
+  return { MOSSAIC_USER: E.MOSSAIC_USER as MossaicEnv["MOSSAIC_USER"] };
 }
 
 /**
@@ -34,8 +34,8 @@ async function setLimit(
   perSec: number,
   burst: number
 ): Promise<void> {
-  const stub = E.USER_DO.get(
-    E.USER_DO.idFromName(vfsUserDOName("default", tenant))
+  const stub = E.MOSSAIC_USER.get(
+    E.MOSSAIC_USER.idFromName(vfsUserDOName("default", tenant))
   );
   // Trigger init.
   await stub.vfsExists({ ns: "default", tenant }, "/");

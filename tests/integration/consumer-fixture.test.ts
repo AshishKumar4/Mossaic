@@ -30,7 +30,7 @@ import handler, {
 } from "../fixtures/consumer/src/index";
 
 interface E {
-  USER_DO: DurableObjectNamespace;
+  MOSSAIC_USER: DurableObjectNamespace;
 }
 const E = env as unknown as E;
 
@@ -124,7 +124,7 @@ function makeEnvWithCounter(
 ): ConsumerEnv {
   return {
     MOSSAIC_USER: makeCountingNamespace(
-      E.USER_DO,
+      E.MOSSAIC_USER,
       counter
     ) as unknown as ConsumerEnv["MOSSAIC_USER"],
     TEST_TENANT: tenant,

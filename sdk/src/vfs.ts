@@ -310,13 +310,18 @@ export interface UserDOClient {
 
 /**
  * Consumer-side env shape. The consumer's Worker `Env` interface must
- * include `MOSSAIC_USER: DurableObjectNamespace<UserDO>` (and ideally
- * `MOSSAIC_SHARD` as well — though the SDK only directly addresses
- * `MOSSAIC_USER`, the worker-side code dispatches to `SHARD_DO` and
- * the wrangler binding name is fixed at the consumer side).
+ * include BOTH:
+ *   - `MOSSAIC_USER: DurableObjectNamespace<UserDO>`  — the SDK addresses
+ *     this directly.
+ *   - `MOSSAIC_SHARD: DurableObjectNamespace<ShardDO>` — internal-only;
+ *     the SDK never reads `env.MOSSAIC_SHARD`, but UserDO's bundled
+ *     placement code dispatches to this binding via its OWN env, so the
+ *     consumer's wrangler MUST declare it for the DO class to instantiate.
  *
- * Naming: by convention the binding is `MOSSAIC_USER`, but consumers
- * can choose anything and pass the correct namespace into createVFS.
+ * Naming: the canonical binding names are `MOSSAIC_USER` / `MOSSAIC_SHARD`
+ * (Phase 13 — prefixed for consumer-env safety). Renaming the binding
+ * `name` while keeping `class_name` is data-safe per CF docs:
+ * https://developers.cloudflare.com/durable-objects/reference/durable-objects-migrations/
  *
  * The namespace is typed as `unknown`-but-callable on its `get()`
  * method because the workers-types `DurableObjectNamespace<T>`
@@ -327,6 +332,15 @@ export interface UserDOClient {
  */
 export interface MossaicEnv {
   MOSSAIC_USER: {
+    idFromName(name: string): DurableObjectId;
+    get(id: DurableObjectId): unknown;
+  };
+  /**
+   * Required at the wrangler level even though the SDK never reads it
+   * directly — the bundled UserDO code calls `env.MOSSAIC_SHARD` from
+   * inside its own Worker context.
+   */
+  MOSSAIC_SHARD: {
     idFromName(name: string): DurableObjectId;
     get(id: DurableObjectId): unknown;
   };

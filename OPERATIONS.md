@@ -39,8 +39,8 @@ Run **all** of these from `/workspace/Mossaic` (or your local clone). Every box 
 - [ ] `pnpm install` (lockfile-only; should be a no-op in CI).
 - [ ] `pnpm test` — 270+ tests pass, 28+ files. **Zero** flakes tolerated; if a test fails, do not deploy.
 - [ ] `npx tsc -b` — exit 0, zero diagnostics.
-- [ ] `npx wrangler deploy --dry-run` (App mode) — exit 0, prints binding list including `MOSSAIC_USER`/`USER_DO`, `MOSSAIC_SHARD`/`SHARD_DO`, `SEARCH_DO`, and migration tags.
-- [ ] `npx wrangler deploy --dry-run -c deployments/service/wrangler.jsonc` (Service mode) — exit 0, prints bindings WITHOUT `SEARCH_DO`.
+- [ ] `npx wrangler deploy --dry-run` (App mode) — exit 0, prints binding list `MOSSAIC_USER`, `MOSSAIC_SHARD`, `SEARCH_DO`, and migration tags. (Phase 13: legacy `USER_DO`/`SHARD_DO` binding names are retired; `class_name`s `UserDO`/`ShardDO`/`SearchDO` are unchanged.)
+- [ ] `npx wrangler deploy --dry-run -c deployments/service/wrangler.jsonc` (Service mode) — exit 0, prints bindings `MOSSAIC_USER`, `MOSSAIC_SHARD` only (no `SEARCH_DO`).
 - [ ] `pnpm lean:build` (or `lake build` in `lean/`) — succeeds. `bash lean/scripts/check-no-sorry.sh` reports zero `sorry` and zero project-level axioms.
 
 ### 1.3 Production secrets
@@ -90,7 +90,7 @@ Mossaic emits **almost no console.log** in steady state (intentional — quieter
 
 Cloudflare account-level limits on DO instance count are not enforced in Mossaic source — the operator must:
 
-1. Daily, query Cloudflare's analytics API for `durable_object_total` per namespace (`USER_DO`, `SHARD_DO`).
+1. Daily, query Cloudflare's analytics API for `durable_object_total` per namespace (`MOSSAIC_USER`, `MOSSAIC_SHARD`).
 2. Alarm when count exceeds 80% of your account cap. Default Workers Paid: ask CF for your specific cap; treat 1M instances as a soft ceiling unless you have written confirmation otherwise.
 3. Per-tenant: 1 UserDO + `quota.pool_size` ShardDOs (default 32, +1 per 5 GB stored, capped per `shared/placement.ts`).
 

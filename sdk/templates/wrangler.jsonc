@@ -30,8 +30,9 @@
 
   // The two DO classes — UserDO holds per-tenant manifest + metadata;
   // ShardDO holds content-addressed chunk blobs. The binding names
-  // on the left are configurable; the SDK's createVFS reads
-  // MOSSAIC_USER by default but accepts any name passed via env.
+  // are CANONICAL: the SDK reads `env.MOSSAIC_USER` directly, and the
+  // bundled UserDO code reads `env.MOSSAIC_SHARD` from inside its own
+  // env. Both bindings are required (Phase 13).
   //
   // Phase 11.1: SearchDO is no longer part of the SDK surface. The
   // CLIP/BGE vector search backed the photo-library's /api/search

@@ -21,10 +21,10 @@ import {
 } from "@shared/vfs-paths";
 
 interface E {
-  USER_DO: DurableObjectNamespace;
+  MOSSAIC_USER: DurableObjectNamespace;
 }
 const E = env as unknown as E;
-const userStub = (n: string) => E.USER_DO.get(E.USER_DO.idFromName(n));
+const userStub = (n: string) => E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName(n));
 
 describe("normalizePath", () => {
   it("normalizes various forms", () => {
