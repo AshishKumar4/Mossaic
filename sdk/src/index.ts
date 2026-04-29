@@ -145,6 +145,29 @@ export {
   type VFSClient,
 } from "./http";
 
+// Phase 16: parallel multipart transfer engine. Built on top of the
+// HTTP client; saturates user bandwidth via N-way parallel chunk
+// uploads/downloads while keeping UserDO touches limited to session
+// boundaries (begin + finalize).
+export {
+  parallelUpload,
+  parallelDownload,
+  parallelDownloadStream,
+  beginUpload,
+  putChunk,
+  finalizeUpload,
+  abortUpload,
+  statusUpload,
+  deriveClientChunkSpec,
+  THROUGHPUT_MATH,
+  type BeginUploadOpts,
+  type BeginUploadResult,
+  type ParallelUploadOpts,
+  type ParallelDownloadOpts,
+  type ProgressEvent as TransferProgressEvent,
+  type MossaicHttpClient,
+} from "./transfer";
+
 // isomorphic-git adapter (Phase 8: optional batched-lstat). Re-exported
 // from the root for ergonomic single-import use; also available via
 // the explicit `@mossaic/sdk/fs` subpath.

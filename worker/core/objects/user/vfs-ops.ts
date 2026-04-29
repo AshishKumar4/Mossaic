@@ -3482,3 +3482,60 @@ export async function vfsCreateWriteStream(
 
   return { stream, handle };
 }
+
+// ── Phase 16: helper exports for the multipart-upload module ──────────
+//
+// The multipart upload code in `multipart-upload.ts` shares the same
+// path-resolution + supersede protocol as the streaming-write path
+// (`commitRename`, `hardDeleteFileRow`). Rather than duplicate the
+// logic, we expose a tiny set of named exports the multipart module
+// imports.  Naming follows the existing `*External` pattern from
+// Phase 12 (commitRenameExternal etc).
+
+/**
+ * Phase 16: external accessor for `userIdFor`. Same validation, same
+ * `${tenant}::${sub}` composition.
+ */
+export function userIdForExternal(scope: VFSScope): string {
+  return userIdFor(scope);
+}
+
+/**
+ * Phase 16: external accessor for `resolveParent`. Returns
+ * `(parentId, leaf)` tuple for a path's would-be parent.
+ */
+export function resolveParentExternal(
+  durableObject: UserDO,
+  userId: string,
+  path: string
+): { parentId: string | null; leaf: string } {
+  return resolveParent(durableObject, userId, path);
+}
+
+/** Phase 16: external accessor for `poolSizeFor`. */
+export function poolSizeForExternal(
+  durableObject: UserDO,
+  userId: string
+): number {
+  return poolSizeFor(durableObject, userId);
+}
+
+/** Phase 16: external accessor for `folderExists`. */
+export function folderExistsExternal(
+  durableObject: UserDO,
+  userId: string,
+  parentId: string | null,
+  name: string
+): boolean {
+  return folderExists(durableObject, userId, parentId, name);
+}
+
+/** Phase 16: external accessor for `findLiveFile`. */
+export function findLiveFileExternal(
+  durableObject: UserDO,
+  userId: string,
+  parentId: string | null,
+  leaf: string
+): { file_id: string } | undefined {
+  return findLiveFile(durableObject, userId, parentId, leaf);
+}

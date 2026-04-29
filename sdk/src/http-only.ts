@@ -79,3 +79,23 @@ export { issueVFSToken, verifyVFSToken, type VFSTokenPayload } from "./auth";
 
 // Re-export shared scope shape for typed scopes in client code.
 export type { VFSScope } from "../../shared/vfs-types";
+
+// Phase 16: parallel multipart transfer engine.
+export {
+  parallelUpload,
+  parallelDownload,
+  parallelDownloadStream,
+  beginUpload,
+  putChunk,
+  finalizeUpload,
+  abortUpload,
+  statusUpload,
+  deriveClientChunkSpec,
+  THROUGHPUT_MATH,
+  type BeginUploadOpts,
+  type BeginUploadResult,
+  type ParallelUploadOpts,
+  type ParallelDownloadOpts,
+  type ProgressEvent as TransferProgressEvent,
+  type MossaicHttpClient,
+} from "./transfer";
