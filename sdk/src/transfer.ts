@@ -456,6 +456,9 @@ export async function parallelUpload(
   // Drive lanes up to `state.target`, refreshing as `target` changes.
   state.active = Math.min(state.target, pending.size);
   const lanes: Promise<void>[] = [];
+  // Endgame extras are pushed after Promise.all(lanes) snapshots, so we
+  // track them separately and await them after the main lanes complete.
+  const extras: Promise<void>[] = [];
   for (let w = 0; w < state.active; w++) {
     lanes.push(lane());
   }
@@ -478,7 +481,7 @@ export async function parallelUpload(
         // endgameMaxFanout).
         const extra = Math.min(pending.size, endgameMaxFanout);
         for (let i = 0; i < extra; i++) {
-          lanes.push(lane());
+          extras.push(lane());
         }
         return;
       }
@@ -489,6 +492,11 @@ export async function parallelUpload(
   try {
     await Promise.all(lanes);
     await endgameLane;
+    // After the original lanes drain, any endgame extras that were
+    // spawned mid-flight may still be in the middle of uploadOne(); we
+    // MUST await them before finalize, otherwise chunkHashList[] can
+    // contain undefined slots for chunks the extras claimed.
+    await Promise.all(extras);
   } catch (err) {
     // Best-effort abort on the server so chunks aren't pinned.
     try {
