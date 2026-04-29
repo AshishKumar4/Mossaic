@@ -46,6 +46,34 @@ function getSecret(env: Env): Uint8Array {
 }
 
 /**
+ * Resolve the secret used to HMAC listFiles cursors. Same source as
+ * `JWT_SECRET` (we deliberately reuse the one Workers secret rather
+ * than introducing a second). Throws `VFSConfigError` on
+ * missing/empty — there is intentionally NO dev fallback string.
+ *
+ * This mirrors the C1 audit fix on `getSecret`. The cursor codec at
+ * `worker/core/lib/cursor.ts` accepts a string secret (so it can be
+ * unit-tested with an explicit value); the only production caller —
+ * `vfsListFiles` — must route through this helper so a deploy
+ * without `JWT_SECRET` cannot silently fall back to a public string
+ * that any reader of this open-source repo could replay.
+ *
+ * Returns the raw string (the cursor codec hashes it itself via
+ * `crypto.subtle.importKey`).
+ */
+export function getCursorSecret(env: { JWT_SECRET?: string }): string {
+  const secret = env.JWT_SECRET;
+  if (typeof secret !== "string" || secret.length === 0) {
+    throw new VFSConfigError(
+      "JWT_SECRET is not configured. Set it via `wrangler secret put JWT_SECRET` " +
+        "before deploying. Refusing to sign or verify listFiles cursors with a " +
+        "missing/empty secret.",
+    );
+  }
+  return secret;
+}
+
+/**
  * Sign a JWT with userId and email claims.
  */
 export async function signJWT(
