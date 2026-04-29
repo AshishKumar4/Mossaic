@@ -122,55 +122,74 @@ The Service worker exposes a public Yjs WebSocket upgrade route at `/api/vfs/yjs
 
 ## Architecture
 
-```
-                   ┌─────────────────────────────────────────────────────┐
-                   │  DO instance ID  =  vfs:${ns}:${tenant}[:${sub}]    │
-                   │  (per-tenant scoping; cross-tenant data unreachable)│
-                   └─────────────────────────────────────────────────────┘
+DO instance IDs derive from `vfs:${ns}:${tenant}[:${sub}]` — distinct triples land on distinct SQLite databases, so cross-tenant data is unreachable by construction.
 
-  Consumer Worker / SPA                  Cloudflare Workers runtime
-  ─────────────────────                  ─────────────────────────────────
-                          DO RPC
-   createVFS(env, opts) ─────────────►  ┌──────────────────────────┐
-   vfs.readFile / writeFile / ...       │         UserDO           │
-   vfs.stat / readdir / unlink          │  (per-tenant)            │
-                                        │                          │
-                                        │  • auth, manifests,      │
-                                        │    folders, quota        │
-                                        │  • file-level versioning │
-                                        │  • inline tier (≤16 KB)  │  ◄── tier 1
-                                        │    stays in UserDO row   │      no fanout
-                                        │  • atomic temp→commit    │
-                                        │  • Yjs runtime (per-file)│
-                                        └────┬───────────┬─────────┘
-                                             │           │
-   Live editor client                        │           │
-   (browser / Worker)                        │           │
-        │                                    │           │
-        │   WebSocket upgrade                │           │  DO RPC: rendezvous-
-        │   (Hibernation API,                │           │  hashed chunk fanout
-        │    $0 idle, binary frames,         │           │
-        │    Yjs sync protocol)              │           ▼
-        └────────────────────────────────►   │  ┌──────────────────────────┐
-                                             │  │  ShardDO pool (n shards) │
-                                             │  │                          │
-                                             │  │  • normal chunks         │  ◄── tier 2
-                                             │  │    (1 MB, content-       │      blob storage
-                                             │  │     addressed, refct'd)  │
-                                             │  │  • Yjs op-log + check-   │  ◄── tier 3
-                                             │  │    point chunks (mode_   │      live CRDT
-                                             │  │     yjs files)           │
-                                             │  │  • 30s-grace alarm GC    │
-                                             │  └──────────────────────────┘
-                                             │
-                                             ▼
-                                     ┌────────────────┐
-                                     │   SearchDO     │  (optional, per-tenant
-                                     │ (per-tenant)   │   semantic-search index)
-                                     └────────────────┘
+```mermaid
+flowchart TD
+    %% ───── Consumers ─────
+    subgraph Consumers["Consumers"]
+        direction LR
+        SPA["React SPA<br/>(photo app)"]
+        Worker["SDK consumer Worker<br/>createVFS(env, opts)"]
+        CLI["@mossaic/cli<br/>(mossaic / mscli)"]
+        HTTP["Non-Worker HTTP client<br/>(browser / Node)"]
+    end
+
+    %% ───── Service-mode boundary (App ⊃ Core) ─────
+    subgraph App["App deployment (worker/app/) — superset of Core"]
+        direction TB
+        subgraph Core["Service deployment (worker/core/) — SDK-essential surface"]
+            direction TB
+            CoreRouter["Hono router<br/>Bearer-JWT auth on /api/vfs/*<br/>HTTP fallback + WSS upgrade"]
+            UserDOCore[("UserDOCore (per-tenant)<br/>manifests + inline tier · versioning<br/>metadata + tags + indexed listFiles (P12)<br/>HMAC pagination cursor · Yjs op log<br/>+ awareness relay (P13) · alarm GC")]
+            subgraph ShardPool["ShardDO pool × N (rendezvous-hashed)"]
+                direction LR
+                S0[("ShardDO 0")]
+                S1[("ShardDO 1")]
+                Sn[("ShardDO n…")]
+            end
+        end
+        AppRouter["Legacy /api/upload, /api/download,<br/>/api/auth, /api/files, /api/folders,<br/>/api/gallery, /api/analytics,<br/>/api/search, /api/shared"]
+        SearchDO[("SearchDO (per-tenant)<br/>CLIP + BGE — App only")]
+    end
+
+    %% ───── Edges: HTTP / RPC ─────
+    SPA -- "HTTPS (legacy + /api/vfs)" --> AppRouter
+    Worker -- "in-Worker DO RPC" --> UserDOCore
+    CLI -- "HTTPS Bearer JWT" --> CoreRouter
+    HTTP -- "HTTPS Bearer JWT" --> CoreRouter
+    AppRouter -- "auth, quota, gallery,<br/>analytics" --> UserDOCore
+    AppRouter -- "semantic search" --> SearchDO
+    CoreRouter -- "VFS RPC dispatch" --> UserDOCore
+
+    %% ───── Storage flow ─────
+    UserDOCore -- "rendezvous-hashed<br/>chunk fanout (1 MB,<br/>content-addressed,<br/>refcounted, GC alarm)" --> S0
+    UserDOCore --> S1
+    UserDOCore --> Sn
+    UserDOCore -- "copyFile (P12):<br/>manifest copy +<br/>chunk_refs ref_count++<br/>(zero bytes move)" --> S0
+
+    %% ───── Yjs WebSocket path ─────
+    Browser["Live editor peer<br/>(browser / Worker)"]
+    Browser2["Other peer(s)"]
+    Browser -- "WSS upgrade<br/>(Hibernation API,<br/>$0 idle, binary frames)" --> CoreRouter
+    CoreRouter -- "Yjs sync + awareness<br/>(P13 relay-only)" --> UserDOCore
+    UserDOCore -. "broadcast peer updates<br/>(awareness in-memory,<br/>never persisted)" .-> Browser2
+
+    %% ───── Styling (light + dark GitHub themes) ─────
+    classDef consumer fill:#e5e7eb,stroke:#6b7280,stroke-width:1px,color:#111827;
+    classDef core fill:#dbeafe,stroke:#3b82f6,stroke-width:1px,color:#0c4a6e;
+    classDef app fill:#fef3c7,stroke:#d97706,stroke-width:1px,color:#78350f;
+    classDef shard fill:#dcfce7,stroke:#16a34a,stroke-width:1px,color:#14532d;
+    classDef peer fill:#f3e8ff,stroke:#9333ea,stroke-width:1px,color:#581c87;
+
+    class SPA,Worker,CLI,HTTP consumer;
+    class CoreRouter,UserDOCore core;
+    class AppRouter,SearchDO app;
+    class S0,S1,Sn,ShardPool shard;
+    class Browser,Browser2 peer;
 ```
 
-Each tenant gets their own **UserDO** (auth, file manifests, folder hierarchy, quota, versioning, Yjs runtime) and a **dynamic pool of ShardDOs** that store the actual chunk data. Chunks are placed deterministically via rendezvous hashing — both client and server can independently compute which shard holds any chunk with zero coordination.
+Each tenant gets their own **UserDOCore** (manifests, metadata + tags + indexes, HMAC cursor, versioning, Yjs runtime + awareness relay) and a **dynamic pool of ShardDOs** that store the actual chunk data. Chunks are placed deterministically via rendezvous hashing — both client and server can independently compute which shard holds any chunk with zero coordination. The **Service deployment** ships UserDOCore + ShardDO + the Bearer-JWT-authed `/api/vfs/*` Hono router (HTTP fallback + WSS upgrade); the **App deployment** is a superset that adds the legacy photo-app routes, password auth, and SearchDO (CLIP + BGE semantic index).
 
 **Three storage tiers**:
 1. **Inline** (≤16 KB) — the file body lives in the UserDO row itself; no ShardDO fanout, no chunk RPC.
