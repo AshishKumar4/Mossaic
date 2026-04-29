@@ -260,7 +260,7 @@ const chunk1 = await vfs.readChunk("/huge.tar", 1);
 
 Note: `chunks[].shardIndex` is intentionally hidden — it's an internal placement detail, not a stable identifier.
 
-### Parallel multipart transfer (Phase 16/17.6)
+### Parallel multipart transfer
 
 For high-throughput uploads/downloads, use the `parallelUpload` / `parallelDownload` engine. It drives R2/S3-style multipart sessions with adaptive concurrency (1 → 64 lanes) and endgame mode for tail-latency reduction.
 
@@ -306,7 +306,7 @@ const bytes = await parallelDownload(client, "/photo.jpg", {
 });
 ```
 
-#### Per-chunk events (Phase 17.6)
+#### Per-chunk events
 
 `onChunkEvent` fires for every chunk's lifecycle:
 - `started` — chunk pulled from queue, hashing begins.

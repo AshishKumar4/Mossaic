@@ -65,7 +65,7 @@ import {
   stampFileEncryption,
   type EncryptionStampOpts,
 } from "./encryption-stamp";
-// Phase 17.5: placement is resolved via `getPlacement(scope)` (already
+// placement is resolved via `getPlacement(scope)` (already
 // imported above); no direct `placeChunk` import needed.
 import { hashChunk } from "../../../../shared/crypto";
 

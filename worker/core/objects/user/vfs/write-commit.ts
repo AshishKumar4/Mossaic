@@ -7,7 +7,7 @@ import {
 import { INLINE_LIMIT, WRITEFILE_MAX } from "../../../../../shared/inline";
 import { hashChunk } from "../../../../../shared/crypto";
 import { computeChunkSpec } from "../../../../../shared/chunking";
-// Phase 17.5: placement is resolved via `getPlacement(scope)` (already
+// placement is resolved via `getPlacement(scope)` (already
 // imported above); no direct `placeChunk` import needed.
 import { generateId } from "../../../lib/utils";
 import { getPlacement } from "../../../lib/placement-resolver";

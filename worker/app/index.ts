@@ -13,7 +13,7 @@ import searchRoutes from "./routes/search";
 import vfsRoutes from "@core/routes/vfs";
 import yjsWsRoutes from "@core/routes/vfs-yjs-ws";
 import multipartRoutes, { chunkDownload } from "@core/routes/multipart-routes";
-// Phase 17.6 — App-pinned multipart route (`/api/upload/multipart/*`).
+// App-pinned multipart route (`/api/upload/multipart/*`).
 // Routes through legacy DO instances (`user:<userId>` /
 // `shard:<userId>:<idx>`) instead of the canonical `vfs:default:*`
 // namespace. SPA passes `multipartBaseOverride: "/api/upload/multipart"`
@@ -60,7 +60,7 @@ app.use(
 
 // Mount API routes
 app.route("/api/auth", authRoutes);
-// Phase 17.6: App-pinned multipart route. Mounted BEFORE the legacy
+// App-pinned multipart route. Mounted BEFORE the legacy
 // `/api/upload/init|chunk|complete` route so the more-specific path
 // wins. Feature-flagged via `FEATURE_VFS_UPLOAD_MULTIPART`; default
 // ON. Set the flag to "false" via wrangler secret to disable

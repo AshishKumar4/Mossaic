@@ -47,7 +47,7 @@ import {
   type DownloadTokenResponse,
 } from "../../../shared/multipart";
 import { hashChunk } from "../../../shared/crypto";
-// Phase 17.5: placement is resolved via `getPlacement(scope)`; no
+// placement is resolved via `getPlacement(scope)`; no
 // direct `placeChunk` import needed.
 
 // ── Shared auth middleware (Bearer VFS token) ──────────────────────────

@@ -1,5 +1,5 @@
 /**
- * Phase 17.6 — SPA HTTP transfer client.
+ * SPA HTTP transfer client.
  *
  * The SPA upload/download hooks (`use-upload.ts`, `use-download.ts`)
  * collapse onto `@mossaic/sdk` 's `parallelUpload` /
@@ -7,7 +7,7 @@
  * configured to:
  *
  *  1. Send multipart calls to `/api/upload/multipart/*` (App-pinned
- *     bridge route — Phase 17.6 §4).
+ *    bridge route — §4).
  *  2. Send cacheable per-chunk GETs to `/api/download/chunk/...`
  *     (App's existing legacy chunk download path — preserves
  *     production data integrity).

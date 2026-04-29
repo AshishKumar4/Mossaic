@@ -76,9 +76,9 @@ export interface ParallelUploadOpts extends Omit<BeginUploadOpts, "size" | "sign
   /** Progress callback (throttled to ~10 Hz). */
   onProgress?: (e: ProgressEvent) => void;
   /**
-   * Phase 17.6 — per-chunk lifecycle event callback. Optional.
-   * When undefined, the engine is byte-equivalent to the pre-17.6
-   * implementation (zero overhead).
+   * Per-chunk lifecycle event callback. Optional. When undefined,
+   * the engine is byte-equivalent to a callback-free implementation
+   * (zero overhead).
    */
   onChunkEvent?: (e: ChunkEvent) => void;
   /** Cancel the in-flight upload. Triggers `abortUpload` on the server. */
@@ -109,7 +109,7 @@ export interface ProgressEvent {
 }
 
 /**
- * Phase 17.6 — per-chunk lifecycle event.
+ * Per-chunk lifecycle event.
  *
  * Emitted from `parallelUpload` / `parallelDownload` (and the
  * streaming download variant). Consumers (e.g. the photo-library
@@ -138,7 +138,7 @@ export interface ChunkEvent {
 }
 
 /**
- * Phase 17.6 — manifest delivered before any chunk download.
+ * Manifest delivered before any chunk download.
  *
  * Fired exactly once by `parallelDownload` / `parallelDownloadStream`
  * after `multipartDownloadToken` returns. Lets consumers seed their
@@ -160,14 +160,14 @@ export interface ParallelDownloadOpts {
   signal?: AbortSignal;
   onProgress?: (e: ProgressEvent) => void;
   /**
-   * Phase 17.6 — per-chunk lifecycle event callback. Optional.
-   * When undefined, the engine is byte-equivalent to the pre-17.6
-   * implementation (zero overhead).
+   * Per-chunk lifecycle event callback. Optional. When undefined,
+   * the engine is byte-equivalent to a callback-free implementation
+   * (zero overhead).
    */
   onChunkEvent?: (e: ChunkEvent) => void;
   /**
-   * Phase 17.6 — fired exactly once after the download token returns,
-   * before any `onChunkEvent`. Carries the manifest (mimeType, size,
+   * Fired exactly once after the download token returns, before
+   * any `onChunkEvent`. Carries the manifest (mimeType, size,
    * chunk index/hash/size triples) for UI seeding.
    */
   onManifest?: (m: ManifestEvent) => void;
@@ -652,7 +652,7 @@ export async function parallelUpload(
   let chunksDone = landed.size;
 
   const onProgress = opts.onProgress;
-  // Phase 17.6: hoist per-chunk event callback (zero-overhead when undefined).
+  // hoist per-chunk event callback (zero-overhead when undefined).
   const onChunkEvent = opts.onChunkEvent;
   let lastProgressTs = 0;
   function maybeProgress() {
@@ -694,7 +694,7 @@ export async function parallelUpload(
       }
       try {
         const bytes = await chunkBytes(idx);
-        // Phase 17.6: emit `started` exactly once per index, on first
+        // emit `started` exactly once per index, on first
         // attempt (post-bytes-prep so zero-byte/range errors still
         // fire `failed`). Retries do not re-emit `started`.
         if (!startedEmitted && onChunkEvent) {
@@ -727,7 +727,7 @@ export async function parallelUpload(
           throw err;
         }
         if (attempt >= MAX_RETRIES) {
-          // Phase 17.6: surface the terminal error to consumers.
+          // surface the terminal error to consumers.
           if (onChunkEvent) {
             onChunkEvent({
               index: idx,
@@ -738,7 +738,7 @@ export async function parallelUpload(
           }
           throw err;
         }
-        // Phase 17.6: emit `retrying` before backoff so consumers
+        // emit `retrying` before backoff so consumers
         // can update UI optimistically.
         if (onChunkEvent) {
           onChunkEvent({
@@ -797,7 +797,7 @@ export async function parallelUpload(
         const start = pick * chunkSize;
         const end = Math.min(start + chunkSize, totalSize);
         uploaded += end - start;
-        // Phase 17.6: per-chunk `completed` event after success.
+        // per-chunk `completed` event after success.
         if (onChunkEvent) {
           onChunkEvent({
             index: pick,

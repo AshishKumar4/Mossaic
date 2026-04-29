@@ -14,7 +14,7 @@ download.use("*", authMiddleware());
 /**
  * GET /api/download/manifest/:fileId
  *
- * Phase 17: typed RPC `appGetFileManifest` replaces the legacy
+ * typed RPC `appGetFileManifest` replaces the legacy
  * `stub.fetch("/files/manifest/:id")`.
  */
 download.get("/manifest/:fileId", async (c) => {
@@ -31,7 +31,7 @@ download.get("/manifest/:fileId", async (c) => {
 /**
  * GET /api/download/chunk/:fileId/:chunkIndex
  *
- * Phase 17: manifest read via typed RPC. ShardDO addressing stays on
+ * manifest read via typed RPC. ShardDO addressing stays on
  * the legacy `shard:userId:idx` namespace because production chunk
  * bytes live there.
  */

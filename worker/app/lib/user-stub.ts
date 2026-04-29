@@ -1,5 +1,5 @@
 /**
- * Phase 17 — typed UserDO stub helper.
+ * typed UserDO stub helper.
  *
  * App routes use this helper to obtain a `UserDO` stub from the
  * `MOSSAIC_USER` binding with the App's typed RPC surface

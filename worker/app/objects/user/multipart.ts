@@ -1,5 +1,5 @@
 /**
- * Phase 17.6 — App-side multipart upload helpers.
+ * App-side multipart upload helpers.
  *
  * Mirrors `worker/core/objects/user/multipart-upload.ts` but adapted to
  * the legacy App schema (no `_vfs_tmp_*` rename pattern; legacy `files`
@@ -13,7 +13,7 @@
  * (`worker/app/routes/multipart.ts`) calls them via the typed DO RPC
  * binding.
  *
- * **Score-template invariance** (Phase 17.5 §1.4): chunk placement uses
+ * **Score-template invariance** (§1.4): chunk placement uses
  * `legacyAppPlacement.placeChunk` which delegates to the shared
  * `placeChunk` rendezvous score keyed by `shard:${userId}:${idx}` —
  * identical to the legacy App route's per-chunk placement. New chunks
@@ -22,9 +22,9 @@
  *
  * **Cross-class consistency.** `worker/core/objects/shard/shard-do.ts`
  * already provides `putChunkMultipart` + `getMultipartManifest` +
- * `getMultipartLanded` + `clearMultipartStaging` from Phase 16. The
- * legacy App ShardDOs (`shard:${userId}:${idx}`) instantiate the same
- * physical class so all four RPCs are present without modification.
+ * `getMultipartLanded` + `clearMultipartStaging`. The legacy App
+ * ShardDOs (`shard:${userId}:${idx}`) instantiate the same physical
+ * class so all four RPCs are present without modification.
  */
 
 import type { UserDO } from "./user-do";
@@ -625,7 +625,7 @@ export async function appGetMultipartStatus(
 
 /**
  * Open a manifest for a finalized App file. Wraps `getFileManifest`
- * (legacy SQL helper) into the Phase 16 `MultipartDownloadTokenResponse`
+ * (legacy SQL helper) into the `MultipartDownloadTokenResponse`
  * manifest shape so the SDK's `parallelDownload` can consume it
  * verbatim.
  */

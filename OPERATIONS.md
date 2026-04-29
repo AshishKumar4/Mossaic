@@ -565,7 +565,7 @@ mode preserves cross-file dedup on encrypted uploads (see plan
   with the same `uploadId` to recover. Fresh tokens; existing
   `landed[]` chunks re-used.
 
-## 6.8 SPA on SDK transfer engine (Phase 17.6)
+## 6.8 SPA on SDK transfer engine
 
 The SPA at `mossaic.ashishkumarsingh.com` was migrated from a
 hand-rolled chunked transfer engine (~395 LoC of AIMD/processChunk/
@@ -615,13 +615,13 @@ fail with a typed network error from `parallelUpload`. To restore
 the legacy single-chunk path during rollback, also revert
 `src/hooks/use-upload.ts` to call `api.uploadInit/uploadChunk/uploadComplete`
 (the legacy methods on `api.ts` are deferred-deletion, scheduled
-for Phase 17.6.1 cleanup).
+for the legacy-routes cleanup phase).
 
 ### 6.8.3 Score-template invariance — production data integrity
 
 The new App-pinned multipart route uses `legacyAppPlacement.placeChunk`
-(Phase 17.5) which keys the rendezvous score on
-`shard:${userId}:${idx}` — IDENTICAL to the legacy single-chunk
+which keys the rendezvous score on `shard:${userId}:${idx}` —
+IDENTICAL to the legacy single-chunk
 upload route's score. **Every existing photo's chunk addressing is
 preserved.** Migration-safety integration test
 `tests/integration/spa-roundtrip-live.test.ts:S2` verifies the
@@ -630,8 +630,8 @@ read back via the legacy `/api/download/chunk/*` endpoint.
 
 ### 6.8.4 Per-chunk progress UI
 
-The SDK extensions added in Phase 17.6 (`onChunkEvent` +
-`onManifest`) drive the SPA's per-chunk status grid. Every chunk
+The SDK extensions `onChunkEvent` + `onManifest` drive the SPA's
+per-chunk status grid. Every chunk
 emits `started → completed` (or `→ failed`) events; the SPA hooks
 map these to `ChunkProgress` state flips. Across chunks, ordering
 is non-deterministic (concurrent lanes); per-index ordering is

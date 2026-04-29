@@ -47,7 +47,7 @@ export {
   type VersionMarkOpts,
 } from "./vfs";
 
-// Phase 17.5 — placement abstraction. `canonicalPlacement` is the
+// placement abstraction. `canonicalPlacement` is the
 // default (used by `createVFS()` consumers); `legacyAppPlacement` is
 // App-internal and intentionally NOT re-exported. Advanced consumers
 // can implement the `Placement` interface directly for custom DO

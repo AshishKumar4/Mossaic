@@ -106,7 +106,7 @@ class ApiClient {
 
   // Upload + Download
   //
-  // Phase 17.6: the SPA's chunked transfer pipeline collapsed onto
+  // the SPA's chunked transfer pipeline collapsed onto
   // `@mossaic/sdk` 's `parallelUpload` / `parallelDownload` (see
   // `src/hooks/use-upload.ts` + `src/hooks/use-download.ts`). The
   // `uploadInit` / `uploadChunk` / `uploadComplete` / `getManifest` /
@@ -119,7 +119,7 @@ class ApiClient {
   // (`/api/upload/init`, `/api/upload/chunk/*`,
   // `/api/upload/complete/*`, `/api/download/manifest/*`,
   // `/api/download/chunk/*`) remain mounted on the worker for
-  // back-compat during the rollout window. Phase 17.6.1 cleanup
+  // back-compat during the rollout window. A follow-up cleanup
   // (deferred 1–2 weeks post-stability) deletes the unused legacy
   // upload routes and their typed RPCs.
 

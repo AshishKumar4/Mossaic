@@ -1,5 +1,5 @@
 /**
- * Phase 17.5 — Placement resolver.
+ * Placement resolver.
  *
  * Maps a `VFSScope` to its placement strategy. **Server-authoritative**;
  * clients cannot influence this. Every server-side site that previously
@@ -11,7 +11,7 @@
  * unconditionally returns `canonicalPlacement` for every canonical
  * code path. The 27 `vfsShardDOName` sites in `worker/core/` are
  * canonical-by-construction — they were already using the canonical
- * template before Phase 17.5; the only purpose of routing through
+ * template before the abstraction landed; the only purpose of routing through
  * `getPlacement(scope)` is to make the abstraction available for
  * advanced consumers who want to wire a custom placement at the SDK
  * boundary (e.g. tests, multi-tenant deployments with custom DO
@@ -20,8 +20,8 @@
  * The legacy App at `mossaic.ashishkumarsingh.com` does NOT enter
  * any of these canonical sites. Its routes (`worker/app/routes/*.ts`)
  * call `legacyAppPlacement.{shardDOName,placeChunk,userDOName}`
- * **explicitly** (Phase 17.5 Step 5). This is a clean two-namespace
- * partition with no overlap and no heuristic guessing.
+ * **explicitly**. This is a clean two-namespace partition with no
+ * overlap and no heuristic guessing.
  *
  * **Why no heuristic.** An earlier draft of this plan (§1.3) proposed
  * a structural heuristic of `ns === "default" && sub === undefined →
@@ -31,7 +31,7 @@
  * disambiguate at the resolver — the dispatch is already
  * unambiguous at the call-site level.
  *
- * **Future extensibility.** Phase 18 may promote this to a
+ * **Future extensibility.** A later phase may promote this to a
  * config-driven mechanism (`env.PLACEMENT_RULES`) for multi-app
  * deployments. The signature stays the same; only the body changes.
  *
@@ -39,7 +39,7 @@
  * `legacyAppPlacement` use the same rendezvous score key
  * (`shard:${userId}:${idx}`) regardless of which one is selected.
  * Only the resulting *DO instance name* differs. See
- * `shared/placement.ts:placeChunk` and Phase 17.5 §1.4.
+ * `shared/placement.ts:placeChunk` and §1.4.
  */
 
 import {

@@ -16,7 +16,7 @@ import type {
 } from "@app/types";
 
 /**
- * Phase 17.6 — SPA download hook.
+ * SPA download hook.
  *
  * Collapsed onto `@mossaic/sdk` 's `parallelDownload`. The previous
  * implementation (~205 LoC of AIMD/processChunk/worker/scaleInterval/

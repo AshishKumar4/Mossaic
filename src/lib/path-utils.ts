@@ -1,5 +1,5 @@
 /**
- * Phase 17.6 — SPA path/parentId reconciliation helpers.
+ * SPA path/parentId reconciliation helpers.
  *
  * `parallelUpload(client, path, source)` takes a `path`, but the
  * legacy App's UI is `parentId`-based — the photo-library models

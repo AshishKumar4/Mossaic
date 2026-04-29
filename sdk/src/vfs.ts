@@ -446,7 +446,7 @@ export interface CreateVFSOptions {
     keyId?: string;
   };
   /**
-   * Phase 17.5 — pluggable placement strategy.
+   * pluggable placement strategy.
    *
    * Decides which DO instance names the SDK addresses. Default:
    * `canonicalPlacement` (`vfs:${ns}:${tenant}[:${sub}][:s${idx}]`).
@@ -460,7 +460,7 @@ export interface CreateVFSOptions {
    * **Score-template invariance.** Both built-in placements
    * (`canonicalPlacement`, `legacyAppPlacement`) keep the same
    * rendezvous-score function; only the resulting *DO instance
-   * name* differs. See `shared/placement.ts` and Phase 17.5 §1.4.
+   * name* differs. See `shared/placement.ts` and §1.4.
    */
   placement?: import("../../shared/placement").Placement;
 }
@@ -756,7 +756,7 @@ export class VFS implements VFSClient {
   // `createVFS`.
 
   protected user(): UserDOClient {
-    // Phase 17.5: route through the placement abstraction. Default
+    // route through the placement abstraction. Default
     // (`canonicalPlacement`) produces the same `vfs:${ns}:${tenant}`
     // name as before; consumers that pass `opts.placement` (e.g.
     // `legacyAppPlacement` via `createAppVFS`) get their custom

@@ -15,7 +15,7 @@ import type {
 } from "@app/types";
 
 /**
- * Phase 17.6 — SPA upload hook.
+ * SPA upload hook.
  *
  * Collapsed onto `@mossaic/sdk` 's `parallelUpload`. The previous
  * implementation (~213 LoC of AIMD/processChunk/worker/scaleInterval/

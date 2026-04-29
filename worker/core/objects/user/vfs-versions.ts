@@ -68,7 +68,7 @@ export function placeChunkForVersion(
   // First placement: rendezvous-hash as before. The result will be
   // recorded in version_chunks by the caller, freezing future
   // placements for this hash even if poolSize subsequently grows.
-  // Phase 17.5 routes through the placement abstraction; the resulting
+  // routes through the placement abstraction; the resulting
   // integer is identical to the legacy path because the rendezvous
   // score template is invariant across placements (§1.4).
   return getPlacement(scope).placeChunk(scope, hash, 0, poolSize);

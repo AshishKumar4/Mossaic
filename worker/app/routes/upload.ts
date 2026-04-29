@@ -16,7 +16,7 @@ upload.use("*", authMiddleware());
  * POST /api/upload/init
  * Initialize a new file upload. Returns fileId + chunk spec + poolSize.
  *
- * Phase 17: replaced `stub.fetch("/files/create")` with the typed RPC
+ * replaced `stub.fetch("/files/create")` with the typed RPC
  * `UserDO.appCreateFile`. Wire shape is preserved 1:1 so the SPA's
  * `UploadInitResponse` is unchanged.
  */
@@ -59,11 +59,11 @@ upload.post("/init", async (c) => {
  * Upload a single chunk. The worker streams it to the appropriate
  * ShardDO, then records the chunk in UserDO via typed RPC.
  *
- * Phase 17: ShardDO addressing is unchanged (`shard:userId:idx`)
+ * ShardDO addressing is unchanged (`shard:userId:idx`)
  * because production chunk bytes live in those legacy DO instances.
  * Routing them to the canonical `vfs:default:userId:sN` namespace
- * would orphan all existing data. The follow-up Phase 17.5
- * (`local/phase-17-plan.md` §5.9) covers ShardDO data migration.
+ * would orphan all existing data. The follow-up ShardDO data
+ * migration is tracked in `local/phase-17-plan.md` §5.9.
  *
  * The UserDO chunk-record call is a typed RPC (`appRecordChunk`)
  * — the legacy JSON-fetch indirection is gone.
@@ -87,7 +87,8 @@ upload.put("/chunk/:fileId/:chunkIndex", async (c) => {
   }
 
   // Determine shard placement (legacy app shard naming — see header
-  // comment). Phase 17.5: explicit `legacyAppPlacement` dispatch.
+  // comment). Explicit `legacyAppPlacement` dispatch keeps new
+  // chunks landing on the same physical instances as legacy data.
   const scope = { ns: "default" as const, tenant: userId };
   const shardIndex = legacyAppPlacement.placeChunk(
     scope,
@@ -137,7 +138,7 @@ upload.put("/chunk/:fileId/:chunkIndex", async (c) => {
  * Finalize a file upload — flip status='complete', stamp file_hash,
  * bump quota, schedule semantic indexing.
  *
- * Phase 17: typed RPC `appGetFileManifest` + `appCompleteFile`.
+ * typed RPC `appGetFileManifest` + `appCompleteFile`.
  */
 upload.post("/complete/:fileId", async (c) => {
   const userId = c.get("userId");

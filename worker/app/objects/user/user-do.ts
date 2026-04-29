@@ -21,7 +21,7 @@ import {
 import { createFolder, listFolders, getFolderPath } from "./folders";
 import { getQuota, checkQuota, updateUsage } from "./quota";
 import { UserDOCore } from "@core/objects/user/user-do-core";
-// Phase 17.6 — multipart upload helpers (App-side variants).
+// multipart upload helpers (App-side variants).
 import {
   appBeginMultipart as appBeginMultipartImpl,
   appAbortMultipart as appAbortMultipartImpl,
@@ -83,16 +83,16 @@ export interface AppFileRow {
  * (script, class_name) so storage on the existing app at
  * mossaic.ashishkumarsingh.com is untouched.
  *
- * ── Phase 17 — `_legacyFetch` removal ───────────────────────────────
+ * ── `_legacyFetch` removal ───────────────────────────────
  *
- * Prior to Phase 17, all app-only operations were dispatched through
- * a hand-rolled JSON router named `_legacyFetch` (193 byte-pinned
+ * Historically, all app-only operations were dispatched through a
+ * hand-rolled JSON router named `_legacyFetch` (193 byte-pinned
  * lines, sha256 `4c6eb84925cd8b34298aa92a5201c6e8074defb4527c3bbb1d2c677f9f2c8e70`).
  * Routes called `stub.fetch("http://internal/files/create", ...)` and
  * parsed the JSON reply.
  *
- * Phase 17 deletes that handler and replaces it with the typed RPC
- * methods on this class (`appHandleSignup`, `appCreateFile`, etc.).
+ * That handler is gone. The typed-RPC methods on this class
+ * (`appHandleSignup`, `appCreateFile`, etc.) replace it.
  * App routes call them directly as `stub.appCreateFile(...)`,
  * eliminating one JSON parse + one URL allocation per call and
  * making the surface type-checked end-to-end.
@@ -111,8 +111,8 @@ export class UserDO extends UserDOCore {
   /**
    * Override Core's `fetch` to surface the WebSocket upgrade path
    * through `super.fetch` (Yjs collab WS). Non-WS HTTP requests fall
-   * through to Core's default 404 — Phase 17 removed the legacy JSON
-   * router that handled them.
+   * through to Core's default 404 — the legacy JSON router that
+   * handled them was retired with the App-on-SDK refactor.
    */
   override async fetch(request: Request): Promise<Response> {
     return super.fetch(request);
@@ -185,7 +185,7 @@ export class UserDO extends UserDOCore {
     updateUsage(this, userId, fileSize, 1);
   }
 
-  // ── Phase 17.6: multipart upload RPCs (legacy schema) ──────────────
+  // ── multipart upload RPCs (legacy schema) ──────────────
   //
   // Mirror the canonical `vfsBeginMultipart`/`vfsFinalizeMultipart`/
   // `vfsAbortMultipart`/`vfsGetMultipartStatus`/`vfsOpenManifest`
@@ -194,7 +194,7 @@ export class UserDO extends UserDOCore {
   // multipart route at `/api/upload/multipart/*` calls these via the
   // typed DO RPC binding.
 
-  /** Phase 17.6: begin a multipart upload session against legacy schema. */
+  /** begin a multipart upload session against legacy schema. */
   async appBeginMultipart(
     userId: string,
     path: string,
@@ -204,7 +204,7 @@ export class UserDO extends UserDOCore {
     return appBeginMultipartImpl(this, userId, path, opts);
   }
 
-  /** Phase 17.6: abort a multipart upload session. Idempotent. */
+  /** abort a multipart upload session. Idempotent. */
   async appAbortMultipart(
     userId: string,
     uploadId: string
@@ -213,7 +213,7 @@ export class UserDO extends UserDOCore {
     return appAbortMultipartImpl(this, userId, uploadId);
   }
 
-  /** Phase 17.6: finalize a multipart upload — verify + flip to complete. */
+  /** finalize a multipart upload — verify + flip to complete. */
   async appFinalizeMultipart(
     userId: string,
     uploadId: string,
@@ -223,7 +223,7 @@ export class UserDO extends UserDOCore {
     return appFinalizeMultipartImpl(this, userId, uploadId, chunkHashList);
   }
 
-  /** Phase 17.6: probe the status of an open multipart session. */
+  /** probe the status of an open multipart session. */
   async appGetMultipartStatus(
     userId: string,
     uploadId: string
@@ -237,7 +237,7 @@ export class UserDO extends UserDOCore {
     return appGetMultipartStatusImpl(this, userId, uploadId);
   }
 
-  /** Phase 17.6: open a download manifest for a finalized App file. */
+  /** open a download manifest for a finalized App file. */
   async appOpenManifest(fileId: string): Promise<{
     fileId: string;
     size: number;

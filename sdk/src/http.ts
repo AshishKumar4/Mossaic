@@ -45,7 +45,7 @@ export interface CreateMossaicHttpClientOptions {
   /** Optional: a fetch implementation. Defaults to globalThis.fetch. Useful for tests. */
   fetcher?: typeof fetch;
   /**
-   * Phase 17.6 — override the multipart endpoint base path.
+   * Override the multipart endpoint base path.
    *
    * Default: `"/api/vfs/multipart"` (canonical SDK consumers).
    *
@@ -66,7 +66,7 @@ export interface CreateMossaicHttpClientOptions {
    */
   multipartBaseOverride?: string;
   /**
-   * Phase 17.6 — override the cacheable per-chunk endpoint base.
+   * Override the cacheable per-chunk endpoint base.
    *
    * Default: `"/api/vfs/chunk"` (canonical). The App's photo-library
    * SPA passes `"/api/download/chunk"` (or similar) to address its
@@ -92,13 +92,13 @@ export class HttpVFS implements VFSClient {
   private readonly base: string;
   private readonly apiKey: string;
   /**
-   * Phase 17.6 — multipart route base. Defaults to `/api/vfs/multipart`.
+   * Multipart route base. Defaults to `/api/vfs/multipart`.
    * Set via `multipartBaseOverride` for the SPA's `/api/upload/multipart`
    * App-pinned bridge.
    */
   private readonly multipartBase: string;
   /**
-   * Phase 17.6 — cacheable chunk route base. Defaults to `/api/vfs/chunk`.
+   * Cacheable chunk route base. Defaults to `/api/vfs/chunk`.
    * Set via `chunkFetchBaseOverride` for the SPA's legacy download path.
    */
   private readonly chunkFetchBase: string;
@@ -120,8 +120,8 @@ export class HttpVFS implements VFSClient {
     this.base = opts.url.replace(/\/$/, "");
     this.apiKey = opts.apiKey;
     this.fetcher = opts.fetcher ?? fetch;
-    // Phase 17.6: optional multipart and chunk-fetch route overrides.
-    // Defaults preserve canonical SDK consumer behavior byte-for-byte.
+    // Optional multipart and chunk-fetch route overrides. Defaults
+    // preserve canonical SDK consumer behavior byte-for-byte.
     this.multipartBase =
       opts.multipartBaseOverride !== undefined
         ? opts.multipartBaseOverride.replace(/\/$/, "")
@@ -742,9 +742,9 @@ export class HttpVFS implements VFSClient {
     path: string,
     signal?: AbortSignal
   ): Promise<Uint8Array> {
-    // Phase 17.6: when a chunk-fetch override is set, prefer the
+    // when a chunk-fetch override is set, prefer the
     // cacheable GET endpoint. Otherwise fall back to the canonical
-    // POST /api/vfs/readChunk path that pre-existed Phase 17.6.
+    // POST /api/vfs/readChunk path that pre-existed.
     if (this.chunkFetchBase !== "/api/vfs/chunk") {
       const url = `${this.base}${this.chunkFetchBase}/chunk/${encodeURIComponent(fileId)}/${idx}`;
       const res = await this.fetcher(url, {

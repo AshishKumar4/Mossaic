@@ -1,10 +1,10 @@
 /-
 Mossaic.Vfs.Common — shared types and helpers used by every invariant module.
 
-Models: shared types referenced across worker/objects/{user,shard}/*.ts and
-shared/vfs-types.ts. This module is intentionally minimal — each invariant
-file owns its own state-machine types; only types used by more than one
-invariant live here.
+Models: shared types referenced across worker/core/objects/{user,shard}/*.ts
+and shared/vfs-types.ts. This module is intentionally minimal — each
+invariant file owns its own state-machine types; only types used by more
+than one invariant live here.
 
 Design choice: SQL tables are modeled as `List Row`. Numerical invariants
 are stated via `Mathlib.Data.List.Count.countP` so that the relationship
@@ -22,8 +22,8 @@ SHA-256 in any theorem — that is a cryptographic axiom of the runtime,
 not a property of the TypeScript code. -/
 abbrev Hash := String
 
-/-- Synthetic file_id used by Phase 9 versioning. Mirrors `shardRefId` in
-worker/objects/user/vfs-versions.ts:166-200. -/
+/-- Synthetic file_id used by versioning. Mirrors `shardRefId` in
+worker/core/objects/user/vfs-versions.ts. -/
 abbrev FileId := String
 
 /-- Path identifier for VFS-level paths. -/

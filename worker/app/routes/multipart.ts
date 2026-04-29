@@ -1,5 +1,5 @@
 /**
- * Phase 17.6 — App-pinned multipart upload route.
+ * App-pinned multipart upload route.
  *
  * Mounted at `/api/upload/multipart/*` from `worker/app/index.ts`.
  *
@@ -14,10 +14,10 @@
  *
  * The chunk PUT path stays the load-bearing surface: stateless HMAC
  * verify (no UserDO RPC), one ShardDO.putChunkMultipart RPC. The
- * ShardDO physical class is shared with canonical (Phase 16
- * `upload_chunks` staging table), so no shard-class change.
+ * ShardDO physical class is shared with canonical (`upload_chunks`
+ * staging table), so no shard-class change.
  *
- * **Score-template invariance** (Phase 17.5 §1.4): chunk placement
+ * **Score-template invariance** (§1.4): chunk placement
  * uses the SAME rendezvous score key as the legacy single-chunk path
  * (`shard:${userId}:${idx}` prefix). New chunks land on the same
  * physical ShardDO instances as existing photo-library data. Verified
@@ -154,7 +154,7 @@ mp.post("/begin", async (c) => {
       size: body.size,
       chunkSize: body.chunkSize,
       mimeType: body.mimeType,
-      // Phase 17.6: SPA passes parentId via the metadata field for
+      // SPA passes parentId via the metadata field for
       // back-compat with the canonical wire shape.
       parentId:
         body.metadata && typeof body.metadata === "object"
@@ -370,7 +370,8 @@ mp.put("/:uploadId/chunk/:idx", async (c) => {
     }
 
     const hash = await hashChunk(bytes);
-    // Phase 17.5 / 17.6: explicit legacyAppPlacement.placeChunk.
+    // Explicit legacyAppPlacement.placeChunk dispatch — keeps new
+    // chunks landing on the same physical instances as legacy data.
     const sIdx = legacyAppPlacement.placeChunk(
       { ns: "default", tenant: userId },
       uploadId,
@@ -458,7 +459,7 @@ mp.post("/download-token", async (c) => {
         chunkCount: manifest.chunkCount,
         chunks: manifest.chunks,
         inlined: manifest.inlined,
-        // Phase 17.6 — surface mimeType for SPA Blob construction.
+        // surface mimeType for SPA Blob construction.
         mimeType: manifest.mimeType,
       },
     };

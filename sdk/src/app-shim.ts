@@ -1,5 +1,5 @@
 /**
- * Phase 17 — internal shim for the photo-library App at
+ * internal shim for the photo-library App at
  * mossaic.ashishkumarsingh.com.
  *
  * NOT part of the SDK's public API. This file is intentionally not
@@ -67,7 +67,7 @@ export interface CreateAppVFSOptions
  * (`user:<userId>`) and legacy ShardDO naming
  * (`shard:<userId>:<idx>`).
  *
- * Phase 17.5: this is now a thin factory that passes
+ * this is now a thin factory that passes
  * `placement: legacyAppPlacement` to the canonical `VFS` constructor.
  * No subclass override needed — the base class's `user()` method
  * routes through the placement abstraction (`sdk/src/vfs.ts`).

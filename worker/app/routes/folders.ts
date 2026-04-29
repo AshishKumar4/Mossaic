@@ -14,7 +14,7 @@ folders.use("*", authMiddleware());
  * POST /api/folders
  * Create a new folder.
  *
- * Phase 17: typed RPC `appCreateFolder`.
+ * typed RPC `appCreateFolder`.
  */
 folders.post("/", async (c) => {
   const userId = c.get("userId");
@@ -39,7 +39,7 @@ folders.post("/", async (c) => {
  * GET /api/folders/:folderId
  * List contents of a folder + breadcrumb path.
  *
- * Phase 17: typed RPCs `appListFiles` + `appGetFolderPath`.
+ * typed RPCs `appListFiles` + `appGetFolderPath`.
  */
 folders.get("/:folderId", async (c) => {
   const userId = c.get("userId");
