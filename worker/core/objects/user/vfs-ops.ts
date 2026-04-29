@@ -67,7 +67,7 @@ import { replaceTags } from "./metadata-tags";
  */
 const VFS_SCOPE_TOKEN = /^[A-Za-z0-9._-]{1,128}$/;
 
-function userIdFor(scope: VFSScope): string {
+export function userIdFor(scope: VFSScope): string {
   if (!scope || typeof scope.tenant !== "string" || scope.tenant.length === 0) {
     throw new VFSError("EINVAL", "scope.tenant is required");
   }
@@ -1042,7 +1042,7 @@ export async function vfsReadChunk(
  *
  * Root is special-cased: a path of `/leaf` returns `(null, "leaf")`.
  */
-function resolveParent(
+export function resolveParent(
   durableObject: UserDO,
   userId: string,
   path: string
@@ -1087,7 +1087,7 @@ function resolveParent(
 }
 
 /** Read the server-authoritative pool size from quota. Defaults to 32. */
-function poolSizeFor(durableObject: UserDO, userId: string): number {
+export function poolSizeFor(durableObject: UserDO, userId: string): number {
   const row = durableObject.sql
     .exec("SELECT pool_size FROM quota WHERE user_id = ?", userId)
     .toArray()[0] as { pool_size: number } | undefined;
@@ -1098,7 +1098,7 @@ function poolSizeFor(durableObject: UserDO, userId: string): number {
  * Find the live (non-deleted, non-uploading) file row at (parentId, leaf).
  * Used by the commit-rename phase to identify a row to supersede.
  */
-function findLiveFile(
+export function findLiveFile(
   durableObject: UserDO,
   userId: string,
   parentId: string | null,
@@ -1117,7 +1117,7 @@ function findLiveFile(
 }
 
 /** True iff the (parentId, name) slot is occupied by a live folder. */
-function folderExists(
+export function folderExists(
   durableObject: UserDO,
   userId: string,
   parentId: string | null,
@@ -1150,51 +1150,7 @@ function folderExists(
  *
  * Subrequest cost: U fan-out RPCs to ShardDOs (one per unique shard).
  */
-/**
- * External re-export of `hardDeleteFileRow` for the H1 alarm sweeper.
- * The internal callers stay on the private name to keep the surface
- * minimal; the alarm in `user-do.ts` reaches this via dynamic import
- * (avoiding a module-init cycle on the type-side).
- */
-export async function hardDeleteFileRowExternal(
-  durableObject: UserDO,
-  userId: string,
-  scope: VFSScope,
-  fileId: string
-): Promise<void> {
-  return hardDeleteFileRow(durableObject, userId, scope, fileId);
-}
-
-/**
- * external wrapper around `commitRename` for use by the
- * copyFile primitive in `copy-file.ts`. Same semantics as the
- * private function used internally by writeFile.
- */
-export async function commitRenameExternal(
-  durableObject: UserDO,
-  userId: string,
-  scope: VFSScope,
-  tmpId: string,
-  parentId: string | null,
-  leaf: string
-): Promise<void> {
-  return commitRename(durableObject, userId, scope, tmpId, parentId, leaf);
-}
-
-/**
- * external wrapper around `abortTempFile` for copy-file's
- * fan-out failure path. Same semantics as the private wrapper.
- */
-export async function abortTempFileExternal(
-  durableObject: UserDO,
-  userId: string,
-  scope: VFSScope,
-  tmpId: string
-): Promise<void> {
-  return abortTempFile(durableObject, userId, scope, tmpId);
-}
-
-async function hardDeleteFileRow(
+export async function hardDeleteFileRow(
   durableObject: UserDO,
   userId: string,
   scope: VFSScope,
@@ -1946,7 +1902,7 @@ async function applyPhase12SideEffects(
  * happens AFTER the readable-state transition so a reader between
  * commit and GC sees the new content.
  */
-async function commitRename(
+export async function commitRename(
   durableObject: UserDO,
   userId: string,
   scope: VFSScope,
@@ -2073,7 +2029,7 @@ async function commitRename(
  * already-recorded `file_chunks`, and queue chunk GC on each touched
  * shard. Idempotent: safe to call on a tmp_id that no longer exists.
  */
-async function abortTempFile(
+export async function abortTempFile(
   durableObject: UserDO,
   userId: string,
   scope: VFSScope,
@@ -3481,59 +3437,4 @@ export async function vfsCreateWriteStream(
   return { stream, handle };
 }
 
-// ── helper exports for the multipart-upload module ──────────
-//
-// The multipart upload code in `multipart-upload.ts` shares the same
-// path-resolution + supersede protocol as the streaming-write path
-// (`commitRename`, `hardDeleteFileRow`). Rather than duplicate the
-// logic, we expose a tiny set of named exports the multipart module
-// imports.  Naming follows the existing `*External` pattern from
-// (commitRenameExternal etc).
 
-/**
- * external accessor for `userIdFor`. Same validation, same
- * `${tenant}::${sub}` composition.
- */
-export function userIdForExternal(scope: VFSScope): string {
-  return userIdFor(scope);
-}
-
-/**
- * external accessor for `resolveParent`. Returns
- * `(parentId, leaf)` tuple for a path's would-be parent.
- */
-export function resolveParentExternal(
-  durableObject: UserDO,
-  userId: string,
-  path: string
-): { parentId: string | null; leaf: string } {
-  return resolveParent(durableObject, userId, path);
-}
-
-/** external accessor for `poolSizeFor`. */
-export function poolSizeForExternal(
-  durableObject: UserDO,
-  userId: string
-): number {
-  return poolSizeFor(durableObject, userId);
-}
-
-/** external accessor for `folderExists`. */
-export function folderExistsExternal(
-  durableObject: UserDO,
-  userId: string,
-  parentId: string | null,
-  name: string
-): boolean {
-  return folderExists(durableObject, userId, parentId, name);
-}
-
-/** external accessor for `findLiveFile`. */
-export function findLiveFileExternal(
-  durableObject: UserDO,
-  userId: string,
-  parentId: string | null,
-  leaf: string
-): { file_id: string } | undefined {
-  return findLiveFile(durableObject, userId, parentId, leaf);
-}

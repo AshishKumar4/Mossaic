@@ -332,7 +332,7 @@ async function copyInline(
     inlineData
   );
   await durableObject.scheduleStaleUploadSweep();
-  await opsMod.commitRenameExternal(
+  await opsMod.commitRename(
     durableObject,
     userId,
     scope,
@@ -441,11 +441,11 @@ async function copyChunked(
       })
     );
   } catch (err) {
-    await opsMod.abortTempFileExternal(durableObject, userId, scope, tmpId);
+    await opsMod.abortTempFile(durableObject, userId, scope, tmpId);
     throw err;
   }
 
-  await opsMod.commitRenameExternal(
+  await opsMod.commitRename(
     durableObject,
     userId,
     scope,
@@ -542,7 +542,7 @@ async function copyVersioned(
       // the same mode so SDK readFile knows to decrypt.
       encryption: srcHead.encryption,
     });
-    await opsMod.commitRenameExternal(
+    await opsMod.commitRename(
       durableObject,
       userId,
       scope,
@@ -611,7 +611,7 @@ async function copyVersioned(
       "DELETE FROM version_chunks WHERE version_id = ?",
       newVersionId
     );
-    await opsMod.abortTempFileExternal(durableObject, userId, scope, tmpId);
+    await opsMod.abortTempFile(durableObject, userId, scope, tmpId);
     throw err;
   }
 
@@ -633,7 +633,7 @@ async function copyVersioned(
     // see inline branch above. Chunked copy preserves source mode.
     encryption: srcHead.encryption,
   });
-  await opsMod.commitRenameExternal(
+  await opsMod.commitRename(
     durableObject,
     userId,
     scope,

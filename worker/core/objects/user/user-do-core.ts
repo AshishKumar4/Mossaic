@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import type { EnvCore as Env } from "../../../../shared/types";
 import {
-  hardDeleteFileRowExternal,
+  hardDeleteFileRow,
   vfsAbortWriteStream,
   vfsAppendWriteStream,
   vfsBeginWriteStream,
@@ -944,7 +944,7 @@ export class UserDOCore extends DurableObject<Env> {
       const userId =
         scope.sub !== undefined ? `${scope.tenant}::${scope.sub}` : scope.tenant;
       try {
-        await hardDeleteFileRowExternal(this, userId, scope, file_id);
+        await hardDeleteFileRow(this, userId, scope, file_id);
       } catch {
         // Best-effort: a transient ShardDO error leaves the row
         // intact; the next alarm fires on the same row. The 1h
