@@ -17,6 +17,10 @@
     "./yjs": {
       "types": "./dist/yjs.d.ts",
       "import": "./dist/yjs.js"
+    },
+    "./http": {
+      "types": "./dist/http-only.d.ts",
+      "import": "./dist/http-only.js"
     }
   },
   "files": [

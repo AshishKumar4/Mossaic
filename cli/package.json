@@ -1,0 +1,44 @@
+{
+  "name": "@mossaic/cli",
+  "version": "0.1.0",
+  "description": "Command-line interface for Mossaic VFS over @mossaic/sdk's HTTP fallback. Mints VFS tokens locally and speaks to a deployed Mossaic Service worker.",
+  "type": "module",
+  "main": "./dist/main.js",
+  "types": "./dist/main.d.ts",
+  "bin": {
+    "mossaic": "./dist/bin.js",
+    "mscli": "./dist/bin.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "build:watch": "tsup --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run tests/unit",
+    "test:e2e": "vitest run tests/e2e --reporter=verbose"
+  },
+  "dependencies": {
+    "@mossaic/sdk": "workspace:*",
+    "commander": "^12.1.0",
+    "jose": "^5.9.0",
+    "ulid": "^2.3.0",
+    "ws": "^8.18.0",
+    "yjs": "^13.6.0",
+    "y-protocols": "^1.0.6"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "@types/ws": "^8.5.10",
+    "execa": "^9.5.0",
+    "tsup": "^8.3.0",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}

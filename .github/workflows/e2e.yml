@@ -1,0 +1,72 @@
+name: cli-e2e
+
+on:
+  pull_request:
+    paths:
+      - "cli/**"
+      - "sdk/**"
+      - "worker/**"
+      - "shared/**"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - ".github/workflows/e2e.yml"
+  schedule:
+    # Nightly run against the live deploy.
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+jobs:
+  unit-and-functional:
+    runs-on: ubuntu-latest
+    name: Unit + functional CLI tests
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Build SDK
+        run: pnpm -F @mossaic/sdk build
+      - name: Build CLI
+        run: pnpm -F @mossaic/cli build
+      - name: Typecheck workspace
+        run: npx tsc -b
+      - name: CLI typecheck
+        run: pnpm -F @mossaic/cli typecheck
+      - name: CLI unit tests
+        run: pnpm -F @mossaic/cli test
+      - name: CLI functional + E2E tests (live)
+        if: ${{ github.event_name != 'pull_request' || env.HAVE_SECRET == '1' }}
+        env:
+          MOSSAIC_E2E_ENDPOINT: ${{ vars.MOSSAIC_E2E_ENDPOINT || 'https://mossaic-core.ashishkmr472.workers.dev' }}
+          MOSSAIC_E2E_JWT_SECRET: ${{ secrets.MOSSAIC_E2E_JWT_SECRET }}
+          HAVE_SECRET: ${{ secrets.MOSSAIC_E2E_JWT_SECRET != '' && '1' || '0' }}
+        run: pnpm -F @mossaic/cli test:e2e
+
+  worker-tests:
+    runs-on: ubuntu-latest
+    name: Worker integration tests (no live network)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Build SDK
+        run: pnpm -F @mossaic/sdk build
+      - name: Workspace typecheck
+        run: npx tsc -b
+      - name: Wrangler dry-run (App mode)
+        run: npx wrangler deploy --dry-run
+      - name: Wrangler dry-run (Service mode)
+        run: npx wrangler deploy --dry-run -c deployments/service/wrangler.jsonc
+      - name: Vitest (worker integration)
+        run: npx vitest run
