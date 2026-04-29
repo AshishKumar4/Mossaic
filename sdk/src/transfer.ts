@@ -574,21 +574,13 @@ export async function parallelDownload(
     return new Uint8Array(0);
   }
 
-  // Patch the client's fileId→path resolver so `fetchChunkByHash`
-  // can route through `/api/vfs/readChunk`. v1 hack; v2 will replace
-  // with a typed `/readChunkByFileId` endpoint.
-  const priorResolver = client.fileIdToPath;
-  client.fileIdToPath = (id: string) =>
-    id === manifest.fileId ? path : priorResolver?.(id);
-
-  // For each chunk, fetch ?hash=… to the cacheable endpoint plus
-  // ?shard=… so the server can short-circuit without a manifest read.
-  // Compute placement client-side via the manifest the server
-  // already gave us — that's the chunk's authoritative shard.
-  // We also need the chunk's `shardIndex`; the manifest hides it
-  // (intentionally — see vfs-ops.ts:openManifest comment). Without
-  // it, we fall back to the regular readChunk path which does the
-  // lookup server-side.
+  // For each chunk, fetch via the cacheable per-chunk endpoint.
+  // The chunk's `shardIndex` is intentionally hidden by the manifest
+  // (see vfs-ops.ts:openManifest comment), so we route through the
+  // `/api/vfs/readChunk` endpoint which does the lookup server-side.
+  // `path` is captured per-call (no shared mutable state on the
+  // client) so concurrent `parallelDownload` calls on the same
+  // client are race-free.
   const initial = opts.concurrency?.initial ?? 4;
   const min = opts.concurrency?.min ?? 1;
   const max = opts.concurrency?.max ?? 64;
@@ -654,6 +646,7 @@ export async function parallelDownload(
           idx,
           ch.hash,
           dl.token,
+          path,
           signal
         );
         // Verify hash matches the manifest's claim. This is a cheap
@@ -739,14 +732,8 @@ export async function parallelDownload(
       await sleep(50);
     }
   })();
-  try {
-    await Promise.all(lanes);
-    await endgameLane;
-  } finally {
-    // Restore the client's resolver so concurrent downloads on the
-    // same client don't see each other's paths.
-    client.fileIdToPath = priorResolver;
-  }
+  await Promise.all(lanes);
+  await endgameLane;
   // Concatenate per-chunk slots in index order. When `chunkTransform`
   // is the identity, this matches `manifest.size`; when it shrinks
   // bytes (decrypt), the output is the post-transform size.
@@ -815,12 +802,8 @@ export async function parallelDownloadStream(
     });
   }
 
-  // Patch the resolver as parallelDownload does — preserves the
-  // routing-by-fileId fallback path inside the HTTP client.
-  const priorResolver = client.fileIdToPath;
-  client.fileIdToPath = (id: string) =>
-    id === manifest.fileId ? path : priorResolver?.(id);
-
+  // `path` is captured per-call (no shared mutable state on the
+  // client) so concurrent downloads on the same client are race-free.
   const initial = opts.concurrency?.initial ?? 4;
   const min = opts.concurrency?.min ?? 1;
   const max = opts.concurrency?.max ?? 64;
@@ -903,6 +886,7 @@ export async function parallelDownloadStream(
           idx,
           ch.hash,
           dl.token,
+          path,
           signal
         );
         const verify = await hashChunk(bytes);
@@ -1001,15 +985,11 @@ export async function parallelDownloadStream(
         } catch (err) {
           aborted = true;
           streamController?.error(err);
-        } finally {
-          client.fileIdToPath = priorResolver;
         }
       })();
     },
     cancel() {
       aborted = true;
-      // Restore the client resolver on cancel as well.
-      client.fileIdToPath = priorResolver;
     },
   });
 }
