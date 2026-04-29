@@ -307,6 +307,6 @@ Sync frames (`0`/`1`/`2`) are persisted as `yjs_oplog` rows. Awareness frames (`
 4. `npx wrangler deploy --dry-run -c deployments/service/wrangler.jsonc` (Service mode) — bindings show `MOSSAIC_USER`, `MOSSAIC_SHARD` only.
 5. Verify the legacy fetch hash on `worker/app/objects/user/user-do.ts:70..263` is unchanged (`4c6eb84925cd8b34298aa92a5201c6e8074defb4527c3bbb1d2c677f9f2c8e70`).
 6. `pnpm lean:build` — proofs green; no new `sorry`s, no new project-level axioms.
-7. Final grep: `rg -nw 'USER_DO|SHARD_DO'` returns zero matches outside `local/` (plans), `lean/` (proofs), and audit/history files.
+7. Final grep for the legacy binding-name tokens (whole-word match) returns zero hits outside `local/` (plans), `lean/` (proofs), and audit/history files such as `OPERATIONS.md` and this guide's migration-safety callout.
 
 That is the full Phase 13 contract.
