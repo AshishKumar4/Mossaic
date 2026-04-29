@@ -60,6 +60,39 @@ export class ShardDO extends DurableObject<Env> {
       CREATE INDEX IF NOT EXISTS idx_chunk_refs_file
         ON chunk_refs(file_id)
     `);
+
+    // ── Phase 16: multipart staging table ───────────────────────────────
+    //
+    // Records `(upload_id, chunk_index)` → `chunk_hash` for each chunk
+    // landed during a multipart upload. The chunk bytes themselves
+    // live in `chunks` and are referenced through `chunk_refs` exactly
+    // as for a non-multipart write — the staging table is metadata
+    // only, used by UserDO's finalize to verify that every chunk in
+    // the client's hash list actually landed and matches.
+    //
+    // Written in the same DO turn as `chunk_refs` by `putChunkMultipart`,
+    // so each per-chunk PUT costs zero extra subrequests.
+    //
+    // PRIMARY KEY (upload_id, chunk_index) makes re-PUT idempotent —
+    // a retry under the same hash is `INSERT OR REPLACE` no-op; a
+    // retry with different bytes overwrites and `putChunkMultipart`
+    // takes the supersession branch (drops old ref, registers new
+    // chunk, replaces this row).
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS upload_chunks (
+        upload_id    TEXT NOT NULL,
+        chunk_index  INTEGER NOT NULL,
+        chunk_hash   TEXT NOT NULL,
+        chunk_size   INTEGER NOT NULL,
+        user_id      TEXT NOT NULL,
+        created_at   INTEGER NOT NULL,
+        PRIMARY KEY (upload_id, chunk_index)
+      )
+    `);
+    this.sql.exec(`
+      CREATE INDEX IF NOT EXISTS idx_upload_chunks_user
+        ON upload_chunks(user_id, upload_id)
+    `);
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -133,6 +166,61 @@ export class ShardDO extends DurableObject<Env> {
         });
       }
 
+      // ── Phase 16: multipart staging endpoints ─────────────────────────
+      //
+      // Internal HTTP shapes used by UserDO finalize/abort to query
+      // the staging table this shard accumulated during the upload.
+      // All three are read-only or staging-only (they never touch
+      // `chunk_refs` or `chunks`); committing real refs goes through
+      // the typed `putChunkMultipart` RPC.
+      if (path === "/multipart/manifest" && request.method === "GET") {
+        const uploadId = url.searchParams.get("upload_id") ?? "";
+        if (uploadId.length === 0) {
+          return Response.json({ error: "upload_id required" }, { status: 400 });
+        }
+        const rows = this.sql
+          .exec(
+            "SELECT chunk_index AS idx, chunk_hash AS hash, chunk_size AS size FROM upload_chunks WHERE upload_id = ? ORDER BY chunk_index",
+            uploadId
+          )
+          .toArray();
+        return Response.json({ rows });
+      }
+
+      if (path === "/multipart/landed" && request.method === "GET") {
+        const uploadId = url.searchParams.get("upload_id") ?? "";
+        if (uploadId.length === 0) {
+          return Response.json({ error: "upload_id required" }, { status: 400 });
+        }
+        const rows = this.sql
+          .exec(
+            "SELECT chunk_index FROM upload_chunks WHERE upload_id = ? ORDER BY chunk_index",
+            uploadId
+          )
+          .toArray() as { chunk_index: number }[];
+        return Response.json({ idx: rows.map((r) => r.chunk_index) });
+      }
+
+      if (path === "/multipart/clear" && request.method === "DELETE") {
+        const uploadId = url.searchParams.get("upload_id") ?? "";
+        if (uploadId.length === 0) {
+          return Response.json({ error: "upload_id required" }, { status: 400 });
+        }
+        const before = (
+          this.sql
+            .exec(
+              "SELECT COUNT(*) AS n FROM upload_chunks WHERE upload_id = ?",
+              uploadId
+            )
+            .toArray()[0] as { n: number }
+        ).n;
+        this.sql.exec(
+          "DELETE FROM upload_chunks WHERE upload_id = ?",
+          uploadId
+        );
+        return Response.json({ dropped: before });
+      }
+
       return new Response("Not found", { status: 404 });
     } catch (err) {
       const message = err instanceof Error ? err.message : "Internal error";
@@ -165,6 +253,181 @@ export class ShardDO extends DurableObject<Env> {
       chunkIndex,
       userId
     );
+  }
+
+  // ── Phase 16: multipart staging-aware put ────────────────────────────
+  //
+  // Same semantics as `putChunk` PLUS:
+  //   - records `(upload_id, chunk_index)` → hash in `upload_chunks` so
+  //     UserDO finalize can verify completeness without per-chunk
+  //     UserDO touches.
+  //   - on re-PUT with a *different* hash for the same `(upload_id,
+  //     chunk_index)`, drops the prior `chunk_refs` row, decrements the
+  //     prior chunk's ref_count (soft-mark if it hits 0), and proceeds
+  //     to register the new chunk. Both the old and new operations
+  //     happen in a single DO turn → atomic relative to refcount
+  //     observers.
+  //
+  // `uploadId` is the same value as the tmp `files.file_id` minted by
+  // `vfsBeginMultipart`. This means after `commitRename` (which is a
+  // file_name UPDATE; file_id is preserved) the chunk_refs rows are
+  // already keyed correctly to the post-rename file id — no refcount
+  // transfer needed at finalize.
+  //
+  // Returns one of "created" / "deduplicated" / "superseded" so the
+  // caller (and tests) can observe which branch fired.
+  //
+  // @lean-invariant Mossaic.Vfs.Multipart.putChunkMultipart_idempotent
+  //   The Lean state-machine model proves that this operation
+  //   preserves the structural invariant on (chunks, chunk_refs)
+  //   inherited from `writeChunkInternal` and `removeFileRefs`. See
+  //   `lean/Mossaic/Vfs/Multipart.lean :: putChunkMultipart_idempotent`
+  //   and `:: putChunkMultipart_supersedes_safely`.
+  async putChunkMultipart(
+    chunkHash: string,
+    data: Uint8Array,
+    uploadId: string,
+    chunkIndex: number,
+    userId: string
+  ): Promise<{
+    status: "created" | "deduplicated" | "superseded";
+    bytesStored: number;
+  }> {
+    this.ensureInit();
+
+    // Supersession check — does a prior staging row exist with a
+    // different hash? If so, drop the prior `(oldHash, uploadId,
+    // chunkIndex)` chunk_refs row and decrement the prior chunk's
+    // ref_count. Soft-mark on hit-zero is handled by the existing
+    // alarm GC — same path as `removeFileRefs` for consistency.
+    const prior = this.sql
+      .exec(
+        "SELECT chunk_hash FROM upload_chunks WHERE upload_id = ? AND chunk_index = ?",
+        uploadId,
+        chunkIndex
+      )
+      .toArray()[0] as { chunk_hash: string } | undefined;
+
+    let supersededOldRef = false;
+    if (prior && prior.chunk_hash !== chunkHash) {
+      // Drop the old ref row.
+      this.sql.exec(
+        "DELETE FROM chunk_refs WHERE chunk_hash = ? AND file_id = ? AND chunk_index = ?",
+        prior.chunk_hash,
+        uploadId,
+        chunkIndex
+      );
+      const decremented =
+        (
+          this.sql.exec("SELECT changes() AS n").toArray()[0] as {
+            n: number;
+          }
+        ).n > 0;
+      if (decremented) {
+        this.sql.exec(
+          "UPDATE chunks SET ref_count = MAX(0, ref_count - 1) WHERE hash = ?",
+          prior.chunk_hash
+        );
+        const r = this.sql
+          .exec("SELECT ref_count FROM chunks WHERE hash = ?", prior.chunk_hash)
+          .toArray()[0] as { ref_count: number } | undefined;
+        if (r && r.ref_count === 0) {
+          this.sql.exec(
+            "UPDATE chunks SET deleted_at = ? WHERE hash = ? AND deleted_at IS NULL",
+            Date.now(),
+            prior.chunk_hash
+          );
+          await this.scheduleSweep();
+        }
+      }
+      supersededOldRef = true;
+    }
+
+    // Register the new chunk + ref via the existing path. Preserves
+    // the dedup branch if `chunkHash` already exists on the shard.
+    const writeResult = this.writeChunkInternal(
+      chunkHash,
+      data,
+      uploadId,
+      chunkIndex,
+      userId
+    );
+
+    // Stamp the staging row. INSERT OR REPLACE absorbs same-hash retry
+    // (no-op) and the supersession branch (overwrite with new hash).
+    this.sql.exec(
+      `INSERT OR REPLACE INTO upload_chunks
+         (upload_id, chunk_index, chunk_hash, chunk_size, user_id, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      uploadId,
+      chunkIndex,
+      chunkHash,
+      data.byteLength,
+      userId,
+      Date.now()
+    );
+
+    const status: "created" | "deduplicated" | "superseded" = supersededOldRef
+      ? "superseded"
+      : writeResult.status;
+    return { status, bytesStored: writeResult.bytesStored };
+  }
+
+  /**
+   * Phase 16: read the staging manifest for a given upload_id. Used by
+   * UserDO finalize to verify chunk completeness across all touched
+   * shards. Read-only; never mutates state.
+   */
+  async getMultipartManifest(
+    uploadId: string
+  ): Promise<{ rows: Array<{ idx: number; hash: string; size: number }> }> {
+    this.ensureInit();
+    const rows = this.sql
+      .exec(
+        "SELECT chunk_index AS idx, chunk_hash AS hash, chunk_size AS size FROM upload_chunks WHERE upload_id = ? ORDER BY chunk_index",
+        uploadId
+      )
+      .toArray() as Array<{ idx: number; hash: string; size: number }>;
+    return { rows };
+  }
+
+  /**
+   * Phase 16: read just the landed-chunk indices. Cheaper than the
+   * full manifest — used by status / resume probe.
+   */
+  async getMultipartLanded(
+    uploadId: string
+  ): Promise<{ idx: number[] }> {
+    this.ensureInit();
+    const rows = this.sql
+      .exec(
+        "SELECT chunk_index FROM upload_chunks WHERE upload_id = ? ORDER BY chunk_index",
+        uploadId
+      )
+      .toArray() as { chunk_index: number }[];
+    return { idx: rows.map((r) => r.chunk_index) };
+  }
+
+  /**
+   * Phase 16: drop staging rows for an upload_id. DOES NOT touch
+   * `chunk_refs` — that's the finalize/abort caller's job (finalize
+   * keeps refs alive; abort calls `deleteChunks(uploadId)`).
+   */
+  async clearMultipartStaging(uploadId: string): Promise<{ dropped: number }> {
+    this.ensureInit();
+    const before = (
+      this.sql
+        .exec(
+          "SELECT COUNT(*) AS n FROM upload_chunks WHERE upload_id = ?",
+          uploadId
+        )
+        .toArray()[0] as { n: number }
+    ).n;
+    this.sql.exec(
+      "DELETE FROM upload_chunks WHERE upload_id = ?",
+      uploadId
+    );
+    return { dropped: before };
   }
 
   /**

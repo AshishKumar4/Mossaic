@@ -591,6 +591,52 @@ export class UserDOCore extends DurableObject<Env> {
         WHERE status = 'complete'
     `);
 
+    // ── Phase 16: multipart upload sessions ──────────────────────────────
+    //
+    // Per-tenant table tracking open / finalized / aborted multipart
+    // upload sessions. The `upload_id` is the same value as the tmp
+    // `files.file_id` minted at begin — that way a session row and
+    // its tmp file share identity, and `commitRename` at finalize
+    // doesn't need to bridge two id namespaces. The actual chunk
+    // staging lives on each touched ShardDO (in `upload_chunks`); this
+    // table holds only the manifest-level metadata and validated
+    // commit-time payload (metadata/tags/version/encryption).
+    //
+    // CREATE TABLE IF NOT EXISTS is naturally idempotent; no migration
+    // tag needed — additive table.
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS upload_sessions (
+        upload_id            TEXT PRIMARY KEY,
+        user_id              TEXT NOT NULL,
+        parent_id            TEXT,
+        leaf                 TEXT NOT NULL,
+        total_size           INTEGER NOT NULL,
+        total_chunks         INTEGER NOT NULL,
+        chunk_size           INTEGER NOT NULL,
+        pool_size            INTEGER NOT NULL,
+        expires_at           INTEGER NOT NULL,
+        status               TEXT NOT NULL,
+        encryption_mode      TEXT,
+        encryption_key_id    TEXT,
+        metadata_blob        BLOB,
+        tags_json            TEXT,
+        version_label        TEXT,
+        version_user_visible INTEGER,
+        mode                 INTEGER NOT NULL,
+        mime_type            TEXT NOT NULL,
+        created_at           INTEGER NOT NULL
+      )
+    `);
+    this.sql.exec(`
+      CREATE INDEX IF NOT EXISTS idx_upload_sessions_open_expires
+        ON upload_sessions(expires_at)
+        WHERE status = 'open'
+    `);
+    this.sql.exec(`
+      CREATE INDEX IF NOT EXISTS idx_upload_sessions_user_status
+        ON upload_sessions(user_id, status)
+    `);
+
     // ── Audit H6: surface UNIQUE INDEX failure on legacy data ────────────
     //
     // The previous code swallowed the throw silently when the file
@@ -908,9 +954,25 @@ export class UserDOCore extends DurableObject<Env> {
       }
     }
 
+    // Phase 16: sweep expired multipart sessions in the same alarm
+    // cadence. The same `scope` works for every session row because
+    // the scope is the persisted tenant identity for THIS DO instance
+    // (tenant + optional sub) — multipart sessions can't span
+    // tenants, only span uploads within one tenant. Idempotent.
+    let multipartHasMore = false;
+    try {
+      const { sweepExpiredMultipartSessions } = await import(
+        "./multipart-upload"
+      );
+      const r = await sweepExpiredMultipartSessions(this, () => scope);
+      multipartHasMore = r.remaining;
+    } catch {
+      // Best-effort.
+    }
+
     // Reschedule if the batch was capped, otherwise fall through —
     // the next gated VFS call will re-arm via ensureStaleSweepScheduled.
-    if (rows.length === 200) {
+    if (rows.length === 200 || multipartHasMore) {
       await this.ctx.storage.setAlarm(Date.now() + 60_000);
     }
   }
@@ -1200,6 +1262,73 @@ export class UserDOCore extends DurableObject<Env> {
   ): Promise<{ stream: WritableStream<Uint8Array>; handle: VFSWriteHandle }> {
     this.gateVfsWrite(scope);
     return vfsCreateWriteStream(this, scope, path, opts);
+  }
+
+  // ── Phase 16: multipart parallel transfer engine ─────────────────────
+  //
+  // Three RPCs forming the upload session boundary. Per-chunk PUTs do
+  // NOT touch UserDO — they validate the session token in the route
+  // handler (CPU-only, HMAC verify) and call ShardDO directly. This
+  // is the load-bearing constraint that lets multipart saturate user
+  // bandwidth without bottlenecking on UserDO single-thread.
+  //
+  // - vfsBeginMultipart: mints session, inserts tmp row + session row,
+  //   returns HMAC token. Resume mode probes shards for landed[].
+  // - vfsAbortMultipart: flips status, fans out chunk-ref drops + staging
+  //   clears across the pool, hard-deletes tmp row.
+  // - vfsFinalizeMultipart: verifies completeness, batch-inserts
+  //   file_chunks, atomic supersede via commitRename.
+  // - vfsGetMultipartStatus: read landed[] for resume / progress.
+  //
+  // See worker/core/objects/user/multipart-upload.ts for implementation
+  // details; this file just wires the RPCs to gates.
+
+  async vfsBeginMultipart(
+    scope: VFSScope,
+    path: string,
+    opts: import("./multipart-upload").VFSBeginMultipartOpts
+  ): Promise<import("../../../../shared/multipart").MultipartBeginResponse> {
+    this.gateVfsWrite(scope);
+    const { vfsBeginMultipart } = await import("./multipart-upload");
+    const r = await vfsBeginMultipart(this, scope, path, opts);
+    // Schedule the orphan-session sweep alarm (re-uses the existing
+    // stale-write alarm). Idempotent if already scheduled.
+    await this.ensureStaleSweepScheduled();
+    return r;
+  }
+
+  async vfsAbortMultipart(
+    scope: VFSScope,
+    uploadId: string
+  ): Promise<{ ok: true }> {
+    this.gateVfs(scope);
+    const { vfsAbortMultipart } = await import("./multipart-upload");
+    return vfsAbortMultipart(this, scope, uploadId);
+  }
+
+  async vfsFinalizeMultipart(
+    scope: VFSScope,
+    uploadId: string,
+    chunkHashList: readonly string[]
+  ): Promise<import("../../../../shared/multipart").MultipartFinalizeResponse> {
+    this.gateVfsWrite(scope);
+    const { vfsFinalizeMultipart } = await import("./multipart-upload");
+    return vfsFinalizeMultipart(this, scope, uploadId, chunkHashList);
+  }
+
+  async vfsGetMultipartStatus(
+    scope: VFSScope,
+    uploadId: string
+  ): Promise<{
+    landed: number[];
+    total: number;
+    bytesUploaded: number;
+    expiresAtMs: number;
+    status: string;
+  }> {
+    this.gateVfs(scope);
+    const { vfsGetMultipartStatus } = await import("./multipart-upload");
+    return vfsGetMultipartStatus(this, scope, uploadId);
   }
 
   // ── Phase 9: file-level versioning RPCs ───────────────────────────────

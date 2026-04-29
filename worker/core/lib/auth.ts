@@ -223,3 +223,199 @@ export async function verifyVFSToken(
     return null;
   }
 }
+
+// ── Phase 16: multipart session + download tokens ──────────────────────
+//
+// Two new HMAC token shapes layered onto the same `JWT_SECRET` via
+// scope-discrimination claims:
+//
+//   - `scope: "vfs-mp"` — multipart upload session token. Mints at
+//     `beginMultipart`, validates per-chunk PUTs without a UserDO RPC.
+//     Carries enough state (`poolSize`, `totalChunks`, `chunkSize`,
+//     `totalSize`) for the chunk PUT route to compute placement and
+//     enforce caps without consulting the DO.
+//
+//   - `scope: "vfs-dl"` — cacheable-chunk download token. Mints at
+//     `mintDownloadToken`, validates per-chunk GETs against the
+//     browser-direct cacheable endpoint. Short-lived (1h default).
+//
+// Same JWT_SECRET signs all three (`vfs`, `vfs-mp`, `vfs-dl`); each
+// verify function rejects tokens lacking its sentinel — RFC 8725 §2.8
+// scope-binding pattern. Cross-purpose forgery is impossible without
+// the secret.
+
+import {
+  VFS_MP_SCOPE,
+  VFS_DL_SCOPE,
+  MULTIPART_DEFAULT_TTL_MS,
+  MULTIPART_MAX_TTL_MS,
+  DOWNLOAD_TOKEN_DEFAULT_TTL_MS,
+  type MultipartSessionTokenPayload,
+  type DownloadTokenPayload,
+} from "../../../shared/multipart";
+
+/**
+ * Sign a multipart session token. Called once per `beginMultipart` —
+ * the resulting token is presented on every subsequent chunk PUT to
+ * authorise it without a UserDO round-trip.
+ *
+ * `poolSize` is the snapshotted-at-begin pool size; freezing it in
+ * the token guarantees `placeChunk(uid, uploadId, idx, poolSize)`
+ * stays stable across the session even if the tenant's pool grows
+ * between begin and finalize.
+ */
+export async function signVFSMultipartToken(
+  env: Env,
+  payload: Omit<MultipartSessionTokenPayload, "scope" | "iat" | "exp">,
+  ttlMs: number = MULTIPART_DEFAULT_TTL_MS
+): Promise<{ token: string; expiresAtMs: number }> {
+  const secret = getSecret(env);
+  const ttl = Math.min(Math.max(ttlMs, 60_000), MULTIPART_MAX_TTL_MS);
+  const expiresAtMs = Date.now() + ttl;
+  const claims: Record<string, unknown> = {
+    scope: VFS_MP_SCOPE,
+    uploadId: payload.uploadId,
+    ns: payload.ns,
+    tn: payload.tn,
+    poolSize: payload.poolSize,
+    totalChunks: payload.totalChunks,
+    chunkSize: payload.chunkSize,
+    totalSize: payload.totalSize,
+  };
+  if (payload.sub !== undefined) claims.sub = payload.sub;
+  const token = await new SignJWT(claims)
+    .setProtectedHeader({ alg: "HS256" })
+    .setIssuedAt()
+    .setExpirationTime(Math.floor(expiresAtMs / 1000))
+    .sign(secret);
+  return { token, expiresAtMs };
+}
+
+/**
+ * Verify a multipart session token. Returns parsed payload or null
+ * on any failure. CPU-only; no DO round-trip.
+ *
+ * The `scope === "vfs-mp"` sentinel rejects `vfs` and `vfs-dl`
+ * tokens — even though they share JWT_SECRET, they cannot be replayed
+ * across surfaces.
+ */
+export async function verifyVFSMultipartToken(
+  env: Env,
+  token: string
+): Promise<MultipartSessionTokenPayload | null> {
+  const secret = getSecret(env);
+  try {
+    const { payload } = await jwtVerify(token, secret);
+    if (payload.scope !== VFS_MP_SCOPE) return null;
+    if (typeof payload.uploadId !== "string" || payload.uploadId.length === 0)
+      return null;
+    if (typeof payload.ns !== "string" || payload.ns.length === 0) return null;
+    if (typeof payload.tn !== "string" || payload.tn.length === 0) return null;
+    if (
+      typeof payload.poolSize !== "number" ||
+      !Number.isInteger(payload.poolSize) ||
+      payload.poolSize < 1
+    )
+      return null;
+    if (
+      typeof payload.totalChunks !== "number" ||
+      !Number.isInteger(payload.totalChunks) ||
+      payload.totalChunks < 0
+    )
+      return null;
+    if (
+      typeof payload.chunkSize !== "number" ||
+      !Number.isInteger(payload.chunkSize) ||
+      payload.chunkSize < 0
+    )
+      return null;
+    if (
+      typeof payload.totalSize !== "number" ||
+      !Number.isInteger(payload.totalSize) ||
+      payload.totalSize < 0
+    )
+      return null;
+    const sub =
+      typeof payload.sub === "string" && payload.sub.length > 0
+        ? payload.sub
+        : undefined;
+    const iat = typeof payload.iat === "number" ? payload.iat : 0;
+    const exp = typeof payload.exp === "number" ? payload.exp : 0;
+    return {
+      scope: VFS_MP_SCOPE,
+      uploadId: payload.uploadId,
+      ns: payload.ns,
+      tn: payload.tn,
+      sub,
+      poolSize: payload.poolSize,
+      totalChunks: payload.totalChunks,
+      chunkSize: payload.chunkSize,
+      totalSize: payload.totalSize,
+      iat,
+      exp,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Sign a download token. Tied to a specific `fileId` (not `path`) so
+ * it doesn't accidentally grant access if the path's content changes
+ * via a subsequent write — `fileId` is the immutable head's identity.
+ */
+export async function signVFSDownloadToken(
+  env: Env,
+  payload: Omit<DownloadTokenPayload, "scope" | "iat" | "exp">,
+  ttlMs: number = DOWNLOAD_TOKEN_DEFAULT_TTL_MS
+): Promise<{ token: string; expiresAtMs: number }> {
+  const secret = getSecret(env);
+  const ttl = Math.min(Math.max(ttlMs, 60_000), MULTIPART_MAX_TTL_MS);
+  const expiresAtMs = Date.now() + ttl;
+  const claims: Record<string, unknown> = {
+    scope: VFS_DL_SCOPE,
+    fileId: payload.fileId,
+    ns: payload.ns,
+    tn: payload.tn,
+  };
+  if (payload.sub !== undefined) claims.sub = payload.sub;
+  const token = await new SignJWT(claims)
+    .setProtectedHeader({ alg: "HS256" })
+    .setIssuedAt()
+    .setExpirationTime(Math.floor(expiresAtMs / 1000))
+    .sign(secret);
+  return { token, expiresAtMs };
+}
+
+/** Verify a download token. */
+export async function verifyVFSDownloadToken(
+  env: Env,
+  token: string
+): Promise<DownloadTokenPayload | null> {
+  const secret = getSecret(env);
+  try {
+    const { payload } = await jwtVerify(token, secret);
+    if (payload.scope !== VFS_DL_SCOPE) return null;
+    if (typeof payload.fileId !== "string" || payload.fileId.length === 0)
+      return null;
+    if (typeof payload.ns !== "string" || payload.ns.length === 0) return null;
+    if (typeof payload.tn !== "string" || payload.tn.length === 0) return null;
+    const sub =
+      typeof payload.sub === "string" && payload.sub.length > 0
+        ? payload.sub
+        : undefined;
+    const iat = typeof payload.iat === "number" ? payload.iat : 0;
+    const exp = typeof payload.exp === "number" ? payload.exp : 0;
+    return {
+      scope: VFS_DL_SCOPE,
+      fileId: payload.fileId,
+      ns: payload.ns,
+      tn: payload.tn,
+      sub,
+      iat,
+      exp,
+    };
+  } catch {
+    return null;
+  }
+}

@@ -35,6 +35,7 @@ import { cors } from "hono/cors";
 import type { Env } from "../../shared/types";
 import vfsRoutes from "./routes/vfs";
 import yjsWsRoutes from "./routes/vfs-yjs-ws";
+import multipartRoutes, { chunkDownload } from "./routes/multipart-routes";
 
 export { UserDOCore } from "./objects/user/index";
 export { ShardDO } from "./objects/shard/index";
@@ -46,7 +47,7 @@ app.use(
   cors({
     origin: "*",
     allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowHeaders: ["Content-Type", "Authorization"],
+    allowHeaders: ["Content-Type", "Authorization", "X-Session-Token"],
   })
 );
 
@@ -55,6 +56,18 @@ app.use(
 // (header or Sec-WebSocket-Protocol subprotocol) gates the upgrade;
 // the underlying DO's own /yjs/ws handler does the protocol work.
 app.route("/api/vfs/yjs", yjsWsRoutes);
+
+// Phase 16 — multipart parallel transfer engine. Mounted BEFORE the
+// general /api/vfs HTTP fallback so /api/vfs/multipart/* takes
+// precedence. Same Bearer-token auth as /api/vfs, plus per-chunk
+// HMAC session tokens on PUT.
+app.route("/api/vfs/multipart", multipartRoutes);
+
+// Phase 16 — cacheable per-chunk download endpoint. Lives at
+// /api/vfs/chunk/:fileId/:idx. Validates a download token (no
+// Bearer required if the token is presented; download tokens are
+// scope-bound). Cache-Control: immutable for hash-addressed bytes.
+app.route("/api/vfs", chunkDownload);
 
 // Phase 7 HTTP fallback for non-Worker consumers — Bearer VFS token
 // auth, typed UserDOCore RPC under the hood.
