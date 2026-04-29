@@ -445,6 +445,24 @@ export interface CreateVFSOptions {
     /** ≤128B opaque label embedded in every envelope. */
     keyId?: string;
   };
+  /**
+   * Phase 17.5 — pluggable placement strategy.
+   *
+   * Decides which DO instance names the SDK addresses. Default:
+   * `canonicalPlacement` (`vfs:${ns}:${tenant}[:${sub}][:s${idx}]`).
+   *
+   * Override only for SDK consumers that need to address pre-existing
+   * data under a non-canonical shard naming. The App's internal
+   * `createAppVFS` shim sets `placement: legacyAppPlacement` to
+   * address the photo-library's legacy `user:${userId}` /
+   * `shard:${userId}:${idx}` instances.
+   *
+   * **Score-template invariance.** Both built-in placements
+   * (`canonicalPlacement`, `legacyAppPlacement`) keep the same
+   * rendezvous-score function; only the resulting *DO instance
+   * name* differs. See `shared/placement.ts` and Phase 17.5 §1.4.
+   */
+  placement?: import("../../shared/placement").Placement;
 }
 
 /**
@@ -631,7 +649,7 @@ export interface DropVersionsPolicy {
   exceptVersions?: string[];
 }
 
-import { vfsUserDOName } from "../../worker/core/lib/utils";
+import { canonicalPlacement } from "../../shared/placement";
 
 /**
  * fs/promises-shaped client.
@@ -738,11 +756,13 @@ export class VFS implements VFSClient {
   // `createVFS`.
 
   protected user(): UserDOClient {
-    const name = vfsUserDOName(
-      this.opts.namespace ?? "default",
-      this.opts.tenant,
-      this.opts.sub
-    );
+    // Phase 17.5: route through the placement abstraction. Default
+    // (`canonicalPlacement`) produces the same `vfs:${ns}:${tenant}`
+    // name as before; consumers that pass `opts.placement` (e.g.
+    // `legacyAppPlacement` via `createAppVFS`) get their custom
+    // naming for free with no `user()` override needed.
+    const placement = this.opts.placement ?? canonicalPlacement;
+    const name = placement.userDOName(this.scope());
     const id = this.env.MOSSAIC_USER.idFromName(name);
     // The runtime stub has all the typed RPC methods; the
     // workers-types DO namespace generic doesn't structurally
@@ -1155,11 +1175,8 @@ export class VFS implements VFSClient {
     url.searchParams.set("ns", scope.ns ?? "default");
     url.searchParams.set("tenant", scope.tenant);
     if (scope.sub !== undefined) url.searchParams.set("sub", scope.sub);
-    const name = vfsUserDOName(
-      this.opts.namespace ?? "default",
-      this.opts.tenant,
-      this.opts.sub
-    );
+    const placement = this.opts.placement ?? canonicalPlacement;
+    const name = placement.userDOName(this.scope());
     const id = this.env.MOSSAIC_USER.idFromName(name);
     const stub = this.env.MOSSAIC_USER.get(id) as {
       fetch(req: Request): Promise<Response>;

@@ -27,7 +27,8 @@ import type { EnvCore as Env } from "../../../shared/types";
 import type { VFSScope } from "../../../shared/vfs-types";
 import type { UserDOCore } from "../objects/user/user-do-core";
 import type { ShardDO } from "../objects/shard/shard-do";
-import { vfsUserDOName, vfsShardDOName } from "../lib/utils";
+import { vfsUserDOName } from "../lib/utils";
+import { getPlacement } from "../lib/placement-resolver";
 import {
   verifyVFSToken,
   verifyVFSMultipartToken,
@@ -46,7 +47,8 @@ import {
   type DownloadTokenResponse,
 } from "../../../shared/multipart";
 import { hashChunk } from "../../../shared/crypto";
-import { placeChunk } from "../../../shared/placement";
+// Phase 17.5: placement is resolved via `getPlacement(scope)`; no
+// direct `placeChunk` import needed.
 
 // ── Shared auth middleware (Bearer VFS token) ──────────────────────────
 
@@ -98,7 +100,7 @@ function shardStub(
 ) {
   const ns =
     env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
-  const name = vfsShardDOName(scope.ns, scope.tenant, scope.sub, shardIndex);
+  const name = getPlacement(scope).shardDOName(scope, shardIndex);
   return ns.get(ns.idFromName(name));
 }
 
@@ -391,7 +393,12 @@ mp.put("/:uploadId/chunk/:idx", async (c) => {
     const userId = c.var.scope.sub
       ? `${c.var.scope.tenant}::${c.var.scope.sub}`
       : c.var.scope.tenant;
-    const sIdx = placeChunk(userId, uploadId, idx, payload.poolSize);
+    const sIdx = getPlacement(c.var.scope).placeChunk(
+      c.var.scope,
+      uploadId,
+      idx,
+      payload.poolSize
+    );
     const stub = shardStub(c.env, c.var.scope, sIdx);
     let putResult;
     try {

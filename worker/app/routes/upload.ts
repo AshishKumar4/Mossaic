@@ -1,8 +1,7 @@
 import { Hono } from "hono";
 import type { EnvApp as Env } from "@shared/types";
 import { authMiddleware } from "@core/lib/auth";
-import { shardDOName } from "@core/lib/utils";
-import { placeChunk } from "@shared/placement";
+import { legacyAppPlacement } from "@shared/placement";
 import { indexFile } from "./search";
 import { userStub } from "../lib/user-stub";
 
@@ -88,9 +87,15 @@ upload.put("/chunk/:fileId/:chunkIndex", async (c) => {
   }
 
   // Determine shard placement (legacy app shard naming — see header
-  // comment).
-  const shardIndex = placeChunk(userId, fileId, chunkIndex, poolSize);
-  const doName = shardDOName(userId, shardIndex);
+  // comment). Phase 17.5: explicit `legacyAppPlacement` dispatch.
+  const scope = { ns: "default" as const, tenant: userId };
+  const shardIndex = legacyAppPlacement.placeChunk(
+    scope,
+    fileId,
+    chunkIndex,
+    poolSize
+  );
+  const doName = legacyAppPlacement.shardDOName(scope, shardIndex);
 
   // Stream chunk data to ShardDO (never buffer fully in worker)
   const body = await c.req.arrayBuffer();

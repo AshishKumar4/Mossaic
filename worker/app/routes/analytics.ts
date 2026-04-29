@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import type { EnvApp as Env } from "@shared/types";
 import type { ShardStats, AnalyticsOverview } from "../types";
 import { authMiddleware } from "@core/lib/auth";
-import { shardDOName } from "@core/lib/utils";
+import { legacyAppPlacement } from "@shared/placement";
 import { userStub } from "../lib/user-stub";
 
 const analytics = new Hono<{
@@ -48,7 +48,10 @@ analytics.get("/overview", async (c) => {
 
     const shardPromises: Promise<ShardStats | null>[] = indicesToQuery.map(
       (i) => {
-        const doName = shardDOName(userId, i);
+        const doName = legacyAppPlacement.shardDOName(
+          { ns: "default", tenant: userId },
+          i
+        );
         const shardId = c.env.MOSSAIC_SHARD.idFromName(doName);
         const shardStub = c.env.MOSSAIC_SHARD.get(shardId);
 

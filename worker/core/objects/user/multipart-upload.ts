@@ -33,7 +33,8 @@ import {
   type VFSScope,
 } from "../../../../shared/vfs-types";
 import { computeChunkSpec } from "../../../../shared/chunking";
-import { generateId, vfsShardDOName } from "../../lib/utils";
+import { generateId } from "../../lib/utils";
+import { getPlacement } from "../../lib/placement-resolver";
 import {
   signVFSMultipartToken,
 } from "../../lib/auth";
@@ -64,7 +65,8 @@ import {
   stampFileEncryption,
   type EncryptionStampOpts,
 } from "./encryption-stamp";
-import { placeChunk } from "../../../../shared/placement";
+// Phase 17.5: placement is resolved via `getPlacement(scope)` (already
+// imported above); no direct `placeChunk` import needed.
 import { hashChunk } from "../../../../shared/crypto";
 
 export interface VFSBeginMultipartOpts {
@@ -374,12 +376,7 @@ async function resumeMultipart(
   const landedSet = new Set<number>();
   const probes: Promise<void>[] = [];
   for (let sIdx = 0; sIdx < row.pool_size; sIdx++) {
-    const shardName = vfsShardDOName(
-      scope.ns,
-      scope.tenant,
-      scope.sub,
-      sIdx
-    );
+    const shardName = getPlacement(scope).shardDOName(scope, sIdx);
     const stub = ns.get(ns.idFromName(shardName));
     probes.push(
       (async () => {
@@ -483,7 +480,7 @@ export async function vfsAbortMultipart(
   const ns = shardNs(durableObject);
   const cleanup: Promise<void>[] = [];
   for (let sIdx = 0; sIdx < row.pool_size; sIdx++) {
-    const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, sIdx);
+    const shardName = getPlacement(scope).shardDOName(scope, sIdx);
     const stub = ns.get(ns.idFromName(shardName));
     cleanup.push(
       (async () => {
@@ -576,7 +573,12 @@ export async function vfsFinalizeMultipart(
   const touched = new Set<number>();
   const idxToShard = new Array<number>(session.total_chunks);
   for (let i = 0; i < session.total_chunks; i++) {
-    const sIdx = placeChunk(userId, uploadId, i, session.pool_size);
+    const sIdx = getPlacement(scope).placeChunk(
+      scope,
+      uploadId,
+      i,
+      session.pool_size
+    );
     idxToShard[i] = sIdx;
     touched.add(sIdx);
   }
@@ -587,12 +589,7 @@ export async function vfsFinalizeMultipart(
   const collectErrors: unknown[] = [];
   await Promise.all(
     Array.from(touched).map(async (sIdx) => {
-      const shardName = vfsShardDOName(
-        scope.ns,
-        scope.tenant,
-        scope.sub,
-        sIdx
-      );
+      const shardName = getPlacement(scope).shardDOName(scope, sIdx);
       const stub = ns.get(ns.idFromName(shardName));
       try {
         const res = await stub.getMultipartManifest(uploadId);
@@ -707,12 +704,7 @@ export async function vfsFinalizeMultipart(
   );
   await Promise.all(
     Array.from(touched).map(async (sIdx) => {
-      const shardName = vfsShardDOName(
-        scope.ns,
-        scope.tenant,
-        scope.sub,
-        sIdx
-      );
+      const shardName = getPlacement(scope).shardDOName(scope, sIdx);
       const stub = ns.get(ns.idFromName(shardName));
       try {
         await stub.clearMultipartStaging(uploadId);
@@ -771,12 +763,7 @@ export async function vfsGetMultipartStatus(
   await Promise.all(
     Array.from({ length: row.pool_size }, (_, sIdx) => sIdx).map(
       async (sIdx) => {
-        const shardName = vfsShardDOName(
-          scope.ns,
-          scope.tenant,
-          scope.sub,
-          sIdx
-        );
+        const shardName = getPlacement(scope).shardDOName(scope, sIdx);
         const stub = ns.get(ns.idFromName(shardName));
         try {
           const res = await stub.getMultipartManifest(uploadId);

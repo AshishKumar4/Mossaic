@@ -7,8 +7,10 @@ import {
 import { WRITEFILE_MAX } from "../../../../../shared/inline";
 import { hashChunk } from "../../../../../shared/crypto";
 import { computeChunkSpec } from "../../../../../shared/chunking";
-import { placeChunk } from "../../../../../shared/placement";
-import { generateId, vfsShardDOName } from "../../../lib/utils";
+// Phase 17.5: placement is resolved via `getPlacement(scope)` (already
+// imported above); no direct `placeChunk` import needed.
+import { generateId } from "../../../lib/utils";
+import { getPlacement } from "../../../lib/placement-resolver";
 import {
   commitVersion,
   isVersioningEnabled,
@@ -212,12 +214,7 @@ export async function vfsPullReadStream(
     );
   }
   const env = durableObject.envPublic;
-  const shardName = vfsShardDOName(
-    scope.ns,
-    scope.tenant,
-    scope.sub,
-    chunkRow.shard_index
-  );
+  const shardName = getPlacement(scope).shardDOName(scope, chunkRow.shard_index);
   const stub = env.MOSSAIC_SHARD.get(env.MOSSAIC_SHARD.idFromName(shardName));
   const res = await stub.fetch(
     new Request(`http://internal/chunk/${chunkRow.chunk_hash}`)
@@ -486,10 +483,15 @@ export async function vfsAppendWriteStream(
   }
 
   const hash = await hashChunk(data);
-  const sIdx = placeChunk(userId, handle.tmpId, chunkIndex, handle.poolSize);
+  const sIdx = getPlacement(scope).placeChunk(
+    scope,
+    handle.tmpId,
+    chunkIndex,
+    handle.poolSize
+  );
   const env = durableObject.envPublic;
   const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
-  const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, sIdx);
+  const shardName = getPlacement(scope).shardDOName(scope, sIdx);
   const stub = shardNs.get(shardNs.idFromName(shardName));
   await stub.putChunk(hash, data, handle.tmpId, chunkIndex, userId);
 

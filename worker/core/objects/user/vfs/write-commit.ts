@@ -7,8 +7,10 @@ import {
 import { INLINE_LIMIT, WRITEFILE_MAX } from "../../../../../shared/inline";
 import { hashChunk } from "../../../../../shared/crypto";
 import { computeChunkSpec } from "../../../../../shared/chunking";
-import { placeChunk } from "../../../../../shared/placement";
-import { generateId, vfsShardDOName } from "../../../lib/utils";
+// Phase 17.5: placement is resolved via `getPlacement(scope)` (already
+// imported above); no direct `placeChunk` import needed.
+import { generateId } from "../../../lib/utils";
+import { getPlacement } from "../../../lib/placement-resolver";
 import {
   commitVersion,
   isVersioningEnabled,
@@ -120,12 +122,7 @@ export async function hardDeleteFileRow(
   // overlap with the typed form.
   const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
   for (const { shard_index } of shardRows) {
-    const shardName = vfsShardDOName(
-      scope.ns,
-      scope.tenant,
-      scope.sub,
-      shard_index
-    );
+    const shardName = getPlacement(scope).shardDOName(scope, shard_index);
     const stub = shardNs.get(shardNs.idFromName(shardName));
     // Use the typed RPC; don't await across all in parallel — keep
     // sequential so one bad shard doesn't fan out errors.
@@ -334,8 +331,8 @@ async function vfsWriteFileVersioned(
       // placement for spread across shards on a single file.
       // (H4 freezes poolSize at the chunk's first-write so pool
       //  growth never re-routes a hash to a different shard.)
-      const sIdx = placeChunkForVersion(durableObject, userId, hash, poolSize);
-      const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, sIdx);
+      const sIdx = placeChunkForVersion(durableObject, scope, hash, poolSize);
+      const shardName = getPlacement(scope).shardDOName(scope, sIdx);
       const stub = shardNs.get(shardNs.idFromName(shardName));
       await stub.putChunk(hash, slice, refId, i, userId);
       touchedShards.add(sIdx);
@@ -373,7 +370,7 @@ async function vfsWriteFileVersioned(
       versionId
     );
     for (const sIdx of touchedShards) {
-      const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, sIdx);
+      const shardName = getPlacement(scope).shardDOName(scope, sIdx);
       const stub = shardNs.get(shardNs.idFromName(shardName));
       try {
         await stub.deleteChunks(refId);
@@ -680,8 +677,8 @@ export async function vfsWriteFile(
       const end = Math.min(start + chunkSize, data.byteLength);
       const slice = data.subarray(start, end);
       const hash = await hashChunk(slice);
-      const sIdx = placeChunk(userId, tmpId, i, poolSize);
-      const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, sIdx);
+      const sIdx = getPlacement(scope).placeChunk(scope, tmpId, i, poolSize);
+      const shardName = getPlacement(scope).shardDOName(scope, sIdx);
       const stub = shardNs.get(shardNs.idFromName(shardName));
       await stub.putChunk(hash, slice, tmpId, i, userId);
       durableObject.sql.exec(

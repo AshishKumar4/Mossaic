@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import type { EnvApp as Env } from "@shared/types";
 import { authMiddleware } from "@core/lib/auth";
-import { shardDOName } from "@core/lib/utils";
+import { legacyAppPlacement } from "@shared/placement";
 import { userStub } from "../lib/user-stub";
 
 const download = new Hono<{
@@ -52,7 +52,7 @@ download.get("/chunk/:fileId/:chunkIndex", async (c) => {
 
   // Fetch chunk from ShardDO — stream it directly.
   const shardId = c.env.MOSSAIC_SHARD.idFromName(
-    shardDOName(userId, chunk.shardIndex)
+    legacyAppPlacement.shardDOName({ ns: "default", tenant: userId }, chunk.shardIndex)
   );
   const shardStub = c.env.MOSSAIC_SHARD.get(shardId);
 

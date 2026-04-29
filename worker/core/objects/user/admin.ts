@@ -46,7 +46,7 @@
 
 import type { UserDOCore as UserDO } from "./user-do-core";
 import type { ShardDO } from "../shard/shard-do";
-import { vfsShardDOName } from "../../lib/utils";
+import { getPlacement } from "../../lib/placement-resolver";
 import type { VFSScope } from "../../../../shared/vfs-types";
 
 export interface DedupeResult {
@@ -254,7 +254,7 @@ async function hardDeleteLoser(
   const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
   for (const { shard_index } of shardRows) {
     const shardName = scope
-      ? vfsShardDOName(scope.ns, scope.tenant, scope.sub, shard_index)
+      ? getPlacement(scope).shardDOName(scope, shard_index)
       : `shard:${userId}:${shard_index}`;
     const stub = shardNs.get(shardNs.idFromName(shardName));
     await stub.deleteChunks(fileId);
