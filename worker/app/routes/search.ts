@@ -3,7 +3,8 @@ import type { EnvApp as Env } from "@shared/types";
 import type { SearchResult, ProviderStatus, VectorSpace } from "@shared/embedding-types";
 import { classifyResultType, isClipIndexable, isImageMime } from "@shared/embedding-types";
 import { authMiddleware } from "@core/lib/auth";
-import { userDOName, shardDOName } from "@core/lib/utils";
+import { shardDOName } from "@core/lib/utils";
+import { userStub } from "../lib/user-stub";
 import {
   createEmbeddingProviders,
   getBestTextProvider,
@@ -205,20 +206,19 @@ search.post("/config", async (c) => {
 search.post("/reindex", async (c) => {
   const userId = c.get("userId");
 
-  // Get all user files from UserDO
-  const userDoId = c.env.MOSSAIC_USER.idFromName(userDOName(userId));
-  const userStub = c.env.MOSSAIC_USER.get(userDoId);
-
-  const filesRes = await userStub.fetch(new Request("http://internal/files/list"));
-  if (!filesRes.ok) {
-    return c.json({ error: "Failed to list files" }, 500);
-  }
-
-  const filesData = (await filesRes.json()) as {
-    files: { file_id: string; file_name: string; file_size: number; mime_type: string; status: string }[];
-  };
-
-  const files = filesData.files.filter((f) => f.status === "complete");
+  // Phase 17: typed RPC `appListAllFiles` replaces a stale legacy
+  // GET against `/files/list` (which never matched the POST-only
+  // handler in the old `_legacyFetch` router and silently 404'd).
+  const allFiles = await userStub(c.env, userId).appListAllFiles(userId);
+  const files = allFiles
+    .filter((f) => f.status === "complete")
+    .map((f) => ({
+      file_id: f.fileId,
+      file_name: f.fileName,
+      file_size: f.fileSize,
+      mime_type: f.mimeType,
+      status: f.status,
+    }));
 
   if (files.length === 0) {
     return c.json({ ok: true, indexed: { text: 0, clip: 0 } });
@@ -346,18 +346,8 @@ async function fetchFileBytes(
   fileId: string
 ): Promise<Uint8Array | null> {
   try {
-    const userDoId = env.MOSSAIC_USER.idFromName(userDOName(userId));
-    const userStub = env.MOSSAIC_USER.get(userDoId);
-
-    const manifestRes = await userStub.fetch(
-      new Request(`http://internal/files/manifest/${fileId}`)
-    );
-    if (!manifestRes.ok) return null;
-
-    const manifest = (await manifestRes.json()) as {
-      fileSize: number;
-      chunks: Array<{ index: number; hash: string; shardIndex: number; size: number }>;
-    };
+    const manifest = await userStub(env, userId).appGetFileManifest(fileId);
+    if (!manifest) return null;
 
     // Single chunk — fast path
     if (manifest.chunks.length === 1) {

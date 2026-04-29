@@ -1,7 +1,8 @@
 import { Hono } from "hono";
 import type { EnvApp as Env } from "@shared/types";
 import { authMiddleware } from "@core/lib/auth";
-import { userDOName, shardDOName } from "@core/lib/utils";
+import { shardDOName } from "@core/lib/utils";
+import { userStub } from "../lib/user-stub";
 
 const gallery = new Hono<{
   Bindings: Env;
@@ -13,181 +14,96 @@ gallery.use("*", authMiddleware());
 /**
  * GET /api/gallery/photos
  * List all image files across all folders, sorted by date descending.
+ *
+ * Phase 17: typed RPC `appGetGalleryPhotos`.
  */
 gallery.get("/photos", async (c) => {
   const userId = c.get("userId");
-
-  const doId = c.env.MOSSAIC_USER.idFromName(userDOName(userId));
-  const stub = c.env.MOSSAIC_USER.get(doId);
-
-  const res = await stub.fetch(
-    new Request("http://internal/gallery/photos", {
-      method: "POST",
-      body: JSON.stringify({ userId }),
-    })
-  );
-
-  return c.json(await res.json());
+  const photos = await userStub(c.env, userId).appGetGalleryPhotos(userId);
+  return c.json({ photos });
 });
 
 /**
  * GET /api/gallery/image/:fileId
- * Serve a full image by reassembling all chunks. Streams the response.
- * Supports range requests for large images.
+ * Serve a full image by reassembling all chunks. Streams the response
+ * for single-chunk images; concatenates for multi-chunk.
+ *
+ * Phase 17: typed RPC `appGetFileManifest` replaces the legacy fetch
+ * indirection. ShardDO addressing stays on the legacy
+ * `shard:userId:idx` namespace.
+ *
+ * Future: replace the multi-chunk concat with `vfs.createReadStream`
+ * once ShardDO data is migrated (Phase 17.5 / §5.9). For now the
+ * legacy concat preserves byte-equality with the existing live
+ * deploy.
  */
 gallery.get("/image/:fileId", async (c) => {
-  const userId = c.get("userId");
-  const fileId = c.req.param("fileId");
-
-  const doId = c.env.MOSSAIC_USER.idFromName(userDOName(userId));
-  const stub = c.env.MOSSAIC_USER.get(doId);
-
-  // Get manifest
-  const manifestRes = await stub.fetch(
-    new Request(`http://internal/files/manifest/${fileId}`)
-  );
-
-  if (!manifestRes.ok) {
-    return c.json({ error: "File not found" }, 404);
-  }
-
-  const manifest = (await manifestRes.json()) as {
-    fileSize: number;
-    mimeType: string;
-    chunks: Array<{
-      index: number;
-      hash: string;
-      shardIndex: number;
-      size: number;
-    }>;
-  };
-
-  // For small images (single chunk), stream directly
-  if (manifest.chunks.length === 1) {
-    const chunk = manifest.chunks[0];
-    const shardId = c.env.MOSSAIC_SHARD.idFromName(
-      shardDOName(userId, chunk.shardIndex)
-    );
-    const shardStub = c.env.MOSSAIC_SHARD.get(shardId);
-    const chunkRes = await shardStub.fetch(
-      new Request(`http://internal/chunk/${chunk.hash}`)
-    );
-
-    if (!chunkRes.ok) {
-      return c.json({ error: "Chunk data not found" }, 404);
-    }
-
-    return new Response(chunkRes.body, {
-      headers: {
-        "Content-Type": manifest.mimeType,
-        "Content-Length": manifest.fileSize.toString(),
-        "Cache-Control": "private, max-age=3600",
-      },
-    });
-  }
-
-  // For multi-chunk images, fetch all chunks and concatenate
-  const chunkBuffers: ArrayBuffer[] = [];
-  for (const chunk of manifest.chunks.sort((a, b) => a.index - b.index)) {
-    const shardId = c.env.MOSSAIC_SHARD.idFromName(
-      shardDOName(userId, chunk.shardIndex)
-    );
-    const shardStub = c.env.MOSSAIC_SHARD.get(shardId);
-    const chunkRes = await shardStub.fetch(
-      new Request(`http://internal/chunk/${chunk.hash}`)
-    );
-    if (!chunkRes.ok) {
-      return c.json({ error: "Chunk data not found" }, 404);
-    }
-    chunkBuffers.push(await chunkRes.arrayBuffer());
-  }
-
-  // Concatenate all buffers
-  const totalSize = chunkBuffers.reduce((sum, buf) => sum + buf.byteLength, 0);
-  const combined = new Uint8Array(totalSize);
-  let offset = 0;
-  for (const buf of chunkBuffers) {
-    combined.set(new Uint8Array(buf), offset);
-    offset += buf.byteLength;
-  }
-
-  return new Response(combined, {
-    headers: {
-      "Content-Type": manifest.mimeType,
-      "Content-Length": totalSize.toString(),
-      "Cache-Control": "private, max-age=3600",
-    },
-  });
+  return serveImage(c.env, c.get("userId"), c.req.param("fileId"), 3600);
 });
 
 /**
  * GET /api/gallery/thumbnail/:fileId
- * Serve a thumbnail. For V1, just serve the original (browser resizes).
- * The frontend uses object-fit: cover for display.
+ * Same content as /image but with a 24h Cache-Control. The browser
+ * resizes via object-fit: cover.
  */
 gallery.get("/thumbnail/:fileId", async (c) => {
-  const userId = c.get("userId");
-  const fileId = c.req.param("fileId");
+  return serveImage(c.env, c.get("userId"), c.req.param("fileId"), 86400);
+});
 
-  const doId = c.env.MOSSAIC_USER.idFromName(userDOName(userId));
-  const stub = c.env.MOSSAIC_USER.get(doId);
-
-  const manifestRes = await stub.fetch(
-    new Request(`http://internal/files/manifest/${fileId}`)
-  );
-
-  if (!manifestRes.ok) {
-    return c.json({ error: "File not found" }, 404);
+/**
+ * Shared helper: fetch the manifest, then either single-chunk-stream
+ * or multi-chunk-concat the bytes back as the response body. Sets
+ * private Cache-Control with the supplied max-age.
+ */
+async function serveImage(
+  env: Env,
+  userId: string,
+  fileId: string,
+  maxAge: number
+): Promise<Response> {
+  const manifest = await userStub(env, userId).appGetFileManifest(fileId);
+  if (!manifest) {
+    return Response.json({ error: "File not found" }, { status: 404 });
   }
 
-  const manifest = (await manifestRes.json()) as {
-    fileSize: number;
-    mimeType: string;
-    chunks: Array<{
-      index: number;
-      hash: string;
-      shardIndex: number;
-      size: number;
-    }>;
+  const cacheHeaders = {
+    "Content-Type": manifest.mimeType,
+    "Cache-Control": `private, max-age=${maxAge}`,
   };
 
-  // For thumbnails, we serve the whole image (browser does the resizing).
-  // For small images (<=1MB), just serve the single chunk
+  // Single chunk — stream directly without buffering.
   if (manifest.chunks.length === 1) {
     const chunk = manifest.chunks[0];
-    const shardId = c.env.MOSSAIC_SHARD.idFromName(
+    const shardId = env.MOSSAIC_SHARD.idFromName(
       shardDOName(userId, chunk.shardIndex)
     );
-    const shardStub = c.env.MOSSAIC_SHARD.get(shardId);
+    const shardStub = env.MOSSAIC_SHARD.get(shardId);
     const chunkRes = await shardStub.fetch(
       new Request(`http://internal/chunk/${chunk.hash}`)
     );
-
     if (!chunkRes.ok) {
-      return c.json({ error: "Chunk data not found" }, 404);
+      return Response.json({ error: "Chunk data not found" }, { status: 404 });
     }
-
     return new Response(chunkRes.body, {
       headers: {
-        "Content-Type": manifest.mimeType,
-        "Content-Length": chunk.size.toString(),
-        "Cache-Control": "private, max-age=86400",
+        ...cacheHeaders,
+        "Content-Length": manifest.fileSize.toString(),
       },
     });
   }
 
-  // Multi-chunk: assemble
+  // Multi-chunk — fetch and concatenate.
   const chunkBuffers: ArrayBuffer[] = [];
   for (const chunk of manifest.chunks.sort((a, b) => a.index - b.index)) {
-    const shardId = c.env.MOSSAIC_SHARD.idFromName(
+    const shardId = env.MOSSAIC_SHARD.idFromName(
       shardDOName(userId, chunk.shardIndex)
     );
-    const shardStub = c.env.MOSSAIC_SHARD.get(shardId);
+    const shardStub = env.MOSSAIC_SHARD.get(shardId);
     const chunkRes = await shardStub.fetch(
       new Request(`http://internal/chunk/${chunk.hash}`)
     );
     if (!chunkRes.ok) {
-      return c.json({ error: "Chunk data not found" }, 404);
+      return Response.json({ error: "Chunk data not found" }, { status: 404 });
     }
     chunkBuffers.push(await chunkRes.arrayBuffer());
   }
@@ -202,11 +118,10 @@ gallery.get("/thumbnail/:fileId", async (c) => {
 
   return new Response(combined, {
     headers: {
-      "Content-Type": manifest.mimeType,
+      ...cacheHeaders,
       "Content-Length": totalSize.toString(),
-      "Cache-Control": "private, max-age=86400",
     },
   });
-});
+}
 
 export default gallery;

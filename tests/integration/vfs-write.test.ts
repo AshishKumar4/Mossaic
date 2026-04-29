@@ -26,7 +26,7 @@ import {
  *   - removeRecursive only orphans GC'd; shared chunks survive
  */
 
-import type { UserDOCore as UserDO } from "@core/objects/user/user-do-core";
+import type { UserDO } from "@app/objects/user/user-do";
 import type { ShardDO } from "@core/objects/shard/shard-do";
 import { INLINE_LIMIT } from "@shared/inline";
 import { vfsShardDOName } from "@core/lib/utils";
@@ -40,22 +40,17 @@ const E = env as unknown as E;
 // ── Helpers ────────────────────────────────────────────────────────────
 
 /**
- * Seed a UserDO via the legacy /signup route to materialize the quota
- * row + the user_id we'll use as scope.tenant. Identical pattern to
- * vfs-read.test.ts.
+ * Seed a UserDO via the App's `appHandleSignup` typed RPC to
+ * materialize the quota row + the user_id we'll use as
+ * scope.tenant. Phase 17 replaced the legacy `/signup` JSON router
+ * with the typed RPC; behaviour is bit-for-bit identical (same
+ * `handleSignup` helper underneath).
  */
 async function seedUser(
   stub: DurableObjectStub<UserDO>,
   email: string
 ): Promise<string> {
-  const sup = await stub.fetch(
-    new Request("http://internal/signup", {
-      method: "POST",
-      body: JSON.stringify({ email, password: "abcd1234" }),
-    })
-  );
-  expect(sup.ok).toBe(true);
-  const { userId } = (await sup.json()) as { userId: string };
+  const { userId } = await stub.appHandleSignup(email, "abcd1234");
   return userId;
 }
 

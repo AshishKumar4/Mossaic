@@ -1,8 +1,18 @@
 import { useState, useCallback, useRef } from "react";
 import { api } from "@/lib/api";
-import { hashChunk, computeFileHash } from "@shared/crypto";
+// Phase 17: import the chunk hashing + AIMD primitives from the
+// `@mossaic/sdk/http` browser-safe entry instead of reaching into
+// `@shared/*` directly. The `/http` entry omits the Worker-only
+// DO class re-exports (UserDO, ShardDO) so it tree-shakes cleanly
+// in the browser bundle. Behaviour is bit-identical to the
+// pre-Phase-17 `@shared/crypto` + `@shared/aimd` imports — the SDK
+// re-exports the SAME implementations.
+import {
+  hashChunk,
+  computeFileHash,
+  AIMDController,
+} from "@mossaic/sdk/http";
 import { MAX_RETRIES, RETRY_BASE_DELAY } from "@shared/constants";
-import { AIMDController } from "@shared/aimd";
 import { addTransferStats } from "@/lib/transfer-stats";
 import type { TransferProgress, ChunkProgress, ChunkStatus, CompletedTransferStats } from "@app/types";
 

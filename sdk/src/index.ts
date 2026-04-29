@@ -179,6 +179,21 @@ export { createIgitFs, type CreateIgitFsOptions } from "./igit";
 // that import `@mossaic/sdk/yjs` pay for the runtime.
 export { VFS_MODE_YJS_BIT } from "../../shared/constants";
 
+// content-hash helpers. Exposed at the root so consumers
+// (e.g. browser-side `useUpload`) can hash chunks the same way the
+// SDK does — single import surface, no internal `@shared/*` reach-in.
+export { hashChunk, computeFileHash } from "../../shared/crypto";
+
+// AIMD controller. Exposed as a building block for consumer-side
+// adaptive transfer engines that aren't covered by `parallelUpload`
+// (e.g. the photo-library SPA's existing per-chunk PUT path against
+// the App's legacy `/api/upload/chunk/*` URL contract).
+export { AIMDController } from "../../shared/aimd";
+
+// chunk-spec helper for callers that need to mirror the server's
+// adaptive chunk-size decisions on the client.
+export { computeChunkSpec } from "../../shared/chunking";
+
 import { VFS, type CreateVFSOptions, type MossaicEnv } from "./vfs";
 
 /**
