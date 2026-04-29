@@ -102,6 +102,17 @@ function userStub(c: { env: Env; var: { scope: VFSScope } }): UserDOCore {
 
 /** Map a thrown error to (status, body) for JSON responses. */
 function errToResponse(err: unknown): { status: number; body: { code: string; message: string } } {
+  // VFSConfigError = JWT_SECRET missing on the deploy. Surface as 503
+  // service-misconfigured (mirrors the auth-middleware path). Caught
+  // here as defense-in-depth: post-auth handlers like listFiles can
+  // also throw VFSConfigError if the cursor secret resolves to empty
+  // (B-1 fix in worker/core/objects/user/list-files.ts).
+  if (err instanceof VFSConfigError) {
+    return {
+      status: 503,
+      body: { code: "EMOSSAIC_UNAVAILABLE", message: err.message },
+    };
+  }
   const e = err as { code?: unknown; message?: unknown };
   const rawMsg = typeof e?.message === "string" ? e.message : String(err);
   // Extract code via the same scan-all-tokens approach as

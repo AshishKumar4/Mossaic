@@ -24,6 +24,7 @@ import {
   type Direction,
   type OrderBy,
 } from "../../lib/cursor";
+import { getCursorSecret } from "../../lib/auth";
 import {
   LIST_LIMIT_DEFAULT,
   LIST_LIMIT_MAX,
@@ -81,8 +82,14 @@ export async function vfsListFiles(
     );
   }
 
-  const secret = (durableObject.envPublic as { JWT_SECRET?: string }).JWT_SECRET ??
-    "mossaic-cursor-dev-secret-do-not-use-in-prod";
+  // B-1 (final-audit): NO dev-string fallback. If `JWT_SECRET` is
+  // missing/empty, refuse to sign or verify cursors. Mirrors the C1
+  // fix in `worker/core/lib/auth.ts:getSecret`. A hard-coded fallback
+  // in source would let any reader of this open-source repo forge
+  // cursors against any deployment that forgot to run
+  // `wrangler secret put JWT_SECRET`. The thrown VFSConfigError
+  // surfaces at the route layer as 503 (mirrors the JWT path).
+  const secret = getCursorSecret(durableObject.envPublic);
   let cursor: CursorPayload | null = null;
   if (opts.cursor) {
     cursor = await decodeCursor(opts.cursor, secret, orderBy, direction);
