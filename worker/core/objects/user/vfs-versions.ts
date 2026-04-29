@@ -111,6 +111,16 @@ export interface VersionRow {
   size: number;
   mode: number;
   deleted: boolean;
+  /** Phase 12: optional human-readable label. */
+  label?: string | null;
+  /**
+   * Phase 12: true iff this version was created by an explicit
+   * user-facing op (writeFile, restoreVersion, flush()). False for
+   * Yjs opportunistic compactions and pre-Phase-12 rows.
+   */
+  userVisible?: boolean;
+  /** Phase 12: snapshot of metadata at this version (when requested). */
+  metadata?: Record<string, unknown> | null;
 }
 
 /** True iff versioning is enabled for the tenant on this DO. */
@@ -196,13 +206,29 @@ export function commitVersion(
     mimeType: string;
     inlineData: Uint8Array | null;
     deleted?: boolean;
+    /**
+     * Phase 12: per-version flags. All optional; defaults preserve
+     * Phase-9 behavior (NULL label, user_visible=0, NULL metadata).
+     *
+     * - `userVisible`: when truthy, sets `file_versions.user_visible = 1`.
+     *   Used by writeFile (default true), restoreVersion (true), and
+     *   YjsRuntime.compact when called via flush() (true). Opportunistic
+     *   YjsRuntime compactions pass false.
+     * - `label`: optional ≤128-char human label; SDK validates.
+     * - `metadata`: snapshot of `files.metadata` at commit time, as
+     *   already-encoded bytes. NULL preserves the column's NULL.
+     */
+    userVisible?: boolean;
+    label?: string | null;
+    metadata?: Uint8Array | null;
   }
 ): void {
   durableObject.sql.exec(
     `INSERT INTO file_versions
        (path_id, version_id, user_id, size, mode, mtime_ms, deleted,
-        inline_data, chunk_size, chunk_count, file_hash, mime_type)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        inline_data, chunk_size, chunk_count, file_hash, mime_type,
+        user_visible, label, metadata)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     args.pathId,
     args.versionId,
     args.userId,
@@ -214,7 +240,10 @@ export function commitVersion(
     args.chunkSize,
     args.chunkCount,
     args.fileHash,
-    args.mimeType
+    args.mimeType,
+    args.userVisible ? 1 : 0,
+    args.label ?? null,
+    args.metadata ?? null
   );
   // Update head pointer to the new version. Tombstones also become
   // the head — readers find them by mtime_ms and then check deleted.
@@ -299,33 +328,119 @@ export function getVersion(
 export function listVersions(
   durableObject: UserDO,
   pathId: string,
-  opts: { limit?: number } = {}
+  opts: {
+    limit?: number;
+    /** Phase 12: filter to versions with `user_visible = 1`. */
+    userVisibleOnly?: boolean;
+    /** Phase 12: include the metadata snapshot per row. */
+    includeMetadata?: boolean;
+  } = {}
 ): VersionRow[] {
   const limit = opts.limit ?? 1000;
+  const where: string[] = ["path_id = ?"];
+  const args: (string | number)[] = [pathId];
+  if (opts.userVisibleOnly) {
+    where.push("user_visible = 1");
+  }
+  args.push(limit);
+  const sql = `
+    SELECT version_id, mtime_ms, size, mode, deleted,
+           user_visible, label, metadata
+      FROM file_versions
+     WHERE ${where.join(" AND ")}
+     ORDER BY mtime_ms DESC
+     LIMIT ?
+  `;
   const rows = durableObject.sql
-    .exec(
-      `SELECT version_id, mtime_ms, size, mode, deleted
-         FROM file_versions
-        WHERE path_id = ?
-        ORDER BY mtime_ms DESC
-        LIMIT ?`,
-      pathId,
-      limit
-    )
+    .exec(sql, ...(args as [string, ...unknown[]]))
     .toArray() as {
     version_id: string;
     mtime_ms: number;
     size: number;
     mode: number;
     deleted: number;
+    user_visible: number;
+    label: string | null;
+    metadata: ArrayBuffer | null;
   }[];
-  return rows.map((r) => ({
-    versionId: r.version_id,
-    mtimeMs: r.mtime_ms,
-    size: r.size,
-    mode: r.mode,
-    deleted: r.deleted === 1,
-  }));
+  return rows.map((r) => {
+    const out: VersionRow = {
+      versionId: r.version_id,
+      mtimeMs: r.mtime_ms,
+      size: r.size,
+      mode: r.mode,
+      deleted: r.deleted === 1,
+      userVisible: r.user_visible === 1,
+      label: r.label,
+    };
+    if (opts.includeMetadata) {
+      if (r.metadata) {
+        try {
+          out.metadata = JSON.parse(
+            new TextDecoder().decode(new Uint8Array(r.metadata))
+          ) as Record<string, unknown>;
+        } catch {
+          out.metadata = null;
+        }
+      } else {
+        out.metadata = null;
+      }
+    }
+    return out;
+  });
+}
+
+/**
+ * Phase 12: set per-version flags. Idempotent. Throws EINVAL on
+ *   - userVisible:false (the flag is monotonic; demoting is not
+ *     supported because consumers may have built durable bookmarks
+ *     against the version_id and silently flipping it would break
+ *     them).
+ *   - missing version row.
+ *   - label > 128 chars (caller validates).
+ */
+export function markVersion(
+  durableObject: UserDO,
+  pathId: string,
+  versionId: string,
+  opts: { label?: string; userVisible?: boolean }
+): void {
+  // Existence check + current state.
+  const row = durableObject.sql
+    .exec(
+      "SELECT user_visible FROM file_versions WHERE path_id = ? AND version_id = ?",
+      pathId,
+      versionId
+    )
+    .toArray()[0] as { user_visible: number } | undefined;
+  if (!row) {
+    throw new VFSError(
+      "ENOENT",
+      `markVersion: version ${versionId} not found at pathId ${pathId}`
+    );
+  }
+  if (opts.userVisible === false) {
+    throw new VFSError(
+      "EINVAL",
+      "markVersion: userVisible cannot be set to false (the bit is monotonic)"
+    );
+  }
+  if (opts.label !== undefined) {
+    durableObject.sql.exec(
+      "UPDATE file_versions SET label = ? WHERE path_id = ? AND version_id = ?",
+      opts.label,
+      pathId,
+      versionId
+    );
+  }
+  if (opts.userVisible === true) {
+    durableObject.sql.exec(
+      `UPDATE file_versions SET user_visible = 1
+        WHERE path_id = ? AND version_id = ? AND user_visible = 0`,
+      pathId,
+      versionId
+    );
+  }
 }
 
 /**

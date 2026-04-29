@@ -451,6 +451,75 @@ export class UserDOCore extends DurableObject<Env> {
       )
     `);
 
+    // ── Phase 12: metadata + tags + version label/visibility ─────────────
+    //
+    // Schema-only additions delivered via the existing idempotent
+    // ensureInit path. NO new wrangler migration tag — additive
+    // ALTERs + CREATE TABLE/INDEX IF NOT EXISTS are safe to replay.
+    //
+    // - files.metadata: opaque JSON blob, ≤64 KB. NULL on legacy rows.
+    // - file_versions.user_visible: 0=compaction/internal,
+    //   1=writeFile/flush()/restore. Default 0; legacy versions
+    //   appear non-user-visible to listVersions(userVisibleOnly:true).
+    // - file_versions.label: optional human-readable ≤128-char label.
+    // - file_versions.metadata: snapshot of files.metadata at commit.
+    // - file_tags(path_id, tag): per-file tag set; (tag, mtime_ms DESC)
+    //   index drives listFiles-by-tag.
+    // - idx_files_parent_mtime / idx_files_parent_size: drive
+    //   listFiles-by-prefix in O(log N + K) seek+scan.
+    //
+    // Caps live in shared/metadata-caps.ts and are enforced in
+    // vfs-ops (validators throw VFSError("EINVAL", ...) before any
+    // SQL touches the row).
+
+    try {
+      this.sql.exec("ALTER TABLE files ADD COLUMN metadata BLOB");
+    } catch {
+      // column already exists
+    }
+    try {
+      this.sql.exec(
+        "ALTER TABLE file_versions ADD COLUMN user_visible INTEGER NOT NULL DEFAULT 0"
+      );
+    } catch {
+      // column already exists
+    }
+    try {
+      this.sql.exec("ALTER TABLE file_versions ADD COLUMN label TEXT");
+    } catch {
+      // column already exists
+    }
+    try {
+      this.sql.exec("ALTER TABLE file_versions ADD COLUMN metadata BLOB");
+    } catch {
+      // column already exists
+    }
+
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS file_tags (
+        path_id   TEXT NOT NULL,
+        tag       TEXT NOT NULL,
+        user_id   TEXT NOT NULL,
+        mtime_ms  INTEGER NOT NULL,
+        PRIMARY KEY (path_id, tag)
+      )
+    `);
+    this.sql.exec(`
+      CREATE INDEX IF NOT EXISTS idx_file_tags_tag_mtime
+        ON file_tags(tag, mtime_ms DESC, path_id)
+    `);
+
+    this.sql.exec(`
+      CREATE INDEX IF NOT EXISTS idx_files_parent_mtime
+        ON files(IFNULL(parent_id, ''), updated_at DESC, file_name)
+        WHERE status = 'complete'
+    `);
+    this.sql.exec(`
+      CREATE INDEX IF NOT EXISTS idx_files_parent_size
+        ON files(IFNULL(parent_id, ''), file_size DESC, file_name)
+        WHERE status = 'complete'
+    `);
+
     // ── Audit H6: surface UNIQUE INDEX failure on legacy data ────────────
     //
     // The previous code swallowed the throw silently when the file
@@ -860,12 +929,22 @@ export class UserDOCore extends DurableObject<Env> {
   // Inline tier (≤ INLINE_LIMIT) writes never touch ShardDO — the data
   // lives in files.inline_data and the entire write is one INSERT.
 
-  /** writeFile() — atomic, last-writer-wins. Inline tier ≤16KB; chunked otherwise. */
+  /**
+   * writeFile() — atomic, last-writer-wins. Inline tier ≤16KB;
+   * chunked otherwise. Phase 12 extends the opts to carry metadata,
+   * tags, and version flags; defaults preserve Phase 11 behavior.
+   */
   async vfsWriteFile(
     scope: VFSScope,
     path: string,
     data: Uint8Array,
-    opts?: { mode?: number; mimeType?: string }
+    opts?: {
+      mode?: number;
+      mimeType?: string;
+      metadata?: Record<string, unknown> | null;
+      tags?: readonly string[];
+      version?: { label?: string; userVisible?: boolean };
+    }
   ): Promise<void> {
     this.gateVfsWrite(scope);
     return vfsWriteFile(this, scope, path, data, opts);
@@ -1061,7 +1140,11 @@ export class UserDOCore extends DurableObject<Env> {
   async vfsListVersions(
     scope: VFSScope,
     path: string,
-    opts?: { limit?: number }
+    opts?: {
+      limit?: number;
+      userVisibleOnly?: boolean;
+      includeMetadata?: boolean;
+    }
   ): Promise<VersionRow[]> {
     this.gateVfs(scope);
     const userId = scope.sub
@@ -1076,6 +1159,88 @@ export class UserDOCore extends DurableObject<Env> {
       throw new VFSError("ENOENT", `listVersions: path not found: ${path}`);
     }
     return listVersions(this, pathId, opts);
+  }
+
+  /**
+   * Phase 12: mark a version's label and/or user-visible flag.
+   * `userVisible:false` is rejected EINVAL — the bit is monotonic.
+   */
+  async vfsMarkVersion(
+    scope: VFSScope,
+    path: string,
+    versionId: string,
+    opts: { label?: string; userVisible?: boolean }
+  ): Promise<void> {
+    this.gateVfsWrite(scope);
+    const userId = scope.sub
+      ? `${scope.tenant}::${scope.sub}`
+      : scope.tenant;
+    const pathId = resolvePathId(this, userId, path);
+    if (!pathId) {
+      const { VFSError } = await import("@shared/vfs-types");
+      throw new VFSError("ENOENT", `markVersion: path not found: ${path}`);
+    }
+    if (opts.label !== undefined) {
+      const { validateLabel } = await import("@shared/metadata-validate");
+      validateLabel(opts.label);
+    }
+    const { markVersion } = await import("./vfs-versions");
+    markVersion(this, pathId, versionId, opts);
+  }
+
+  /**
+   * Phase 12: explicit flush of a yjs-mode file. Triggers a Yjs
+   * compaction whose checkpoint emits a user-visible version row
+   * (when versioning is enabled for the tenant) and an optional
+   * label. Returns the new version_id (or null if versioning is
+   * off for the tenant — the checkpoint still happens, just
+   * without a Mossaic version row).
+   */
+  async vfsFlushYjs(
+    scope: VFSScope,
+    path: string,
+    opts?: { label?: string }
+  ): Promise<{ versionId: string | null; checkpointSeq: number }> {
+    this.gateVfsWrite(scope);
+    if (opts?.label !== undefined) {
+      const { validateLabel } = await import("@shared/metadata-validate");
+      validateLabel(opts.label);
+    }
+    const userId = scope.sub
+      ? `${scope.tenant}::${scope.sub}`
+      : scope.tenant;
+    const { resolvePathFollow } = await import("./path-walk");
+    const r = resolvePathFollow(this, userId, path);
+    if (r.kind !== "file") {
+      const { VFSError } = await import("@shared/vfs-types");
+      throw new VFSError(
+        "EINVAL",
+        `flushYjs: not a regular file: ${path}`
+      );
+    }
+    const { isYjsMode } = await import("./vfs-ops");
+    if (!isYjsMode(this, userId, r.leafId)) {
+      const { VFSError } = await import("@shared/vfs-types");
+      throw new VFSError(
+        "EINVAL",
+        `flushYjs: file is not in yjs mode: ${path}`
+      );
+    }
+    const poolRow = this.sql
+      .exec("SELECT pool_size FROM quota WHERE user_id = ?", userId)
+      .toArray()[0] as { pool_size: number } | undefined;
+    const poolSize = poolRow ? poolRow.pool_size : 32;
+    const result = await this.yjsRuntime.compact(
+      scope,
+      userId,
+      r.leafId,
+      poolSize,
+      { userVisible: true, label: opts?.label }
+    );
+    return {
+      versionId: result.versionId ?? null,
+      checkpointSeq: result.checkpointSeq,
+    };
   }
 
   /**
@@ -1172,6 +1337,73 @@ export class UserDOCore extends DurableObject<Env> {
   ): Promise<DedupeResult> {
     this.ensureInit();
     return dedupePaths(this, userId, scope);
+  }
+
+  // ── Phase 12: metadata + tags primitives ──────────────────────────────
+
+  /**
+   * Deep-merge a metadata patch into the path's metadata blob,
+   * optionally adding/removing tags atomically. See
+   * `vfsPatchMetadata` in vfs-ops.ts for full semantics.
+   */
+  async vfsPatchMetadata(
+    scope: VFSScope,
+    path: string,
+    patch: Record<string, unknown> | null,
+    opts?: { addTags?: readonly string[]; removeTags?: readonly string[] }
+  ): Promise<void> {
+    this.gateVfsWrite(scope);
+    const { vfsPatchMetadata } = await import("./vfs-ops");
+    return vfsPatchMetadata(this, scope, path, patch, opts);
+  }
+
+  /**
+   * Phase 12: same-tenant copyFile. Manifest-only copy for chunked +
+   * versioned tiers; bytes-only copy for inline tier; bytes-snapshot
+   * fork for yjs-mode src. See `copy-file.ts` for the refcount and
+   * atomicity contracts.
+   */
+  async vfsCopyFile(
+    scope: VFSScope,
+    src: string,
+    dest: string,
+    opts?: {
+      metadata?: Record<string, unknown> | null;
+      tags?: readonly string[];
+      version?: { label?: string; userVisible?: boolean };
+      overwrite?: boolean;
+    }
+  ): Promise<void> {
+    this.gateVfsWrite(scope);
+    const { vfsCopyFile } = await import("./copy-file");
+    return vfsCopyFile(this, scope, src, dest, opts);
+  }
+
+  /**
+   * Phase 12: indexed listFiles. Drives an HMAC-signed cursor for
+   * stable pagination. Tag intersection capped at 8 tags/query.
+   * See `list-files.ts` for index selection and cursor semantics.
+   */
+  async vfsListFiles(
+    scope: VFSScope,
+    opts?: {
+      prefix?: string;
+      tags?: readonly string[];
+      metadata?: Record<string, unknown>;
+      limit?: number;
+      cursor?: string;
+      orderBy?: "mtime" | "name" | "size";
+      direction?: "asc" | "desc";
+      includeStat?: boolean;
+      includeMetadata?: boolean;
+    }
+  ): Promise<{
+    items: import("./list-files").ListFilesItemRaw[];
+    cursor?: string;
+  }> {
+    this.gateVfs(scope);
+    const { vfsListFiles } = await import("./list-files");
+    return vfsListFiles(this, scope, opts);
   }
 
   // ── Phase 10: yjs-mode primitives ─────────────────────────────────────

@@ -68,7 +68,7 @@ export interface VFSClient {
   writeFile(
     p: string,
     data: Uint8Array | string,
-    opts?: { mode?: number; mimeType?: string }
+    opts?: WriteFileOpts
   ): Promise<void>;
   unlink(p: string): Promise<void>;
   mkdir(
@@ -80,6 +80,16 @@ export interface VFSClient {
   symlink(target: string, p: string): Promise<void>;
   chmod(p: string, mode: number): Promise<void>;
   rename(src: string, dst: string): Promise<void>;
+  /** Phase 12: deep-merge metadata + add/remove tags atomically. */
+  patchMetadata(
+    p: string,
+    patch: Record<string, unknown> | null,
+    opts?: PatchMetadataOpts
+  ): Promise<void>;
+  /** Phase 12: same-tenant copyFile (chunk-refcount-aware). */
+  copyFile(src: string, dest: string, opts?: CopyFileOpts): Promise<void>;
+  /** Phase 12: indexed listFiles with HMAC-signed cursor pagination. */
+  listFiles(opts?: ListFilesOpts): Promise<ListFilesPage>;
 
   // Streams (HTTP fallback throws EINVAL for these in v1)
   createReadStream(
@@ -114,13 +124,19 @@ export interface VFSClient {
   // / EINVAL on tenants without versioning).
   listVersions(
     p: string,
-    opts?: { limit?: number }
+    opts?: ListVersionsOpts
   ): Promise<VersionInfo[]>;
   restoreVersion(p: string, sourceVersionId: string): Promise<{ id: string }>;
   dropVersions(
     p: string,
     policy: DropVersionsPolicy
   ): Promise<{ dropped: number; kept: number }>;
+  /** Phase 12: set per-version label and/or user-visible flag. */
+  markVersion(
+    p: string,
+    versionId: string,
+    opts: VersionMarkOpts
+  ): Promise<void>;
 }
 
 /**
@@ -149,7 +165,7 @@ export interface UserDOClient {
     scope: VFSScope,
     path: string,
     data: Uint8Array,
-    opts?: { mode?: number; mimeType?: string }
+    opts?: WriteFileOpts
   ): Promise<void>;
   vfsUnlink(scope: VFSScope, path: string): Promise<void>;
   vfsMkdir(
@@ -169,6 +185,34 @@ export interface UserDOClient {
     path: string
   ): Promise<void>;
   vfsChmod(scope: VFSScope, path: string, mode: number): Promise<void>;
+  /** Phase 12: deep-merge metadata + add/remove tags atomically. */
+  vfsPatchMetadata(
+    scope: VFSScope,
+    path: string,
+    patch: Record<string, unknown> | null,
+    opts?: PatchMetadataOpts
+  ): Promise<void>;
+  /** Phase 12: same-tenant copyFile. */
+  vfsCopyFile(
+    scope: VFSScope,
+    src: string,
+    dest: string,
+    opts?: CopyFileOpts
+  ): Promise<void>;
+  /** Phase 12: indexed listFiles + paginated cursor. */
+  vfsListFiles(
+    scope: VFSScope,
+    opts?: ListFilesOpts
+  ): Promise<{
+    items: Array<{
+      path: string;
+      pathId: string;
+      stat?: VFSStatRaw;
+      metadata?: Record<string, unknown> | null;
+      tags: string[];
+    }>;
+    cursor?: string;
+  }>;
   /** Phase 10: flip the per-file Yjs-mode bit. */
   vfsSetYjsMode(
     scope: VFSScope,
@@ -221,7 +265,7 @@ export interface UserDOClient {
   vfsListVersions(
     scope: VFSScope,
     path: string,
-    opts?: { limit?: number }
+    opts?: ListVersionsOpts
   ): Promise<
     Array<{
       versionId: string;
@@ -229,6 +273,9 @@ export interface UserDOClient {
       size: number;
       mode: number;
       deleted: boolean;
+      label?: string | null;
+      userVisible?: boolean;
+      metadata?: Record<string, unknown> | null;
     }>
   >;
   vfsRestoreVersion(
@@ -241,6 +288,19 @@ export interface UserDOClient {
     path: string,
     policy: DropVersionsPolicy
   ): Promise<{ dropped: number; kept: number }>;
+  /** Phase 12: set per-version label / mark user-visible. */
+  vfsMarkVersion(
+    scope: VFSScope,
+    path: string,
+    versionId: string,
+    opts: VersionMarkOpts
+  ): Promise<void>;
+  /** Phase 12: explicit flush of a yjs-mode file → user-visible version. */
+  vfsFlushYjs(
+    scope: VFSScope,
+    path: string,
+    opts?: { label?: string }
+  ): Promise<{ versionId: string | null; checkpointSeq: number }>;
   adminSetVersioning(
     userId: string,
     enabled: boolean
@@ -317,6 +377,136 @@ export interface VersionInfo {
   mode: number;
   /** True iff this version is a tombstone (an unlink mark). */
   deleted: boolean;
+  /** Phase 12: optional human-readable label. */
+  label?: string | null;
+  /**
+   * Phase 12: true if this version was created by an explicit
+   * user-facing operation (writeFile, restoreVersion, flush()).
+   * False for opportunistic Yjs compactions and pre-Phase-12 rows.
+   */
+  userVisible?: boolean;
+  /** Phase 12: snapshot of files.metadata at this version (when requested). */
+  metadata?: Record<string, unknown> | null;
+}
+
+/**
+ * Phase 12: per-version flags accepted by `writeFile`, `copyFile`,
+ * and `markVersion`.
+ */
+export interface VersionMarkOpts {
+  /** Optional ≤128-char human label. Replaces any prior label. */
+  label?: string;
+  /**
+   * Mark the version user-visible. Default `true` for explicit
+   * writeFile / copyFile calls. `false` is REJECTED EINVAL on
+   * `markVersion` — the bit is monotonic (once visible, always
+   * visible) by design.
+   */
+  userVisible?: boolean;
+}
+
+/**
+ * Phase 12: extended writeFile options. Defaults preserve Phase 11
+ * behavior bit-identically.
+ */
+export interface WriteFileOpts {
+  mode?: number;
+  mimeType?: string;
+  /**
+   * Plain JSON-shaped object. `undefined` keeps existing metadata;
+   * `null` clears; an object SETs (validated against caps in
+   * `@shared/metadata-caps.ts`).
+   */
+  metadata?: Record<string, unknown> | null;
+  /**
+   * Tag set. `undefined` keeps; `[]` drops all; `[...]` REPLACES.
+   * Each tag must match `[A-Za-z0-9._:/-]{1,128}` and the array
+   * must contain at most 32 unique tags.
+   */
+  tags?: readonly string[];
+  /**
+   * Per-version flags (only meaningful when versioning is enabled
+   * for the tenant). On non-versioning tenants the flags are
+   * silently no-ops.
+   */
+  version?: VersionMarkOpts;
+}
+
+/**
+ * Phase 12: copyFile options.
+ */
+export interface CopyFileOpts {
+  /** Overrides src metadata for the dest. `undefined` inherits src. */
+  metadata?: Record<string, unknown> | null;
+  /** Overrides src tags for the dest. `undefined` inherits src. */
+  tags?: readonly string[];
+  version?: VersionMarkOpts;
+  /** When dest exists: false → EEXIST, true (default) → supersede. */
+  overwrite?: boolean;
+}
+
+/**
+ * Phase 12: patchMetadata options.
+ */
+export interface PatchMetadataOpts {
+  addTags?: readonly string[];
+  removeTags?: readonly string[];
+}
+
+/**
+ * Phase 12: listFiles options.
+ */
+export interface ListFilesOpts {
+  /** Path prefix (e.g. "/photos/2026/"). Resolves to a folder. */
+  prefix?: string;
+  /** AND semantics. Up to 8 tags per query. */
+  tags?: readonly string[];
+  /**
+   * Exact-match metadata filter. Post-filtered (not indexed) — pair
+   * with prefix or tags for index-driven performance.
+   */
+  metadata?: Record<string, unknown>;
+  /** 1..1000, default 50. */
+  limit?: number;
+  /** Opaque cursor returned from a prior call. */
+  cursor?: string;
+  /** Default 'mtime'. */
+  orderBy?: "mtime" | "name" | "size";
+  /** Default 'desc' for mtime/size, 'asc' for name. */
+  direction?: "asc" | "desc";
+  /** Default true. */
+  includeStat?: boolean;
+  /** Default false (size pressure). */
+  includeMetadata?: boolean;
+}
+
+/** Phase 12: a single row returned by listFiles. */
+export interface ListFilesItem {
+  /** Absolute path with leading slash. */
+  path: string;
+  /** Stable file_id for this path. */
+  pathId: string;
+  /** Present when `includeStat !== false`. */
+  stat?: VFSStat;
+  /** Present when `includeMetadata === true` AND the file has metadata. */
+  metadata?: Record<string, unknown> | null;
+  /** Always present — the file's tag set, sorted alphabetically. */
+  tags: string[];
+}
+
+export interface ListFilesPage {
+  items: ListFilesItem[];
+  /** Present iff there's another page. */
+  cursor?: string;
+}
+
+/** Phase 12: listVersions options. */
+export interface ListVersionsOpts {
+  limit?: number;
+  /** When true, filter to versions with user_visible = 1. */
+  userVisibleOnly?: boolean;
+  /** When true, return `metadata` snapshots on each VersionInfo. */
+  includeMetadata?: boolean;
 }
 
 /**
@@ -509,7 +699,7 @@ export class VFS implements VFSClient {
   async writeFile(
     p: string,
     data: Uint8Array | string,
-    opts?: { mode?: number; mimeType?: string }
+    opts?: WriteFileOpts
   ): Promise<void> {
     await this.ensureVersioning();
     const bytes =
@@ -615,6 +805,113 @@ export class VFS implements VFSClient {
     } catch (err) {
       throw mapServerError(err, { path: p, syscall: "chmod" });
     }
+  }
+
+  /**
+   * Phase 12: deep-merge a metadata patch onto a file, optionally
+   * adding/removing tags atomically.
+   *
+   * - `patch === null`: clear the metadata blob (UPDATE files SET
+   *   metadata = NULL). Tag opts may still be applied.
+   * - `patch === {...}`: deep-merge with existing metadata. A `null`
+   *   leaf in the patch DELETES that key from the merged result
+   *   (tombstone semantics — the only way to remove a key without
+   *   replacing the entire blob). Arrays are REPLACED, not merged.
+   * - `opts.addTags`: idempotent INSERT (existing tags skipped).
+   * - `opts.removeTags`: drops only the listed tags.
+   *
+   * Atomic in the worker. Throws `EINVAL` on cap violations
+   * (post-merge metadata size, tag charset/length, depth, etc.).
+   */
+  async patchMetadata(
+    p: string,
+    patch: Record<string, unknown> | null,
+    opts?: PatchMetadataOpts
+  ): Promise<void> {
+    try {
+      await this.user().vfsPatchMetadata(this.scope(), p, patch, opts);
+    } catch (err) {
+      throw mapServerError(err, { path: p, syscall: "open" });
+    }
+  }
+
+  /**
+   * Phase 12: same-tenant copyFile.
+   *
+   * Three-tier behavior:
+   *   - Inline files: bytes-only copy (no shard work).
+   *   - Chunked / versioned files: manifest copy + chunk refcount
+   *     bumps. ZERO chunk bytes traverse the wire — content-addressing
+   *     means the existing chunks already live on the right shards.
+   *   - Yjs-mode src: bytes-snapshot fork — dest is a plain file
+   *     materialized from src's current Y.Doc state. Future src edits
+   *     do NOT propagate to dest. Documented behavior.
+   *
+   * Cross-tenant copies are rejected EACCES at the SDK layer
+   * (the binding scope already pins the tenant).
+   *
+   * Throws:
+   *   - ENOENT — src doesn't exist.
+   *   - EISDIR — src is a directory.
+   *   - EEXIST — dest exists and `opts.overwrite === false`.
+   *   - EINVAL — src === dest, or cap violations on metadata/tags.
+   */
+  async copyFile(
+    src: string,
+    dest: string,
+    opts?: CopyFileOpts
+  ): Promise<void> {
+    await this.ensureVersioning();
+    try {
+      await this.user().vfsCopyFile(this.scope(), src, dest, opts);
+    } catch (err) {
+      throw mapServerError(err, { path: src, syscall: "open" });
+    }
+  }
+
+  /**
+   * Phase 12: indexed listFiles with HMAC-signed cursor pagination.
+   *
+   * Filters: `prefix` (path), `tags` (AND, ≤8 per query),
+   * `metadata` (post-filter; pair with prefix or tags for index-driven
+   * latency).
+   *
+   * Pagination: `cursor` is opaque — pass the previous page's cursor
+   * to fetch the next slice. Cursors are HMAC-signed; tampering or
+   * orderBy/direction mismatch surfaces as `EINVAL`.
+   *
+   * Performance gates (DO SQLite, 100k files):
+   *   - prefix-only: ≤20ms p99
+   *   - tag-only:    ≤10ms p99
+   *   - default:     ≤50ms p99
+   */
+  async listFiles(opts: ListFilesOpts = {}): Promise<ListFilesPage> {
+    let raw: {
+      items: Array<{
+        path: string;
+        pathId: string;
+        stat?: VFSStatRaw;
+        metadata?: Record<string, unknown> | null;
+        tags: string[];
+      }>;
+      cursor?: string;
+    };
+    try {
+      raw = await this.user().vfsListFiles(this.scope(), opts);
+    } catch (err) {
+      throw mapServerError(err, {
+        path: opts.prefix ?? "/",
+        syscall: "scandir",
+      });
+    }
+    const items: ListFilesItem[] = raw.items.map((r) => ({
+      path: r.path,
+      pathId: r.pathId,
+      stat: r.stat ? new VFSStat(r.stat) : undefined,
+      metadata: r.metadata,
+      tags: r.tags,
+    }));
+    return { items, cursor: raw.cursor };
   }
 
   /**
@@ -757,7 +1054,7 @@ export class VFS implements VFSClient {
    */
   async listVersions(
     p: string,
-    opts?: { limit?: number }
+    opts?: ListVersionsOpts
   ): Promise<VersionInfo[]> {
     try {
       const rows = await this.user().vfsListVersions(this.scope(), p, opts);
@@ -767,9 +1064,46 @@ export class VFS implements VFSClient {
         size: r.size,
         mode: r.mode,
         deleted: r.deleted,
+        label: r.label,
+        userVisible: r.userVisible,
+        metadata: opts?.includeMetadata ? r.metadata ?? null : undefined,
       }));
     } catch (err) {
       throw mapServerError(err, { path: p, syscall: "listVersions" });
+    }
+  }
+
+  /**
+   * Phase 12: set per-version metadata flags. `userVisible` is
+   * monotonic — the worker rejects `false` with EINVAL.
+   */
+  async markVersion(
+    p: string,
+    versionId: string,
+    opts: VersionMarkOpts
+  ): Promise<void> {
+    try {
+      await this.user().vfsMarkVersion(this.scope(), p, versionId, opts);
+    } catch (err) {
+      throw mapServerError(err, { path: p, syscall: "open" });
+    }
+  }
+
+  /**
+   * Phase 12: explicit flush of a yjs-mode file. Triggers a Yjs
+   * compaction whose checkpoint emits a USER-VISIBLE Mossaic
+   * version row (when versioning is enabled for the tenant).
+   * Internal — called by `YDocHandle.flush` from the
+   * `@mossaic/sdk/yjs` subpath.
+   */
+  async _flushYjs(
+    p: string,
+    opts?: { label?: string }
+  ): Promise<{ versionId: string | null; checkpointSeq: number }> {
+    try {
+      return await this.user().vfsFlushYjs(this.scope(), p, opts);
+    } catch (err) {
+      throw mapServerError(err, { path: p, syscall: "open" });
     }
   }
 
