@@ -474,3 +474,188 @@ describe("Phase 10 — live two-client round-trip (I10)", () => {
     await Promise.all([a.close(), b.close()]);
   });
 });
+
+// ───────────────────────────────────────────────────────────────────────
+// Phase 13 — awareness relay (presence / cursors / selections).
+//
+// Server relays awareness frames (msg tag 3) but NEVER persists them.
+// Two clients on the same path see each other's local state via the
+// y-protocols/awareness `change` event. On disconnect, the server
+// emits a synthetic "removed" frame so survivors observe the departure.
+// ───────────────────────────────────────────────────────────────────────
+
+describe("Phase 13 — Yjs awareness relay (presence)", () => {
+  it("two clients exchange awareness state via the server relay", async () => {
+    const tenant = "yjs-aware-2c";
+    const vfs = createVFS(envFor(), { tenant });
+    await vfs.writeFile("/aware.md", "");
+    await vfs.setYjsMode("/aware.md", true);
+
+    const a = await openYDoc(vfs, "/aware.md");
+    const b = await openYDoc(vfs, "/aware.md");
+    await Promise.all([a.synced, b.synced]);
+
+    // B observes any awareness change, captures all states.
+    const seenA: Promise<{ name: string; cursor: number }> = new Promise(
+      (resolve) => {
+        const onChange = () => {
+          const states = b.awareness.getStates();
+          for (const [, state] of states) {
+            const s = state as { name?: string; cursor?: number };
+            if (s.name === "alice") {
+              b.awareness.off("change", onChange);
+              resolve({ name: s.name!, cursor: s.cursor ?? -1 });
+              return;
+            }
+          }
+        };
+        b.awareness.on("change", onChange);
+      }
+    );
+
+    a.awareness.setLocalState({ name: "alice", cursor: 7 });
+
+    const got = await Promise.race([
+      seenA,
+      new Promise<{ name: string; cursor: number }>((_, rej) =>
+        setTimeout(
+          () => rej(new Error("awareness round-trip timed out")),
+          3000
+        )
+      ),
+    ]);
+    expect(got.name).toBe("alice");
+    expect(got.cursor).toBe(7);
+
+    // Reciprocal: B sets state, A sees it.
+    const seenB: Promise<string> = new Promise((resolve) => {
+      const onChange = () => {
+        const states = a.awareness.getStates();
+        for (const [, state] of states) {
+          const s = state as { name?: string };
+          if (s.name === "bob") {
+            a.awareness.off("change", onChange);
+            resolve(s.name!);
+            return;
+          }
+        }
+      };
+      a.awareness.on("change", onChange);
+    });
+    b.awareness.setLocalState({ name: "bob" });
+    const gotB = await Promise.race([
+      seenB,
+      new Promise<string>((_, rej) =>
+        setTimeout(() => rej(new Error("reciprocal timed out")), 3000)
+      ),
+    ]);
+    expect(gotB).toBe("bob");
+
+    await Promise.all([a.close(), b.close()]);
+  });
+
+  it("disconnecting client A propagates state removal to B", async () => {
+    const tenant = "yjs-aware-disconnect";
+    const vfs = createVFS(envFor(), { tenant });
+    await vfs.writeFile("/leave.md", "");
+    await vfs.setYjsMode("/leave.md", true);
+
+    const a = await openYDoc(vfs, "/leave.md");
+    const b = await openYDoc(vfs, "/leave.md");
+    await Promise.all([a.synced, b.synced]);
+
+    a.awareness.setLocalState({ name: "carol" });
+
+    // Wait for B to learn of A.
+    await new Promise<void>((resolve) => {
+      const onChange = () => {
+        for (const [, state] of b.awareness.getStates()) {
+          const s = state as { name?: string };
+          if (s.name === "carol") {
+            b.awareness.off("change", onChange);
+            resolve();
+            return;
+          }
+        }
+      };
+      b.awareness.on("change", onChange);
+    });
+
+    const aClientID = a.doc.clientID;
+    expect(b.awareness.getStates().has(aClientID)).toBe(true);
+
+    // Wait for B to observe the removal of A's clientID.
+    const removed = new Promise<void>((resolve) => {
+      const onChange = ({ removed }: { removed: number[] }) => {
+        if (removed.includes(aClientID)) {
+          b.awareness.off("change", onChange);
+          resolve();
+        }
+      };
+      b.awareness.on("change", onChange);
+    });
+
+    await a.close();
+
+    await Promise.race([
+      removed,
+      new Promise<void>((_, rej) =>
+        setTimeout(
+          () => rej(new Error("disconnect removal timed out")),
+          3000
+        )
+      ),
+    ]);
+    expect(b.awareness.getStates().has(aClientID)).toBe(false);
+
+    await b.close();
+  });
+
+  it("awareness frames do NOT increment yjs_oplog seq (no persistence)", async () => {
+    const tenant = "yjs-aware-no-persist";
+    const vfs = createVFS(envFor(), { tenant });
+    await vfs.writeFile("/np.md", "");
+    await vfs.setYjsMode("/np.md", true);
+
+    const a = await openYDoc(vfs, "/np.md");
+    const b = await openYDoc(vfs, "/np.md");
+    await Promise.all([a.synced, b.synced]);
+
+    // Sync handshake exchanges sync-step-2 frames which DO get
+    // persisted as op rows (even when the diff is empty); allow the
+    // handshake to fully drain before snapshotting.
+    await new Promise((r) => setTimeout(r, 200));
+
+    // Snapshot oplog row count before awareness traffic.
+    const stub = userStub(tenant);
+    const before = await runInDurableObject(stub, async (_inst, state) => {
+      return (
+        state.storage.sql
+          .exec("SELECT COUNT(*) AS n FROM yjs_oplog")
+          .toArray()[0] as { n: number }
+      ).n;
+    });
+
+    // Pump 50 awareness updates from each client.
+    for (let i = 0; i < 50; i++) {
+      a.awareness.setLocalState({ cursor: i, who: "a" });
+      b.awareness.setLocalState({ cursor: i * 2, who: "b" });
+    }
+
+    // Allow the relay round-trip to drain.
+    await new Promise((r) => setTimeout(r, 200));
+
+    const after = await runInDurableObject(stub, async (_inst, state) => {
+      return (
+        state.storage.sql
+          .exec("SELECT COUNT(*) AS n FROM yjs_oplog")
+          .toArray()[0] as { n: number }
+      ).n;
+    });
+
+    // The strict invariant: zero rows added during awareness traffic.
+    expect(after).toBe(before);
+
+    await Promise.all([a.close(), b.close()]);
+  });
+});

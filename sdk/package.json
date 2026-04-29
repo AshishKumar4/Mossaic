@@ -32,7 +32,8 @@
   },
   "peerDependencies": {
     "isomorphic-git": ">=1.25.0",
-    "yjs": ">=13.6.0"
+    "yjs": ">=13.6.0",
+    "y-protocols": ">=1.0.6"
   },
   "peerDependenciesMeta": {
     "isomorphic-git": {
@@ -40,12 +41,16 @@
     },
     "yjs": {
       "optional": true
+    },
+    "y-protocols": {
+      "optional": true
     }
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250224.0",
     "tsup": "^8.0.0",
-    "typescript": "^5.7.0"
+    "typescript": "^5.7.0",
+    "y-protocols": "^1.0.7"
   },
   "license": "MIT"
 }
