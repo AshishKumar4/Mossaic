@@ -133,6 +133,15 @@ function errToResponse(err: unknown): { status: number; body: { code: string; me
     EROFS: 403,
     EINVAL: 400,
     EMOSSAIC_UNAVAILABLE: 503,
+    EAGAIN: 429,
+    // Phase 15 — encryption error surface.
+    // EBADF: writeFile attempted to mix encryption modes within a
+    //   single path's history, OR write plaintext to an encrypted
+    //   path. 409 (Conflict) matches the EISDIR / EEXIST family.
+    // ENOTSUP: chmod-style encryption toggle in v15. 501 (Not
+    //   Implemented) — the operation is well-formed but unsupported.
+    EBADF: 409,
+    ENOTSUP: 501,
   };
   const explicitCode = typeof e?.code === "string" ? (e.code as string) : undefined;
   let code: string | undefined =
@@ -180,17 +189,41 @@ vfs.post("/readFile", async (c) => {
       versionId?: string;
     }>();
     const path = expectPath(body);
+    // Phase 15: surface encryption metadata via response header so the
+    // HTTP-fallback consumer knows whether to decrypt the bytes. The
+    // server NEVER decrypts; it just reports the per-file
+    // encryption_mode + encryption_key_id from `stat`.
+    const stat = await userStub(c).vfsStat(c.var.scope, path);
     const buf = await userStub(c).vfsReadFile(
       c.var.scope,
       path,
       body.versionId ? { versionId: body.versionId } : undefined,
     );
     if (body.encoding === "utf8") {
+      // utf8 mode is incompatible with encryption — the bytes returned
+      // are the envelope, not text. We refuse with EINVAL rather than
+      // silently mojibake the consumer's screen.
+      if (stat.encryption !== undefined) {
+        return c.json(
+          {
+            code: "EINVAL",
+            message:
+              "readFile: cannot encoding=utf8 on an encrypted file (use binary)",
+          },
+          400
+        );
+      }
       return c.json({ data: new TextDecoder().decode(buf) });
+    }
+    const headers: Record<string, string> = {
+      "Content-Type": "application/octet-stream",
+    };
+    if (stat.encryption !== undefined) {
+      headers["X-Mossaic-Encryption"] = JSON.stringify(stat.encryption);
     }
     return new Response(buf, {
       status: 200,
-      headers: { "Content-Type": "application/octet-stream" },
+      headers,
     });
   } catch (err) {
     const r = errToResponse(err);
@@ -291,6 +324,46 @@ vfs.post("/writeFile", async (c) => {
     //                          { mode?, mimeType?, metadata?, tags?, version? }.
     //     This is the parity path with the binding-mode `writeFile`.
     const ct = c.req.header("Content-Type") ?? "";
+    // Phase 15: parse `X-Mossaic-Encryption` header, applies to all
+    // body-shape branches (octet-stream / multipart / json). The
+    // header value is JSON `{ mode, keyId? }`.
+    const encryptionHeader = c.req.header("X-Mossaic-Encryption");
+    let httpEncryption:
+      | { mode: "convergent" | "random"; keyId?: string }
+      | undefined;
+    if (encryptionHeader !== undefined && encryptionHeader.length > 0) {
+      try {
+        const parsed = JSON.parse(encryptionHeader);
+        if (
+          parsed &&
+          typeof parsed === "object" &&
+          (parsed.mode === "convergent" || parsed.mode === "random")
+        ) {
+          httpEncryption = { mode: parsed.mode };
+          if (typeof parsed.keyId === "string") {
+            httpEncryption.keyId = parsed.keyId;
+          }
+        } else {
+          return c.json(
+            {
+              code: "EINVAL",
+              message:
+                "X-Mossaic-Encryption: invalid mode (must be 'convergent' or 'random')",
+            },
+            400
+          );
+        }
+      } catch {
+        return c.json(
+          {
+            code: "EINVAL",
+            message:
+              "X-Mossaic-Encryption: header value is not valid JSON",
+          },
+          400
+        );
+      }
+    }
     if (ct.includes("multipart/form-data")) {
       const path = c.req.query("path");
       if (typeof path !== "string" || path.length === 0) {
@@ -322,6 +395,7 @@ vfs.post("/writeFile", async (c) => {
         metadata?: Record<string, unknown> | null;
         tags?: readonly string[];
         version?: { label?: string; userVisible?: boolean };
+        encryption?: { mode: "convergent" | "random"; keyId?: string };
       } = {};
       if (typeof metaRaw === "string" && metaRaw.length > 0) {
         try {
@@ -333,6 +407,10 @@ vfs.post("/writeFile", async (c) => {
           );
         }
       }
+      // Header takes precedence over `meta.encryption` (defense
+      // against accidentally forgetting to include encryption opts in
+      // the meta JSON body). Both can be set; the header value wins.
+      if (httpEncryption !== undefined) opts.encryption = httpEncryption;
       await userStub(c).vfsWriteFile(c.var.scope, path, data, opts);
       return c.json({ ok: true });
     }
@@ -345,7 +423,12 @@ vfs.post("/writeFile", async (c) => {
         );
       }
       const data = new Uint8Array(await c.req.arrayBuffer());
-      await userStub(c).vfsWriteFile(c.var.scope, path, data);
+      await userStub(c).vfsWriteFile(
+        c.var.scope,
+        path,
+        data,
+        httpEncryption !== undefined ? { encryption: httpEncryption } : undefined
+      );
       return c.json({ ok: true });
     }
     const body = await c.req.json<{
@@ -372,6 +455,12 @@ vfs.post("/writeFile", async (c) => {
       metadata: body.metadata,
       tags: body.tags,
       version: body.version,
+      // Phase 15: header > body precedence (no body field for JSON path
+      // — JSON writeFile is for plaintext text only; encryption uses
+      // the header).
+      ...(httpEncryption !== undefined
+        ? { encryption: httpEncryption }
+        : {}),
     });
     return c.json({ ok: true });
   } catch (err) {

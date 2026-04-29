@@ -63,6 +63,14 @@ const YJS_UPDATE = 2;
  */
 const YJS_AWARENESS = 3;
 
+/**
+ * Phase 15 — server → client advisory: "your op-log is approaching
+ * the compaction threshold; please run vfs.compactYjs(path)". Payload
+ * is a uint32 BE seq count. The SDK exposes this as the
+ * `handle.onCompactNeeded?` callback.
+ */
+const YJS_COMPACT_PLEASE = 4;
+
 function encodeUpdateMessage(update: Uint8Array): Uint8Array {
   const out = new Uint8Array(update.byteLength + 1);
   out[0] = YJS_UPDATE;
@@ -172,6 +180,26 @@ export interface YDocHandle {
    * once per handle.
    */
   onError(cb: (err: unknown) => void): void;
+
+  /**
+   * Phase 15 — true iff the underlying file is encrypted. The SDK
+   * encrypts outbound sync_step_2 / update / awareness frames and
+   * decrypts inbound ones. Server-side compaction is disabled for
+   * encrypted yjs files; the consumer is responsible for calling
+   * `vfs.compactYjs(path)` when {@link onCompactNeeded} fires or on
+   * a timer.
+   */
+  readonly encrypted: boolean;
+
+  /**
+   * Phase 15 — register a callback for the server's compact-please
+   * advisory (tag-4 frame). The argument is the current op-log seq
+   * count. Called at most once per handle until manually re-armed.
+   *
+   * Plain (non-encrypted) yjs files compact server-side automatically
+   * — this advisory is fired ONLY for encrypted files.
+   */
+  onCompactNeeded(cb: (seqCount: number) => void): void;
 }
 
 /**
@@ -204,6 +232,33 @@ export async function openYDoc(
   path: string,
   opts: OpenYDocOptions = {}
 ): Promise<YDocHandle> {
+  // Phase 15: detect encryption status BEFORE the WS upgrade so that
+  // a config-less consumer attempting to open an encrypted yjs file
+  // gets EACCES synchronously (no WS connection wasted; no opaque
+  // frames flowing through the consumer's reactive layer). For
+  // plaintext yjs files behaviour is identical to Phase 14.
+  let fileEnc: { mode: "convergent" | "random"; keyId?: string } | undefined;
+  try {
+    const stat = await vfs.stat(path);
+    fileEnc = stat.encryption;
+  } catch {
+    // stat may fail because the file doesn't exist yet; openYDoc
+    // creates it via the WS upgrade. In that case, encryption is
+    // never set on a non-existent path — no decision to make.
+  }
+  if (fileEnc !== undefined) {
+    const config = (vfs as unknown as { opts: { encryption?: unknown } }).opts
+      .encryption;
+    if (!config) {
+      const { makeEncryptionRequiredError } = await import("./encryption");
+      throw makeEncryptionRequiredError("open", path);
+    }
+  }
+  const encryptionConfig = fileEnc
+    ? ((vfs as unknown as { opts: { encryption: unknown } }).opts
+        .encryption as import("@shared/encryption-types").EncryptionConfig)
+    : undefined;
+
   // The VFS class exposes a typed accessor that returns the
   // upgrade Response. We DO NOT use the public `fetch()`
   // surface — the consumer's worker dispatches RPC method calls
@@ -222,10 +277,57 @@ export async function openYDoc(
   const doc = opts.doc ?? new Y.Doc();
   const awareness = new Awareness(doc);
 
+  // Phase 15: encryption helpers (lazy-loaded once per handle).
+  // Encrypt PAYLOAD bytes (NOT the tag prefix) for tags 1/2/3 when
+  // the file is encrypted; tag 0 (sync_step_1) stays plaintext —
+  // state vectors are clientID→seq maps and don't reveal content.
+  let encryptForWire:
+    | ((payload: Uint8Array, aadTag: "yj" | "aw") => Promise<Uint8Array>)
+    | null = null;
+  let decryptFromWire:
+    | ((payload: Uint8Array, aadTag: "yj" | "aw") => Promise<Uint8Array>)
+    | null = null;
+  if (encryptionConfig) {
+    const encMod = await import("./encryption");
+    encryptForWire = (payload, aadTag) =>
+      encMod.encryptPayload(
+        payload,
+        encryptionConfig,
+        // Yjs ops always use random mode (per plan §10 Q10): they're
+        // tiny + frequent + dedup gain is negligible + random IV
+        // avoids the operational-data leak via op equality.
+        "random",
+        encryptionConfig.keyId,
+        aadTag
+      );
+    decryptFromWire = (envelope, aadTag) =>
+      encMod.decryptPayload(envelope, encryptionConfig, aadTag, {
+        path,
+        syscall: "yjs",
+      });
+  }
+
   // Install the outbound update pump. Origin === ws means a frame
   // from this very socket — don't echo back.
   const onLocalUpdate = (update: Uint8Array, origin: unknown) => {
     if (origin === ws) return;
+    if (encryptForWire) {
+      // Encrypt the update payload before sending. Errors during
+      // encryption surface to onError but otherwise drop the frame
+      // — we don't want to spam the server with malformed bytes.
+      encryptForWire(update, "yj")
+        .then((env) => {
+          try {
+            ws.send(encodeUpdateMessage(env));
+          } catch {
+            /* socket may be closing */
+          }
+        })
+        .catch((err) => {
+          if (errorCb) errorCb(err);
+        });
+      return;
+    }
     try {
       ws.send(encodeUpdateMessage(update));
     } catch {
@@ -239,6 +341,9 @@ export async function openYDoc(
   // (added/updated/removed clientIDs). We send the encoded update
   // to the server which relays to other peers. Origin === ws means
   // the update arrived FROM the server; don't echo back.
+  // Phase 15: when encrypted, the awareness payload is wrapped in
+  // an envelope with AAD='aw' (distinct from 'yj' so a yjs envelope
+  // can't be replayed as awareness or vice versa).
   const onLocalAwareness = (
     {
       added,
@@ -250,8 +355,22 @@ export async function openYDoc(
     if (origin === ws) return;
     const ids = [...added, ...updated, ...removed];
     if (ids.length === 0) return;
+    const payload = encodeAwarenessUpdate(awareness, ids);
+    if (encryptForWire) {
+      encryptForWire(payload, "aw")
+        .then((env) => {
+          try {
+            ws.send(encodeAwarenessMessage(env));
+          } catch {
+            /* socket may be closing */
+          }
+        })
+        .catch((err) => {
+          if (errorCb) errorCb(err);
+        });
+      return;
+    }
     try {
-      const payload = encodeAwarenessUpdate(awareness, ids);
       ws.send(encodeAwarenessMessage(payload));
     } catch {
       /* socket may be closing */
@@ -281,15 +400,78 @@ export async function openYDoc(
     if (!bytes || bytes.byteLength === 0) return;
     const tag = bytes[0];
     const body = bytes.subarray(1);
+    // Phase 15: when the file is encrypted, tags 1/2/3 carry envelope
+    // bytes; we decrypt before dispatch. Tag 0 stays plaintext (state
+    // vectors are content-free). Tag 4 is the compact-please advisory
+    // and is plaintext (it's a uint32 BE seq count).
+    //
+    // Special case: an empty body on tag-1 (sync_step_2) is the
+    // server's "no state to send" signal for encrypted files (the
+    // server cannot materialise the doc to compute a diff). In that
+    // case we mark synced and return without attempting decrypt.
+    if (
+      decryptFromWire &&
+      tag === YJS_SYNC_STEP_2 &&
+      body.byteLength === 0
+    ) {
+      if (!gotServerStep2) {
+        gotServerStep2 = true;
+        resolveSynced();
+      }
+      return;
+    }
+    if (
+      decryptFromWire &&
+      (tag === YJS_SYNC_STEP_2 ||
+        tag === YJS_UPDATE ||
+        tag === YJS_AWARENESS)
+    ) {
+      const aadTag = tag === YJS_AWARENESS ? "aw" : "yj";
+      decryptFromWire(body, aadTag)
+        .then((plaintext) => {
+          if (tag === YJS_SYNC_STEP_2) {
+            Y.applyUpdate(doc, plaintext, ws);
+            if (!gotServerStep2) {
+              gotServerStep2 = true;
+              resolveSynced();
+            }
+          } else if (tag === YJS_UPDATE) {
+            Y.applyUpdate(doc, plaintext, ws);
+          } else {
+            applyAwarenessUpdate(awareness, plaintext, ws);
+          }
+        })
+        .catch((err) => {
+          // Decrypt failure → close socket loudly + surface error.
+          try {
+            ws.close(1011, "decrypt failure");
+          } catch {
+            /* already closing */
+          }
+          if (errorCb) errorCb(err);
+          if (!gotServerStep2) rejectSynced(err);
+        });
+      return;
+    }
     switch (tag) {
       case YJS_SYNC_STEP_1: {
-        // Server's state vector — reply with our diff.
+        // Server's state vector — reply with our diff. When encrypted,
+        // we encrypt our diff before sending (handled inline below).
         const diff = Y.encodeStateAsUpdate(doc, body);
-        ws.send(encodeSyncStep2(diff));
+        if (encryptForWire) {
+          encryptForWire(diff, "yj")
+            .then((env) => ws.send(encodeSyncStep2(env)))
+            .catch((err) => {
+              if (errorCb) errorCb(err);
+            });
+        } else {
+          ws.send(encodeSyncStep2(diff));
+        }
         return;
       }
       case YJS_SYNC_STEP_2: {
-        // Server's diff for us — apply, mark synced.
+        // Server's diff for us — apply, mark synced. (Plaintext path;
+        // encrypted path is handled above.)
         Y.applyUpdate(doc, body, ws);
         if (!gotServerStep2) {
           gotServerStep2 = true;
@@ -308,6 +490,17 @@ export async function openYDoc(
         applyAwarenessUpdate(awareness, body, ws);
         return;
       }
+      case YJS_COMPACT_PLEASE: {
+        // Phase 15 — server advisory. body[0..3] = uint32 BE seq count.
+        if (body.byteLength < 4) return;
+        const seqCount =
+          ((body[0] ?? 0) << 24) |
+          ((body[1] ?? 0) << 16) |
+          ((body[2] ?? 0) << 8) |
+          (body[3] ?? 0);
+        if (compactNeededCb) compactNeededCb(seqCount >>> 0);
+        return;
+      }
       default:
         // Unknown — forward-compat ignore.
         return;
@@ -320,6 +513,7 @@ export async function openYDoc(
 
   let closeCb: ((event: CloseEvent | { code: number; reason: string }) => void) | null = null;
   let errorCb: ((err: unknown) => void) | null = null;
+  let compactNeededCb: ((seqCount: number) => void) | null = null;
   let closed = false;
 
   ws.addEventListener("close", (ev: Event) => {
@@ -348,6 +542,7 @@ export async function openYDoc(
     doc,
     awareness,
     synced,
+    encrypted: encryptionConfig !== undefined,
     async close(): Promise<void> {
       if (closed) return;
       closed = true;
@@ -377,6 +572,9 @@ export async function openYDoc(
     },
     onError(cb) {
       errorCb = cb;
+    },
+    onCompactNeeded(cb) {
+      compactNeededCb = cb;
     },
   };
 }

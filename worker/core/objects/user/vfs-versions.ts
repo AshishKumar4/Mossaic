@@ -121,6 +121,11 @@ export interface VersionRow {
   userVisible?: boolean;
   /** Phase 12: snapshot of metadata at this version (when requested). */
   metadata?: Record<string, unknown> | null;
+  /**
+   * Phase 15: per-version encryption stamp. Undefined for plaintext
+   * (default for pre-Phase-15 rows and explicit plaintext writes).
+   */
+  encryption?: { mode: "convergent" | "random"; keyId?: string };
 }
 
 /** True iff versioning is enabled for the tenant on this DO. */
@@ -221,14 +226,23 @@ export function commitVersion(
     userVisible?: boolean;
     label?: string | null;
     metadata?: Uint8Array | null;
+    /**
+     * Phase 15: per-version encryption stamp. Mirrors the column on
+     * `files`. When set, the columns on both `file_versions` (this
+     * row) and `files` (the head row) are updated. The `data` payload
+     * has already been written; this is metadata only.
+     */
+    encryption?: { mode: "convergent" | "random"; keyId?: string };
   }
 ): void {
+  const encMode = args.encryption?.mode ?? null;
+  const encKeyId = args.encryption?.keyId ?? null;
   durableObject.sql.exec(
     `INSERT INTO file_versions
        (path_id, version_id, user_id, size, mode, mtime_ms, deleted,
         inline_data, chunk_size, chunk_count, file_hash, mime_type,
-        user_visible, label, metadata)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        user_visible, label, metadata, encryption_mode, encryption_key_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     args.pathId,
     args.versionId,
     args.userId,
@@ -243,14 +257,25 @@ export function commitVersion(
     args.mimeType,
     args.userVisible ? 1 : 0,
     args.label ?? null,
-    args.metadata ?? null
+    args.metadata ?? null,
+    encMode,
+    encKeyId
   );
   // Update head pointer to the new version. Tombstones also become
   // the head — readers find them by mtime_ms and then check deleted.
+  // Phase 15: also stamp `files.encryption_mode` + `files.encryption_key_id`
+  // so non-versioned reads (`stat`, `readFile`) reflect the latest mode.
   durableObject.sql.exec(
-    "UPDATE files SET head_version_id = ?, updated_at = ? WHERE file_id = ?",
+    `UPDATE files
+        SET head_version_id = ?,
+            updated_at = ?,
+            encryption_mode = ?,
+            encryption_key_id = ?
+      WHERE file_id = ?`,
     args.versionId,
     args.mtimeMs,
+    encMode,
+    encKeyId,
     args.pathId
   );
 }
@@ -275,6 +300,13 @@ export interface VersionContent {
   chunkCount: number;
   fileHash: string;
   mimeType: string;
+  /**
+   * Phase 15: per-version encryption stamp. NULL for plaintext (default
+   * for pre-Phase-15 rows and for plaintext writes). When set, the SDK
+   * decrypts the bytes (envelope-stream stored in `inline_data` or
+   * across `version_chunks`) before returning them to the consumer.
+   */
+  encryption?: { mode: "convergent" | "random"; keyId?: string };
 }
 
 export function getVersion(
@@ -286,7 +318,8 @@ export function getVersion(
     ? durableObject.sql
         .exec(
           `SELECT version_id, size, mode, mtime_ms, deleted, inline_data,
-                  chunk_size, chunk_count, file_hash, mime_type
+                  chunk_size, chunk_count, file_hash, mime_type,
+                  encryption_mode, encryption_key_id
              FROM file_versions
             WHERE path_id = ? AND version_id = ?`,
           pathId,
@@ -296,7 +329,8 @@ export function getVersion(
     : durableObject.sql
         .exec(
           `SELECT version_id, size, mode, mtime_ms, deleted, inline_data,
-                  chunk_size, chunk_count, file_hash, mime_type
+                  chunk_size, chunk_count, file_hash, mime_type,
+                  encryption_mode, encryption_key_id
              FROM file_versions
             WHERE path_id = ? AND deleted = 0
             ORDER BY mtime_ms DESC
@@ -306,6 +340,13 @@ export function getVersion(
         .toArray()[0];
   if (!row) return null;
   const r = row as Record<string, unknown>;
+  const encMode = r.encryption_mode as string | null;
+  const encKeyId = r.encryption_key_id as string | null;
+  let encryption: { mode: "convergent" | "random"; keyId?: string } | undefined;
+  if (encMode === "convergent" || encMode === "random") {
+    encryption = { mode: encMode };
+    if (encKeyId !== null) encryption.keyId = encKeyId;
+  }
   return {
     versionId: r.version_id as string,
     size: r.size as number,
@@ -317,6 +358,7 @@ export function getVersion(
     chunkCount: r.chunk_count as number,
     fileHash: r.file_hash as string,
     mimeType: r.mime_type as string,
+    ...(encryption !== undefined ? { encryption } : {}),
   };
 }
 
@@ -345,7 +387,8 @@ export function listVersions(
   args.push(limit);
   const sql = `
     SELECT version_id, mtime_ms, size, mode, deleted,
-           user_visible, label, metadata
+           user_visible, label, metadata,
+           encryption_mode, encryption_key_id
       FROM file_versions
      WHERE ${where.join(" AND ")}
      ORDER BY mtime_ms DESC
@@ -362,6 +405,8 @@ export function listVersions(
     user_visible: number;
     label: string | null;
     metadata: ArrayBuffer | null;
+    encryption_mode: string | null;
+    encryption_key_id: string | null;
   }[];
   return rows.map((r) => {
     const out: VersionRow = {
@@ -373,6 +418,14 @@ export function listVersions(
       userVisible: r.user_visible === 1,
       label: r.label,
     };
+    // Phase 15: surface per-version encryption stamp.
+    if (r.encryption_mode === "convergent" || r.encryption_mode === "random") {
+      const enc: { mode: "convergent" | "random"; keyId?: string } = {
+        mode: r.encryption_mode,
+      };
+      if (r.encryption_key_id !== null) enc.keyId = r.encryption_key_id;
+      out.encryption = enc;
+    }
     if (opts.includeMetadata) {
       if (r.metadata) {
         try {
@@ -717,6 +770,8 @@ export async function restoreVersion(
       fileHash: src.fileHash,
       mimeType: src.mimeType,
       inlineData: new Uint8Array(src.inlineData),
+      // Phase 15: restore preserves the source version's encryption mode.
+      encryption: src.encryption,
     });
     return { versionId: newVersionId };
   }
@@ -838,6 +893,8 @@ export async function restoreVersion(
     fileHash: src.fileHash,
     mimeType: src.mimeType,
     inlineData: null,
+    // Phase 15: restore preserves the source version's encryption mode.
+    encryption: src.encryption,
   });
   return { versionId: newVersionId };
 }

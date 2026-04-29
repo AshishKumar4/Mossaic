@@ -165,7 +165,16 @@ export interface UserDOClient {
     scope: VFSScope,
     path: string,
     data: Uint8Array,
-    opts?: WriteFileOpts
+    /**
+     * Wire-shape opts. Consumer-facing `WriteFileOpts` are normalized
+     * by `VFS.writeFile` before reaching the RPC — `encrypted` is
+     * stripped and `encryption: { mode, keyId }` is added for the
+     * server. This typed surface is intentionally permissive so the
+     * normalization can pass either shape through.
+     */
+    opts?: WriteFileOpts & {
+      encryption?: { mode: "convergent" | "random"; keyId?: string };
+    }
   ): Promise<void>;
   vfsUnlink(scope: VFSScope, path: string): Promise<void>;
   vfsMkdir(
@@ -301,6 +310,32 @@ export interface UserDOClient {
     path: string,
     opts?: { label?: string }
   ): Promise<{ versionId: string | null; checkpointSeq: number }>;
+  /**
+   * Phase 15: client-driven compaction of an encrypted yjs file. The
+   * client supplies a checkpoint envelope (encrypted state-as-update)
+   * + the expected `next_seq` for CAS. Server appends the checkpoint
+   * atomically and drops oplog rows below it.
+   */
+  vfsCompactEncryptedYjs(
+    scope: VFSScope,
+    path: string,
+    checkpointEnvelope: Uint8Array,
+    expectedNextSeq: number
+  ): Promise<{ checkpointSeq: number; opsReaped: number }>;
+  /**
+   * Phase 15: read raw oplog rows for a yjs-mode file. Used by the
+   * client-side compactor to fetch encrypted op envelopes for
+   * local replay.
+   */
+  vfsReadYjsOplog(
+    scope: VFSScope,
+    path: string,
+    opts?: { afterSeq?: number; limit?: number }
+  ): Promise<{
+    rows: { seq: number; kind: "op" | "checkpoint"; envelope: Uint8Array }[];
+    nextSeq: number;
+    hasMore: boolean;
+  }>;
   adminSetVersioning(
     userId: string,
     enabled: boolean
@@ -374,6 +409,42 @@ export interface CreateVFSOptions {
    * stub.adminSetVersioning(userId, true).
    */
   versioning?: "enabled" | "disabled";
+  /**
+   * Phase 15: opt-in end-to-end encryption.
+   *
+   * When set, `writeFile(p, d, { encrypted: true })` AES-GCM-encrypts
+   * `d` client-side before sending; `readFile(p)` auto-detects
+   * encrypted files via `stat.encryption` and decrypts before
+   * returning. The Mossaic server NEVER decrypts — it only stamps
+   * `files.encryption_mode` + `files.encryption_key_id` so the SDK
+   * knows what to do on read.
+   *
+   * Custody is the consumer's responsibility:
+   *  - Browser: WebCrypto + IndexedDB non-extractable CryptoKey.
+   *  - Node/Worker: KMS unwrap on cold start.
+   *  - CLI: PBKDF2 (`deriveMasterFromPassword`) over a password.
+   *
+   * Loss of `masterKey` = permanent data loss. There is no recovery
+   * path — Mossaic does not store master keys anywhere.
+   *
+   * See `local/phase-15-plan.md` §4.1 + the SDK README's
+   * "End-to-end encryption" section for full details.
+   */
+  encryption?: {
+    /** 32-byte raw AES-GCM-256 key material. */
+    masterKey: Uint8Array;
+    /** 32-byte stable per-tenant salt. */
+    tenantSalt: Uint8Array;
+    /**
+     * Default mode for writes that don't specify per-call. Defaults
+     * to `convergent` (preserves dedup; documented within-tenant
+     * equality oracle as the cost). Use `random` for high-secrecy
+     * tenants that don't need dedup.
+     */
+    mode?: "convergent" | "random";
+    /** ≤128B opaque label embedded in every envelope. */
+    keyId?: string;
+  };
 }
 
 /**
@@ -444,6 +515,25 @@ export interface WriteFileOpts {
    * silently no-ops.
    */
   version?: VersionMarkOpts;
+  /**
+   * Phase 15: opt-in encryption for this write.
+   *
+   * - `true`: use the VFS instance's `encryption` config defaults.
+   *   EINVAL if `createVFS` was called without `encryption`.
+   * - `false`: explicit plaintext (the default). Server rejects with
+   *   EBADF if the path's history is encrypted.
+   * - `{ mode?, keyId? }`: per-call override. Empty object inherits
+   *   defaults; non-empty overrides. EINVAL if no `encryption` config
+   *   on createVFS.
+   *
+   * Mode-history is monotonic per path: once a path is written
+   * encrypted with mode X, all future writes must also be encrypted
+   * with mode X (server enforces with EBADF).
+   */
+  encrypted?:
+    | true
+    | false
+    | { mode?: "convergent" | "random"; keyId?: string };
 }
 
 /**
@@ -592,6 +682,31 @@ export class VFS implements VFSClient {
   }
 
   /**
+   * Phase 15: best-effort cleanup of in-memory key material when the
+   * consumer is done with this VFS instance.
+   *
+   * If `opts.encryption` was supplied with raw 32-byte master key
+   * bytes, this method overwrites those bytes with zeroes. Note this
+   * does NOT zero references the consumer still holds — it's the
+   * responsibility of the consumer to drop their `masterKey`
+   * reference. The zero is best-effort because JavaScript's GC may
+   * have already moved the buffer; treat it as a hardening
+   * measure rather than a guarantee.
+   *
+   * Idempotent. Safe to call multiple times.
+   */
+  destroy(): void {
+    if (this.opts.encryption?.masterKey) {
+      try {
+        this.opts.encryption.masterKey.fill(0);
+      } catch {
+        // The buffer may already be detached / non-writable in some
+        // host environments. Best-effort.
+      }
+    }
+  }
+
+  /**
    * If the consumer constructed with `versioning: 'enabled'`, ensure
    * the server-side flag is on before issuing the actual operation.
    * Skipped after the first successful latch.
@@ -646,6 +761,31 @@ export class VFS implements VFSClient {
     p: string,
     opts?: { encoding?: "utf8"; version?: string }
   ): Promise<Uint8Array | string> {
+    // Phase 15: pre-flight stat to detect encryption ONLY when the
+    // consumer's VFS instance has an encryption config. Without
+    // encryption config, behaviour is byte-identical to Phase 14 —
+    // exactly one outbound RPC (the consumer-fixture test pins this).
+    // With encryption config, we pay one extra RPC per readFile in
+    // exchange for the security feature; this is the documented cost.
+    let fileEnc: { mode: "convergent" | "random"; keyId?: string } | undefined;
+    if (this.opts.encryption) {
+      let stat: VFSStatRaw;
+      try {
+        stat = await this.user().vfsStat(this.scope(), p);
+      } catch (err) {
+        throw mapServerError(err, { path: p, syscall: "stat" });
+      }
+      fileEnc = stat.encryption;
+    }
+    // If a file IS encrypted but the caller has no encryption config,
+    // the readFile path below will still succeed and return the
+    // envelope bytes verbatim — which is wrong. We can't detect that
+    // case without a stat. The Step 3 invariant: clients that don't
+    // configure encryption MUST NOT be reading encrypted files. The
+    // server's writeFile mode-history-monotonicity prevents accidental
+    // mixed-tenant scenarios; an explicit attempt by an
+    // encryption-unaware client to read an encrypted file returns the
+    // raw envelope (which they will fail to use as a regular file).
     let buf: Uint8Array;
     try {
       buf = await this.user().vfsReadFile(
@@ -655,6 +795,13 @@ export class VFS implements VFSClient {
       );
     } catch (err) {
       throw mapServerError(err, { path: p, syscall: "open" });
+    }
+    if (fileEnc !== undefined && this.opts.encryption) {
+      const { decryptPayload } = await import("./encryption");
+      buf = await decryptPayload(buf, this.opts.encryption, "ck", {
+        path: p,
+        syscall: "open",
+      });
     }
     return opts?.encoding === "utf8"
       ? new TextDecoder().decode(buf)
@@ -719,10 +866,58 @@ export class VFS implements VFSClient {
     opts?: WriteFileOpts
   ): Promise<void> {
     await this.ensureVersioning();
-    const bytes =
+    let bytes =
       typeof data === "string" ? new TextEncoder().encode(data) : data;
+
+    // Phase 15: encryption flow. If the consumer signaled
+    // `encrypted: truthy`, we encrypt `bytes` to a single envelope
+    // before sending. The server stamps `files.encryption_*` columns
+    // via the `opts.encryption` payload we pass; on read, the SDK's
+    // readFile reverses the flow.
+    let serverEncryption:
+      | { mode: "convergent" | "random"; keyId?: string }
+      | undefined;
+    if (opts?.encrypted !== undefined && opts.encrypted !== false) {
+      const { resolveCallEncryption, encryptPayload } = await import(
+        "./encryption"
+      );
+      const resolved = resolveCallEncryption(this.opts.encryption, opts.encrypted);
+      if (!resolved) {
+        // resolveCallEncryption already threw on the explicit-true
+        // case without config; reaching here means the consumer
+        // passed `encrypted: false` somehow (typed-narrowing escape).
+        throw new EINVAL({ syscall: "open", path: p });
+      }
+      bytes = await encryptPayload(
+        bytes,
+        this.opts.encryption!,
+        resolved.mode,
+        resolved.keyId,
+        "ck"
+      );
+      serverEncryption = resolved;
+    }
+
+    // Build the server-side opts. We strip the SDK-only `encrypted`
+    // field and add the wire-level `encryption: { mode, keyId }` field
+    // expected by the server's vfsWriteFile RPC.
+    let serverOpts:
+      | (WriteFileOpts & {
+          encryption?: { mode: "convergent" | "random"; keyId?: string };
+        })
+      | undefined;
+    if (opts) {
+      const { encrypted: _ignored, ...rest } = opts;
+      serverOpts = { ...rest };
+      if (serverEncryption !== undefined) {
+        serverOpts.encryption = serverEncryption;
+      }
+    } else if (serverEncryption !== undefined) {
+      serverOpts = { encryption: serverEncryption };
+    }
+
     try {
-      await this.user().vfsWriteFile(this.scope(), p, bytes, opts);
+      await this.user().vfsWriteFile(this.scope(), p, bytes, serverOpts);
     } catch (err) {
       throw mapServerError(err, { path: p, syscall: "open" });
     }
@@ -1128,6 +1323,130 @@ export class VFS implements VFSClient {
     } catch (err) {
       throw mapServerError(err, { path: p, syscall: "open" });
     }
+  }
+
+  /**
+   * Phase 15 — client-driven compaction for an encrypted yjs file.
+   *
+   * The server cannot materialise an encrypted yjs doc, so this
+   * method runs entirely in the SDK:
+   *   1. `vfsReadYjsOplog` to fetch all op envelopes since the last
+   *      checkpoint.
+   *   2. Decrypt each envelope locally via the configured master key.
+   *   3. Build a fresh `Y.Doc`, apply the decrypted updates.
+   *   4. Encode `Y.encodeStateAsUpdate(doc)` + encrypt as one
+   *      checkpoint envelope.
+   *   5. Submit via `vfsCompactEncryptedYjs` with CAS-on-`next_seq`.
+   *      On EBUSY (race), retry up to 3 times with exp backoff.
+   *
+   * Plain (non-encrypted) yjs files compact server-side automatically
+   * on every 50 ops or 60 seconds (Phase 10) — calling `compactYjs`
+   * on a plain file is a no-op.
+   *
+   * @param p path to the yjs-mode file
+   * @returns checkpoint seq + ops reaped, or `null` if the file is
+   *   plaintext (compaction is server-driven there)
+   */
+  async compactYjs(p: string): Promise<{
+    checkpointSeq: number;
+    opsReaped: number;
+  } | null> {
+    if (!this.opts.encryption) {
+      // Plaintext yjs files compact server-side; nothing to do.
+      return null;
+    }
+    const stat = await this.stat(p);
+    if (!stat.encryption) {
+      // File is plaintext yjs — server-driven compaction handles it.
+      return null;
+    }
+    const Y = await import("yjs");
+    const { decryptPayload, encryptPayload } = await import("./encryption");
+    const config = this.opts.encryption;
+
+    // Retry loop with exponential backoff on CAS races.
+    const backoffMs = [100, 400, 1600];
+    let lastErr: unknown;
+    for (let attempt = 0; attempt <= backoffMs.length; attempt++) {
+      try {
+        // Step 1: read all oplog rows in pages.
+        let cursor = -1;
+        let allRows: {
+          seq: number;
+          kind: "op" | "checkpoint";
+          envelope: Uint8Array;
+        }[] = [];
+        for (;;) {
+          const page = await this.user().vfsReadYjsOplog(this.scope(), p, {
+            afterSeq: cursor,
+            limit: 1000,
+          });
+          allRows = allRows.concat(page.rows);
+          if (!page.hasMore) break;
+          cursor = page.nextSeq;
+        }
+        if (allRows.length === 0) {
+          // Nothing to compact.
+          return { checkpointSeq: -1, opsReaped: 0 };
+        }
+        const expectedNextSeq = allRows[allRows.length - 1]!.seq + 1;
+
+        // Step 2 + 3: decrypt + apply onto a fresh Y.Doc.
+        const doc = new Y.Doc();
+        for (const row of allRows) {
+          const plaintext = await decryptPayload(row.envelope, config, "yj", {
+            path: p,
+            syscall: "compactYjs",
+          });
+          // Empty bytes can occur for the server's "no state" reply;
+          // skip them.
+          if (plaintext.byteLength === 0) continue;
+          Y.applyUpdate(doc, plaintext, "compactor");
+        }
+
+        // Step 4: encode state-as-update + encrypt as checkpoint.
+        const stateBytes = Y.encodeStateAsUpdate(doc);
+        const checkpointEnvelope = await encryptPayload(
+          stateBytes,
+          config,
+          "random",
+          config.keyId,
+          "yj"
+        );
+
+        // Step 5: submit with CAS.
+        const result = await this.user().vfsCompactEncryptedYjs(
+          this.scope(),
+          p,
+          checkpointEnvelope,
+          expectedNextSeq
+        );
+        return result;
+      } catch (err) {
+        // RPC-thrown errors don't carry `.code` directly — the code
+        // is encoded in the message. Inspect both.
+        const msg =
+          err && typeof err === "object" && "message" in err
+            ? String((err as { message: unknown }).message)
+            : String(err);
+        const codeFromMsg = msg.match(/EBUSY/);
+        const codeFromField =
+          err && typeof err === "object" && "code" in err
+            ? (err as { code: string }).code
+            : undefined;
+        const isBusy = codeFromField === "EBUSY" || codeFromMsg !== null;
+        if (isBusy && attempt < backoffMs.length) {
+          // CAS race; back off and retry.
+          await new Promise((resolve) =>
+            setTimeout(resolve, backoffMs[attempt])
+          );
+          lastErr = err;
+          continue;
+        }
+        throw mapServerError(err, { path: p, syscall: "compactYjs" });
+      }
+    }
+    throw mapServerError(lastErr, { path: p, syscall: "compactYjs" });
   }
 
   /**

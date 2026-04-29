@@ -72,10 +72,24 @@ export {
   EROFS,
   ENOTEMPTY,
   EAGAIN,
+  // Phase 15: encryption-surface error classes.
+  EBADF,
+  ENOTSUP,
   MossaicUnavailableError,
   isLikelyUnavailable,
   type VFSErrorCode,
 } from "./errors";
+
+// Phase 15: encryption types are re-exported from the main entry for
+// convenient `import { type EncryptionConfig } from "@mossaic/sdk"`.
+// The runtime helpers (encrypt/decrypt) stay on the `/encryption` lazy
+// chunk to avoid pulling crypto code into bundles that don't need it.
+export type {
+  EncryptionConfig,
+  EncryptionMode,
+  FileEncryption,
+  AadTag,
+} from "@shared/encryption-types";
 export type {
   ReadStreamOptions,
   ReadHandle,

@@ -50,7 +50,9 @@
     "@shared/embedding-types": "../../shared/embedding-types.ts",
     "@shared/metadata-caps": "../../shared/metadata-caps.ts",
     "@shared/metadata-validate": "../../shared/metadata-validate.ts",
-    "@shared/metadata-merge": "../../shared/metadata-merge.ts"
+    "@shared/metadata-merge": "../../shared/metadata-merge.ts",
+    "@shared/encryption-types": "../../shared/encryption-types.ts",
+    "@shared/encryption": "../../shared/encryption.ts"
   },
 
   "durable_objects": {
