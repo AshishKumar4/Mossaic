@@ -11,7 +11,7 @@ export default defineConfig({
   // Without this, Vite falls through to ./dist/*.js which doesn't exist
   // until `pnpm -F @mossaic/sdk build` has been run.
   resolve: {
-    conditions: ["workspace", "import", "module", "browser", "default"],
+    conditions: ["workspace", "import", "module", "default"],
   },
   test: {
     include: ["tests/**/*.test.ts"],
