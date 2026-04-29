@@ -1,0 +1,732 @@
+import type { UserDOCore as UserDO } from "../user-do-core";
+import type { ShardDO } from "../../shard/shard-do";
+import {
+  VFSError,
+  type VFSScope,
+} from "../../../../../shared/vfs-types";
+import { WRITEFILE_MAX } from "../../../../../shared/inline";
+import { hashChunk } from "../../../../../shared/crypto";
+import { computeChunkSpec } from "../../../../../shared/chunking";
+import { placeChunk } from "../../../../../shared/placement";
+import { generateId, vfsShardDOName } from "../../../lib/utils";
+import {
+  commitVersion,
+  isVersioningEnabled,
+} from "../vfs-versions";
+import {
+  validateLabel,
+  validateMetadata,
+  validateTags,
+} from "../../../../../shared/metadata-validate";
+import { replaceTags } from "../metadata-tags";
+import {
+  folderExists,
+  poolSizeFor,
+  resolveOrThrow,
+  resolveParent,
+  userIdFor,
+} from "./helpers";
+import {
+  abortTempFile,
+  commitRename,
+  type VFSWriteFileOpts,
+} from "./write-commit";
+
+/**
+ * Streams + low-level escape hatch.
+ *
+ * Two shapes ship together because they cover different consumer needs:
+ *
+ *   A. ReadableStream / WritableStream returned over Workers RPC. These
+ *      are the easy-path "just give me a stream" surface for consumers
+ *      that happen to be Workers themselves. Stream chunks flow over the
+ *      binding without buffering the whole file in either side. Backed
+ *      by Workers' RPC streaming support (compat-date 2024-04-03+).
+ *
+ *   B. Handle-based stream primitives (vfsBeginWriteStream / appendWrite
+ *      / commitWriteStream / abortWriteStream; vfsOpenReadStream /
+ *      pullReadStream / closeReadStream). These work from non-Worker
+ *      consumers (browsers, third-party clouds calling the HTTP fallback
+ *     from) and are the spine that the Worker-side stream
+ *      wrappers reuse internally. They also let callers resume a stream
+ *      across separate consumer invocations — important when a single
+ *      invocation can't fan out enough chunk fetches to read a 10 GB
+ *      file in one go.
+ *
+ * Both shapes share state stored in `files` rows (uploading-status tmp
+ * rows for writes; manifest+file_id for reads). No additional table —
+ * the read handle is just a (file_id, scope) pair the caller must pass
+ * back.
+ */
+
+// ── Read stream ────────────────────────────────────────────────────────
+
+/** Opaque write handle returned by vfsBeginWriteStream. */
+export interface VFSWriteHandle {
+  /** tmp file_id; the same id we'll rename to the real leaf at commit */
+  tmpId: string;
+  /** parent folder id at commit time */
+  parentId: string | null;
+  /** target leaf name at commit time */
+  leaf: string;
+  /** server-authoritative chunk size for this write */
+  chunkSize: number;
+  /** server-authoritative pool size for placement */
+  poolSize: number;
+  /**
+   * metadata/tags/version snapshot captured at begin-time and
+   * applied at commit-time. Internal-only; not surfaced to SDK consumers
+   * (the SDK's `WriteHandle` interface is a structural subset that omits
+   * this field). Validated at begin so the caller fails fast — commit
+   * just SETs.
+   */
+  commitOpts?: {
+    metadataEncoded?: Uint8Array | null;
+    tags?: readonly string[];
+    versionLabel?: string;
+    versionUserVisible?: boolean;
+  };
+}
+
+/** Opaque read handle returned by vfsOpenReadStream. */
+export interface VFSReadHandle {
+  fileId: string;
+  /** total file size, in bytes */
+  size: number;
+  /** number of chunks (0 for inlined files) */
+  chunkCount: number;
+  /** true iff content lives in inline_data; chunkCount == 0 in that case */
+  inlined: boolean;
+}
+
+/**
+ * Open a read handle. Returns a handle the caller pumps via
+ * vfsPullReadStream(handle, chunkIndex). The handle is stateless on
+ * the server (it's just a fileId + metadata snapshot) so the caller
+ * can resume across invocations or fan out parallel pulls.
+ */
+export function vfsOpenReadStream(
+  durableObject: UserDO,
+  scope: VFSScope,
+  path: string
+): VFSReadHandle {
+  const userId = userIdFor(scope);
+  const r = resolveOrThrow(durableObject, userId, path, /*follow*/ true);
+  if (r.kind !== "file") {
+    throw new VFSError(
+      "EINVAL",
+      `openReadStream: not a regular file: ${path}`
+    );
+  }
+  const row = durableObject.sql
+    .exec(
+      `SELECT file_id, file_size, chunk_count, inline_data
+         FROM files
+        WHERE file_id=? AND user_id=? AND status='complete'`,
+      r.leafId,
+      userId
+    )
+    .toArray()[0] as
+    | {
+        file_id: string;
+        file_size: number;
+        chunk_count: number;
+        inline_data: ArrayBuffer | null;
+      }
+    | undefined;
+  if (!row) throw new VFSError("ENOENT", "openReadStream: file vanished");
+  return {
+    fileId: row.file_id,
+    size: row.file_size,
+    chunkCount: row.inline_data ? 0 : row.chunk_count,
+    inlined: !!row.inline_data,
+  };
+}
+
+/**
+ * Pull one chunk from an open read handle. For inlined files
+ * (chunkIndex must be 0), returns the inline blob. For chunked files,
+ * fetches the chunk from its recorded ShardDO.
+ *
+ * Range support: callers can pass start/end (in bytes within this
+ * chunk) to get a slice. The default is the full chunk.
+ *
+ * Note: this is the same machinery as vfsReadChunk but typed against
+ * a handle for clarity and to make the streaming code paths
+ * symmetric with writes.
+ */
+export async function vfsPullReadStream(
+  durableObject: UserDO,
+  scope: VFSScope,
+  handle: VFSReadHandle,
+  chunkIndex: number,
+  range?: { start?: number; end?: number }
+): Promise<Uint8Array> {
+  const userId = userIdFor(scope);
+  if (handle.inlined) {
+    if (chunkIndex !== 0) {
+      throw new VFSError(
+        "EINVAL",
+        `pullReadStream: inlined file has no chunk index ${chunkIndex}`
+      );
+    }
+    const row = durableObject.sql
+      .exec(
+        "SELECT inline_data FROM files WHERE file_id=? AND user_id=? AND status='complete'",
+        handle.fileId,
+        userId
+      )
+      .toArray()[0] as { inline_data: ArrayBuffer | null } | undefined;
+    if (!row || !row.inline_data) {
+      throw new VFSError("ENOENT", "pullReadStream: file vanished");
+    }
+    const buf = new Uint8Array(row.inline_data);
+    return range ? sliceWithRange(buf, range) : buf;
+  }
+
+  if (
+    !Number.isInteger(chunkIndex) ||
+    chunkIndex < 0 ||
+    chunkIndex >= handle.chunkCount
+  ) {
+    throw new VFSError(
+      "EINVAL",
+      `pullReadStream: chunkIndex ${chunkIndex} out of range [0, ${handle.chunkCount})`
+    );
+  }
+
+  const chunkRow = durableObject.sql
+    .exec(
+      `SELECT chunk_hash, chunk_size, shard_index FROM file_chunks
+        WHERE file_id=? AND chunk_index=?`,
+      handle.fileId,
+      chunkIndex
+    )
+    .toArray()[0] as
+    | { chunk_hash: string; chunk_size: number; shard_index: number }
+    | undefined;
+  if (!chunkRow) {
+    throw new VFSError(
+      "ENOENT",
+      `pullReadStream: no chunk at index ${chunkIndex}`
+    );
+  }
+  const env = durableObject.envPublic;
+  const shardName = vfsShardDOName(
+    scope.ns,
+    scope.tenant,
+    scope.sub,
+    chunkRow.shard_index
+  );
+  const stub = env.MOSSAIC_SHARD.get(env.MOSSAIC_SHARD.idFromName(shardName));
+  const res = await stub.fetch(
+    new Request(`http://internal/chunk/${chunkRow.chunk_hash}`)
+  );
+  if (!res.ok) {
+    throw new VFSError(
+      "ENOENT",
+      `pullReadStream: chunk data missing on shard ${chunkRow.shard_index}`
+    );
+  }
+  const buf = new Uint8Array(await res.arrayBuffer());
+  return range ? sliceWithRange(buf, range) : buf;
+}
+
+function sliceWithRange(
+  buf: Uint8Array,
+  range: { start?: number; end?: number }
+): Uint8Array {
+  const start = range.start ?? 0;
+  const end = range.end ?? buf.byteLength;
+  if (start < 0 || end > buf.byteLength || start > end) {
+    throw new VFSError(
+      "EINVAL",
+      `range invalid: [${start}, ${end}) for chunk of size ${buf.byteLength}`
+    );
+  }
+  return buf.subarray(start, end);
+}
+
+/**
+ * Worker-side createReadStream: return a ReadableStream that pulls
+ * chunk-by-chunk via vfsPullReadStream. Memory stays bounded to one
+ * chunk regardless of file size. Backpressure is honored via the
+ * pull controller — each chunk is fetched only when the consumer
+ * dequeues the previous one.
+ *
+ * Range support: optional byte-range over the file; chunks are
+ * sliced as needed at the start/end boundaries.
+ */
+export async function vfsCreateReadStream(
+  durableObject: UserDO,
+  scope: VFSScope,
+  path: string,
+  range?: { start?: number; end?: number }
+): Promise<ReadableStream<Uint8Array>> {
+  const handle = vfsOpenReadStream(durableObject, scope, path);
+  const fileSize = handle.size;
+  const chunkSize = await getChunkSizeForHandle(durableObject, handle);
+
+  const start = clampOffset(range?.start ?? 0, fileSize);
+  const end = clampOffset(range?.end ?? fileSize, fileSize);
+  if (end < start) {
+    throw new VFSError("EINVAL", `range end < start: [${start}, ${end})`);
+  }
+  if (handle.inlined) {
+    return new ReadableStream<Uint8Array>({
+      pull: async (ctrl) => {
+        const all = await vfsPullReadStream(durableObject, scope, handle, 0);
+        ctrl.enqueue(all.subarray(start, end));
+        ctrl.close();
+      },
+    });
+  }
+
+  // Compute first/last chunk indices that intersect the range.
+  const firstIdx = Math.floor(start / chunkSize);
+  const lastIdx = end === start ? firstIdx - 1 : Math.floor((end - 1) / chunkSize);
+
+  let cur = firstIdx;
+  return new ReadableStream<Uint8Array>({
+    pull: async (ctrl) => {
+      if (cur > lastIdx) {
+        ctrl.close();
+        return;
+      }
+      const chunkStartOffset = cur * chunkSize;
+      const chunkEndOffset = Math.min(chunkStartOffset + chunkSize, fileSize);
+      const sliceStart = Math.max(0, start - chunkStartOffset);
+      const sliceEnd = Math.min(
+        chunkEndOffset - chunkStartOffset,
+        end - chunkStartOffset
+      );
+      const buf = await vfsPullReadStream(durableObject, scope, handle, cur, {
+        start: sliceStart,
+        end: sliceEnd,
+      });
+      ctrl.enqueue(buf);
+      cur++;
+    },
+  });
+}
+
+function clampOffset(n: number, max: number): number {
+  if (!Number.isFinite(n) || !Number.isInteger(n))
+    throw new VFSError("EINVAL", `range value not an integer: ${n}`);
+  if (n < 0) throw new VFSError("EINVAL", `range value negative: ${n}`);
+  return Math.min(n, max);
+}
+
+async function getChunkSizeForHandle(
+  durableObject: UserDO,
+  handle: VFSReadHandle
+): Promise<number> {
+  if (handle.inlined) return handle.size;
+  const row = durableObject.sql
+    .exec("SELECT chunk_size FROM files WHERE file_id=?", handle.fileId)
+    .toArray()[0] as { chunk_size: number } | undefined;
+  if (!row) throw new VFSError("ENOENT", "createReadStream: file vanished");
+  return row.chunk_size;
+}
+
+// ── Write stream (handle-based + WritableStream wrapper) ───────────────
+
+/**
+ * Begin a write stream. Inserts a tmp file row (status='uploading',
+ * file_name='_vfs_tmp_<id>') and returns an opaque handle the caller
+ * pumps via vfsAppendWriteStream. Server-authoritative chunkSize and
+ * poolSize travel in the handle so the caller cannot influence
+ * placement.
+ *
+ * Concurrency: two parallel begins for the same target path are fine —
+ * each gets a distinct tmpId. They race only at commit (the rename),
+ * where the unique partial index serializes them.
+ */
+export function vfsBeginWriteStream(
+  durableObject: UserDO,
+  scope: VFSScope,
+  path: string,
+  opts: VFSWriteFileOpts = {}
+): VFSWriteHandle {
+  const userId = userIdFor(scope);
+  const { parentId, leaf } = resolveParent(durableObject, userId, path);
+  if (folderExists(durableObject, userId, parentId, leaf)) {
+    throw new VFSError(
+      "EISDIR",
+      `beginWriteStream: target is a directory: ${path}`
+    );
+  }
+
+  // validate metadata + tags + version label up front so the
+  // caller fails fast rather than late-at-commit. Validated payload is
+  // stashed on the handle and re-applied at commit.
+  let metadataEncoded: Uint8Array | null | undefined;
+  if (opts.metadata === null) {
+    metadataEncoded = null;
+  } else if (opts.metadata !== undefined) {
+    metadataEncoded = validateMetadata(opts.metadata).encoded;
+  }
+  if (opts.tags !== undefined) {
+    validateTags(opts.tags);
+  }
+  if (opts.version?.label !== undefined) {
+    validateLabel(opts.version.label);
+  }
+
+  const mode = opts.mode ?? 0o644;
+  const mimeType = opts.mimeType ?? "application/octet-stream";
+  const tmpId = generateId();
+  const tmpName = `_vfs_tmp_${tmpId}`;
+  const poolSize = poolSizeFor(durableObject, userId);
+  const now = Date.now();
+
+  // Pick an initial chunkSize. Streaming writes don't know the final
+  // file size upfront, so we use the largest adaptive size (MAX_BLOB_SIZE)
+  // when we can't predict — this maximizes throughput per chunk while
+  // staying inside the SQLite blob ceiling.
+  // NOTE: streaming writes never go through the inline tier — the
+  // caller can use writeFile() for small payloads.
+  const { chunkSize: defaultChunkSize } = computeChunkSpec(
+    1024 * 1024 * 1024
+  ); // 1 GB hint → 2 MB chunks
+  durableObject.sql.exec(
+    `INSERT INTO files (file_id, user_id, parent_id, file_name, file_size, file_hash, mime_type, chunk_size, chunk_count, pool_size, status, created_at, updated_at, mode, node_kind)
+     VALUES (?, ?, ?, ?, 0, '', ?, ?, 0, ?, 'uploading', ?, ?, ?, 'file')`,
+    tmpId,
+    userId,
+    parentId,
+    tmpName,
+    mimeType,
+    defaultChunkSize,
+    poolSize,
+    now,
+    now,
+    mode
+  );
+
+  // Stash the validated commit-time payload on the handle. Cheap to
+  // re-pass through the caller; the SDK's structural `WriteHandle` does
+  // NOT expose this field so consumers cannot tamper with it.
+  const hasCommitOpts =
+    metadataEncoded !== undefined ||
+    opts.tags !== undefined ||
+    opts.version !== undefined;
+  return {
+    tmpId,
+    parentId,
+    leaf,
+    chunkSize: defaultChunkSize,
+    poolSize,
+    ...(hasCommitOpts
+      ? {
+          commitOpts: {
+            metadataEncoded,
+            tags: opts.tags,
+            versionLabel: opts.version?.label,
+            versionUserVisible: opts.version?.userVisible,
+          },
+        }
+      : {}),
+  };
+}
+
+/**
+ * Append a single chunk to an open write handle. The chunk is hashed,
+ * placed via rendezvous hashing, and PUT to the appropriate ShardDO.
+ *
+ * `chunkIndex` must be the next sequential index — out-of-order
+ * writes are rejected (EINVAL) since the read path assumes contiguous
+ * chunks ordered by chunk_index.
+ *
+ * Returns the bytes written so far (cumulative file size). Useful for
+ * caller-side EFBIG enforcement against the consumer's quota.
+ */
+export async function vfsAppendWriteStream(
+  durableObject: UserDO,
+  scope: VFSScope,
+  handle: VFSWriteHandle,
+  chunkIndex: number,
+  data: Uint8Array
+): Promise<{ bytesWritten: number }> {
+  const userId = userIdFor(scope);
+  // Verify handle still refers to an uploading row owned by this user.
+  const row = durableObject.sql
+    .exec(
+      `SELECT file_size, chunk_count, status FROM files WHERE file_id=? AND user_id=?`,
+      handle.tmpId,
+      userId
+    )
+    .toArray()[0] as
+    | { file_size: number; chunk_count: number; status: string }
+    | undefined;
+  if (!row) {
+    throw new VFSError("ENOENT", "appendWriteStream: handle not found");
+  }
+  if (row.status !== "uploading") {
+    throw new VFSError(
+      "EINVAL",
+      `appendWriteStream: handle not in uploading state (status=${row.status})`
+    );
+  }
+  if (chunkIndex !== row.chunk_count) {
+    throw new VFSError(
+      "EINVAL",
+      `appendWriteStream: out-of-order chunkIndex ${chunkIndex}, expected ${row.chunk_count}`
+    );
+  }
+  if (row.file_size + data.byteLength > WRITEFILE_MAX) {
+    throw new VFSError(
+      "EFBIG",
+      `appendWriteStream: cumulative ${row.file_size + data.byteLength} > WRITEFILE_MAX ${WRITEFILE_MAX}`
+    );
+  }
+  if (data.byteLength === 0) {
+    // Zero-byte append is a no-op; don't create a chunk_refs row.
+    return { bytesWritten: row.file_size };
+  }
+
+  const hash = await hashChunk(data);
+  const sIdx = placeChunk(userId, handle.tmpId, chunkIndex, handle.poolSize);
+  const env = durableObject.envPublic;
+  const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
+  const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, sIdx);
+  const stub = shardNs.get(shardNs.idFromName(shardName));
+  await stub.putChunk(hash, data, handle.tmpId, chunkIndex, userId);
+
+  durableObject.sql.exec(
+    `INSERT OR REPLACE INTO file_chunks (file_id, chunk_index, chunk_hash, chunk_size, shard_index)
+     VALUES (?, ?, ?, ?, ?)`,
+    handle.tmpId,
+    chunkIndex,
+    hash,
+    data.byteLength,
+    sIdx
+  );
+  const newSize = row.file_size + data.byteLength;
+  const newCount = row.chunk_count + 1;
+  durableObject.sql.exec(
+    "UPDATE files SET file_size=?, chunk_count=?, updated_at=? WHERE file_id=?",
+    newSize,
+    newCount,
+    Date.now(),
+    handle.tmpId
+  );
+  return { bytesWritten: newSize };
+}
+
+/**
+ * Commit a write stream: hash the recorded chunk hashes into a file
+ * hash, then commit-rename the tmp row onto the target leaf via the
+ * same supersede protocol as vfsWriteFile. The displaced row (if any)
+ * is hard-deleted and its chunks are queued for GC.
+ *
+ * when the handle carries `commitOpts` (metadata/tags/version
+ * captured at begin-time, validated then), apply them to the tmp row
+ * BEFORE commitRename. metadata is written to `files.metadata`; tags
+ * are recorded via `replaceTags` (which uses path_id == tmpId, and
+ * commitRename carries them forward by virtue of the rename being a
+ * file-name-only update — file_id stays stable). The `version` opts
+ * are wired only when versioning is enabled for the tenant; when
+ * disabled they are silently dropped (matches `writeFile`).
+ */
+export async function vfsCommitWriteStream(
+  durableObject: UserDO,
+  scope: VFSScope,
+  handle: VFSWriteHandle
+): Promise<void> {
+  const userId = userIdFor(scope);
+  const row = durableObject.sql
+    .exec(
+      "SELECT status FROM files WHERE file_id=? AND user_id=?",
+      handle.tmpId,
+      userId
+    )
+    .toArray()[0] as { status: string } | undefined;
+  if (!row) {
+    throw new VFSError("ENOENT", "commitWriteStream: handle not found");
+  }
+  if (row.status !== "uploading") {
+    throw new VFSError(
+      "EINVAL",
+      `commitWriteStream: not in uploading state (status=${row.status})`
+    );
+  }
+  const chunkHashes = durableObject.sql
+    .exec(
+      "SELECT chunk_hash FROM file_chunks WHERE file_id=? ORDER BY chunk_index",
+      handle.tmpId
+    )
+    .toArray() as { chunk_hash: string }[];
+  const fileHash = await hashChunk(
+    new TextEncoder().encode(chunkHashes.map((c) => c.chunk_hash).join(""))
+  );
+  durableObject.sql.exec(
+    "UPDATE files SET file_hash=? WHERE file_id=?",
+    fileHash,
+    handle.tmpId
+  );
+
+  // apply metadata + tags BEFORE commitRename. The opts
+  // were validated at begin-time so we can write directly.
+  const co = handle.commitOpts;
+  if (co) {
+    if (co.metadataEncoded === null) {
+      durableObject.sql.exec(
+        "UPDATE files SET metadata = NULL WHERE file_id = ?",
+        handle.tmpId
+      );
+    } else if (co.metadataEncoded !== undefined) {
+      durableObject.sql.exec(
+        "UPDATE files SET metadata = ? WHERE file_id = ?",
+        co.metadataEncoded,
+        handle.tmpId
+      );
+    }
+    if (co.tags !== undefined) {
+      replaceTags(durableObject, userId, handle.tmpId, co.tags);
+    }
+  }
+
+  await commitRename(
+    durableObject,
+    userId,
+    scope,
+    handle.tmpId,
+    handle.parentId,
+    handle.leaf
+  );
+
+  // version row creation. Streaming writes don't go through
+  // commitVersion (the versioned write path is content-addressed by
+  // hash; streaming uses tmp-file-id refs). For tenants with versioning
+  // enabled, we add a post-commit version row capturing the file_hash
+  // + size + label + visibility flag, mirroring writeFile's contract.
+  // The chunks themselves are already placed under the path_id (the
+  // post-rename file_id == tmpId) which provides the dedup boundary.
+  if (co?.versionLabel !== undefined || co?.versionUserVisible !== undefined) {
+    if (isVersioningEnabled(durableObject, userId)) {
+      const final = durableObject.sql
+        .exec(
+          "SELECT file_id, file_size, chunk_size, chunk_count, mime_type, mode FROM files WHERE file_id=?",
+          handle.tmpId
+        )
+        .toArray()[0] as
+        | {
+            file_id: string;
+            file_size: number;
+            chunk_size: number;
+            chunk_count: number;
+            mime_type: string;
+            mode: number;
+          }
+        | undefined;
+      if (final) {
+        const versionId = generateId();
+        commitVersion(durableObject, {
+          pathId: final.file_id,
+          versionId,
+          userId,
+          size: final.file_size,
+          mode: final.mode,
+          mtimeMs: Date.now(),
+          chunkSize: final.chunk_size,
+          chunkCount: final.chunk_count,
+          fileHash,
+          mimeType: final.mime_type,
+          inlineData: null,
+          userVisible: co.versionUserVisible ?? true,
+          label: co.versionLabel,
+          metadata: co.metadataEncoded ?? null,
+        });
+      }
+    }
+  }
+}
+
+/**
+ * Abort a write stream: hard-delete the tmp row + queue chunk GC for
+ * any chunks already pushed. Idempotent — safe to call after commit
+ * (it's a no-op since the tmp row no longer exists).
+ */
+export async function vfsAbortWriteStream(
+  durableObject: UserDO,
+  scope: VFSScope,
+  handle: VFSWriteHandle
+): Promise<void> {
+  const userId = userIdFor(scope);
+  await abortTempFile(durableObject, userId, scope, handle.tmpId);
+}
+
+/**
+ * Worker-side createWriteStream: return a WritableStream backed by the
+ * handle-based primitives. The internal buffer is split into chunks
+ * of `handle.chunkSize` bytes; each full chunk dispatches an append
+ * RPC. close() drains the residual buffer + commits; abort() aborts.
+ *
+ * Returns a wrapper holding `{ stream, handle }` so callers that want
+ * to surface the handle (e.g. for resumability) can grab it.
+ */
+export async function vfsCreateWriteStream(
+  durableObject: UserDO,
+  scope: VFSScope,
+  path: string,
+  opts: VFSWriteFileOpts = {}
+): Promise<{ stream: WritableStream<Uint8Array>; handle: VFSWriteHandle }> {
+  const handle = vfsBeginWriteStream(durableObject, scope, path, opts);
+  let buffer = new Uint8Array(0);
+  let chunkIndex = 0;
+  let aborted = false;
+
+  const flush = async (final: boolean) => {
+    while (
+      !aborted &&
+      (buffer.byteLength >= handle.chunkSize ||
+        (final && buffer.byteLength > 0))
+    ) {
+      const take = Math.min(handle.chunkSize, buffer.byteLength);
+      const slice = buffer.subarray(0, take);
+      const copy = new Uint8Array(slice); // detach from rolling buffer
+      buffer = buffer.subarray(take);
+      await vfsAppendWriteStream(
+        durableObject,
+        scope,
+        handle,
+        chunkIndex,
+        copy
+      );
+      chunkIndex++;
+    }
+  };
+
+  const stream = new WritableStream<Uint8Array>({
+    write: async (chunk) => {
+      if (aborted) {
+        throw new VFSError("EINVAL", "createWriteStream: stream aborted");
+      }
+      if (!(chunk instanceof Uint8Array)) {
+        chunk = new Uint8Array(chunk);
+      }
+      // Concat into buffer.
+      if (buffer.byteLength === 0) {
+        buffer = chunk.slice();
+      } else {
+        const merged = new Uint8Array(buffer.byteLength + chunk.byteLength);
+        merged.set(buffer, 0);
+        merged.set(chunk, buffer.byteLength);
+        buffer = merged;
+      }
+      await flush(false);
+    },
+    close: async () => {
+      if (aborted) return;
+      await flush(true);
+      await vfsCommitWriteStream(durableObject, scope, handle);
+    },
+    abort: async () => {
+      aborted = true;
+      await vfsAbortWriteStream(durableObject, scope, handle);
+    },
+  });
+
+  return { stream, handle };
+}
