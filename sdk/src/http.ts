@@ -227,19 +227,52 @@ export class HttpVFS implements VFSClient {
       );
       return;
     }
-    // Bytes → octet-stream body with ?path=... query. mode/mimeType
-    // can't ride along on octet-stream; for v1 they're string-only.
+    // Bytes path — Phase 13: when opts include metadata/tags/version,
+    // switch to multipart/form-data so the meta payload rides along
+    // with the binary bytes. Without those opts we keep the legacy
+    // octet-stream envelope (smaller, no FormData allocation).
+    const hasMeta =
+      opts !== undefined &&
+      (opts.metadata !== undefined ||
+        opts.tags !== undefined ||
+        opts.version !== undefined ||
+        opts.mode !== undefined ||
+        opts.mimeType !== undefined);
     const url = `${this.base}/api/vfs/writeFile?path=${encodeURIComponent(p)}`;
     let res: Response;
     try {
-      res = await this.fetcher(url, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${this.apiKey}`,
-          "Content-Type": "application/octet-stream",
-        },
-        body: data,
-      });
+      if (hasMeta) {
+        const form = new FormData();
+        // The bytes part — server reads via formData().get("bytes").
+        form.append("bytes", new Blob([data]));
+        form.append(
+          "meta",
+          JSON.stringify({
+            mode: opts!.mode,
+            mimeType: opts!.mimeType,
+            metadata: opts!.metadata,
+            tags: opts!.tags,
+            version: opts!.version,
+          })
+        );
+        res = await this.fetcher(url, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${this.apiKey}`,
+            // Don't set Content-Type — fetch sets multipart boundary.
+          },
+          body: form,
+        });
+      } else {
+        res = await this.fetcher(url, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${this.apiKey}`,
+            "Content-Type": "application/octet-stream",
+          },
+          body: data,
+        });
+      }
     } catch (err) {
       throw new MossaicUnavailableError({
         message: `HTTP fetch to ${url} failed: ${(err as Error).message}`,

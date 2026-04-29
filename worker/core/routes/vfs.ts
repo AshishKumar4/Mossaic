@@ -269,12 +269,63 @@ vfs.post("/readManyStat", async (c) => {
 
 vfs.post("/writeFile", async (c) => {
   try {
-    // Two body shapes:
-    //   - application/json: { path, encoding: "utf8", data: <string>, opts? }
+    // Three body shapes (Phase 13):
+    //   - application/json: { path, encoding: "utf8", data: <string>,
+    //                         mode?, mimeType?, metadata?, tags?, version? }
     //   - application/octet-stream + ?path=...: raw bytes; path comes
-    //     from the query string. This avoids base64-bloating large
-    //     payloads through JSON.
+    //     from the query string. No metadata/tags/version on this path
+    //     (use multipart for those).
+    //   - multipart/form-data + ?path=...: two parts —
+    //         "bytes" (Blob) — required, the file content,
+    //         "meta"  (text) — JSON string with
+    //                          { mode?, mimeType?, metadata?, tags?, version? }.
+    //     This is the parity path with the binding-mode `writeFile`.
     const ct = c.req.header("Content-Type") ?? "";
+    if (ct.includes("multipart/form-data")) {
+      const path = c.req.query("path");
+      if (typeof path !== "string" || path.length === 0) {
+        return c.json(
+          { code: "EINVAL", message: "?path=... required for multipart" },
+          400
+        );
+      }
+      const form = await c.req.formData();
+      const bytesPart = form.get("bytes") as unknown;
+      if (
+        bytesPart === null ||
+        typeof bytesPart === "string" ||
+        typeof (bytesPart as { arrayBuffer?: unknown }).arrayBuffer !==
+          "function"
+      ) {
+        return c.json(
+          { code: "EINVAL", message: "multipart: 'bytes' part required (Blob)" },
+          400
+        );
+      }
+      const data = new Uint8Array(
+        await (bytesPart as { arrayBuffer(): Promise<ArrayBuffer> }).arrayBuffer()
+      );
+      const metaRaw = form.get("meta");
+      let opts: {
+        mode?: number;
+        mimeType?: string;
+        metadata?: Record<string, unknown> | null;
+        tags?: readonly string[];
+        version?: { label?: string; userVisible?: boolean };
+      } = {};
+      if (typeof metaRaw === "string" && metaRaw.length > 0) {
+        try {
+          opts = JSON.parse(metaRaw);
+        } catch {
+          return c.json(
+            { code: "EINVAL", message: "multipart: 'meta' part is not valid JSON" },
+            400
+          );
+        }
+      }
+      await userStub(c).vfsWriteFile(c.var.scope, path, data, opts);
+      return c.json({ ok: true });
+    }
     if (ct.includes("application/octet-stream")) {
       const path = c.req.query("path");
       if (typeof path !== "string" || path.length === 0) {
@@ -293,6 +344,9 @@ vfs.post("/writeFile", async (c) => {
       encoding?: "utf8";
       mode?: number;
       mimeType?: string;
+      metadata?: Record<string, unknown> | null;
+      tags?: readonly string[];
+      version?: { label?: string; userVisible?: boolean };
     }>();
     const path = expectPath(body);
     if (typeof body.data !== "string") {
@@ -305,6 +359,9 @@ vfs.post("/writeFile", async (c) => {
     await userStub(c).vfsWriteFile(c.var.scope, path, data, {
       mode: body.mode,
       mimeType: body.mimeType,
+      metadata: body.metadata,
+      tags: body.tags,
+      version: body.version,
     });
     return c.json({ ok: true });
   } catch (err) {
