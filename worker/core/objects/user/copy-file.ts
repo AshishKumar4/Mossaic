@@ -27,7 +27,7 @@
 
 import type { UserDOCore as UserDO } from "./user-do-core";
 import type { ShardDO } from "../shard/shard-do";
-import { VFSError, type VFSScope } from "@shared/vfs-types";
+import { VFSError, type VFSScope } from "../../../../shared/vfs-types";
 import { generateId, vfsShardDOName } from "../../lib/utils";
 import { commitVersion, isVersioningEnabled, shardRefId } from "./vfs-versions";
 
@@ -89,7 +89,7 @@ export async function vfsCopyFile(
   }
 
   // Phase 12 cap pre-validation (mirrors writeFile).
-  const validateMod = await import("@shared/metadata-validate");
+  const validateMod = await import("../../../../shared/metadata-validate");
   let metadataEncoded: Uint8Array | null | undefined;
   if (opts.metadata === null) {
     metadataEncoded = null;
@@ -255,7 +255,7 @@ async function resolveDestParent(
   dest: string
 ): Promise<{ parentId: string | null; leaf: string }> {
   const pathMod = await import("./path-walk");
-  const pathsMod = await import("@shared/vfs-paths");
+  const pathsMod = await import("../../../../shared/vfs-paths");
   let segs: string[];
   try {
     segs = pathsMod.normalizePath(dest);

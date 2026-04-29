@@ -506,7 +506,7 @@ export class HttpVFS implements VFSClient {
       items: Array<{
         path: string;
         pathId: string;
-        stat?: import("@shared/vfs-types").VFSStatRaw;
+        stat?: import("../../shared/vfs-types").VFSStatRaw;
         metadata?: Record<string, unknown> | null;
         tags: string[];
       }>;

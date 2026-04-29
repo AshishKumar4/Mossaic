@@ -3,8 +3,8 @@ import {
   normalizePath,
   resolveSymlinkTarget,
   VFSPathError,
-} from "@shared/vfs-paths";
-import { SYMLINK_MAX_HOPS, type ResolveResult } from "@shared/vfs-types";
+} from "../../../../shared/vfs-paths";
+import { SYMLINK_MAX_HOPS, type ResolveResult } from "../../../../shared/vfs-types";
 
 /**
  * Path → row resolution, executed entirely inside one UserDO method

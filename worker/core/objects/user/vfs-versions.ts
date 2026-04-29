@@ -1,10 +1,10 @@
 import type { UserDOCore as UserDO } from "./user-do-core";
 import type { ShardDO } from "../shard/shard-do";
-import { VFSError, type VFSScope } from "@shared/vfs-types";
+import { VFSError, type VFSScope } from "../../../../shared/vfs-types";
 import { vfsShardDOName } from "../../lib/utils";
 import { generateId } from "../../lib/utils";
 import { resolvePath } from "./path-walk";
-import { placeChunk } from "@shared/placement";
+import { placeChunk } from "../../../../shared/placement";
 
 /**
  * Audit H4 — placement function for the Phase 9 versioning path.

@@ -6,13 +6,13 @@ import {
   type ResolveResult,
   type VFSScope,
   type VFSStatRaw,
-} from "@shared/vfs-types";
-import { INLINE_LIMIT, READFILE_MAX, WRITEFILE_MAX } from "@shared/inline";
-import { gidFromTenant, inoFromId, uidFromTenant } from "@shared/ino";
-import { normalizePath, VFSPathError } from "@shared/vfs-paths";
-import { hashChunk } from "@shared/crypto";
-import { computeChunkSpec } from "@shared/chunking";
-import { placeChunk } from "@shared/placement";
+} from "../../../../shared/vfs-types";
+import { INLINE_LIMIT, READFILE_MAX, WRITEFILE_MAX } from "../../../../shared/inline";
+import { gidFromTenant, inoFromId, uidFromTenant } from "../../../../shared/ino";
+import { normalizePath, VFSPathError } from "../../../../shared/vfs-paths";
+import { hashChunk } from "../../../../shared/crypto";
+import { computeChunkSpec } from "../../../../shared/chunking";
+import { placeChunk } from "../../../../shared/placement";
 import { generateId, vfsShardDOName } from "../../lib/utils";
 import {
   commitVersion,
@@ -21,12 +21,17 @@ import {
   shardRefId,
 } from "./vfs-versions";
 import { resolvePath, resolvePathFollow } from "./path-walk";
-import { purgeYjs, readYjsAsBytes, writeYjsBytes } from "./yjs";
+// Phase 14: yjs.ts is loaded via dynamic `await import("./yjs")` at
+// each yjs-mode call site below (search for `await import("./yjs")`
+// in this file). Static imports were pulling the yjs + y-protocols
+// runtime into every non-collab consumer's bundle through tsup's
+// chunking. The runtime path is only evaluated when a tenant has
+// `mode_yjs = 1` on the file.
 import {
   validateLabel,
   validateMetadata,
   validateTags,
-} from "@shared/metadata-validate";
+} from "../../../../shared/metadata-validate";
 import { replaceTags } from "./metadata-tags";
 
 /**
@@ -676,6 +681,7 @@ export async function vfsReadFile(
   // through readYjsAsBytes ensures readFile reflects unflushed
   // ops still cached in the in-memory Y.Doc.
   if (isYjsMode(durableObject, userId, r.leafId)) {
+    const { readYjsAsBytes } = await import("./yjs");
     return readYjsAsBytes(durableObject, scope, r.leafId);
   }
 
@@ -1536,17 +1542,15 @@ export async function vfsWriteFile(
   if (opts.metadata === null) {
     metadataEncoded = null; // explicit clear
   } else if (opts.metadata !== undefined) {
-    const { validateMetadata } = await import(
-      "@shared/metadata-validate"
-    );
+    const { validateMetadata } = await import("../../../../shared/metadata-validate");
     metadataEncoded = validateMetadata(opts.metadata).encoded;
   }
   if (opts.tags !== undefined) {
-    const { validateTags } = await import("@shared/metadata-validate");
+    const { validateTags } = await import("../../../../shared/metadata-validate");
     validateTags(opts.tags);
   }
   if (opts.version?.label !== undefined) {
-    const { validateLabel } = await import("@shared/metadata-validate");
+    const { validateLabel } = await import("../../../../shared/metadata-validate");
     validateLabel(opts.version.label);
   }
 
@@ -1582,6 +1586,7 @@ export async function vfsWriteFile(
       | { file_id: string; mode_yjs: number }
       | undefined;
     if (existing && existing.mode_yjs === 1) {
+      const { writeYjsBytes } = await import("./yjs");
       await writeYjsBytes(
         durableObject,
         scope,
@@ -2051,6 +2056,7 @@ export async function vfsUnlink(
   // wipe the per-path oplog/meta rows BEFORE the files row goes,
   // so we still know `r.leafId`.
   if (r.kind === "file" && isYjsMode(durableObject, userId, r.leafId)) {
+    const { purgeYjs } = await import("./yjs");
     await purgeYjs(durableObject, scope, r.leafId);
   }
 
@@ -2445,8 +2451,8 @@ export async function vfsPatchMetadata(
   const {
     validateMetadata,
     validateTags,
-  } = await import("@shared/metadata-validate");
-  const { deepMerge } = await import("@shared/metadata-merge");
+  } = await import("../../../../shared/metadata-validate");
+  const { deepMerge } = await import("../../../../shared/metadata-merge");
   const {
     addTags: addTagsHelper,
     removeTags: removeTagsHelper,

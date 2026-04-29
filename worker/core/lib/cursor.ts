@@ -28,7 +28,7 @@
  * extensions (cross-DO cursors? federated listings?) work.
  */
 
-import { VFSError } from "@shared/vfs-types";
+import { VFSError } from "../../../shared/vfs-types";
 
 export type OrderBy = "mtime" | "name" | "size";
 export type Direction = "asc" | "desc";

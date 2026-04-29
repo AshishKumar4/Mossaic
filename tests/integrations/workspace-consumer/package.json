@@ -1,0 +1,17 @@
+{
+  "name": "mossaic-workspace-consumer",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Phase 14 fixture — proves @mossaic/sdk consumable as TS source via workspace:* with zero consumer-side aliases.",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@mossaic/sdk": "workspace:*"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250224.0",
+    "typescript": "^5.7.0"
+  }
+}

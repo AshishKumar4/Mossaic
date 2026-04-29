@@ -11,15 +11,10 @@
     "resolveJsonModule": true,
     "isolatedModules": true,
     "noEmit": true,
-    "declaration": true,
-    "declarationMap": false,
     "verbatimModuleSyntax": true,
     "erasableSyntaxOnly": true,
-    "customConditions": ["workspace"],
     "types": ["@cloudflare/workers-types"],
-    "paths": {
-      "@shared/*": ["../shared/*"]
-    }
+    "customConditions": ["workspace"]
   },
-  "include": ["src", "src/types", "../shared", "../worker/core"]
+  "include": ["src"]
 }

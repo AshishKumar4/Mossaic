@@ -7,24 +7,30 @@
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
+      "workspace": "./src/index.ts",
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
     "./fs": {
+      "workspace": "./src/igit.ts",
       "types": "./dist/igit.d.ts",
       "import": "./dist/igit.js"
     },
     "./yjs": {
+      "workspace": "./src/yjs.ts",
       "types": "./dist/yjs.d.ts",
       "import": "./dist/yjs.js"
     },
     "./http": {
+      "workspace": "./src/http-only.ts",
       "types": "./dist/http-only.d.ts",
       "import": "./dist/http-only.js"
-    }
+    },
+    "./package.json": "./package.json"
   },
   "files": [
     "dist",
+    "src",
     "templates",
     "README.md"
   ],
