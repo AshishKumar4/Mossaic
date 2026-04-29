@@ -11,6 +11,7 @@ import galleryRoutes from "./routes/gallery";
 import sharedRoutes from "./routes/shared";
 import searchRoutes from "./routes/search";
 import vfsRoutes from "@core/routes/vfs";
+import yjsWsRoutes from "@core/routes/vfs-yjs-ws";
 
 // Phase 11: UserDO is the App-side subclass that adds the legacy
 // photo-app HTTP routes on top of UserDOCore. Production wrangler
@@ -58,6 +59,10 @@ app.route("/api/analytics", analyticsRoutes);
 app.route("/api/gallery", galleryRoutes);
 app.route("/api/shared", sharedRoutes);
 app.route("/api/search", searchRoutes);
+// Phase 13.5: public Yjs WebSocket upgrade. Mounted BEFORE
+// /api/vfs so the more-specific path wins. Bearer-auth gated;
+// the photo-app's /api/upload, /api/download, etc. are unaffected.
+app.route("/api/vfs/yjs", yjsWsRoutes);
 // Phase 7: HTTP fallback for non-Worker consumers of the @mossaic/sdk.
 // Auth via Bearer VFS token (signVFSToken / verifyVFSToken). Routes
 // translate HTTP → typed UserDO RPC. The legacy app's /api/* surface

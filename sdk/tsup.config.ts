@@ -20,7 +20,7 @@ import path from "node:path";
  * Output is ESM only (the SDK is for Workers, which is ESM-native).
  */
 export default defineConfig({
-  entry: ["src/index.ts", "src/igit.ts", "src/yjs.ts"],
+  entry: ["src/index.ts", "src/igit.ts", "src/yjs.ts", "src/http-only.ts"],
   format: ["esm"],
   dts: true,
   sourcemap: true,

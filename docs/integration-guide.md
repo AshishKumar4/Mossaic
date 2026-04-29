@@ -299,7 +299,59 @@ Sync frames (`0`/`1`/`2`) are persisted as `yjs_oplog` rows. Awareness frames (`
 
 ---
 
-## 5. Operations checklist for a Phase 13 deploy
+## 5. Command-line interface (`@mossaic/cli`)
+
+Phase 13.5 adds a Node 20+ CLI (`mossaic` / `mscli`) that drives a deployed Mossaic Service worker over HTTP + WSS. It is intended for operators and scripting workflows that don't run inside a Cloudflare Worker.
+
+### 5.1 Auth
+
+`~/.mossaic/config.json` (mode `0600`) stores `{ endpoint, jwtSecret, scope }` per profile. The CLI mints VFS tokens locally using `jose.SignJWT` with the same wire shape as `worker/core/lib/auth.ts:signVFSToken` (`{ scope: "vfs", ns, tn, sub? }`, HS256, iat/exp). Justification: this is an operator tool and the secret already exists on the operator's machine via `wrangler secret put`; storing it under `0600` locally is no weaker than what wrangler already does.
+
+```bash
+mossaic auth setup --endpoint https://mossaic-core.example.workers.dev --secret "$JWT_SECRET" --tenant team-acme
+mossaic auth whoami
+```
+
+### 5.2 Public Yjs WebSocket route
+
+To make Yjs reachable from external clients (Node CLI, browsers, third-party Workers), the Service worker mounts a public WebSocket upgrade route at:
+
+```
+GET /api/vfs/yjs/ws?path=<encoded path>
+Authorization: Bearer <vfs-token>
+# ...or, for browsers (which can't set Authorization on WebSocket):
+Sec-WebSocket-Protocol: bearer.<vfs-token>
+Upgrade: websocket
+```
+
+The route validates the Bearer (matching `verifyVFSToken`'s `scope === "vfs"` check) and forwards the upgrade to the per-tenant `UserDOCore` via `stub.fetch()` against the synthetic `/yjs/ws?path=...&ns=...&tenant=...[&sub=...]` URL. The DO's existing `_fetchWebSocketUpgrade` then runs the Yjs handshake.
+
+The same Service worker also exposes:
+
+- `POST /api/vfs/setYjsMode { path, enabled }` — flip the per-file yjs-mode bit (binding-mode `vfs.setYjsMode`).
+- `POST /api/vfs/flushYjs { path, label? }` — explicit compaction → user-visible version row (binding-mode `YDocHandle.flush`).
+- `POST /api/vfs/admin/setVersioning { enabled }` — operator-class lazy enable of per-tenant versioning.
+- `POST /api/vfs/readFile { path, versionId? }` — extended to honor `versionId` so external clients can read historical bytes.
+
+### 5.3 Verbs
+
+Every public SDK method is exposed as a CLI verb. See [`cli/README.md`](../cli/README.md) for the full table. Highlights:
+
+- File ops: `ls`, `cat`, `write`, `put`, `get`, `stream-put`, `stream-get`, `rm`, `mv`, `cp`, `mkdir`, `rmdir`, `rm-rf`, `stat`, `ln`, `readlink`, `chmod`, `exists`.
+- Phase 12: `meta patch`, `find` (`listFiles`).
+- Versioning: `versions ls | restore | drop | mark`.
+- Yjs: `yjs init | edit | awareness | flush`.
+- Token utility: `token mint`.
+
+`--json` is supported on every list-style command. Exit codes: `1` for any `VFSFsError`; `2` for `MossaicUnavailableError` (transport-level failures).
+
+### 5.4 Coverage gates
+
+The CLI ships with `≥58` live E2E test cases (categories A–I) plus `≥10` functional tests (execa-driven invocations of the binary) — all run against the live Service worker, not a local mock. Each test creates a fresh ULID-suffixed tenant for isolation.
+
+---
+
+## 6. Operations checklist for a Phase 13 deploy
 
 1. `npx tsc -b` — exit 0.
 2. `pnpm test` — all green (≥ 290 cases at Phase 13).

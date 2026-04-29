@@ -14,6 +14,7 @@ Files are split into 1 MB chunks, SHA-256 hashed, distributed across a dynamic p
 |---|---|---|
 | **Storage app** | A runnable photo library / file manager — drag-and-drop uploads, justified-grid gallery, lightbox, albums, analytics dashboard. Live at [mossaic.ashishkumarsingh.com](https://mossaic.ashishkumarsingh.com). | `src/` (React SPA) + `worker/` (Hono router + DOs) |
 | **`@mossaic/sdk`** | An npm package any Cloudflare Worker can consume to embed Mossaic as a `fs/promises`-shaped VFS. Multi-tenant scoping, streaming, isomorphic-git compatible, per-file Yjs CRDT mode, typed errors, HTTP fallback for non-Worker consumers. | `sdk/` — see **[`sdk/README.md`](./sdk/README.md)** for the full DX walkthrough |
+| **`@mossaic/cli`** | A Node 20+ CLI (`mossaic` / `mscli`) that drives a deployed Mossaic Service worker over HTTP/WSS. Mints VFS tokens locally, exposes every public SDK method as a verb, supports live Yjs editing over `wss://…/api/vfs/yjs/ws`. | `cli/` — see **[`cli/README.md`](./cli/README.md)** for the full command reference |
 
 Both share the same Durable Object backend (`UserDO`, `ShardDO`, `SearchDO`) and the same chunking / placement primitives in `shared/`.
 
@@ -85,6 +86,37 @@ await handle.close();
 ```
 
 `yjs` and `y-protocols` are optional peer deps; importing from `@mossaic/sdk/yjs` is the opt-in. See the [Live editing with Yjs](#live-editing-with-yjs) section below, the **[integration guide](./docs/integration-guide.md)** for the canonical shape of every public API, and **[`sdk/README.md`](./sdk/README.md)** for the full DX walkthrough.
+
+---
+
+## `@mossaic/cli` — command-line tool against a deployed Mossaic worker
+
+For operations and scripting workflows that don't run inside a Cloudflare Worker, `@mossaic/cli` (binary `mossaic`, alias `mscli`) speaks to a deployed Mossaic Service worker over HTTPS + WSS. It mints VFS-scoped JWTs locally (matching `worker/core/lib/auth.ts:signVFSToken`) using the operator's `JWT_SECRET`, and exposes every public SDK method as a CLI verb.
+
+```bash
+# 1) Configure the active profile (writes ~/.mossaic/config.json mode 0600).
+mossaic auth setup \
+  --endpoint https://mossaic-core.ashishkmr472.workers.dev \
+  --secret "$JWT_SECRET" \
+  --tenant team-acme
+
+# 2) Verify.
+mossaic auth whoami
+
+# 3) Drive any VFS operation.
+mossaic write /notes.md --text "# hello"
+mossaic cat /notes.md --encoding utf8
+mossaic find --tag draft --json
+mossaic versions ls /notes.md
+
+# 4) Live CRDT editing (Yjs over wss://).
+mossaic yjs init /notes.md
+echo "DRAFT — " | mossaic yjs edit /notes.md --flush --label "morning save"
+```
+
+The CLI is a sibling package at [`cli/`](./cli/) with its own README and its own ≥58 live E2E tests + ≥10 functional execa tests run against the deployed Service worker. See **[`cli/README.md`](./cli/README.md)** for the full command reference.
+
+The Service worker exposes a public Yjs WebSocket upgrade route at `/api/vfs/yjs/ws` (Bearer-authenticated, forwards to `UserDOCore._fetchWebSocketUpgrade`). Without that route, Yjs would only be reachable from sibling Workers via `stub.fetch()`.
 
 ---
 
