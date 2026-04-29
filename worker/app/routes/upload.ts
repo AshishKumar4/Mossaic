@@ -1,9 +1,10 @@
 import { Hono } from "hono";
 import type { EnvApp as Env } from "@shared/types";
 import { authMiddleware } from "@core/lib/auth";
-import { shardDOName, userDOName } from "@core/lib/utils";
+import { shardDOName } from "@core/lib/utils";
 import { placeChunk } from "@shared/placement";
 import { indexFile } from "./search";
+import { userStub } from "../lib/user-stub";
 
 const upload = new Hono<{
   Bindings: Env;
@@ -14,7 +15,11 @@ upload.use("*", authMiddleware());
 
 /**
  * POST /api/upload/init
- * Initialize a new file upload. Returns fileId, chunkSpec, poolSize.
+ * Initialize a new file upload. Returns fileId + chunk spec + poolSize.
+ *
+ * Phase 17: replaced `stub.fetch("/files/create")` with the typed RPC
+ * `UserDO.appCreateFile`. Wire shape is preserved 1:1 so the SPA's
+ * `UploadInitResponse` is unchanged.
  */
 upload.post("/init", async (c) => {
   const userId = c.get("userId");
@@ -26,59 +31,64 @@ upload.post("/init", async (c) => {
   }>();
 
   if (!body.fileName || !body.fileSize || !body.mimeType) {
-    return c.json({ error: "fileName, fileSize, and mimeType are required" }, 400);
+    return c.json(
+      { error: "fileName, fileSize, and mimeType are required" },
+      400
+    );
   }
 
-  const doId = c.env.MOSSAIC_USER.idFromName(userDOName(userId));
-  const stub = c.env.MOSSAIC_USER.get(doId);
+  const stub = userStub(c.env, userId);
 
-  const res = await stub.fetch(
-    new Request("http://internal/files/create", {
-      method: "POST",
-      body: JSON.stringify({
-        userId,
-        fileName: body.fileName,
-        fileSize: body.fileSize,
-        mimeType: body.mimeType,
-        parentId: body.parentId ?? null,
-      }),
-    })
-  );
-
-  if (!res.ok) {
-    const err = (await res.json()) as { error: string };
-    return c.json({ error: err.error }, res.status as 400);
+  try {
+    const result = await stub.appCreateFile(
+      userId,
+      body.fileName,
+      body.fileSize,
+      body.mimeType,
+      body.parentId ?? null
+    );
+    return c.json(result);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Init failed";
+    const status = /Quota/i.test(message) ? 403 : 400;
+    return c.json({ error: message }, status);
   }
-
-  return c.json(await res.json());
 });
 
 /**
  * PUT /api/upload/chunk/:fileId/:chunkIndex
- * Upload a single chunk. The worker streams it to the appropriate ShardDO.
+ * Upload a single chunk. The worker streams it to the appropriate
+ * ShardDO, then records the chunk in UserDO via typed RPC.
+ *
+ * Phase 17: ShardDO addressing is unchanged (`shard:userId:idx`)
+ * because production chunk bytes live in those legacy DO instances.
+ * Routing them to the canonical `vfs:default:userId:sN` namespace
+ * would orphan all existing data. The follow-up Phase 17.5
+ * (`local/phase-17-plan.md` §5.9) covers ShardDO data migration.
+ *
+ * The UserDO chunk-record call is a typed RPC (`appRecordChunk`)
+ * — the legacy JSON-fetch indirection is gone.
  */
 upload.put("/chunk/:fileId/:chunkIndex", async (c) => {
   const userId = c.get("userId");
   const fileId = c.req.param("fileId");
   const chunkIndex = parseInt(c.req.param("chunkIndex"));
   const chunkHash = c.req.header("X-Chunk-Hash") || "";
-  // NOTE: this legacy route honors the client-supplied
-  // `X-Pool-Size` header for back-compat with existing user-facing app
-  // clients that read the pool size from `init` and echo it back. The
-  // server's true pool_size is in `quota.pool_size` and is the source
-  // of truth for the new VFS write path (vfs-ops.ts:poolSizeFor —
-  // server-authoritative). If a misbehaving legacy client sends a
-  // wrong value here, only THIS request's chunk placement is affected;
-  // future writes by the same user re-derive from the server-side
-  // quota row. The new VFS path (worker/objects/user/vfs-ops.ts) does
-  // NOT read this header and cannot be subverted.
+  // The `X-Pool-Size` header is honored for back-compat with existing
+  // SPA clients that read pool size from `init` and echo it back. The
+  // server's true pool_size is in `quota.pool_size` (and the new VFS
+  // write path reads it server-side via `poolSizeFor`). For the
+  // App's legacy chunk path, the legacy header drives placement —
+  // misuse only affects this single chunk's placement, not future
+  // writes.
   const poolSize = parseInt(c.req.header("X-Pool-Size") || "32");
 
   if (!chunkHash) {
     return c.json({ error: "X-Chunk-Hash header is required" }, 400);
   }
 
-  // Determine shard placement (legacy app shard naming)
+  // Determine shard placement (legacy app shard naming — see header
+  // comment).
   const shardIndex = placeChunk(userId, fileId, chunkIndex, poolSize);
   const doName = shardDOName(userId, shardIndex);
 
@@ -104,21 +114,13 @@ upload.put("/chunk/:fileId/:chunkIndex", async (c) => {
     return c.json({ error: "Failed to store chunk" }, 500);
   }
 
-  // Record chunk in UserDO
-  const userDoId = c.env.MOSSAIC_USER.idFromName(userDOName(userId));
-  const userStub = c.env.MOSSAIC_USER.get(userDoId);
-
-  await userStub.fetch(
-    new Request("http://internal/files/chunk", {
-      method: "POST",
-      body: JSON.stringify({
-        fileId,
-        chunkIndex,
-        chunkHash,
-        chunkSize: body.byteLength,
-        shardIndex,
-      }),
-    })
+  // Record chunk in UserDO via typed RPC.
+  await userStub(c.env, userId).appRecordChunk(
+    fileId,
+    chunkIndex,
+    chunkHash,
+    body.byteLength,
+    shardIndex
   );
 
   const result = await shardRes.json();
@@ -127,7 +129,10 @@ upload.put("/chunk/:fileId/:chunkIndex", async (c) => {
 
 /**
  * POST /api/upload/complete/:fileId
- * Finalize a file upload.
+ * Finalize a file upload — flip status='complete', stamp file_hash,
+ * bump quota, schedule semantic indexing.
+ *
+ * Phase 17: typed RPC `appGetFileManifest` + `appCompleteFile`.
  */
 upload.post("/complete/:fileId", async (c) => {
   const userId = c.get("userId");
@@ -138,43 +143,26 @@ upload.post("/complete/:fileId", async (c) => {
     return c.json({ error: "fileHash is required" }, 400);
   }
 
-  // Get file info from UserDO
-  const userDoId = c.env.MOSSAIC_USER.idFromName(userDOName(userId));
-  const userStub = c.env.MOSSAIC_USER.get(userDoId);
+  const stub = userStub(c.env, userId);
 
-  const fileRes = await userStub.fetch(
-    new Request(`http://internal/files/get/${fileId}`)
-  );
-  if (!fileRes.ok) {
+  // Read the file row to get fileSize + filename + mimeType for
+  // quota update and search indexing.
+  const file = await stub.appGetFile(fileId);
+  if (!file) {
     return c.json({ error: "File not found" }, 404);
   }
-  const file = (await fileRes.json()) as {
-    file_size: number;
-    file_name: string;
-    mime_type: string;
-  };
+  const { file_size: fileSize, file_name: fileName, mime_type: mimeType } = file;
 
-  // Complete the file
-  const res = await userStub.fetch(
-    new Request("http://internal/files/complete", {
-      method: "POST",
-      body: JSON.stringify({
-        fileId,
-        fileHash,
-        userId,
-        fileSize: file.file_size,
-      }),
-    })
-  );
-
-  if (!res.ok) {
-    const err = (await res.json()) as { error: string };
-    return c.json({ error: err.error }, 500);
+  try {
+    await stub.appCompleteFile(fileId, fileHash, userId, fileSize);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Complete failed";
+    return c.json({ error: message }, 500);
   }
 
-  // Index file for semantic search (fire-and-forget, non-blocking)
+  // Index file for semantic search (fire-and-forget, non-blocking).
   c.executionCtx.waitUntil(
-    indexFile(c.env, userId, fileId, file.file_name, file.mime_type, file.file_size)
+    indexFile(c.env, userId, fileId, fileName, mimeType, fileSize)
   );
 
   return c.json({ ok: true, fileId }, 201);

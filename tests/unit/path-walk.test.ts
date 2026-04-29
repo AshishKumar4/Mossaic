@@ -20,11 +20,14 @@ import {
   VFSPathError,
 } from "@shared/vfs-paths";
 
+import type { UserDO } from "@app/objects/user/user-do";
+
 interface E {
-  MOSSAIC_USER: DurableObjectNamespace;
+  MOSSAIC_USER: DurableObjectNamespace<UserDO>;
 }
 const E = env as unknown as E;
-const userStub = (n: string) => E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName(n));
+const userStub = (n: string): DurableObjectStub<UserDO> =>
+  E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName(n));
 
 describe("normalizePath", () => {
   it("normalizes various forms", () => {
@@ -88,62 +91,26 @@ describe("resolvePath inside the DO", () => {
   it("resolves files, dirs, missing leaves and ENOTDIR", async () => {
     const stub = userStub("path-walk:basic");
 
-    // Seed via existing legacy routes: signup → folder → file.
-    const sup = await stub.fetch(
-      new Request("http://internal/signup", {
-        method: "POST",
-        body: JSON.stringify({ email: "pw@e.com", password: "abcd1234" }),
-      })
-    );
-    const { userId } = (await sup.json()) as { userId: string };
+    // Seed via typed RPCs: signup → folder → file. Phase 17 replaced
+    // the legacy `_legacyFetch` JSON router with `appHandleSignup`,
+    // `appCreateFolder`, `appCreateFile`, `appCompleteFile`.
+    const { userId } = await stub.appHandleSignup("pw@e.com", "abcd1234");
 
     // Folder /home
-    const homeRes = await stub.fetch(
-      new Request("http://internal/folders/create", {
-        method: "POST",
-        body: JSON.stringify({ userId, name: "home", parentId: null }),
-      })
-    );
-    const home = (await homeRes.json()) as { folderId: string };
+    const home = await stub.appCreateFolder(userId, "home", null);
 
     // Folder /home/work
-    const workRes = await stub.fetch(
-      new Request("http://internal/folders/create", {
-        method: "POST",
-        body: JSON.stringify({
-          userId,
-          name: "work",
-          parentId: home.folderId,
-        }),
-      })
-    );
-    const work = (await workRes.json()) as { folderId: string };
+    const work = await stub.appCreateFolder(userId, "work", home.folderId);
 
-    // File /home/work/notes.txt — uploading status; we'll mark it complete
-    const fileRes = await stub.fetch(
-      new Request("http://internal/files/create", {
-        method: "POST",
-        body: JSON.stringify({
-          userId,
-          fileName: "notes.txt",
-          fileSize: 5,
-          mimeType: "text/plain",
-          parentId: work.folderId,
-        }),
-      })
+    // File /home/work/notes.txt — uploading status; mark it complete.
+    const { fileId } = await stub.appCreateFile(
+      userId,
+      "notes.txt",
+      5,
+      "text/plain",
+      work.folderId
     );
-    const { fileId } = (await fileRes.json()) as { fileId: string };
-    await stub.fetch(
-      new Request("http://internal/files/complete", {
-        method: "POST",
-        body: JSON.stringify({
-          fileId,
-          fileHash: "0".repeat(64),
-          userId,
-          fileSize: 5,
-        }),
-      })
-    );
+    await stub.appCompleteFile(fileId, "0".repeat(64), userId, 5);
 
     // Now drive resolvePath via runInDurableObject.
     await runInDurableObject(stub, async (instance) => {
@@ -190,13 +157,7 @@ describe("resolvePath inside the DO", () => {
   it("symlink resolution: lstat-style returns symlink, follow chases up to ELOOP", async () => {
     const stub = userStub("path-walk:symlink");
 
-    const sup = await stub.fetch(
-      new Request("http://internal/signup", {
-        method: "POST",
-        body: JSON.stringify({ email: "sl@e.com", password: "abcd1234" }),
-      })
-    );
-    const { userId } = (await sup.json()) as { userId: string };
+    const { userId } = await stub.appHandleSignup("sl@e.com", "abcd1234");
 
     // Create /target (a real file) and /link → /target plus a cycle for ELOOP test.
     await runInDurableObject(stub, async (_instance, state) => {

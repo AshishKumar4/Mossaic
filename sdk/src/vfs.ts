@@ -662,8 +662,10 @@ export class VFS implements VFSClient {
   private versioningLatched = false;
   // explicit fields instead of constructor parameter
   // properties — `erasableSyntaxOnly` rejects the shorthand.
-  private readonly env: MossaicEnv;
-  private readonly opts: CreateVFSOptions;
+  // `protected` so App-only subclasses (see `sdk/src/app-shim.ts`)
+  // can read them when overriding `user()`/`scope()`.
+  protected readonly env: MossaicEnv;
+  protected readonly opts: CreateVFSOptions;
 
   constructor(env: MossaicEnv, opts: CreateVFSOptions) {
     this.env = env;
@@ -726,8 +728,16 @@ export class VFS implements VFSClient {
   }
 
   // ── DO stub resolution ────────────────────────────────────────────────
+  //
+  // `user()` and `scope()` are `protected` (not `private`) so that
+  // App-only subclasses inside the same monorepo (see
+  // `sdk/src/app-shim.ts`) can override the DO addressing without
+  // forking the entire VFS surface. The shim is NOT re-exported from
+  // `@mossaic/sdk`'s public entry — external consumers continue to
+  // see the canonical `vfs:${ns}:${tenant}` namespace via
+  // `createVFS`.
 
-  private user(): UserDOClient {
+  protected user(): UserDOClient {
     const name = vfsUserDOName(
       this.opts.namespace ?? "default",
       this.opts.tenant,
@@ -740,7 +750,7 @@ export class VFS implements VFSClient {
     return this.env.MOSSAIC_USER.get(id) as UserDOClient;
   }
 
-  private scope(): VFSScope {
+  protected scope(): VFSScope {
     return {
       ns: this.opts.namespace ?? "default",
       tenant: this.opts.tenant,

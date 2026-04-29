@@ -99,3 +99,11 @@ export {
   type ProgressEvent as TransferProgressEvent,
   type MossaicHttpClient,
 } from "./transfer";
+
+// content-hash helpers + AIMD controller. Pure-JS utilities, no
+// Worker runtime needed — the photo-library SPA imports these from
+// the `/http` entry to avoid pulling DO classes into the browser
+// bundle.
+export { hashChunk, computeFileHash } from "../../shared/crypto";
+export { AIMDController } from "../../shared/aimd";
+export { computeChunkSpec } from "../../shared/chunking";

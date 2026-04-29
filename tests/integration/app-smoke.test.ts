@@ -1,31 +1,36 @@
 import { describe, it, expect } from "vitest";
 import { env } from "cloudflare:test";
+import type { UserDO } from "@app/objects/user/user-do";
 
 /**
  * App-mode round-trip smoke.
  *
  * Drives the photo-app upload/download flow end-to-end through UserDO +
  * ShardDO:
- *   1. signup → user
- *   2. /files/create → fileId
+ *   1. signup → user (typed RPC `appHandleSignup`)
+ *   2. typed RPC `appCreateFile` → fileId
  *   3. ShardDO PUT /chunk
- *   4. /files/chunk (record)
- *   5. /files/complete
- *   6. /files/manifest → assert chunks + optional fields default safely
+ *   4. typed RPC `appRecordChunk`
+ *   5. typed RPC `appCompleteFile`
+ *   6. typed RPC `appGetFileManifest` → assert chunks + default fields
  *   7. ShardDO GET /chunk/<hash> → assert original bytes
  *
- * Smoke test that the photo-app upload/download pipeline through
- * UserDO + ShardDO is functional.
+ * Phase 17: replaced the legacy `_legacyFetch` JSON router calls with
+ * the typed RPC surface on `UserDO extends UserDOCore`. Behaviour is
+ * bit-equivalent — same SQL helpers underneath, same wire shapes
+ * preserved at the App's HTTP boundary (worker-smoke covers that).
  */
 
 interface Env {
-  MOSSAIC_USER: DurableObjectNamespace;
+  MOSSAIC_USER: DurableObjectNamespace<UserDO>;
   MOSSAIC_SHARD: DurableObjectNamespace;
 }
 
 const E = env as unknown as Env;
-const userStub = (n: string) => E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName(n));
-const shardStub = (n: string) => E.MOSSAIC_SHARD.get(E.MOSSAIC_SHARD.idFromName(n));
+const userStub = (n: string): DurableObjectStub<UserDO> =>
+  E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName(n));
+const shardStub = (n: string) =>
+  E.MOSSAIC_SHARD.get(E.MOSSAIC_SHARD.idFromName(n));
 
 async function sha256Hex(data: Uint8Array): Promise<string> {
   const buf = await crypto.subtle.digest("SHA-256", data);
@@ -41,40 +46,21 @@ describe("App-mode upload/download round-trip", () => {
     const userDO = userStub(`user:${userId}`);
     const shardDO = shardStub(`shard:${userId}:${shardIdx}`);
 
-    // 1. signup (creates auth + quota rows)
-    const signup = await userDO.fetch(
-      new Request("http://internal/signup", {
-        method: "POST",
-        body: JSON.stringify({
-          email: "smoke@example.com",
-          password: "password123",
-        }),
-      })
+    // 1. signup (creates auth + quota rows) via typed RPC.
+    const { userId: realUserId } = await userDO.appHandleSignup(
+      "smoke@example.com",
+      "password123"
     );
-    expect(signup.ok).toBe(true);
-    const { userId: realUserId } = (await signup.json()) as { userId: string };
 
-    // 2. files/create
+    // 2. files/create via typed RPC.
     const payload = new TextEncoder().encode("hello world from phase 1 smoke");
-    const create = await userDO.fetch(
-      new Request("http://internal/files/create", {
-        method: "POST",
-        body: JSON.stringify({
-          userId: realUserId,
-          fileName: "smoke.txt",
-          fileSize: payload.byteLength,
-          mimeType: "text/plain",
-          parentId: null,
-        }),
-      })
+    const { fileId } = await userDO.appCreateFile(
+      realUserId,
+      "smoke.txt",
+      payload.byteLength,
+      "text/plain",
+      null
     );
-    expect(create.ok).toBe(true);
-    const { fileId } = (await create.json()) as {
-      fileId: string;
-      chunkSize: number;
-      chunkCount: number;
-      poolSize: number;
-    };
 
     // 3. PUT chunk to shard
     const chunkHash = await sha256Hex(payload);
@@ -95,59 +81,36 @@ describe("App-mode upload/download round-trip", () => {
       "created"
     );
 
-    // 4. record chunk in UserDO
-    const rec = await userDO.fetch(
-      new Request("http://internal/files/chunk", {
-        method: "POST",
-        body: JSON.stringify({
-          fileId,
-          chunkIndex: 0,
-          chunkHash,
-          chunkSize: payload.byteLength,
-          shardIndex: shardIdx,
-        }),
-      })
+    // 4. record chunk in UserDO via typed RPC.
+    await userDO.appRecordChunk(
+      fileId,
+      0,
+      chunkHash,
+      payload.byteLength,
+      shardIdx
     );
-    expect(rec.ok).toBe(true);
 
-    // 5. complete
+    // 5. complete via typed RPC.
     const fileHash = await sha256Hex(new TextEncoder().encode(chunkHash));
-    const done = await userDO.fetch(
-      new Request("http://internal/files/complete", {
-        method: "POST",
-        body: JSON.stringify({
-          fileId,
-          fileHash,
-          userId: realUserId,
-          fileSize: payload.byteLength,
-        }),
-      })
+    await userDO.appCompleteFile(
+      fileId,
+      fileHash,
+      realUserId,
+      payload.byteLength
     );
-    expect(done.ok).toBe(true);
 
-    // 6. manifest — must include chunk + new optional defaults
-    const manRes = await userDO.fetch(
-      new Request(`http://internal/files/manifest/${fileId}`)
-    );
-    expect(manRes.ok).toBe(true);
-    const manifest = (await manRes.json()) as {
-      fileId: string;
-      fileSize: number;
-      chunks: { index: number; hash: string; size: number; shardIndex: number }[];
-      mode?: number;
-      nodeKind?: string;
-      symlinkTarget?: string | null;
-      inlineData?: ArrayBuffer | null;
-    };
-    expect(manifest.fileId).toBe(fileId);
-    expect(manifest.fileSize).toBe(payload.byteLength);
-    expect(manifest.chunks).toHaveLength(1);
-    expect(manifest.chunks[0].hash).toBe(chunkHash);
-    expect(manifest.chunks[0].shardIndex).toBe(shardIdx);
-    expect(manifest.mode).toBe(420);
-    expect(manifest.nodeKind).toBe("file");
-    expect(manifest.symlinkTarget).toBeNull();
-    expect(manifest.inlineData).toBeNull();
+    // 6. manifest — must include chunk + new optional defaults.
+    const manifest = await userDO.appGetFileManifest(fileId);
+    expect(manifest).not.toBeNull();
+    expect(manifest!.fileId).toBe(fileId);
+    expect(manifest!.fileSize).toBe(payload.byteLength);
+    expect(manifest!.chunks).toHaveLength(1);
+    expect(manifest!.chunks[0].hash).toBe(chunkHash);
+    expect(manifest!.chunks[0].shardIndex).toBe(shardIdx);
+    expect(manifest!.mode).toBe(420);
+    expect(manifest!.nodeKind).toBe("file");
+    expect(manifest!.symlinkTarget).toBeNull();
+    expect(manifest!.inlineData).toBeNull();
 
     // 7. fetch chunk back from shard
     const getRes = await shardDO.fetch(
@@ -163,41 +126,20 @@ describe("App-mode upload/download round-trip", () => {
 
   it("listFiles still works with idx_files_parent and returns the new file", async () => {
     const userDO = userStub("user:list-smoke");
-    const sup = await userDO.fetch(
-      new Request("http://internal/signup", {
-        method: "POST",
-        body: JSON.stringify({ email: "ls@example.com", password: "abcdef12" }),
-      })
+    const { userId } = await userDO.appHandleSignup(
+      "ls@example.com",
+      "abcdef12"
     );
-    const { userId } = (await sup.json()) as { userId: string };
 
-    // Create two files at root
+    // Create two files at root via typed RPC.
     for (const name of ["a.txt", "b.txt"]) {
-      await userDO.fetch(
-        new Request("http://internal/files/create", {
-          method: "POST",
-          body: JSON.stringify({
-            userId,
-            fileName: name,
-            fileSize: 5,
-            mimeType: "text/plain",
-            parentId: null,
-          }),
-        })
-      );
+      await userDO.appCreateFile(userId, name, 5, "text/plain", null);
     }
 
-    const listRes = await userDO.fetch(
-      new Request("http://internal/files/list", {
-        method: "POST",
-        body: JSON.stringify({ userId, parentId: null }),
-      })
-    );
-    expect(listRes.ok).toBe(true);
-    const list = (await listRes.json()) as {
-      files: { fileName: string }[];
-      folders: unknown[];
-    };
-    expect(list.files.map((f) => f.fileName).sort()).toEqual(["a.txt", "b.txt"]);
+    const list = await userDO.appListFiles(userId, null);
+    expect(list.files.map((f) => f.fileName).sort()).toEqual([
+      "a.txt",
+      "b.txt",
+    ]);
   });
 });

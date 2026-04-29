@@ -16,7 +16,7 @@ import { env, runInDurableObject } from "cloudflare:test";
  * the scope the tests pass to the RPC methods.
  */
 
-import type { UserDOCore as UserDO } from "@core/objects/user/user-do-core";
+import type { UserDO } from "@app/objects/user/user-do";
 import type { ShardDO } from "@core/objects/shard/shard-do";
 import { INLINE_LIMIT } from "@shared/inline";
 import { vfsShardDOName } from "@core/lib/utils";
@@ -35,24 +35,16 @@ async function sha256Hex(data: Uint8Array): Promise<string> {
 }
 
 /**
- * Seed a UserDO with a given userId via the legacy /signup route, then
- * surgically rewrite the SQL `auth.user_id` to a stable test-friendly
- * value. We use the legacy signup to get the quota row created; the
- * `user_id` rewrite gives us a deterministic value to pass as
- * `scope.tenant`.
+ * Seed a UserDO via the App's typed `appHandleSignup` RPC. The RPC
+ * materializes the auth + quota rows (same `handleSignup` helper the
+ * pre-Phase-17 `_legacyFetch` /signup route called) and returns the
+ * generated user_id we use as `scope.tenant`.
  */
 async function seedUser(
   stub: DurableObjectStub<UserDO>,
   email: string
 ): Promise<string> {
-  const sup = await stub.fetch(
-    new Request("http://internal/signup", {
-      method: "POST",
-      body: JSON.stringify({ email, password: "abcd1234" }),
-    })
-  );
-  expect(sup.ok).toBe(true);
-  const { userId } = (await sup.json()) as { userId: string };
+  const { userId } = await stub.appHandleSignup(email, "abcd1234");
   return userId;
 }
 
@@ -61,30 +53,14 @@ describe("vfsStat / vfsLstat / vfsExists", () => {
     const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-read:stat"));
     const userId = await seedUser(stub, "stat@e.com");
 
-    const fr = await stub.fetch(
-      new Request("http://internal/files/create", {
-        method: "POST",
-        body: JSON.stringify({
-          userId,
-          fileName: "stat.txt",
-          fileSize: 5,
-          mimeType: "text/plain",
-          parentId: null,
-        }),
-      })
+    const { fileId } = await stub.appCreateFile(
+      userId,
+      "stat.txt",
+      5,
+      "text/plain",
+      null
     );
-    const { fileId } = (await fr.json()) as { fileId: string };
-    await stub.fetch(
-      new Request("http://internal/files/complete", {
-        method: "POST",
-        body: JSON.stringify({
-          fileId,
-          fileHash: "0".repeat(64),
-          userId,
-          fileSize: 5,
-        }),
-      })
-    );
+    await stub.appCompleteFile(fileId, "0".repeat(64), userId, 5);
 
     const scope = { ns: "default", tenant: userId };
     const stat = await stub.vfsStat(scope, "/stat.txt");
@@ -108,12 +84,7 @@ describe("vfsStat / vfsLstat / vfsExists", () => {
   it("EISDIR-like for stat on a directory returns dir kind, readFile throws EISDIR", async () => {
     const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-read:isdir"));
     const userId = await seedUser(stub, "isdir@e.com");
-    await stub.fetch(
-      new Request("http://internal/folders/create", {
-        method: "POST",
-        body: JSON.stringify({ userId, name: "docs", parentId: null }),
-      })
-    );
+    await stub.appCreateFolder(userId, "docs", null);
     const scope = { ns: "default", tenant: userId };
 
     const stat = await stub.vfsStat(scope, "/docs");
@@ -170,38 +141,17 @@ describe("vfsReaddir", () => {
 
     // Create /a (dir), /b (dir), /c.txt, /d.txt — at root.
     for (const name of ["a", "b"]) {
-      await stub.fetch(
-        new Request("http://internal/folders/create", {
-          method: "POST",
-          body: JSON.stringify({ userId, name, parentId: null }),
-        })
-      );
+      await stub.appCreateFolder(userId, name, null);
     }
     for (const name of ["c.txt", "d.txt"]) {
-      const fr = await stub.fetch(
-        new Request("http://internal/files/create", {
-          method: "POST",
-          body: JSON.stringify({
-            userId,
-            fileName: name,
-            fileSize: 1,
-            mimeType: "text/plain",
-            parentId: null,
-          }),
-        })
+      const { fileId } = await stub.appCreateFile(
+        userId,
+        name,
+        1,
+        "text/plain",
+        null
       );
-      const { fileId } = (await fr.json()) as { fileId: string };
-      await stub.fetch(
-        new Request("http://internal/files/complete", {
-          method: "POST",
-          body: JSON.stringify({
-            fileId,
-            fileHash: "0".repeat(64),
-            userId,
-            fileSize: 1,
-          }),
-        })
-      );
+      await stub.appCompleteFile(fileId, "0".repeat(64), userId, 1);
     }
     const scope = { ns: "default", tenant: userId };
 
@@ -215,30 +165,14 @@ describe("vfsReaddir", () => {
   it("ENOTDIR when path resolves to a file", async () => {
     const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-read:enotdir"));
     const userId = await seedUser(stub, "ntd@e.com");
-    const fr = await stub.fetch(
-      new Request("http://internal/files/create", {
-        method: "POST",
-        body: JSON.stringify({
-          userId,
-          fileName: "f.txt",
-          fileSize: 1,
-          mimeType: "text/plain",
-          parentId: null,
-        }),
-      })
+    const { fileId } = await stub.appCreateFile(
+      userId,
+      "f.txt",
+      1,
+      "text/plain",
+      null
     );
-    const { fileId } = (await fr.json()) as { fileId: string };
-    await stub.fetch(
-      new Request("http://internal/files/complete", {
-        method: "POST",
-        body: JSON.stringify({
-          fileId,
-          fileHash: "0".repeat(64),
-          userId,
-          fileSize: 1,
-        }),
-      })
-    );
+    await stub.appCompleteFile(fileId, "0".repeat(64), userId, 1);
     const scope = { ns: "default", tenant: userId };
     await expect(stub.vfsReaddir(scope, "/f.txt")).rejects.toThrow(/ENOTDIR/);
   });
@@ -304,19 +238,13 @@ describe("vfsReadFile (inline tier + chunked path)", () => {
     full.set(part1, 0);
     full.set(part2, part1.byteLength);
 
-    const fr = await stub.fetch(
-      new Request("http://internal/files/create", {
-        method: "POST",
-        body: JSON.stringify({
-          userId,
-          fileName: "two.bin",
-          fileSize: full.byteLength,
-          mimeType: "application/octet-stream",
-          parentId: null,
-        }),
-      })
+    const { fileId } = await stub.appCreateFile(
+      userId,
+      "two.bin",
+      full.byteLength,
+      "application/octet-stream",
+      null
     );
-    const { fileId } = (await fr.json()) as { fileId: string };
 
     // Override chunk_size + chunk_count so reading walks two chunk rows.
     await runInDurableObject(stub, async (_instance, state) => {
@@ -344,29 +272,13 @@ describe("vfsReadFile (inline tier + chunked path)", () => {
         })
       );
       expect(put.ok).toBe(true);
-      await stub.fetch(
-        new Request("http://internal/files/chunk", {
-          method: "POST",
-          body: JSON.stringify({
-            fileId,
-            chunkIndex: i,
-            chunkHash: hash,
-            chunkSize: part.byteLength,
-            shardIndex: shardIdx,
-          }),
-        })
-      );
+      await stub.appRecordChunk(fileId, i, hash, part.byteLength, shardIdx);
     }
-    await stub.fetch(
-      new Request("http://internal/files/complete", {
-        method: "POST",
-        body: JSON.stringify({
-          fileId,
-          fileHash: "0".repeat(64),
-          userId,
-          fileSize: full.byteLength,
-        }),
-      })
+    await stub.appCompleteFile(
+      fileId,
+      "0".repeat(64),
+      userId,
+      full.byteLength
     );
 
     const scope = { ns: "default", tenant: userId };
@@ -383,30 +295,14 @@ describe("vfsReadManyStat", () => {
     const userId = await seedUser(stub, "many@e.com");
 
     for (const name of ["a.txt", "b.txt"]) {
-      const fr = await stub.fetch(
-        new Request("http://internal/files/create", {
-          method: "POST",
-          body: JSON.stringify({
-            userId,
-            fileName: name,
-            fileSize: 3,
-            mimeType: "text/plain",
-            parentId: null,
-          }),
-        })
+      const { fileId } = await stub.appCreateFile(
+        userId,
+        name,
+        3,
+        "text/plain",
+        null
       );
-      const { fileId } = (await fr.json()) as { fileId: string };
-      await stub.fetch(
-        new Request("http://internal/files/complete", {
-          method: "POST",
-          body: JSON.stringify({
-            fileId,
-            fileHash: "0".repeat(64),
-            userId,
-            fileSize: 3,
-          }),
-        })
-      );
+      await stub.appCompleteFile(fileId, "0".repeat(64), userId, 3);
     }
 
     const scope = { ns: "default", tenant: userId };
@@ -432,19 +328,13 @@ describe("vfsOpenManifest / vfsReadChunk", () => {
     );
 
     const part = new TextEncoder().encode("just-one-chunk");
-    const fr = await stub.fetch(
-      new Request("http://internal/files/create", {
-        method: "POST",
-        body: JSON.stringify({
-          userId,
-          fileName: "m.bin",
-          fileSize: part.byteLength,
-          mimeType: "application/octet-stream",
-          parentId: null,
-        }),
-      })
+    const { fileId } = await stub.appCreateFile(
+      userId,
+      "m.bin",
+      part.byteLength,
+      "application/octet-stream",
+      null
     );
-    const { fileId } = (await fr.json()) as { fileId: string };
     const hash = await sha256Hex(part);
     await shardDO.fetch(
       new Request("http://internal/chunk", {
@@ -458,28 +348,12 @@ describe("vfsOpenManifest / vfsReadChunk", () => {
         body: part,
       })
     );
-    await stub.fetch(
-      new Request("http://internal/files/chunk", {
-        method: "POST",
-        body: JSON.stringify({
-          fileId,
-          chunkIndex: 0,
-          chunkHash: hash,
-          chunkSize: part.byteLength,
-          shardIndex: shardIdx,
-        }),
-      })
-    );
-    await stub.fetch(
-      new Request("http://internal/files/complete", {
-        method: "POST",
-        body: JSON.stringify({
-          fileId,
-          fileHash: "0".repeat(64),
-          userId,
-          fileSize: part.byteLength,
-        }),
-      })
+    await stub.appRecordChunk(fileId, 0, hash, part.byteLength, shardIdx);
+    await stub.appCompleteFile(
+      fileId,
+      "0".repeat(64),
+      userId,
+      part.byteLength
     );
 
     const scope = { ns: "default", tenant: userId };
@@ -537,18 +411,7 @@ describe("scope handling", () => {
     const userId = await seedUser(stub, "iso@e.com");
 
     // Insert a file under tenant=userId, sub=undefined.
-    await stub.fetch(
-      new Request("http://internal/files/create", {
-        method: "POST",
-        body: JSON.stringify({
-          userId,
-          fileName: "owned.txt",
-          fileSize: 1,
-          mimeType: "text/plain",
-          parentId: null,
-        }),
-      })
-    );
+    await stub.appCreateFile(userId, "owned.txt", 1, "text/plain", null);
 
     // scope.sub set → user_id becomes "<userId>::<sub>" which has no rows
     const scopeWithSub = { ns: "default", tenant: userId, sub: "alice" };
