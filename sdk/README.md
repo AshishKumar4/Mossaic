@@ -23,7 +23,7 @@ Cloudflare-Worker-native VFS over Mossaic. fs/promises-shaped, isomorphic-git co
                                   └────────────┬────────────┘
                                                │ (App vs Core split)
                                                │ App: UserDO extends UserDOCore
-                                               │       └─ + _legacyFetch (byte-pinned)
+                                               │       └─ + appXxx typed RPCs (legacy photo-app)
                                                │       └─ + SearchDO (App-only, not in SDK)
                                                │ Service-mode: binds UserDOCore directly
                                                ▼
@@ -39,7 +39,7 @@ The runtime split:
 
 | Mode          | DO bindings                    | Routes mounted                  | Use case |
 |---------------|--------------------------------|---------------------------------|----------|
-| App mode      | `UserDO` (subclass of `UserDOCore`) + `ShardDO` + `SearchDO` | legacy `/api/upload`, `/api/download`, photo-app, `/api/vfs/*` | the existing `mossaic.ashishkumarsingh.com` deployment — the App's `UserDO.fetch` delegates non-WS HTTP to a byte-pinned `_legacyFetch` and forwards WS upgrades to `super.fetch` for Yjs |
+| App mode      | `UserDO` (subclass of `UserDOCore`) + `ShardDO` + `SearchDO` | legacy `/api/upload`, `/api/download`, photo-app, `/api/vfs/*` | the existing `mossaic.ashishkumarsingh.com` deployment — App routes call typed `stub.appXxx(...)` RPCs on the UserDO subclass; WS upgrades fall through to `super.fetch` for Yjs |
 | Service mode  | `UserDOCore` + `ShardDO` (no SearchDO) | `/api/vfs/*` only | a new fresh deployment for SDK consumers — see `deployments/service/wrangler.jsonc` |
 | Library mode  | consumer's own `MOSSAIC_USER` + `MOSSAIC_SHARD` (re-exported `UserDO`/`ShardDO` from `@mossaic/sdk`) | consumer-defined | the recommended path: `import { UserDO, ShardDO, createVFS }` and bind in your own Worker — 1 DO RPC per VFS call, no HTTP hop |
 

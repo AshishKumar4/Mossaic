@@ -16,7 +16,7 @@ Keep this open during deploys. Search-by-symptom: the runbooks at the bottom are
 | **UserDO / UserDOCore** | One DO instance per `(ns, tenant, sub?)` tuple. Holds VFS metadata + Yjs op log + listFiles indexes. |
 | **ShardDO** | Pool of DO instances (default 32, grows with stored bytes). Holds content-addressed chunks. |
 | **JWT_SECRET** | Workers secret. Required. Used for both VFS-token HS256 signing AND listFiles cursor HMAC. **No dev fallback in source** — a deploy without this secret returns 503 on every VFS-token verify and every listFiles cursor op (encode or decode). |
-| **byte-pin** | The legacy `_legacyFetch` body in `worker/app/objects/user/user-do.ts:70..263` is hashed at sha256 `4c6eb84925cd8b34298aa92a5201c6e8074defb4527c3bbb1d2c677f9f2c8e70`. Any deploy that changes this hash silently changes the legacy contract. |
+| **App-on-SDK** | App-mode `UserDO` (`worker/app/objects/user/user-do.ts`) is a typed-RPC subclass of `UserDOCore`. The legacy `_legacyFetch` JSON router was retired; routes call `stub.appXxx(...)` directly. Contract is now enforced by the integration suite (`tests/integration/multipart-routes.test.ts`, `tests/integration/app-smoke.test.ts`, and the App e2e endpoints) — there is no byte-pin gate any more. |
 
 ---
 
@@ -28,11 +28,12 @@ Run **all** of these from `/workspace/Mossaic` (or your local clone). Every box 
 
 - [ ] **Working tree clean**: `git status` reports no modifications, no untracked files.
 - [ ] **On the deploy branch**: `git rev-parse --abbrev-ref HEAD` is `main` (or the documented release branch).
-- [ ] **Legacy fetch byte-pin holds**:
-      ```
-      awk 'NR>=70 && NR<=263' worker/app/objects/user/user-do.ts | sha256sum
-      ```
-      MUST return `4c6eb84925cd8b34298aa92a5201c6e8074defb4527c3bbb1d2c677f9f2c8e70`. If different, **abort deploy** — the legacy app contract has drifted.
+- [ ] **App-mode contract intact**: the typed-RPC App surface
+      (`worker/app/objects/user/user-do.ts:appXxx` methods) is exercised end-to-end by the
+      integration suite. `pnpm test tests/integration/app-smoke.test.ts` and
+      `pnpm test tests/integration/multipart-routes.test.ts` MUST pass — these
+      pin the legacy photo-app HTTP wire shape that the SPA still depends on.
+      If either fails, **abort deploy** — the App contract has drifted.
 
 ### 1.2 Build + tests + proofs (all green, no skips)
 

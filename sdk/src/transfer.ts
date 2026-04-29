@@ -290,6 +290,265 @@ function quantile(arr: number[], q: number): number {
   return sorted[idx];
 }
 
+// ── Shared download engine (used by parallelDownload + parallelDownloadStream) ─
+
+/**
+ * Manifest shape consumed by the shared download engine. Mirrors the
+ * fields of `DownloadTokenResponse.manifest` actually used inside the
+ * engine — kept narrow so tests can supply a plain object without
+ * needing the full server-side response shape.
+ */
+interface DownloadEngineManifest {
+  fileId: string;
+  size: number;
+  chunkCount: number;
+  chunks: Array<{ index: number; hash: string; size: number }>;
+}
+
+/**
+ * Per-chunk sink. Called by the engine after a chunk has been fetched,
+ * hash-verified, and (optionally) `chunkTransform`'d.
+ *
+ * `parallelDownload` writes into a pre-allocated slot array.
+ * `parallelDownloadStream` stores into a reorder buffer and emits
+ * contiguous chunks to the stream controller.
+ *
+ * The sink runs on the same microtask as the chunk's settle, so any
+ * synchronous side effects (e.g. `streamController.enqueue`) are
+ * ordered with the rest of the engine's bookkeeping.
+ */
+type DownloadChunkSink = (idx: number, bytes: Uint8Array) => void;
+
+interface DownloadEngineOpts {
+  client: MossaicHttpClient;
+  path: string;
+  manifest: DownloadEngineManifest;
+  token: string;
+  parallel: ParallelDownloadOpts;
+  /** Per-chunk sink — see `DownloadChunkSink`. */
+  sink: DownloadChunkSink;
+  /**
+   * Optional secondary abort flag. Used by `parallelDownloadStream` to
+   * fail fast when the consumer cancels the ReadableStream — the lane
+   * + downloadOne loops short-circuit when this returns `true`.
+   * `parallelDownload` doesn't supply this (only `opts.signal` matters).
+   */
+  isAborted?: () => boolean;
+}
+
+interface DownloadEngineResult {
+  /** Bytes summed across all chunks (`ch.size`, not transformed). */
+  downloaded: number;
+  /** Number of chunks the engine settled successfully. */
+  chunksDone: number;
+}
+
+/**
+ * Adaptive download engine. Runs `manifest.chunkCount` per-chunk
+ * fetches against the cacheable `/api/vfs/readChunk` endpoint:
+ *
+ *   - probe-and-scale concurrency (4 → 64 default), gated by p95/p50
+ *     RTT ratio
+ *   - retry + jittered backoff per chunk (`MAX_RETRIES = 5`)
+ *   - endgame: when ≥ `endgameThreshold` of chunks done and pending
+ *     count ≤ `endgameMaxFanout`, spawn duplicate lanes (idempotent
+ *     re-fetch) to reduce tail latency
+ *   - emits `onManifest` once before any chunk events; `onChunkEvent`
+ *     per-chunk lifecycle (started → completed | retrying | failed);
+ *     `onProgress` throttled to ~10Hz
+ *
+ * Returns when all chunks have been delivered to `sink`. Throws if any
+ * chunk fails terminally (after retries) or if the abort signal fires.
+ */
+async function runAdaptiveDownloadEngine(
+  engineOpts: DownloadEngineOpts
+): Promise<DownloadEngineResult> {
+  const { client, path, manifest, token, parallel, sink, isAborted } =
+    engineOpts;
+  const totalChunks = manifest.chunkCount;
+  const totalSize = manifest.size;
+
+  const initial = parallel.concurrency?.initial ?? 4;
+  const min = parallel.concurrency?.min ?? 1;
+  const max = parallel.concurrency?.max ?? 64;
+  const state: AdaptiveState = {
+    active: 0,
+    target: Math.min(Math.max(initial, min), max),
+    min,
+    max,
+    rttMs: [],
+    successWindow: 0,
+    errorBackoffMs: 0,
+    endgameActive: false,
+    errorsRecovered: 0,
+  };
+
+  const pending = new Set<number>();
+  for (let i = 0; i < totalChunks; i++) pending.add(i);
+  let downloaded = 0;
+  let chunksDone = 0;
+
+  const onProgress = parallel.onProgress;
+  const onChunkEvent = parallel.onChunkEvent;
+  let lastProgressTs = 0;
+  function maybeProgress(): void {
+    if (!onProgress) return;
+    const now = Date.now();
+    if (now - lastProgressTs < 100 && chunksDone < totalChunks) return;
+    lastProgressTs = now;
+    onProgress({
+      uploaded: downloaded, // reuse the field as "bytes transferred"
+      total: totalSize,
+      chunksDone,
+      chunksTotal: totalChunks,
+      currentParallelism: state.active,
+      endgameActive: state.endgameActive,
+      rttP50Ms: quantile(state.rttMs, 0.5),
+      rttP95Ms: quantile(state.rttMs, 0.95),
+      errorsRecovered: state.errorsRecovered,
+    });
+  }
+
+  const MAX_RETRIES = 5;
+  function aborted(signal?: AbortSignal): boolean {
+    if (signal?.aborted) return true;
+    if (isAborted && isAborted()) return true;
+    return false;
+  }
+
+  async function downloadOne(idx: number, signal?: AbortSignal): Promise<void> {
+    let attempt = 0;
+    let startedEmitted = false;
+    while (true) {
+      if (aborted(signal)) throw new DOMException("aborted", "AbortError");
+      try {
+        if (!startedEmitted && onChunkEvent) {
+          onChunkEvent({ index: idx, state: "started" });
+          startedEmitted = true;
+        }
+        const t0 = performance.now();
+        const ch = manifest.chunks[idx];
+        const bytes = await client.fetchChunkByHash(
+          manifest.fileId,
+          idx,
+          ch.hash,
+          token,
+          path,
+          signal
+        );
+        // Hash verification — server divergence aborts.
+        const verify = await hashChunk(bytes);
+        if (verify !== ch.hash) {
+          throw new Error(
+            `chunk ${idx} hash mismatch (server=${verify}, manifest=${ch.hash})`
+          );
+        }
+        const transformed = parallel.chunkTransform
+          ? await parallel.chunkTransform(bytes, idx)
+          : bytes;
+        sink(idx, transformed);
+        downloaded += ch.size;
+        chunksDone++;
+        const elapsed = performance.now() - t0;
+        state.rttMs.push(elapsed);
+        if (state.rttMs.length > 32) state.rttMs.shift();
+        state.successWindow++;
+        if (state.target < state.max && state.successWindow >= 8) {
+          const p50 = quantile(state.rttMs, 0.5);
+          const p95 = quantile(state.rttMs, 0.95);
+          if (p95 < 1.2 * Math.max(p50, 1)) {
+            state.target = Math.min(state.target + 4, state.max);
+          }
+          state.successWindow = 0;
+        }
+        if (onChunkEvent) {
+          onChunkEvent({
+            index: idx,
+            state: "completed",
+            hash: ch.hash,
+            bytesAccepted: ch.size,
+          });
+        }
+        maybeProgress();
+        return;
+      } catch (err) {
+        attempt++;
+        const msg = (err as Error)?.message ?? String(err);
+        const isAbortErr =
+          (err as Error)?.name === "AbortError" || aborted(signal);
+        if (isAbortErr) throw err;
+        if (attempt >= MAX_RETRIES) {
+          if (onChunkEvent) {
+            onChunkEvent({
+              index: idx,
+              state: "failed",
+              attempt,
+              error: msg,
+            });
+          }
+          throw err;
+        }
+        if (onChunkEvent) {
+          onChunkEvent({
+            index: idx,
+            state: "retrying",
+            attempt,
+            error: msg,
+          });
+        }
+        state.errorsRecovered++;
+        await sleep(50 + attempt * 100 + Math.random() * 50);
+      }
+    }
+  }
+
+  async function lane(): Promise<void> {
+    while (true) {
+      if (aborted(parallel.signal))
+        throw new DOMException("aborted", "AbortError");
+      let pick: number | undefined;
+      for (const i of pending) {
+        if (pick === undefined || i < pick) pick = i;
+      }
+      if (pick === undefined) return;
+      pending.delete(pick);
+      try {
+        await downloadOne(pick, parallel.signal);
+      } catch (err) {
+        pending.add(pick);
+        throw err;
+      }
+    }
+  }
+
+  state.active = Math.min(state.target, pending.size);
+  const lanes: Promise<void>[] = [];
+  for (let w = 0; w < state.active; w++) {
+    lanes.push(lane());
+  }
+  const endgameThreshold = parallel.endgameThreshold ?? 0.9;
+  const endgameMaxFanout = parallel.endgameMaxFanout ?? 8;
+  const endgameLane = (async () => {
+    while (pending.size > 0 && !aborted(parallel.signal)) {
+      if (
+        !state.endgameActive &&
+        chunksDone / totalChunks >= endgameThreshold &&
+        pending.size <= endgameMaxFanout &&
+        pending.size > 0
+      ) {
+        state.endgameActive = true;
+        const extra = Math.min(pending.size, endgameMaxFanout);
+        for (let i = 0; i < extra; i++) lanes.push(lane());
+        return;
+      }
+      await sleep(50);
+    }
+  })();
+  await Promise.all(lanes);
+  await endgameLane;
+  return { downloaded, chunksDone };
+}
+
 /**
  * High-level parallel upload. Splits `source` into chunks of the
  * server-authoritative size, runs an adaptive concurrency engine,
@@ -669,10 +928,10 @@ export async function parallelDownload(
   const totalSize = manifest.size;
   const totalChunks = manifest.chunkCount;
 
-  // Phase 17.6: emit `onManifest` exactly once, before any chunk
-  // events. SPA uses this to seed per-chunk progress UI and capture
-  // mimeType for Blob construction. Inlined / empty files still get
-  // the manifest event before short-circuit returns.
+  // Emit `onManifest` exactly once, before any chunk events. The SPA
+  // uses this to seed per-chunk progress UI and capture mimeType for
+  // Blob construction. Inlined / empty files still get the manifest
+  // event before the short-circuit returns.
   if (opts.onManifest) {
     opts.onManifest({
       fileId: manifest.fileId,
@@ -693,204 +952,26 @@ export async function parallelDownload(
     return new Uint8Array(0);
   }
 
-  // For each chunk, fetch via the cacheable per-chunk endpoint.
-  // The chunk's `shardIndex` is intentionally hidden by the manifest
-  // (see vfs-ops.ts:openManifest comment), so we route through the
-  // `/api/vfs/readChunk` endpoint which does the lookup server-side.
-  // `path` is captured per-call (no shared mutable state on the
-  // client) so concurrent `parallelDownload` calls on the same
-  // client are race-free.
-  const initial = opts.concurrency?.initial ?? 4;
-  const min = opts.concurrency?.min ?? 1;
-  const max = opts.concurrency?.max ?? 64;
-  const state: AdaptiveState = {
-    active: 0,
-    target: Math.min(Math.max(initial, min), max),
-    min,
-    max,
-    rttMs: [],
-    successWindow: 0,
-    errorBackoffMs: 0,
-    endgameActive: false,
-    errorsRecovered: 0,
-  };
-
   // Pre-allocate per-chunk slots. When `chunkTransform` is used (e.g.
-  // unseal), each chunk's POST-transform size is unknown
-  // until the transform runs — envelopes are larger than plaintext.
-  // We collect transformed-bytes into a per-index slot and concat at
-  // the end. Without `chunkTransform`, we still concat per-index for
-  // uniformity (one alloc per chunk; cheap).
-  //
+  // unseal), each chunk's post-transform size is unknown until the
+  // transform runs — envelopes are larger than plaintext. We collect
+  // transformed-bytes into a per-index slot and concat at the end.
   // Why not pre-allocate the full output? When `chunkTransform`
   // shrinks bytes (decrypt), `manifest.size` would be the envelope
   // size — wrong. Per-slot collection sidesteps the problem entirely.
   const slots = new Array<Uint8Array>(totalChunks);
 
-  const pending = new Set<number>();
-  for (let i = 0; i < totalChunks; i++) pending.add(i);
-  let downloaded = 0;
-  let chunksDone = 0;
+  await runAdaptiveDownloadEngine({
+    client,
+    path,
+    manifest,
+    token: dl.token,
+    parallel: opts,
+    sink: (idx, bytes) => {
+      slots[idx] = bytes;
+    },
+  });
 
-  const onProgress = opts.onProgress;
-  // Phase 17.6: hoist per-chunk event callback (zero-overhead when undefined).
-  const onChunkEvent = opts.onChunkEvent;
-  let lastProgressTs = 0;
-  function maybeProgress() {
-    if (!onProgress) return;
-    const now = Date.now();
-    if (now - lastProgressTs < 100 && chunksDone < totalChunks) return;
-    lastProgressTs = now;
-    onProgress({
-      uploaded: downloaded, // reuse the field as "bytes transferred"
-      total: totalSize,
-      chunksDone,
-      chunksTotal: totalChunks,
-      currentParallelism: state.active,
-      endgameActive: state.endgameActive,
-      rttP50Ms: quantile(state.rttMs, 0.5),
-      rttP95Ms: quantile(state.rttMs, 0.95),
-      errorsRecovered: state.errorsRecovered,
-    });
-  }
-
-  const MAX_RETRIES = 5;
-  async function downloadOne(idx: number, signal?: AbortSignal): Promise<void> {
-    let attempt = 0;
-    let startedEmitted = false;
-    while (true) {
-      if (signal?.aborted) throw new DOMException("aborted", "AbortError");
-      try {
-        // Phase 17.6: emit `started` once per index on first attempt.
-        if (!startedEmitted && onChunkEvent) {
-          onChunkEvent({ index: idx, state: "started" });
-          startedEmitted = true;
-        }
-        const t0 = performance.now();
-        const ch = manifest.chunks[idx];
-        const bytes = await client.fetchChunkByHash(
-          manifest.fileId,
-          idx,
-          ch.hash,
-          dl.token,
-          path,
-          signal
-        );
-        // Verify hash matches the manifest's claim. This is a cheap
-        // integrity check — if it fails, the download endpoint
-        // returned the wrong bytes (corruption / bug).
-        const verify = await hashChunk(bytes);
-        if (verify !== ch.hash) {
-          throw new Error(
-            `chunk ${idx} hash mismatch (server=${verify}, manifest=${ch.hash})`
-          );
-        }
-        const transformed = opts.chunkTransform
-          ? await opts.chunkTransform(bytes, idx)
-          : bytes;
-        slots[idx] = transformed;
-        downloaded += ch.size;
-        chunksDone++;
-        const elapsed = performance.now() - t0;
-        state.rttMs.push(elapsed);
-        if (state.rttMs.length > 32) state.rttMs.shift();
-        state.successWindow++;
-        if (state.target < state.max && state.successWindow >= 8) {
-          const p50 = quantile(state.rttMs, 0.5);
-          const p95 = quantile(state.rttMs, 0.95);
-          if (p95 < 1.2 * Math.max(p50, 1)) {
-            state.target = Math.min(state.target + 4, state.max);
-          }
-          state.successWindow = 0;
-        }
-        // Phase 17.6: per-chunk `completed` event after success.
-        if (onChunkEvent) {
-          onChunkEvent({
-            index: idx,
-            state: "completed",
-            hash: ch.hash,
-            bytesAccepted: ch.size,
-          });
-        }
-        maybeProgress();
-        return;
-      } catch (err) {
-        attempt++;
-        const msg = (err as Error)?.message ?? String(err);
-        const aborted =
-          (err as Error)?.name === "AbortError" || signal?.aborted;
-        if (aborted) throw err;
-        if (attempt >= MAX_RETRIES) {
-          // Phase 17.6: terminal failure event.
-          if (onChunkEvent) {
-            onChunkEvent({
-              index: idx,
-              state: "failed",
-              attempt,
-              error: msg,
-            });
-          }
-          throw err;
-        }
-        // Phase 17.6: retrying notification.
-        if (onChunkEvent) {
-          onChunkEvent({
-            index: idx,
-            state: "retrying",
-            attempt,
-            error: msg,
-          });
-        }
-        state.errorsRecovered++;
-        await sleep(50 + attempt * 100 + Math.random() * 50);
-      }
-    }
-  }
-
-  async function lane(): Promise<void> {
-    while (true) {
-      if (opts.signal?.aborted)
-        throw new DOMException("aborted", "AbortError");
-      let pick: number | undefined;
-      for (const i of pending) {
-        if (pick === undefined || i < pick) pick = i;
-      }
-      if (pick === undefined) return;
-      pending.delete(pick);
-      try {
-        await downloadOne(pick, opts.signal);
-      } catch (err) {
-        pending.add(pick);
-        throw err;
-      }
-    }
-  }
-
-  state.active = Math.min(state.target, pending.size);
-  const lanes: Promise<void>[] = [];
-  for (let w = 0; w < state.active; w++) {
-    lanes.push(lane());
-  }
-  const endgameThreshold = opts.endgameThreshold ?? 0.9;
-  const endgameMaxFanout = opts.endgameMaxFanout ?? 8;
-  const endgameLane = (async () => {
-    while (pending.size > 0 && !opts.signal?.aborted) {
-      if (
-        !state.endgameActive &&
-        chunksDone / totalChunks >= endgameThreshold &&
-        pending.size <= endgameMaxFanout &&
-        pending.size > 0
-      ) {
-        state.endgameActive = true;
-        const extra = Math.min(pending.size, endgameMaxFanout);
-        for (let i = 0; i < extra; i++) lanes.push(lane());
-        return;
-      }
-      await sleep(50);
-    }
-  })();
-  await Promise.all(lanes);
-  await endgameLane;
   // Concatenate per-chunk slots in index order. When `chunkTransform`
   // is the identity, this matches `manifest.size`; when it shrinks
   // bytes (decrypt), the output is the post-transform size.
@@ -944,8 +1025,8 @@ export async function parallelDownloadStream(
   const manifest = dl.manifest;
   const totalChunks = manifest.chunkCount;
 
-  // Phase 17.6: emit `onManifest` exactly once before any chunk
-  // events. Mirrors `parallelDownload`.
+  // Emit `onManifest` exactly once before any chunk events. Mirrors
+  // `parallelDownload`.
   if (opts.onManifest) {
     opts.onManifest({
       fileId: manifest.fileId,
@@ -971,57 +1052,19 @@ export async function parallelDownloadStream(
     });
   }
 
-  // `path` is captured per-call (no shared mutable state on the
-  // client) so concurrent downloads on the same client are race-free.
-  const initial = opts.concurrency?.initial ?? 4;
-  const min = opts.concurrency?.min ?? 1;
-  const max = opts.concurrency?.max ?? 64;
-  const state: AdaptiveState = {
-    active: 0,
-    target: Math.min(Math.max(initial, min), max),
-    min,
-    max,
-    rttMs: [],
-    successWindow: 0,
-    errorBackoffMs: 0,
-    endgameActive: false,
-    errorsRecovered: 0,
-  };
-
   // Reorder buffer: completed[idx] holds bytes once the chunk
   // download finishes. `nextEmit` is the next index we'll push to
   // the consumer. We only push when `completed[nextEmit]` exists,
-  // then advance.
+  // then advance. The shared engine writes to `completed` via the
+  // sink; this function owns the controller, ordering, and abort
+  // semantics that are stream-specific.
   const completed = new Map<number, Uint8Array>();
   let nextEmit = 0;
   let chunksDone = 0;
-  let downloaded = 0;
   let streamController: ReadableStreamDefaultController<Uint8Array> | null =
     null;
   let pulled = false;
   let aborted = false;
-
-  const onProgress = opts.onProgress;
-  // Phase 17.6: hoist per-chunk event callback (zero-overhead when undefined).
-  const onChunkEvent = opts.onChunkEvent;
-  let lastProgressTs = 0;
-  function maybeProgress() {
-    if (!onProgress) return;
-    const now = Date.now();
-    if (now - lastProgressTs < 100 && chunksDone < totalChunks) return;
-    lastProgressTs = now;
-    onProgress({
-      uploaded: downloaded,
-      total: manifest.size,
-      chunksDone,
-      chunksTotal: totalChunks,
-      currentParallelism: state.active,
-      endgameActive: state.endgameActive,
-      rttP50Ms: quantile(state.rttMs, 0.5),
-      rttP95Ms: quantile(state.rttMs, 0.95),
-      errorsRecovered: state.errorsRecovered,
-    });
-  }
 
   function emitContiguous(): void {
     while (
@@ -1039,120 +1082,6 @@ export async function parallelDownloadStream(
     }
   }
 
-  const pending = new Set<number>();
-  for (let i = 0; i < totalChunks; i++) pending.add(i);
-
-  const MAX_RETRIES = 5;
-  async function downloadOne(idx: number, signal?: AbortSignal): Promise<void> {
-    let attempt = 0;
-    let startedEmitted = false;
-    while (true) {
-      if (signal?.aborted || aborted) {
-        throw new DOMException("aborted", "AbortError");
-      }
-      try {
-        // Phase 17.6: emit `started` once per index on first attempt.
-        if (!startedEmitted && onChunkEvent) {
-          onChunkEvent({ index: idx, state: "started" });
-          startedEmitted = true;
-        }
-        const t0 = performance.now();
-        const ch = manifest.chunks[idx];
-        const bytes = await client.fetchChunkByHash(
-          manifest.fileId,
-          idx,
-          ch.hash,
-          dl.token,
-          path,
-          signal
-        );
-        const verify = await hashChunk(bytes);
-        if (verify !== ch.hash) {
-          throw new Error(
-            `chunk ${idx} hash mismatch (server=${verify}, manifest=${ch.hash})`
-          );
-        }
-        const transformed = opts.chunkTransform
-          ? await opts.chunkTransform(bytes, idx)
-          : bytes;
-        completed.set(idx, transformed);
-        downloaded += ch.size;
-        chunksDone++;
-        const elapsed = performance.now() - t0;
-        state.rttMs.push(elapsed);
-        if (state.rttMs.length > 32) state.rttMs.shift();
-        state.successWindow++;
-        if (state.target < state.max && state.successWindow >= 8) {
-          const p50 = quantile(state.rttMs, 0.5);
-          const p95 = quantile(state.rttMs, 0.95);
-          if (p95 < 1.2 * Math.max(p50, 1)) {
-            state.target = Math.min(state.target + 4, state.max);
-          }
-          state.successWindow = 0;
-        }
-        // Phase 17.6: per-chunk `completed` event after success.
-        if (onChunkEvent) {
-          onChunkEvent({
-            index: idx,
-            state: "completed",
-            hash: ch.hash,
-            bytesAccepted: ch.size,
-          });
-        }
-        maybeProgress();
-        emitContiguous();
-        return;
-      } catch (err) {
-        attempt++;
-        const msg = (err as Error)?.message ?? String(err);
-        const isAborted =
-          (err as Error)?.name === "AbortError" || signal?.aborted;
-        if (isAborted) throw err;
-        if (attempt >= MAX_RETRIES) {
-          if (onChunkEvent) {
-            onChunkEvent({
-              index: idx,
-              state: "failed",
-              attempt,
-              error: msg,
-            });
-          }
-          throw err;
-        }
-        if (onChunkEvent) {
-          onChunkEvent({
-            index: idx,
-            state: "retrying",
-            attempt,
-            error: msg,
-          });
-        }
-        state.errorsRecovered++;
-        await sleep(50 + attempt * 100 + Math.random() * 50);
-      }
-    }
-  }
-
-  async function lane(): Promise<void> {
-    while (true) {
-      if (opts.signal?.aborted || aborted) {
-        throw new DOMException("aborted", "AbortError");
-      }
-      let pick: number | undefined;
-      for (const i of pending) {
-        if (pick === undefined || i < pick) pick = i;
-      }
-      if (pick === undefined) return;
-      pending.delete(pick);
-      try {
-        await downloadOne(pick, opts.signal);
-      } catch (err) {
-        pending.add(pick);
-        throw err;
-      }
-    }
-  }
-
   return new ReadableStream<Uint8Array>({
     start(controller) {
       streamController = controller;
@@ -1162,30 +1091,23 @@ export async function parallelDownloadStream(
       pulled = true;
       void (async () => {
         try {
-          state.active = Math.min(state.target, pending.size);
-          const lanes: Promise<void>[] = [];
-          for (let w = 0; w < state.active; w++) lanes.push(lane());
-          const endgameThreshold = opts.endgameThreshold ?? 0.9;
-          const endgameMaxFanout = opts.endgameMaxFanout ?? 8;
-          const endgameLane = (async () => {
-            while (pending.size > 0 && !opts.signal?.aborted && !aborted) {
-              if (
-                !state.endgameActive &&
-                chunksDone / totalChunks >= endgameThreshold &&
-                pending.size <= endgameMaxFanout &&
-                pending.size > 0
-              ) {
-                state.endgameActive = true;
-                const extra = Math.min(pending.size, endgameMaxFanout);
-                for (let i = 0; i < extra; i++) lanes.push(lane());
-                return;
-              }
-              await sleep(50);
-            }
-          })();
-          await Promise.all(lanes);
-          await endgameLane;
-          // Final emit + close.
+          await runAdaptiveDownloadEngine({
+            client,
+            path,
+            manifest,
+            token: dl.token,
+            parallel: opts,
+            sink: (idx, bytes) => {
+              completed.set(idx, bytes);
+              chunksDone++;
+              emitContiguous();
+            },
+            isAborted: () => aborted,
+          });
+          // Final emit + close. The sink above closed the stream the
+          // moment the last in-order chunk arrived; this catches the
+          // case where an out-of-order tail chunk was sitting in the
+          // reorder buffer at engine exit.
           emitContiguous();
         } catch (err) {
           aborted = true;
