@@ -1,7 +1,7 @@
 import { SignJWT, jwtVerify } from "jose";
 import type { Context, MiddlewareHandler } from "hono";
 import { JWT_EXPIRATION_MS } from "../../../shared/constants";
-import type { Env } from "../../../shared/types";
+import type { EnvCore as Env } from "../../../shared/types";
 
 /**
  * Thrown at request-time when `JWT_SECRET` is missing or empty.

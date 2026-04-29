@@ -1,17 +1,14 @@
+import type { Folder, FileManifest, ApiError as ApiErrorResponse, UserFile } from "@shared/types";
 import type {
   AuthResponse,
   FileListResponse,
   UploadInitRequest,
   UploadInitResponse,
   CreateFolderRequest,
-  Folder,
-  FileManifest,
   AnalyticsOverview,
-  ApiError as ApiErrorResponse,
-  UserFile,
   GalleryPhotosResponse,
   SharedAlbumPhotosResponse,
-} from "@shared/types";
+} from "@app/types";
 import type {
   SearchResult,
   ProviderStatus,

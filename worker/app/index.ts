@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import type { Env } from "@shared/types";
+import type { EnvApp as Env } from "@shared/types";
 import authRoutes from "./routes/auth";
 import uploadRoutes from "./routes/upload";
 import downloadRoutes from "./routes/download";

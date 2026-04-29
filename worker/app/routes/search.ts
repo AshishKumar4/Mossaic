@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import type { Env } from "@shared/types";
+import type { EnvApp as Env } from "@shared/types";
 import type { SearchResult, ProviderStatus, VectorSpace } from "@shared/embedding-types";
 import { classifyResultType, isClipIndexable, isImageMime } from "@shared/embedding-types";
 import { authMiddleware } from "@core/lib/auth";

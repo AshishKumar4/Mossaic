@@ -1,6 +1,6 @@
 import { useState, useCallback, useEffect } from "react";
 import { useAuth } from "@/lib/auth";
-import type { Album, SharedAlbum } from "@shared/types";
+import type { Album, SharedAlbum } from "@app/types";
 
 const ALBUMS_KEY = "mossaic_albums";
 const SHARES_KEY = "mossaic_shares";

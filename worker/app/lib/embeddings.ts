@@ -1,5 +1,5 @@
 import type { EmbeddingProvider, ImageEmbeddingProvider, VectorSpace } from "@shared/embedding-types";
-import type { Env } from "@shared/types";
+import type { EnvApp as Env } from "@shared/types";
 
 // ── Simple Embedding (TF-IDF-like bag-of-words) ──
 // Always available — no external dependencies. Not as good as real embeddings

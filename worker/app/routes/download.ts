@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import type { Env } from "@shared/types";
+import type { EnvApp as Env } from "@shared/types";
 import { authMiddleware } from "@core/lib/auth";
 import { userDOName, shardDOName } from "@core/lib/utils";
 

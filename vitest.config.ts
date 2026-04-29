@@ -33,6 +33,7 @@ export default defineWorkersConfig({
     alias: {
       "@shared": new URL("./shared", import.meta.url).pathname,
       "@core": new URL("./worker/core", import.meta.url).pathname,
+      "@app": new URL("./worker/app", import.meta.url).pathname,
     },
   },
 });

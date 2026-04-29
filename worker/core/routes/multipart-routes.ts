@@ -23,7 +23,7 @@
 
 import { Hono } from "hono";
 import type { MiddlewareHandler } from "hono";
-import type { Env } from "../../../shared/types";
+import type { EnvCore as Env } from "../../../shared/types";
 import type { VFSScope } from "../../../shared/vfs-types";
 import type { UserDOCore } from "../objects/user/user-do-core";
 import type { ShardDO } from "../objects/shard/shard-do";

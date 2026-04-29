@@ -32,7 +32,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import type { GalleryPhoto, Album } from "@shared/types";
+import type { GalleryPhoto, Album } from "@app/types";
 
 // ── Album Cover ─────────────────────
 function AlbumCover({ fileId }: { fileId: string | null }) {

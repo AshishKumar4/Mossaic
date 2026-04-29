@@ -1,6 +1,6 @@
 import { useState, useCallback, useEffect, useMemo } from "react";
 import { api, ApiError } from "@/lib/api";
-import type { GalleryPhoto } from "@shared/types";
+import type { GalleryPhoto } from "@app/types";
 
 interface DateGroup {
   date: string;

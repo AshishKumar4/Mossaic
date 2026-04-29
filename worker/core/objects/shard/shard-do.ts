@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import type { Env } from "../../../../shared/types";
+import type { EnvCore as Env } from "../../../../shared/types";
 
 export class ShardDO extends DurableObject<Env> {
   sql: SqlStorage;

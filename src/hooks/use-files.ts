@@ -1,6 +1,7 @@
 import { useState, useCallback, useEffect } from "react";
 import { api, ApiError } from "@/lib/api";
-import type { UserFile, Folder, FileListResponse } from "@shared/types";
+import type { UserFile, Folder } from "@shared/types";
+import type { FileListResponse } from "@app/types";
 
 interface FilesState {
   files: UserFile[];

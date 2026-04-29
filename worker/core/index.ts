@@ -31,7 +31,7 @@
  */
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import type { Env } from "../../shared/types";
+import type { EnvCore as Env } from "../../shared/types";
 import vfsRoutes from "./routes/vfs";
 import yjsWsRoutes from "./routes/vfs-yjs-ws";
 import multipartRoutes, { chunkDownload } from "./routes/multipart-routes";

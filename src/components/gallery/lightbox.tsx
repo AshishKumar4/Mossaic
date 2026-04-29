@@ -15,7 +15,7 @@ import { cn, formatBytes, formatDate } from "@/lib/utils";
 import { useImageLoader } from "@/hooks/use-image-loader";
 import { useDownload } from "@/hooks/use-download";
 import { Button } from "@/components/ui/button";
-import type { GalleryPhoto } from "@shared/types";
+import type { GalleryPhoto } from "@app/types";
 
 interface LightboxProps {
   photos: GalleryPhoto[];

@@ -1,6 +1,6 @@
 import type { VectorStore } from "@shared/embedding-types";
 import type { VectorSpace } from "@shared/embedding-types";
-import type { Env } from "@shared/types";
+import type { EnvApp as Env } from "@shared/types";
 
 // ── Durable Object Vector Store ──
 // Stores vectors in the SearchDO Durable Object with SQLite.

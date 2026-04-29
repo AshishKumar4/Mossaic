@@ -1,12 +1,12 @@
 import { DurableObject } from "cloudflare:workers";
+import type { EnvApp } from "@shared/types";
 import type {
-  Env,
   UserStats,
   UserFilesByStatus,
   MimeDistribution,
   RecentUpload,
   ShardDistribution,
-} from "@shared/types";
+} from "../../types";
 import { handleSignup, handleLogin } from "./auth";
 import {
   createFile,

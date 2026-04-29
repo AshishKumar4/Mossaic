@@ -1,6 +1,6 @@
 import { motion, AnimatePresence } from "framer-motion";
 import { X, Upload, Download, CheckCircle2, AlertCircle } from "lucide-react";
-import type { TransferProgress } from "@shared/types";
+import type { TransferProgress } from "@app/types";
 import { cn, formatBytes } from "@/lib/utils";
 import { Progress } from "@/components/ui/progress";
 import { Button } from "@/components/ui/button";

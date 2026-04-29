@@ -3,12 +3,7 @@ import { api } from "@/lib/api";
 import { MAX_RETRIES, RETRY_BASE_DELAY } from "@shared/constants";
 import { AIMDController } from "@shared/aimd";
 import { addTransferStats } from "@/lib/transfer-stats";
-import type {
-  TransferProgress,
-  ChunkProgress,
-  ChunkStatus,
-  CompletedTransferStats,
-} from "@shared/types";
+import type { TransferProgress, ChunkProgress, ChunkStatus, CompletedTransferStats } from "@app/types";
 
 export function useDownload() {
   const [transfers, setTransfers] = useState<Map<string, TransferProgress>>(

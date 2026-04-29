@@ -49,7 +49,7 @@
  */
 
 import { Hono } from "hono";
-import type { Env } from "../../../shared/types";
+import type { EnvCore as Env } from "../../../shared/types";
 import { verifyVFSToken, VFSConfigError } from "../lib/auth";
 import { vfsUserDOName } from "../lib/utils";
 

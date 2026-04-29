@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import type { Env } from "../../../shared/types";
+import type { EnvCore as Env } from "../../../shared/types";
 import type { MiddlewareHandler } from "hono";
 import { verifyVFSToken, VFSConfigError } from "../lib/auth";
 import { vfsUserDOName } from "../lib/utils";
