@@ -11,6 +11,7 @@ import { registerPhase12 } from "./phase12.js";
 import { registerVersions } from "./versions.js";
 import { registerYjs } from "./yjs.js";
 import { registerToken } from "./token.js";
+import { registerEncryption } from "./encryption.js";
 
 export function registerCommands(program: Command): void {
   registerAuth(program);
@@ -19,6 +20,7 @@ export function registerCommands(program: Command): void {
   registerVersions(program);
   registerYjs(program);
   registerToken(program);
+  registerEncryption(program);
 }
 
 // Shared types/helpers used across command files.

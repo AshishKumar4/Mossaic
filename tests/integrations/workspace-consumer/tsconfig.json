@@ -14,7 +14,10 @@
     "verbatimModuleSyntax": true,
     "erasableSyntaxOnly": true,
     "types": ["@cloudflare/workers-types"],
-    "customConditions": ["workspace"]
+    "customConditions": ["workspace"],
+    "paths": {
+      "@shared/*": ["../../../shared/*"]
+    }
   },
   "include": ["src"]
 }

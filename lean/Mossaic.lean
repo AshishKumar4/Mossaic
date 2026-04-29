@@ -6,6 +6,7 @@ import Mossaic.Vfs.Refcount
 import Mossaic.Vfs.Gc
 import Mossaic.Vfs.AtomicWrite
 import Mossaic.Vfs.Versioning
+import Mossaic.Vfs.Encryption
 import Mossaic.Generated.ShardDO
 import Mossaic.Generated.UserDO
 import Mossaic.Generated.Placement

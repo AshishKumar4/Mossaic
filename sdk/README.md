@@ -530,6 +530,112 @@ if ((stat.mode & VFS_MODE_YJS_BIT) !== 0) {
 - **Awareness is relay-only and never persisted.** The server forwards awareness frames between connected editors but never writes them to SQLite. On DO eviction the per-pathId Awareness instance resets; clients re-broadcast their state on reconnect (this is the same behavior as a vanilla y-websocket server).
 - **`YDocHandle` shape (Phase 13).** `{ doc: Y.Doc, awareness: Awareness, synced: Promise<void>, close(): Promise<void>, flush({ label? }): Promise<{ versionId, checkpointSeq }>, onClose(cb), onError(cb) }`. Note: there is no `handle.on("sync")` or `handle.on("update")` event-emitter surface. Subscribe to `doc` and `awareness` instances directly via their respective `on(...)` methods.
 
+## End-to-end encryption (opt-in, Phase 15)
+
+Mossaic optionally encrypts file content with AES-GCM-256 before it leaves the consumer Worker. The Mossaic server NEVER decrypts user data — it stores opaque envelopes and the per-file `(encryption_mode, encryption_key_id)` columns. Loss of the master key = permanent data loss; there is no recovery path.
+
+### Quickstart
+
+```ts
+import {
+  createVFS,
+  type EncryptionConfig,
+} from "@mossaic/sdk";
+import { deriveMasterFromPassword } from "@mossaic/sdk/encryption";
+
+const tenantSalt = /* 32 stable random bytes per tenant; treat as data, not a secret */;
+const masterKey = await deriveMasterFromPassword("user-password", tenantSalt);
+// Or: get raw 32-byte key bytes from your KMS / OS-keychain.
+
+const vfs = createVFS(env, {
+  tenant: "alice",
+  encryption: { masterKey, tenantSalt /*, mode: "convergent" by default */ },
+});
+
+await vfs.writeFile("/secret.txt", "private data", { encrypted: true });
+const back = await vfs.readFile("/secret.txt"); // auto-decrypted
+```
+
+### Modes
+
+| Mode | When to use | Storage savings |
+|---|---|---|
+| `convergent` (default) | When dedup matters (image libraries, document repositories). Identical plaintexts under the same `(masterKey, tenantSalt)` produce identical envelopes — cross-file dedup works as before. **Within-tenant equality oracle is the documented cost**: an attacker holding two ciphertexts can determine `pt(a) = pt(b)` but recovers no plaintext bytes. Cross-tenant leak is impossible by salt-distinct construction. |  Full dedup preserved |
+| `random` | High-secrecy tenants. Fresh 96-bit IV + per-chunk DEK wrapped under the master via AES-KW. No determinism, no dedup, no equality oracle. IND-CPA secure. | Dedup lost; ~2× storage |
+
+Pick at the VFS level (`encryption.mode`) or per-call (`writeFile(p, d, { encrypted: { mode: "random" } })`). Mode-history is monotonic per path: once a path is encrypted with mode X, all future writes must be mode X (server enforces with `EBADF`).
+
+### What's encrypted
+
+| Surface | Encrypted? | AAD tag |
+|---|---|---|
+| File content (writeFile / readFile) | YES when `{ encrypted: true }` | `ck` |
+| Yjs sync_step_2 / update / awareness payloads (per-file E2E) | YES when the file is encrypted | `yj` / `aw` |
+| File metadata, tags, mode, mtime, path | NO (plaintext at the server) | — |
+| Yjs state vectors (sync_step_1) | NO (vectors don't reveal content) | — |
+
+### Yjs interaction (encrypted CRDT editing)
+
+Encrypted Yjs files preserve the standard `openYDoc` API:
+
+```ts
+import { openYDoc } from "@mossaic/sdk/yjs";
+
+const handle = await openYDoc(vfs, "/notes.md");
+// handle.encrypted === true when the file is encrypted
+handle.doc.getText("content").insert(0, "secret edit");
+```
+
+**Server-side compaction is disabled for encrypted Yjs** (the server can't materialize the doc). The client compacts via `vfs.compactYjs(path)`:
+
+```ts
+// React to the server's tag-4 compact-please advisory:
+handle.onCompactNeeded(async (seqCount) => {
+  await vfs.compactYjs("/notes.md");
+});
+```
+
+Or call `vfs.compactYjs(path)` on a timer. Backpressure: at 500 envelopes + 100 MB + 7 days inactivity, server rejects further writes with `EBUSY` until the consumer compacts.
+
+### Key custody — your responsibility
+
+Mossaic NEVER stores master keys. Recommendations:
+
+| Environment | Storage |
+|---|---|
+| Browser | WebCrypto + IndexedDB non-extractable `CryptoKey` |
+| Node.js / Worker | KMS (AWS KMS, GCP KMS, etc.) — unwrap on cold start |
+| CLI | PBKDF2 over an interactive password (use `deriveMasterFromPassword`) |
+
+PBKDF2 cost (~250–400 ms at 600k iterations, OWASP 2024) is paid once per session.
+
+### Migrating existing plaintext files
+
+```ts
+import { migrateEncrypt } from "@mossaic/sdk/encryption";
+
+await migrateEncrypt(vfs, "/path/to/file");        // single file (atomic per file)
+// or, in bulk via the CLI:
+//   $ mossaic encrypt /path/to/file --mode=convergent
+//   $ mossaic encrypt --prefix=/photos/ --mode=convergent
+```
+
+Mossaic NEVER auto-encrypts. Pre-Phase-15 files remain plaintext until the consumer opts in.
+
+### Limits & known gotchas
+
+- **Master-key loss is permanent.** Mossaic cannot recover. Document this prominently to your end-users.
+- **Convergent mode leaks plaintext-equality within a tenant** (documented; switch to `random` if undesirable). Cross-tenant leak is structurally impossible.
+- **Encrypted Yjs cold-open starts blank** when no peer with the master key is connected (the server can't bootstrap state). Surviving peers re-broadcast on reconnect.
+- **Re-keying convergent files breaks dedup transitively.** Post-rotation, the chunks table size temporarily ~doubles until the alarm sweeper reaps the old envelopes.
+- **`vfs.destroy()` zeroes the in-memory master key.** Call this when you're done with the VFS instance (best-effort; defense-in-depth).
+
+### See also
+
+- [`local/phase-15-plan.md`](../local/phase-15-plan.md) — full design doc (envelope layout, IND-CPA + dedup-oracle theorems, race-rule analysis).
+- [`lean/Mossaic/Vfs/Encryption.lean`](../lean/Mossaic/Vfs/Encryption.lean) — formal proof obligations + the single new `AES_GCM_IND_CPA` axiom.
+- [`@mossaic/cli`](../cli/README.md) — `mossaic encrypt`, `mossaic decrypt-readback`, `mossaic rotate-key` for command-line use.
+
 ## Phase 12: copy, metadata, tags, indexed listFiles, version marks
 
 Phase 12 extends the surface with five additive primitives. None change Phase 11 byte-equivalence: a tenant that never calls these methods sees no behavior change. All caps are enforced server-side and live in `shared/metadata-caps.ts`.

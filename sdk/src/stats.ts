@@ -47,6 +47,14 @@ export class VFSStat {
   readonly blksize = 4096;
   readonly blocks: number;
 
+  /**
+   * Phase 15: per-file encryption stamp. Undefined for plaintext
+   * files (default for pre-Phase-15 rows and explicit plaintext
+   * writes). Consumers wanting to detect encrypted files can call
+   * `stat(p)` and inspect this field.
+   */
+  readonly encryption?: { mode: "convergent" | "random"; keyId?: string };
+
   constructor(raw: VFSStatRaw) {
     this.type = raw.type;
     this.mode = raw.mode;
@@ -65,6 +73,9 @@ export class VFSStat {
     this.ino = raw.ino;
     // POSIX-ish: blocks count = ceil(size / 512)
     this.blocks = Math.ceil(raw.size / 512);
+    if (raw.encryption !== undefined) {
+      this.encryption = raw.encryption;
+    }
   }
 
   isFile(): boolean {
