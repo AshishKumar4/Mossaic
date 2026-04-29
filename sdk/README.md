@@ -1055,7 +1055,7 @@ The SDK ships with:
 - `tests/integration/streaming.test.ts` — read/write streams, byte-range, handle-based primitives
 - `tests/integration/tenant-isolation.test.ts` — cross-tenant impossibility
 - `tests/integration/readmany-stat.test.ts` — git-status-style batched lstat
-- ... plus path-walk, ino, refcount, migration, legacy-smoke, vfs-read, vfs-write
+- ... plus path-walk, ino, refcount, migration, app-smoke, vfs-read, vfs-write
 
 Run `pnpm test` at the repo root.
 

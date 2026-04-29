@@ -6,7 +6,7 @@ import {
   verifyVFSToken,
   VFSConfigError,
 } from "@core/lib/auth";
-import type { Env } from "@shared/types";
+import type { EnvCore as Env } from "@shared/types";
 
 /**
  * C1 (audit-report.md) — JWT_SECRET fallback removal.
