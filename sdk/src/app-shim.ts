@@ -81,9 +81,15 @@ export function createAppVFS(
   env: MossaicEnv,
   opts: CreateAppVFSOptions
 ): VFS {
+  // Spread `opts` first so caller-supplied fields (versioning, encryption,
+  // etc.) flow through; then OVERWRITE `tenant` with `userId` and pin
+  // `placement` to the legacy App addressing. The order matters: a
+  // caller-supplied `tenant` (if `CreateAppVFSOptions` ever surfaces one)
+  // must NOT win over `userId`, since the legacy App's UserDO instances
+  // are named exclusively by userId.
   return new VFS(env, {
-    tenant: opts.userId,
     ...opts,
+    tenant: opts.userId,
     placement: legacyAppPlacement,
   });
 }
