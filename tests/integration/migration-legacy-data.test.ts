@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
+import type { UserDO } from "@app/objects/user/user-do";
 
 /**
  * Phase 26 — legacy-data migration tests (audit gap G7 /
@@ -38,7 +39,6 @@ import { env, runInDurableObject } from "cloudflare:test";
 import {
   createVFS,
   type MossaicEnv,
-  type UserDO,
 } from "../../sdk/src/index";
 import { vfsUserDOName } from "@core/lib/utils";
 
@@ -50,7 +50,10 @@ const E = env as unknown as E;
 const NS = "default";
 
 function envFor(): MossaicEnv {
-  return { MOSSAIC_USER: E.MOSSAIC_USER as MossaicEnv["MOSSAIC_USER"] };
+  return {
+    MOSSAIC_USER: E.MOSSAIC_USER as MossaicEnv["MOSSAIC_USER"],
+    MOSSAIC_SHARD: E.MOSSAIC_SHARD as unknown as MossaicEnv["MOSSAIC_SHARD"],
+  };
 }
 function userStub(tenant: string) {
   return E.MOSSAIC_USER.get(

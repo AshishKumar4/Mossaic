@@ -74,6 +74,19 @@ interface ListFilesOpts {
    * The CLI / SPA / typical SDK consumer should never pass this.
    */
   includeTombstones?: boolean;
+  /**
+   * Phase 29 — archive bit.
+   *
+   * Default `false`: rows where `files.archived = 1` are EXCLUDED
+   * from results. Archive is the third tier of the delete API
+   * (alongside unlink and purge); a "Hidden" / "Trash" UI surfaces
+   * by passing `includeArchived: true` and either showing only
+   * those rows or the full set.
+   *
+   * Read surfaces (`stat`, `readFile`, etc.) are NOT gated by this
+   * — archived files remain readable by anyone who knows the path.
+   */
+  includeArchived?: boolean;
 }
 
 export interface FileInfoOpts {
@@ -86,6 +99,16 @@ export interface FileInfoOpts {
    * for admin/recovery surfaces.
    */
   includeTombstones?: boolean;
+  /**
+   * Phase 29 — archive filter.
+   *
+   * Default `false`: a path resolving to a row with `archived = 1`
+   * throws ENOENT (matches the `listFiles` exclusion). Set to
+   * `true` to surface archived files in admin/recovery surfaces.
+   * Read surfaces are NOT gated by this — `vfs.stat` /
+   * `vfs.readFile` always succeed on archived paths.
+   */
+  includeArchived?: boolean;
 }
 
 const FILE_NODE_KIND = "file";
@@ -103,6 +126,7 @@ export async function vfsListFiles(
   const includeStat = opts.includeStat !== false;
   const includeMetadata = opts.includeMetadata === true;
   const includeTombstones = opts.includeTombstones === true;
+  const includeArchived = opts.includeArchived === true;
 
   if (opts.tags && opts.tags.length > TAGS_MAX_PER_LIST_QUERY) {
     throw new VFSError(
@@ -145,7 +169,8 @@ export async function vfsListFiles(
       direction,
       cursor,
       limit,
-      includeTombstones
+      includeTombstones,
+      includeArchived
     );
   } else {
     // "prefix" or "none" — both use the files index.
@@ -158,7 +183,8 @@ export async function vfsListFiles(
       cursor,
       limit,
       opts.tags,
-      includeTombstones
+      includeTombstones,
+      includeArchived
     );
   }
 
@@ -177,7 +203,8 @@ export async function vfsListFiles(
       c.pathId,
       includeStat,
       includeMetadata,
-      includeTombstones
+      includeTombstones,
+      includeArchived
     );
     if (item) items.push(item);
   }
@@ -231,7 +258,13 @@ export async function vfsFileInfo(
     // fileInfo is a strict-stat surface by default: a tombstoned
     // head IS ENOENT, matching `vfsStat`/`vfsReadFile`. Admin /
     // recovery callers can opt in via `includeTombstones: true`.
-    opts.includeTombstones === true
+    opts.includeTombstones === true,
+    // Phase 29 — archive default is also strict: archived files are
+    // ENOENT to fileInfo unless the caller opts in. Note this is
+    // STRICTER than `stat` / `readFile` (which never gate on
+    // archived) — fileInfo is the listing-shape surface, and a UI
+    // building a "Trash" view must opt in explicitly.
+    opts.includeArchived === true
   );
   if (!item) throw new VFSError("ENOENT", `fileInfo: path not found: ${path}`);
   return item;
@@ -286,7 +319,8 @@ function listByFiles(
   cursor: CursorPayload | null,
   limit: number,
   tagsFilter: readonly string[] | undefined,
-  includeTombstones: boolean
+  includeTombstones: boolean,
+  includeArchived: boolean
 ): { pathId: string; orderValue: number | string }[] {
   // Choose the SQL ordering column.
   const orderCol =
@@ -319,6 +353,11 @@ function listByFiles(
     where.push(
       "(f.head_version_id IS NULL OR fv.deleted IS NULL OR fv.deleted = 0)"
     );
+  }
+  // Phase 29 — archive bit. Default-on filter so a tenant's
+  // "Hidden" / "Trash" UI must explicitly opt in to see them.
+  if (!includeArchived) {
+    where.push("f.archived = 0");
   }
   if (cursor) {
     // Seek bound: (orderCol < ov) OR (orderCol = ov AND file_id > pid)
@@ -375,7 +414,8 @@ function listByTags(
   direction: Direction,
   cursor: CursorPayload | null,
   limit: number,
-  includeTombstones: boolean
+  includeTombstones: boolean,
+  includeArchived: boolean
 ): { pathId: string; orderValue: number | string }[] {
   // Single-tag fast path.
   if (tags.length === 1) {
@@ -388,7 +428,8 @@ function listByTags(
       direction,
       cursor,
       limit,
-      includeTombstones
+      includeTombstones,
+      includeArchived
     );
   }
   // Multi-tag intersect: drive from the rarest tag.
@@ -418,7 +459,8 @@ function listByTags(
     direction,
     cursor,
     limit * 4, // over-fetch; intersect may drop rows.
-    includeTombstones
+    includeTombstones,
+    includeArchived
   );
   const filtered = driverPairs.filter((p) =>
     hasAllTags(durableObject, p.pathId, otherTags)
@@ -435,7 +477,8 @@ function listSingleTag(
   direction: Direction,
   cursor: CursorPayload | null,
   limit: number,
-  includeTombstones: boolean
+  includeTombstones: boolean,
+  includeArchived: boolean
 ): { pathId: string; orderValue: number | string }[] {
   // The file_tags index covers (tag, mtime_ms DESC, path_id). For
   // orderBy 'mtime' we use it directly. For 'name' or 'size' we
@@ -477,6 +520,15 @@ function listSingleTag(
          )`
       );
     }
+    // Phase 29 — archive filter on the path_id's files row.
+    if (!includeArchived) {
+      where.push(
+        `EXISTS (
+           SELECT 1 FROM files f
+            WHERE f.file_id = t.path_id AND f.archived = 0
+         )`
+      );
+    }
     args.push(limit);
     const sql = `
       SELECT t.path_id AS pid, t.mtime_ms AS ov
@@ -507,6 +559,10 @@ function listSingleTag(
     where.push(
       "(f.head_version_id IS NULL OR fv.deleted IS NULL OR fv.deleted = 0)"
     );
+  }
+  // Phase 29 — archive filter (non-mtime ordering branch).
+  if (!includeArchived) {
+    where.push("f.archived = 0");
   }
   if (cursor) {
     const cmp = direction === "desc" ? "<" : ">";
@@ -623,12 +679,13 @@ function hydrateItem(
   pathId: string,
   includeStat: boolean,
   includeMetadata: boolean,
-  includeTombstones: boolean
+  includeTombstones: boolean,
+  includeArchived: boolean
 ): ListFilesItemRaw | null {
   const f = durableObject.sql
     .exec(
       `SELECT file_id, file_name, parent_id, file_size, updated_at, mode,
-              metadata, mode_yjs, head_version_id
+              metadata, mode_yjs, head_version_id, archived
          FROM files
         WHERE file_id = ? AND user_id = ? AND status = 'complete'`,
       pathId,
@@ -645,9 +702,14 @@ function hydrateItem(
         metadata: ArrayBuffer | null;
         mode_yjs: number;
         head_version_id: string | null;
+        archived: number;
       }
     | undefined;
   if (!f) return null;
+  // Phase 29 — archive filter at the hydration boundary. Default
+  // listings exclude archived rows. fileInfo (with default
+  // `includeArchived: false`) returns null → caller raises ENOENT.
+  if (!includeArchived && f.archived === 1) return null;
 
   // Phase 25 — tombstone-consistency. When the file row carries a
   // versioned head pointer, follow it; if the head is tombstoned we

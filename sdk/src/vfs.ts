@@ -87,10 +87,21 @@ export interface VFSClient {
    *  - `unlink(path)`  — POSIX-style (versioned tombstone if
    *    versioning is on; hard delete if off).
    *  - `purge(path)`   — wipe all history for one path.
-   *  - `archive(path)` — RESERVED for Phase 25.1; not yet
-   *    implemented.
+   *  - `archive(path)` — Phase 29; cosmetic-only hide. Reversible
+   *    via `unarchive`. Read surfaces are unchanged.
    */
   purge(p: string): Promise<void>;
+  /**
+   * Phase 29 — hide a path from the default `listFiles` /
+   * `fileInfo` results without touching data. Reversible via
+   * `unarchive`. Read surfaces (`stat`, `readFile`, etc.) are NOT
+   * gated — an archived file is fully readable by anyone who
+   * knows the path. Idempotent. Throws `EISDIR` for directories,
+   * `ENOENT` for non-existent paths.
+   */
+  archive(p: string): Promise<void>;
+  /** Phase 29 — inverse of `archive`. Idempotent. */
+  unarchive(p: string): Promise<void>;
   mkdir(
     p: string,
     opts?: { recursive?: boolean; mode?: number }
@@ -227,6 +238,10 @@ export interface UserDOClient {
   ): Promise<void>;
   vfsUnlink(scope: VFSScope, path: string): Promise<void>;
   vfsPurge(scope: VFSScope, path: string): Promise<void>;
+  /** Phase 29 — set archived=1 on the path's files row. */
+  vfsArchive(scope: VFSScope, path: string): Promise<void>;
+  /** Phase 29 — set archived=0 on the path's files row. */
+  vfsUnarchive(scope: VFSScope, path: string): Promise<void>;
   vfsMkdir(
     scope: VFSScope,
     path: string,
@@ -659,6 +674,19 @@ export interface ListFilesOpts {
    * `adminReapTombstonedHeads`).
    */
   includeTombstones?: boolean;
+  /**
+   * Phase 29 — default `false`. When `true`, results include
+   * archived rows (`files.archived = 1`). Use to build a "Hidden"
+   * / "Trash" UI: pass `true` to fetch all rows including
+   * archived; combine with the `archived` flag on each item to
+   * partition the view.
+   *
+   * NOTE: read surfaces (`stat`, `readFile`, `readPreview`,
+   * `createReadStream`) are NOT gated by this — an archived file
+   * remains readable by anyone who knows the path. Only listing
+   * surfaces apply the filter.
+   */
+  includeArchived?: boolean;
 }
 
 export interface FileInfoOpts {
@@ -674,6 +702,14 @@ export interface FileInfoOpts {
    * never set this.
    */
   includeTombstones?: boolean;
+  /**
+   * Phase 29 — default `false`. When `true`, an archived path
+   * returns its info instead of throwing ENOENT. Note this is
+   * STRICTER than `stat` / `readFile` (which never gate on
+   * archived) — `fileInfo` is the listing-shape surface, so it
+   * mirrors the `listFiles` exclusion by default.
+   */
+  includeArchived?: boolean;
 }
 
 /** a single row returned by listFiles. */
@@ -1026,6 +1062,22 @@ export class VFS implements VFSClient {
       await this.user().vfsPurge(this.scope(), p);
     } catch (err) {
       throw mapServerError(err, { path: p, syscall: "unlink" });
+    }
+  }
+
+  async archive(p: string): Promise<void> {
+    try {
+      await this.user().vfsArchive(this.scope(), p);
+    } catch (err) {
+      throw mapServerError(err, { path: p, syscall: "chmod" });
+    }
+  }
+
+  async unarchive(p: string): Promise<void> {
+    try {
+      await this.user().vfsUnarchive(this.scope(), p);
+    } catch (err) {
+      throw mapServerError(err, { path: p, syscall: "chmod" });
     }
   }
 

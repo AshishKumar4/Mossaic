@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { env } from "cloudflare:test";
+import type { UserDO } from "@app/objects/user/user-do";
 
 /**
  * Multipart session + download token tests.
@@ -23,7 +24,11 @@ import {
 } from "@core/lib/auth";
 import { VFS_MP_SCOPE, VFS_DL_SCOPE } from "@shared/multipart";
 
-const TEST_ENV = env as unknown as { JWT_SECRET?: string };
+// Phase 29 — auth helpers require the full EnvCore shape (MOSSAIC_USER +
+// MOSSAIC_SHARD + JWT_SECRET). The test bindings provide all three;
+// cast through `unknown` to the import-side EnvCore alias.
+import type { EnvCore } from "@shared/types";
+const TEST_ENV = env as unknown as EnvCore;
 
 describe("multipart session token", () => {
   it("round-trips a valid token", async () => {

@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
+import { listVersionsVia } from "./helpers";
 
 /**
  * Phase 27 follow-up — close the same data-destruction class for
@@ -19,9 +20,11 @@ import { env, runInDurableObject } from "cloudflare:test";
  */
 
 import { vfsUserDOName } from "@core/lib/utils";
+import type { UserDO } from "@app/objects/user/user-do";
 
 interface E {
-  MOSSAIC_USER: DurableObjectNamespace;
+  MOSSAIC_USER: DurableObjectNamespace<UserDO>;
+  MOSSAIC_SHARD: DurableObjectNamespace;
 }
 const TEST_ENV = env as unknown as E;
 const NS = "default";
@@ -50,9 +53,9 @@ describe("Phase 27 follow-ups — vfsRemoveRecursive (FX1)", () => {
     await stub.vfsWriteFile(scope, "/d/b.txt", enc.encode("b-bytes"));
 
     // listVersions before removal — both files have 1 version each.
-    const aBefore = await stub.vfsListVersions(scope, "/d/a.txt");
+    const aBefore = await listVersionsVia(stub, scope, "/d/a.txt");
     expect(aBefore.length).toBe(1);
-    const bBefore = await stub.vfsListVersions(scope, "/d/b.txt");
+    const bBefore = await listVersionsVia(stub, scope, "/d/b.txt");
     expect(bBefore.length).toBe(1);
 
     // Recursive remove.
@@ -114,7 +117,7 @@ describe("Phase 27 follow-ups — vfsCommitWriteStream (FX2)", () => {
     const v2Bytes = enc.encode("v2");
     await stub.vfsWriteFile(scope, "/s.bin", v1Bytes);
     await stub.vfsWriteFile(scope, "/s.bin", v2Bytes);
-    const before = await stub.vfsListVersions(scope, "/s.bin");
+    const before = await listVersionsVia(stub, scope, "/s.bin");
     expect(before.length).toBe(2);
 
     // beginWriteStream + appendWriteStream + commitWriteStream over
@@ -125,7 +128,7 @@ describe("Phase 27 follow-ups — vfsCommitWriteStream (FX2)", () => {
     await stub.vfsCommitWriteStream(scope, handle);
 
     // Phase 27 — stream commit must preserve v1 + v2.
-    const after = await stub.vfsListVersions(scope, "/s.bin");
+    const after = await listVersionsVia(stub, scope, "/s.bin");
     expect(after.length).toBe(3);
 
     // Head bytes are v3.
@@ -158,7 +161,7 @@ describe("Phase 27 follow-ups — vfsCopyFile preserves dst history (FX3, FX4)",
     const dstV2 = enc.encode("dst-v2");
     await stub.vfsWriteFile(scope, "/dst.bin", dstV1);
     await stub.vfsWriteFile(scope, "/dst.bin", dstV2);
-    const dstBefore = await stub.vfsListVersions(scope, "/dst.bin");
+    const dstBefore = await listVersionsVia(stub, scope, "/dst.bin");
     expect(dstBefore.length).toBe(2);
 
     // Seed src with bytes that hit the chunked tier (>16 KB inline limit).
@@ -169,7 +172,7 @@ describe("Phase 27 follow-ups — vfsCopyFile preserves dst history (FX3, FX4)",
     await stub.vfsCopyFile(scope, "/src.bin", "/dst.bin", { overwrite: true });
 
     // Phase 27 — dst's prior history must survive.
-    const dstAfter = await stub.vfsListVersions(scope, "/dst.bin");
+    const dstAfter = await listVersionsVia(stub, scope, "/dst.bin");
     expect(dstAfter.length).toBe(3);
 
     // Head bytes are src's bytes.
@@ -200,7 +203,7 @@ describe("Phase 27 follow-ups — vfsCopyFile preserves dst history (FX3, FX4)",
     const origV2 = enc.encode("orig-v2");
     await stub.vfsWriteFile(scope, "/d.bin", origV1);
     await stub.vfsWriteFile(scope, "/d.bin", origV2);
-    const before = await stub.vfsListVersions(scope, "/d.bin");
+    const before = await listVersionsVia(stub, scope, "/d.bin");
     expect(before.length).toBe(2);
 
     // Seed src in non-versioned form. We need an inline-tier source
@@ -210,7 +213,7 @@ describe("Phase 27 follow-ups — vfsCopyFile preserves dst history (FX3, FX4)",
     // Copy src → dst.
     await stub.vfsCopyFile(scope, "/s.bin", "/d.bin", { overwrite: true });
 
-    const after = await stub.vfsListVersions(scope, "/d.bin");
+    const after = await listVersionsVia(stub, scope, "/d.bin");
     expect(after.length).toBe(3);
 
     const head = await stub.vfsReadFile(scope, "/d.bin");

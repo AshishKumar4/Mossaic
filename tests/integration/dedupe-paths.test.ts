@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
+import type { UserDO } from "@app/objects/user/user-do";
 
 /**
  * admin.dedupePaths regression test.
@@ -26,10 +27,11 @@ import { env, runInDurableObject } from "cloudflare:test";
  */
 
 import { vfsShardDOName, vfsUserDOName } from "@core/lib/utils";
+import type { ShardDO } from "@core/objects/shard/shard-do";
 
 interface E {
-  MOSSAIC_USER: DurableObjectNamespace;
-  MOSSAIC_SHARD: DurableObjectNamespace;
+  MOSSAIC_USER: DurableObjectNamespace<UserDO>;
+  MOSSAIC_SHARD: DurableObjectNamespace<ShardDO>;
 }
 const E = env as unknown as E;
 

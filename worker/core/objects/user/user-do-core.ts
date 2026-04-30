@@ -28,6 +28,8 @@ import {
   vfsSymlink,
   vfsUnlink,
   vfsPurge,
+  vfsArchive,
+  vfsUnarchive,
   vfsWriteFile,
   type VFSReadHandle,
   type VFSWriteFileOpts,
@@ -619,6 +621,36 @@ export class UserDOCore extends DurableObject<Env> {
         ON files(file_id)
         WHERE indexed_at IS NULL AND status = 'complete'
     `);
+
+    // ── Phase 29 — archive bit (three-tier delete API) ────────────
+    //
+    // `archived = 1` hides a path from the default `listFiles` /
+    // `fileInfo` results without destroying or tombstoning data.
+    // Reads (`stat`, `readFile`, `readPreview`, `createReadStream`,
+    // `openManifest`, `readChunk`, `listVersions`, `restoreVersion`)
+    // are UNCHANGED — an archived file is fully readable by anyone
+    // who knows its path. Only the listing-side filters apply.
+    //
+    // Three-tier delete model after Phase 29:
+    //   - `archive(path)` — cosmetic; reversible via `unarchive`;
+    //                       does NOT touch versions or chunks.
+    //   - `unlink(path)`  — POSIX-style; versioning-on writes a
+    //                       tombstone version (path becomes ENOENT
+    //                       to reads); versioning-off hard-deletes.
+    //   - `purge(path)`   — destructive; drops every version row +
+    //                       decrements ShardDO chunk refs.
+    //
+    // Idempotent ALTER: try/catch swallows "duplicate column name"
+    // when the migration runs on an already-migrated DO. NOT NULL
+    // DEFAULT 0 means existing rows surface as not-archived without
+    // a backfill.
+    try {
+      this.sql.exec(
+        "ALTER TABLE files ADD COLUMN archived INTEGER NOT NULL DEFAULT 0"
+      );
+    } catch {
+      // column already exists
+    }
 
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS file_tags (
@@ -1234,6 +1266,24 @@ export class UserDOCore extends DurableObject<Env> {
   async vfsPurge(scope: VFSScope, path: string): Promise<void> {
     this.gateVfsWrite(scope);
     return vfsPurge(this, scope, path);
+  }
+
+  /**
+   * Phase 29 — `archive(path)` / `unarchive(path)`.
+   *
+   * Hide a path from default `listFiles` / `fileInfo` results
+   * without destroying or tombstoning data. Read surfaces (`stat`,
+   * `readFile`, etc.) are unchanged — an archived file is fully
+   * readable by anyone who knows the path.
+   */
+  async vfsArchive(scope: VFSScope, path: string): Promise<void> {
+    this.gateVfsWrite(scope);
+    vfsArchive(this, scope, path);
+  }
+
+  async vfsUnarchive(scope: VFSScope, path: string): Promise<void> {
+    this.gateVfsWrite(scope);
+    vfsUnarchive(this, scope, path);
   }
 
   /** mkdir() — create folder; recursive flag walks intermediates. */
@@ -1945,6 +1995,8 @@ export class UserDOCore extends DurableObject<Env> {
       direction?: "asc" | "desc";
       includeStat?: boolean;
       includeMetadata?: boolean;
+      includeTombstones?: boolean;
+      includeArchived?: boolean;
     }
   ): Promise<{
     items: import("./list-files").ListFilesItemRaw[];
@@ -1962,6 +2014,7 @@ export class UserDOCore extends DurableObject<Env> {
       includeStat?: boolean;
       includeMetadata?: boolean;
       includeTombstones?: boolean;
+      includeArchived?: boolean;
     }
   ): Promise<import("./list-files").ListFilesItemRaw> {
     this.gateVfs(scope);
