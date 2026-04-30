@@ -10,6 +10,9 @@ import Mossaic.Vfs.Encryption
 import Mossaic.Vfs.Multipart
 import Mossaic.Vfs.Quota
 import Mossaic.Vfs.Preview
+import Mossaic.Vfs.Tombstone
+import Mossaic.Vfs.HistoryPreservation
+import Mossaic.Vfs.StreamRouting
 import Mossaic.Generated.ShardDO
 import Mossaic.Generated.UserDO
 import Mossaic.Generated.Placement
