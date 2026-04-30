@@ -13,6 +13,13 @@ import { listFiles, deleteFile, getFile } from "./files";
 import { createFolder, listFolders, getFolderPath } from "./folders";
 import { getQuota, updateUsage } from "./quota";
 import { UserDOCore } from "@core/objects/user/user-do-core";
+import {
+  appAuthScopeFor,
+  appGate,
+  appGateFromPersistedScope,
+  appGateWrite,
+  appScopeFor,
+} from "./gate";
 
 /**
  * Typed projection of a `files` table row. Exposed for callers of
@@ -109,13 +116,25 @@ export class UserDO extends UserDOCore {
   // ── App-only RPCs ────────────────────────────────────────────────
   //
   // All methods below are TYPED RPCs callable from App routes via
-  // `stub.appXxx(...)` over the DO RPC binding. Each calls
-  // `this.ensureInit()` so first-touch on a fresh DO instance
-  // materializes the schema.
+  // `stub.appXxx(...)` over the DO RPC binding. Each method runs a
+  // gate function from `./gate` (`appGate` for reads, `appGateWrite`
+  // for writes, `appGateFromPersistedScope` when the RPC signature
+  // lacks userId) before any work — closing the gap where the
+  // App-side RPCs ran ungated against the per-tenant rate limiter
+  // that VFS tenants enjoyed for free. Route-layer `authMiddleware`
+  // is the upstream auth gate; these are per-tenant rate limiting
+  // + write-degraded refusal.
 
-  /** Create user, hash password, insert quota row. Returns userId+email. */
+  /**
+   * Create user, hash password, insert quota row. Returns userId+email.
+   *
+   * Gate: per-account (auth:<email> DO) bucket. Brute-force defense
+   * for repeated signups against the same email — an attacker
+   * hammering signup with credential variants hits EAGAIN around
+   * attempt ~200 and refills at 100/sec.
+   */
   async appHandleSignup(email: string, password: string): Promise<AuthResult> {
-    this.ensureInit();
+    appGateWrite(this, appAuthScopeFor(email));
     return handleSignup(this, email, password);
   }
 
@@ -131,7 +150,11 @@ export class UserDO extends UserDOCore {
    * Idempotent (`INSERT OR IGNORE`).
    */
   async appInitTenant(userId: string): Promise<void> {
-    this.ensureInit();
+    // Write gate against the *target* tenant DO (not the auth DO);
+    // the route calls this on `userStub(c.env, userId)` after the
+    // signup lands on the auth DO. EBUSY would be alarming here but
+    // the gate is structurally consistent with the rest.
+    appGateWrite(this, appScopeFor(userId));
     this.sql.exec(
       `INSERT OR IGNORE INTO quota (user_id, storage_used, storage_limit, file_count, pool_size)
        VALUES (?, 0, 107374182400, 0, 32)`,
@@ -139,9 +162,17 @@ export class UserDO extends UserDOCore {
     );
   }
 
-  /** Verify credentials. Returns userId+email on success; throws on failure. */
+  /**
+   * Verify credentials. Returns userId+email on success; throws on
+   * failure.
+   *
+   * Gate: per-account (auth:<email> DO) bucket. Same brute-force
+   * defense rationale as appHandleSignup. We deliberately use the
+   * read-only gate here (no EBUSY check) — login does not write
+   * to the `files`/`folders` tables, only reads `auth`.
+   */
   async appHandleLogin(email: string, password: string): Promise<AuthResult> {
-    this.ensureInit();
+    appGate(this, appAuthScopeFor(email));
     return handleLogin(this, email, password);
   }
 
@@ -150,7 +181,7 @@ export class UserDO extends UserDOCore {
     userId: string,
     parentId: string | null
   ): Promise<{ files: UserFile[]; folders: Folder[] }> {
-    this.ensureInit();
+    appGate(this, appScopeFor(userId));
     const files = listFiles(this, userId, parentId);
     const folders = listFolders(this, userId, parentId);
     return { files, folders };
@@ -161,7 +192,7 @@ export class UserDO extends UserDOCore {
     fileId: string,
     userId: string
   ): Promise<{ ok: true } | { ok: false; reason: "not_found" }> {
-    this.ensureInit();
+    appGateWrite(this, appScopeFor(userId));
     const file = getFile(this, fileId);
     if (!file) return { ok: false, reason: "not_found" };
     deleteFile(this, fileId);
@@ -181,7 +212,7 @@ export class UserDO extends UserDOCore {
     userId: string,
     path: string
   ): Promise<AppFileRow | null> {
-    this.ensureInit();
+    appGate(this, appScopeFor(userId));
     if (!path.startsWith("/")) return null;
 
     // Walk segments — descend through `folders` for each non-leaf,
@@ -258,7 +289,15 @@ export class UserDO extends UserDOCore {
   async appGetFilePath(
     fileId: string
   ): Promise<{ path: string; mimeType: string } | null> {
+    // Pre-gate ensureInit so the persisted-scope lookup below sees
+    // the schema. We can't pass userId in without breaking the route
+    // caller signature; recover it from `vfs_meta.scope` (set by any
+    // prior gated app* call) and fall back to deriving from the
+    // file row itself when scope hasn't been persisted yet (first
+    // call on a fresh DO whose only prior touch was an unmigrated
+    // path).
     this.ensureInit();
+    appGateFromPersistedScope(this);
     // Phase 25 — tombstone-consistency. Gallery/shared-album routes
     // call this then immediately read bytes via canonical VFS. A
     // tombstoned head would 404 with the wrong error class
@@ -308,7 +347,12 @@ export class UserDO extends UserDOCore {
    * naming.
    */
   async appGetFile(fileId: string): Promise<AppFileRow | null> {
+    // Same scope-recovery pattern as appGetFilePath — caller route
+    // routes to the correct DO via `userStub(c.env, userId)` so the
+    // DO instance is already tenant-scoped; we recover the userId
+    // for rate-limit accounting from `vfs_meta.scope`.
     this.ensureInit();
+    appGateFromPersistedScope(this);
     const row = getFile(this, fileId);
     if (!row) return null;
     // Project to the typed shape — DO RPC strips index signatures so
@@ -337,13 +381,19 @@ export class UserDO extends UserDOCore {
     name: string,
     parentId: string | null
   ): Promise<Folder> {
-    this.ensureInit();
+    appGateWrite(this, appScopeFor(userId));
     return createFolder(this, userId, name, parentId);
   }
 
-  /** Breadcrumb path from root to the given folderId. */
+  /**
+   * Breadcrumb path from root to the given folderId.
+   *
+   * Signature does not carry userId (caller routes via per-userId
+   * stub); rate-limit via the persisted scope.
+   */
   async appGetFolderPath(folderId: string | null): Promise<Folder[]> {
     this.ensureInit();
+    appGateFromPersistedScope(this);
     return getFolderPath(this, folderId);
   }
 
@@ -359,7 +409,7 @@ export class UserDO extends UserDOCore {
    * default (`includeTombstones=false`).
    */
   async appListAllFiles(userId: string): Promise<UserFile[]> {
-    this.ensureInit();
+    appGate(this, appScopeFor(userId));
     const rows = this.sql
       .exec(
         `SELECT f.*
@@ -396,7 +446,7 @@ export class UserDO extends UserDOCore {
    * preserves history) but the user has expressed intent to hide them.
    */
   async appGetGalleryPhotos(userId: string): Promise<GalleryPhoto[]> {
-    this.ensureInit();
+    appGate(this, appScopeFor(userId));
     const rows = this.sql
       .exec(
         `SELECT f.file_id, f.file_name, f.file_size, f.mime_type,
@@ -426,13 +476,13 @@ export class UserDO extends UserDOCore {
 
   /** Aggregated per-user analytics: files, mime distribution, shards. */
   async appGetUserStats(userId: string): Promise<UserStats> {
-    this.ensureInit();
+    appGate(this, appScopeFor(userId));
     return this.getUserStats(userId);
   }
 
   /** Read the user's quota row. */
   async appGetQuota(userId: string): Promise<QuotaInfo> {
-    this.ensureInit();
+    appGate(this, appScopeFor(userId));
     return getQuota(this, userId);
   }
 
@@ -455,7 +505,16 @@ export class UserDO extends UserDOCore {
    * complete without error.
    */
   async appMarkFileIndexed(fileId: string): Promise<void> {
+    // Per-tenant rate limit via persisted scope (route caller routes
+    // through per-userId stub but the signature only takes fileId).
+    //
+    // Read-class gate intentionally (not write-class): the operation
+    // is `UPDATE files SET indexed_at = ?` on an existing row, which
+    // does NOT risk the H6 partial-UNIQUE-INDEX collision class
+    // (that's about `(parent_id, file_name)` insertion). The EBUSY
+    // marker therefore does not need to gate this call.
     this.ensureInit();
+    appGateFromPersistedScope(this);
     this.sql.exec(
       "UPDATE files SET indexed_at = ? WHERE file_id = ?",
       Date.now(),
@@ -481,7 +540,7 @@ export class UserDO extends UserDOCore {
       file_size: number;
     }>
   > {
-    this.ensureInit();
+    appGate(this, appScopeFor(userId));
     // Phase 25 — tombstone-consistency. Skip files whose head version
     // is tombstoned: re-firing `indexFile` on them would attempt a
     // byte read that throws "head version is a tombstone" downstream.
@@ -546,7 +605,16 @@ export class UserDO extends UserDOCore {
     versionsRemoved: number;
     chunksRemovedFromShards: number;
   }> {
-    this.ensureInit();
+    // Admin-class call. Route at `worker/app/routes/auth.ts:196`
+    // gates the public-facing endpoint with `authMiddleware()` which
+    // verifies the bearer JWT before this RPC runs. The DO trusts
+    // its caller (no separate admin-key system at the DO level —
+    // adding one here would require plumbing a second secret across
+    // every wipe call site, out of scope for this fix). The gate
+    // here is per-tenant rate limit + write-degraded refusal:
+    // defense against repeated/replayed wipe attempts hitting the
+    // same DO faster than the bucket allows.
+    appGateWrite(this, appScopeFor(userId));
 
     // Lazy import to keep the App-side bundle's Core dependency
     // explicit. `hardDeleteFileRow` lives in core; we call it with
@@ -655,7 +723,16 @@ export class UserDO extends UserDOCore {
    * Idempotent — returns false if no row matched.
    */
   async appWipeAuthRow(email: string): Promise<{ removed: boolean }> {
-    this.ensureInit();
+    // Admin-class call against the auth-keyed DO (`auth:<email>`).
+    // Same rationale as appWipeAccountData: route gates the public
+    // surface; this is the per-account rate limiter that bounds
+    // repeated wipe attempts against a single email.
+    //
+    // Read-class gate intentionally (not write-class): the auth DO
+    // has its own UNIQUE INDEX on `email`, not the H6 partial
+    // `(parent_id, file_name)` UNIQUE INDEX on `files`/`folders`.
+    // EBUSY-on-H6 therefore does not apply here.
+    appGate(this, appAuthScopeFor(email));
     const before = (
       this.sql
         .exec("SELECT COUNT(*) AS n FROM auth WHERE email = ?", email)

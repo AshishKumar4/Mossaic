@@ -49,15 +49,16 @@ describe("mintToken", () => {
     ).rejects.toThrow(/tenant must be a non-empty string/);
   });
 
-  it("respects ttlMs (matches the worker-side signVFSToken shape)", async () => {
-    // jose's setExpirationTime(numeric) stores the value as-is (the
-    // claim is meant to be seconds-since-epoch; passing ms produces
-    // a "ms-shaped" exp claim). The Mossaic worker
-    // (worker/core/lib/auth.ts:signVFSToken) uses the same pattern,
-    // so we match it byte-for-byte. jwtVerify accepts both shapes
-    // when the value is in the future. We assert the diff between
-    // exp and iso-equivalent of Date.now() is in the ttl ballpark.
-    const t = Date.now();
+  it("respects ttlMs and emits seconds-since-epoch exp (matches signVFSToken)", async () => {
+    // RFC 7519 `exp` is seconds-since-epoch. jose's
+    // `setExpirationTime(numeric)` stores the value verbatim, so
+    // the caller MUST pass seconds. The Mossaic worker
+    // (`worker/core/lib/auth.ts:239`) does
+    // `Math.floor((Date.now() + ttlMs) / 1000)`; the CLI was
+    // fixed to match. A previous version of this assertion checked
+    // an ms-shaped exp ~Date.now()+ttlMs (year-57000 expiry —
+    // tokens never expired); post-fix exp is ~(Date.now()+ttlMs)/1000.
+    const tNowSec = Math.floor(Date.now() / 1000);
     const tok = await mintToken({
       secret: SECRET,
       ns: "default",
@@ -65,11 +66,16 @@ describe("mintToken", () => {
       ttlMs: 5_000,
     });
     const { payload } = await jwtVerify(tok, new TextEncoder().encode(SECRET));
-    // payload.exp will be approximately Date.now() + ttlMs (ms-shaped).
     expect(payload.exp).toBeTypeOf("number");
-    const diff = (payload.exp as number) - t;
-    expect(diff).toBeGreaterThan(4_000);
-    expect(diff).toBeLessThan(7_000);
+    const expSec = payload.exp as number;
+    // exp should be ~ (now + 5s) in seconds. Allow ±2s for clock
+    // skew / test scheduling jitter.
+    const diffSec = expSec - tNowSec;
+    expect(diffSec).toBeGreaterThanOrEqual(3);
+    expect(diffSec).toBeLessThanOrEqual(7);
+    // Sanity: must NOT be ms-shaped (which would be ~Date.now() ≈
+    // 1.7e12 today; would dwarf seconds-since-epoch ≈ 1.7e9).
+    expect(expSec).toBeLessThan(1e11); // ~year 5138 ceiling
   });
 
   it("token signed with one secret fails verification with another", async () => {

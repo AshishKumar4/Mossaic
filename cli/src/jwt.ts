@@ -63,9 +63,22 @@ export async function mintToken(input: MintTokenInput): Promise<string> {
   if (input.sub !== undefined && input.sub !== null) {
     claims.sub = input.sub;
   }
+  // jose's `setExpirationTime` interprets a numeric input as
+  // seconds-since-epoch (RFC 7519 `exp` claim). A prior version of
+  // this function passed `Date.now() + ttlMs` which is
+  // *milliseconds*-since-epoch — jose stored it verbatim, so the
+  // resulting `exp` claim was a ~1000× bigger number, putting
+  // expiration in the year ~57000. Effectively: tokens never
+  // expired. The worker-side `signVFSToken`
+  // (`worker/core/lib/auth.ts:239`) has always done
+  // `Math.floor((Date.now() + ttlMs) / 1000)`; the CLI matches
+  // that here.
+  const expSec = Math.floor(
+    (Date.now() + (input.ttlMs ?? 60 * 60 * 1000)) / 1000
+  );
   return await new SignJWT(claims)
     .setProtectedHeader({ alg: "HS256" })
     .setIssuedAt()
-    .setExpirationTime(Date.now() + (input.ttlMs ?? 60 * 60 * 1000))
+    .setExpirationTime(expSec)
     .sign(key);
 }
