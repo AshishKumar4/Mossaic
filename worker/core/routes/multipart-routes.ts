@@ -218,11 +218,13 @@ mp.post("/finalize", async (c) => {
       body.chunkHashList
     );
     // Pre-generate standard preview variants in the background so
-    // the user's first gallery click hits a warm cache. Skipped
-    // server-side for empty / encrypted files via
-    // `preGenerateStandardVariants`'s gate. Best-effort: the routine
+    // the user's first gallery click hits a warm cache. Scoped to
+    // image MIME types: that's the gallery-thumbnail use case where
+    // pre-gen actually saves user-visible latency. Other renderers
+    // (code-svg, waveform, icon-card) are cheap enough to run
+    // on-demand from `vfsReadPreview`. Best-effort: the routine
     // catches per-variant failures internally.
-    if (r.size > 0 && !r.isEncrypted) {
+    if (r.size > 0 && !r.isEncrypted && r.mimeType.startsWith("image/")) {
       c.executionCtx.waitUntil(
         stub.adminPreGenerateStandardVariants(c.var.scope, {
           fileId: r.fileId,

@@ -43,4 +43,25 @@ files.delete("/:fileId", async (c) => {
   return c.json({ ok: true });
 });
 
+/**
+ * GET /api/files/:fileId/path
+ *
+ * Resolve a `files.file_id` to its absolute VFS path. Used by the SPA
+ * `useDownload` hook (and any UI surface that addresses files by id):
+ * `parallelDownload(client, path)` requires a real path string, not a
+ * fileId. Tenant isolation is enforced by `userStub` resolving the
+ * caller's per-tenant UserDO instance — appGetFilePath only walks the
+ * `files` + `folders` tables on that one instance.
+ */
+files.get("/:fileId/path", async (c) => {
+  const userId = c.get("userId");
+  const fileId = c.req.param("fileId");
+
+  const resolved = await userStub(c.env, userId).appGetFilePath(fileId);
+  if (!resolved) {
+    return c.json({ error: "File not found" }, 404);
+  }
+  return c.json({ path: resolved.path, mimeType: resolved.mimeType });
+});
+
 export default files;

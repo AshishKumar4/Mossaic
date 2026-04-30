@@ -67,6 +67,7 @@ export function FileRow({ file, onDownload, onDelete }: FileRowProps) {
           <Button
             variant="ghost"
             size="icon"
+            aria-label="Download"
             className="h-8 w-8 transition-all duration-200"
             onClick={() => onDownload(file)}
           >
@@ -78,6 +79,7 @@ export function FileRow({ file, onDownload, onDelete }: FileRowProps) {
             <Button
               variant="ghost"
               size="icon"
+              aria-label="More actions"
               className="h-8 w-8 transition-all duration-200"
             >
               <MoreHorizontal className="h-3.5 w-3.5" />

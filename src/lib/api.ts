@@ -147,6 +147,20 @@ class ApiClient {
     });
   }
 
+  /**
+   * Resolve a `files.file_id` to its absolute VFS path.
+   * `useDownload` calls this before invoking `parallelDownload(client,
+   * path, ...)`; the SDK addresses files by path, not by id, so the
+   * SPA must round-trip through the App's auth-gated lookup.
+   */
+  async getFilePath(
+    fileId: string
+  ): Promise<{ path: string; mimeType: string }> {
+    return this.request<{ path: string; mimeType: string }>(
+      `/files/${fileId}/path`
+    );
+  }
+
   // Folders
   async createFolder(data: CreateFolderRequest): Promise<Folder> {
     return this.request<Folder>("/folders", {

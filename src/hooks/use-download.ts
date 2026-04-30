@@ -5,8 +5,11 @@ import {
   type ManifestEvent,
   type TransferProgressEvent,
 } from "@mossaic/sdk/http";
-import { getTransferClient } from "@/lib/transfer-client";
-import { pathFromFileId } from "@/lib/path-utils";
+import {
+  getTransferClient,
+  resetTransferClient,
+} from "@/lib/transfer-client";
+import { api } from "@/lib/api";
 import { addTransferStats } from "@/lib/transfer-stats";
 import type {
   TransferProgress,
@@ -83,9 +86,13 @@ export function useDownload() {
       );
 
       try {
+        // Resolve fileId → absolute VFS path. The SDK's `parallelDownload`
+        // addresses files by path, not by id; the SPA must round-trip
+        // through the App's auth-gated lookup before invoking the SDK.
+        const { path } = await api.getFilePath(fileId);
         const bytes = await parallelDownload(
           getTransferClient(),
-          pathFromFileId(fileId),
+          path,
           {
             onManifest: (m: ManifestEvent) => {
               mimeType = m.mimeType;
@@ -194,10 +201,26 @@ export function useDownload() {
         a.click();
         URL.revokeObjectURL(url);
       } catch (err) {
+        // Mark the transfer terminally failed so the UI shows the
+        // error state (red badge + clear-button) instead of leaving
+        // the row stuck mid-progress. Mirrors `useUpload`'s catch.
+        const failedAt = Date.now();
+        const message =
+          err instanceof Error
+            ? err.message
+            : typeof err === "string"
+              ? err
+              : "Download failed";
         updateTransfer(fileId, (p) => ({
           ...p,
-          failedChunks: p.failedChunks + 1,
+          failedAt,
+          error: message,
+          failedChunks: Math.max(p.failedChunks + 1, 1),
         }));
+        // Drop the cached HttpVFS so the next call mints a fresh
+        // VFS token. Belt-and-suspenders against pathological
+        // token-cache states.
+        resetTransferClient();
         throw err;
       }
     },
