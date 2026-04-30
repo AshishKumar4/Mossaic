@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { env } from "cloudflare:test";
 
 /**
- * Phase 16 — Multipart session + download token tests.
+ * Multipart session + download token tests.
  *
  * Exercises the HMAC token primitives:
  *   - sign/verify round-trip (multipart + download)
@@ -25,7 +25,7 @@ import { VFS_MP_SCOPE, VFS_DL_SCOPE } from "@shared/multipart";
 
 const TEST_ENV = env as unknown as { JWT_SECRET?: string };
 
-describe("Phase 16 — multipart session token", () => {
+describe("multipart session token", () => {
   it("round-trips a valid token", async () => {
     const { token } = await signVFSMultipartToken(TEST_ENV, {
       uploadId: "u-001",
@@ -162,7 +162,7 @@ describe("Phase 16 — multipart session token", () => {
   });
 });
 
-describe("Phase 16 — download token", () => {
+describe("download token", () => {
   it("round-trips a valid download token", async () => {
     const { token } = await signVFSDownloadToken(TEST_ENV, {
       fileId: "f-001",

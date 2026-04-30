@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
 
 /**
- * Phase 6 — EFBIG enforcement on readFile + writeFile + appendStream.
+ * EFBIG enforcement on readFile + writeFile + appendStream.
  *
  * The plan §11 requires per-method size caps so a pathological
  * payload fails fast with EFBIG rather than blowing the Worker's
@@ -31,8 +31,7 @@ import { env, runInDurableObject } from "cloudflare:test";
  * The error must:
  *   - throw VFSError with code === "EFBIG" on the server side
  *   - reach the SDK consumer as VFSFsError with code === "EFBIG"
- *     (Phase 5 mapServerError extracts the code from the message
- *     even after RPC re-serialisation)
+ *
  */
 
 import { createVFS, type MossaicEnv, EFBIG, VFSFsError } from "../../sdk/src/index";
@@ -143,7 +142,7 @@ describe("EFBIG enforcement", () => {
   it("appendWriteStream throws EFBIG on cumulative overflow", async () => {
     // This is already covered in tests/integration/streaming.test.ts
     // via SQL seeding of file_size. Re-asserting here against the
-    // SDK consumer surface so a single Phase 6 file demonstrates
+    // SDK consumer surface so a single file demonstrates
     // EFBIG on every entry point. Drives through the SDK's
     // createWriteStreamWithHandle to surface the handle, then SQL-
     // seeds file_size, then attempts an append that would push

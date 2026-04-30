@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
 
 /**
- * Phase 12 — metadata + tags as first-class file properties.
+ * metadata + tags as first-class file properties.
  *
  * Pinned invariants:
  *   M1. writeFile metadata round-trip: write `{a:1,b:{c:2}}`, then
@@ -38,7 +38,7 @@ function userStub(tenant: string) {
   return E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName(vfsUserDOName(NS, tenant)));
 }
 
-describe("Phase 12 — writeFile metadata + tags (M1, M5, M6)", () => {
+describe("writeFile metadata + tags (M1, M5, M6)", () => {
   it("metadata round-trip via raw SQL inspection", async () => {
     const tenant = "p12-meta-rt";
     const vfs = createVFS(envFor(), { tenant });
@@ -131,7 +131,7 @@ describe("Phase 12 — writeFile metadata + tags (M1, M5, M6)", () => {
   });
 });
 
-describe("Phase 12 — patchMetadata (M2, M3, M4)", () => {
+describe("patchMetadata (M2, M3, M4)", () => {
   it("deep-merge: nested object recursion", async () => {
     const tenant = "p12-merge-deep";
     const vfs = createVFS(envFor(), { tenant });
@@ -236,7 +236,7 @@ describe("Phase 12 — patchMetadata (M2, M3, M4)", () => {
   });
 });
 
-describe("Phase 12 — cap validation (M7)", () => {
+describe("cap validation (M7)", () => {
   it("metadata over 64KB → EINVAL", async () => {
     const tenant = "p12-meta-cap";
     const vfs = createVFS(envFor(), { tenant });

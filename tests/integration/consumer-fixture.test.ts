@@ -2,11 +2,11 @@ import { describe, it, expect } from "vitest";
 import { env } from "cloudflare:test";
 
 /**
- * Phase 5 — Consumer fixture acceptance gate.
+ * Consumer fixture acceptance gate.
  *
  * Mounts the consumer fixture (tests/fixtures/consumer/src/index.ts —
  * which is what an actual customer's Worker looks like) and proves
- * the Phase 4/5 architectural promise:
+ * the architectural promise:
  *
  *     "Each VFS method on the SDK = exactly 1 DO RPC subrequest from
  *      the consumer's perspective, regardless of internal chunk
@@ -260,7 +260,7 @@ describe("Consumer fixture: SDK as-Library DX + subrequest accounting", () => {
     // The fixture must re-export the DO classes for the wrangler
     // discovery pattern to work in a real deploy.
     //
-    // Phase 11.1: SearchDO is no longer part of the SDK surface —
+    // SearchDO is no longer part of the SDK surface —
     // verify the fixture does NOT carry a `.SearchDO` export so any
     // future regression that re-introduces it (and silently inflates
     // every consumer's bundle with the CLIP/BGE vector code) trips

@@ -2,7 +2,7 @@
  * E2E F — Yjs (6 cases).
  *
  * Requires the public Yjs WS upgrade route at /api/vfs/yjs/ws (added
- * in Phase 13.5 — `worker/core/routes/vfs-yjs-ws.ts`). The route
+ * in `worker/core/routes/vfs-yjs-ws.ts`). The route
  * forwards Bearer-authenticated WS upgrades to the per-tenant
  * UserDOCore via stub.fetch.
  */

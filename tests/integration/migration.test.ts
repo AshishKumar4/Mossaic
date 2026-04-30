@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
 
 /**
- * Phase 1 — Schema migration tests.
+ * Schema migration tests.
  *
  * Verifies sdk-impl-plan §3.1 / §3.2:
  * - new columns (mode, inline_data, symlink_target, node_kind on files;
@@ -34,8 +34,7 @@ describe("UserDO schema migrations", () => {
   it("adds new columns with correct defaults to a fresh DO", async () => {
     const stub = userStub("migration:fresh");
 
-    // First RPC triggers ensureInit (Phase 17 — typed RPC replaces
-    // the legacy POST /quota fetch).
+    // First RPC triggers ensureInit.
     const quota = await stub.appGetQuota("u1");
     expect(quota.poolSize).toBeGreaterThan(0);
 

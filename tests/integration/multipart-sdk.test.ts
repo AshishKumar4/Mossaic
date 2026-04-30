@@ -2,14 +2,14 @@ import { describe, it, expect } from "vitest";
 import { SELF, env } from "cloudflare:test";
 
 /**
- * Phase 16 — SDK parallelUpload / parallelDownload integration tests.
+ * SDK parallelUpload / parallelDownload integration tests.
  *
  * Drives `sdk/src/transfer.ts` end-to-end against the real worker
  * via SELF.fetch. Same fetcher pattern as `http-fallback.test.ts`.
  *
  * Coverage:
  *   - parallelUpload happy path (round-trips bytes via readFile)
- *   - parallelUpload with chunkTransform (Phase 15-style envelope sim)
+ *   - parallelUpload with chunkTransform
  *   - parallelUpload progress callback fires
  *   - parallelUpload abort signal propagates
  *   - parallelDownload happy path round-trip
@@ -69,7 +69,7 @@ function makeBytes(n: number, seed = 0): Uint8Array {
   return out;
 }
 
-describe("Phase 16 — SDK parallelUpload", () => {
+describe("SDK parallelUpload", () => {
   it("uploads a multi-chunk file and round-trips via readFile", async () => {
     const vfs = await clientFor("sdk-mp-1");
     const data = makeBytes(300, 1); // small enough to chunk via override
@@ -108,7 +108,7 @@ describe("Phase 16 — SDK parallelUpload", () => {
     expect(last.uploaded).toBe(500);
   });
 
-  it("supports chunkTransform (Phase 15 envelope simulation)", async () => {
+  it("supports chunkTransform", async () => {
     const vfs = await clientFor("sdk-mp-4");
     const plaintext = makeBytes(250, 3);
     // Pretend each plaintext chunk wraps in a 2-byte header.
@@ -162,7 +162,7 @@ describe("Phase 16 — SDK parallelUpload", () => {
   });
 });
 
-describe("Phase 16 — SDK raw protocol", () => {
+describe("SDK raw protocol", () => {
   it("beginUpload + putChunk + finalizeUpload composes by hand", async () => {
     const vfs = await clientFor("sdk-raw-1");
     const data = makeBytes(150, 6);
@@ -197,7 +197,7 @@ describe("Phase 16 — SDK raw protocol", () => {
   });
 });
 
-describe("Phase 16 — SDK parallelDownload", () => {
+describe("SDK parallelDownload", () => {
   it("round-trips a multi-chunk file uploaded via parallelUpload", async () => {
     const vfs = await clientFor("sdk-dl-1");
     const data = makeBytes(400, 8);
@@ -251,7 +251,7 @@ describe("Phase 16 — SDK parallelDownload", () => {
   });
 });
 
-describe("Phase 16 — throughput math constants", () => {
+describe("throughput math constants", () => {
   it("THROUGHPUT_MATH exposes documented numbers", () => {
     expect(THROUGHPUT_MATH.defaultChunkSizeBytes).toBe(1_048_576);
     expect(THROUGHPUT_MATH.defaultMaxConcurrency).toBe(64);

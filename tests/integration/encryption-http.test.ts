@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { SELF, env } from "cloudflare:test";
 
 /**
- * Phase 15 — Step 7 — HTTP fallback `X-Mossaic-Encryption` header.
+ * Step 7 — HTTP fallback `X-Mossaic-Encryption` header.
  *
  *   H1.  POST /api/vfs/writeFile with `X-Mossaic-Encryption` header
  *        and an octet-stream body stamps the encryption columns
@@ -32,7 +32,7 @@ async function mintToken(
   return signVFSToken(TEST_ENV, { ns, tenant, sub });
 }
 
-describe("Phase 15 — HTTP fallback X-Mossaic-Encryption header", () => {
+describe("HTTP fallback X-Mossaic-Encryption header", () => {
   it("H1 — writeFile with X-Mossaic-Encryption stamps the column", async () => {
     const ns = "default";
     const tenant = "p15-h1";

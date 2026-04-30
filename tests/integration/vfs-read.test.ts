@@ -156,8 +156,7 @@ describe("vfsReadFile (inline tier + chunked path)", () => {
     const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-read:inline"));
     const userId = await seedUser(stub, "il@e.com");
 
-    // Manually insert an inlined file (Phase 3 will write this via
-    // vfsWriteFile; here we simulate the row a writeFile would produce).
+    // Manually insert an inlined file.
     const payload = new TextEncoder().encode("hello inline tier!");
     expect(payload.byteLength).toBeLessThanOrEqual(INLINE_LIMIT);
 

@@ -363,7 +363,7 @@ const preview = await vfs.readPreview("/photos/sunset.jpg", { variant: "thumb" }
 
 Standard variants: `"thumb"` (256² cover), `"medium"` (768² contain), `"lightbox"` (1920² contain). Custom variants accept `{width, height?, fit?}` and cache under a stable encoded key.
 
-Five built-in renderers dispatch by MIME: `image` (Cloudflare Images), `code-svg` (text/source), `waveform-svg` (audio), `video-poster` (video, Phase 20.1+), `icon-card` (universal fallback). Encrypted files throw `ENOTSUP` — server cannot render ciphertext.
+Five built-in renderers dispatch by MIME: `image` (Cloudflare Images), `code-svg` (text/source), `waveform-svg` (audio), `video-poster` (video, (future)), `icon-card` (universal fallback). Encrypted files throw `ENOTSUP` — server cannot render ciphertext.
 
 Batched manifests for galleries:
 

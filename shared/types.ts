@@ -119,8 +119,7 @@ export type ImagesBinding = {
 
 /**
  * Cloudflare Browser Run binding. Reserved for the deferred
- * preview renderers (PDF page-1, video poster, Office). Phase 20
- * wires the binding optionally; renderers requiring it fall through
+ * preview renderers (PDF page-1, video poster, Office). * wires the binding optionally; renderers requiring it fall through
  * to the icon-card when the binding is absent.
  */
 export type BrowserBinding = {

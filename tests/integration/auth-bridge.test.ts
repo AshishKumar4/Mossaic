@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll } from "vitest";
 import { SELF, env } from "cloudflare:test";
 
 /**
- * Phase 21 — Auth-bridge tests.
+ * Auth-bridge tests.
  *
  * `POST /api/auth/vfs-token` exchanges an App session JWT for a
  * short-TTL VFS Bearer token bound to the authenticated user's
@@ -80,7 +80,7 @@ beforeAll(async () => {
   expect(aliceUserId).not.toBe(bobUserId);
 });
 
-describe("Phase 21 auth-bridge — POST /api/auth/vfs-token", () => {
+describe("auth-bridge — POST /api/auth/vfs-token", () => {
   it("T-Auth1 — valid session JWT mints a token bound to the authenticated tenant", async () => {
     const t0 = Date.now();
     const res = await bridgeMint(aliceSessionJWT);
@@ -215,7 +215,7 @@ describe("Phase 21 auth-bridge — POST /api/auth/vfs-token", () => {
   });
 });
 
-describe("Phase 21 auth-bridge — token claims discriminator", () => {
+describe("auth-bridge — token claims discriminator", () => {
   it("rejects an App session JWT used directly on canonical /api/vfs/*", async () => {
     // The App session JWT has scope=undefined (it's a {sub, email}
     // token from signJWT). The canonical /api/vfs/* verifier

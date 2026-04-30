@@ -9,7 +9,7 @@ import {
 } from "@mossaic/sdk/http";
 
 /**
- * Phase 16 — CLI-side smoke tests for the parallel transfer engine.
+ * CLI-side smoke tests for the parallel transfer engine.
  *
  *   T1.  parallelUpload + parallelDownload symbols are exported.
  *   T2.  THROUGHPUT_MATH constants are non-zero & match plan §8.
@@ -20,7 +20,7 @@ import {
  *        (used by `mossaic upload-finalize`'s offline rehash).
  */
 
-describe("CLI / Phase 16 multipart engine smoke", () => {
+describe("CLI / multipart engine smoke", () => {
   it("T1 — parallelUpload, parallelDownload, beginUpload, finalizeUpload are exported", () => {
     expect(typeof parallelUpload).toBe("function");
     expect(typeof parallelDownload).toBe("function");

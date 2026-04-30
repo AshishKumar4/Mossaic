@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { env } from "cloudflare:test";
 
 /**
- * Phase 15 — Step 4 — encrypted Yjs round-trips at the wire boundary.
+ * Step 4 — encrypted Yjs round-trips at the wire boundary.
  *
  *   Y1.  Two clients on the same encrypted yjs file converge on edits.
  *        The server sees only opaque envelope bytes.
@@ -48,7 +48,7 @@ function makeKey(byte: number): Uint8Array {
   return a;
 }
 
-describe("Phase 15 — encrypted Yjs wire boundary", () => {
+describe("encrypted Yjs wire boundary", () => {
   it("Y1 — two clients converge on edits via encrypted Yjs WS", async () => {
     const tenant = "p15-y1";
     const cfg: EncryptionConfig = {

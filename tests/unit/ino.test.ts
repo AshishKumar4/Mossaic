@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { gidFromTenant, inoFromId, uidFromTenant } from "@shared/ino";
 
 /**
- * Phase 2 — `ino` synthesis (sdk-impl-plan §9).
+ * `ino` synthesis (sdk-impl-plan §9).
  *
  * Verifies stable 53-bit safe integers, deterministic per id, low
  * collision rate at the expected scale.

@@ -32,7 +32,7 @@ import {
 } from "@shared/encryption-types";
 
 /**
- * Phase 15 — Step 1 — pure WebCrypto encryption primitives.
+ * Step 1 — pure WebCrypto encryption primitives.
  *
  * These tests run in the workerd isolate (vitest-pool-workers). They
  * exercise the envelope codec, IV derivation, key derivation, AES-GCM
@@ -73,7 +73,7 @@ function pseudoRandom(n: number, seed: number = 1): Uint8Array {
   return out;
 }
 
-describe("Phase 15 — encryption primitives", () => {
+describe("encryption primitives", () => {
   // ─── Round-trips at multiple sizes ────────────────────────────────────
 
   it("round-trips at 0 bytes (convergent)", async () => {

@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
 
 /**
- * Phase 2 — Path resolution tests (sdk-impl-plan §10).
+ * Path resolution tests (sdk-impl-plan §10).
  *
  * Verifies:
  *   - normalizePath/dirname/basename/resolveSymlinkTarget pure utils

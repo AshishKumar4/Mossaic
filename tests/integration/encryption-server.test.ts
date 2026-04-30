@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
 
 /**
- * Phase 15 — Step 2 — server-side encryption metadata + RPC stamp-through.
+ * Step 2 — server-side encryption metadata + RPC stamp-through.
  *
  * The Mossaic server NEVER decrypts user data. These tests exercise
  * what the server DOES do with encryption metadata:
@@ -53,7 +53,7 @@ function userStub(tenant: string) {
 
 const enc = (s: string) => new TextEncoder().encode(s);
 
-describe("Phase 15 — server schema + RPC stamping", () => {
+describe("server schema + RPC stamping", () => {
   it("S1 — vfsWriteFile stamps encryption columns on the head row", async () => {
     const tenant = "p15-s1";
     const stub = userStub(tenant);

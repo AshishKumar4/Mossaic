@@ -2,12 +2,12 @@ import { describe, it, expect } from "vitest";
 import { env, runInDurableObject, runDurableObjectAlarm } from "cloudflare:test";
 
 /**
- * Phase 9 — file-level versioning (S3-style, opt-in).
+ * file-level versioning (S3-style, opt-in).
  *
  * Pinned invariants (these are the targets for the upcoming TSLean
  * formal proofs):
  *
- *   I1. Versioning OFF tenant: byte-equivalent to Phase 8.
+ *   I1. Versioning OFF tenant: byte-equivalent to.
  *       file_versions stays empty; head_version_id stays NULL.
  *   I2. Versioning ON: every writeFile inserts exactly one new
  *       file_versions row; head_version_id points at it.
@@ -47,7 +47,7 @@ function envFor(): MossaicEnv {
   return { MOSSAIC_USER: E.MOSSAIC_USER as MossaicEnv["MOSSAIC_USER"] };
 }
 
-describe("Phase 9 — versioning OFF (default): byte-equivalent to Phase 8 (I1)", () => {
+describe("versioning OFF (default): byte-equivalent to (I1)", () => {
   it("writes do NOT create file_versions rows by default", async () => {
     const tenant = "ver-off-default";
     const vfs = createVFS(envFor(), { tenant });
@@ -72,13 +72,13 @@ describe("Phase 9 — versioning OFF (default): byte-equivalent to Phase 8 (I1)"
     expect(counts.versionRows).toBe(0);
     expect(counts.head).toBeNull();
 
-    // Reads still work — Phase 8 path returns the latest content.
+    // Reads still work — path returns the latest content.
     const back = await vfs.readFile("/x.txt", { encoding: "utf8" });
     expect(back).toBe("third");
   });
 });
 
-describe("Phase 9 — versioning ON (I2, I5, I6): write/read/list", () => {
+describe("versioning ON (I2, I5, I6): write/read/list", () => {
   it("creates 5 versions of /foo.txt; readFile current = v5; readFile by ID = historical", async () => {
     const tenant = "ver-multi";
     const vfs = createVFS(envFor(), { tenant, versioning: "enabled" });
@@ -130,7 +130,7 @@ describe("Phase 9 — versioning ON (I2, I5, I6): write/read/list", () => {
   });
 });
 
-describe("Phase 9 — restoreVersion (I7)", () => {
+describe("restoreVersion (I7)", () => {
   it("restoreVersion creates a new version with old content; head flips", async () => {
     const tenant = "ver-restore";
     const vfs = createVFS(envFor(), { tenant, versioning: "enabled" });
@@ -177,7 +177,7 @@ describe("Phase 9 — restoreVersion (I7)", () => {
   });
 });
 
-describe("Phase 9 — unlink tombstones (I3, I4)", () => {
+describe("unlink tombstones (I3, I4)", () => {
   it("unlink writes a tombstone; readFile head → ENOENT but listVersions still surfaces history", async () => {
     const tenant = "ver-tombstone";
     const vfs = createVFS(envFor(), { tenant, versioning: "enabled" });
@@ -203,7 +203,7 @@ describe("Phase 9 — unlink tombstones (I3, I4)", () => {
   });
 });
 
-describe("Phase 9 — dropVersions retention policies (I8)", () => {
+describe("dropVersions retention policies (I8)", () => {
   it("dropVersions({ keepLast: 2 }) drops v1-v3, keeps v4-v6 (head + 1 newest)", async () => {
     const tenant = "ver-drop-keepLast";
     const vfs = createVFS(envFor(), { tenant, versioning: "enabled" });
@@ -269,7 +269,7 @@ describe("Phase 9 — dropVersions retention policies (I8)", () => {
   });
 });
 
-describe("Phase 9 — cross-version dedup (I9) + chunk reclamation", () => {
+describe("cross-version dedup (I9) + chunk reclamation", () => {
   it("two versions with identical chunked content share the chunk row; refcount = 2", async () => {
     const tenant = "ver-dedup";
     const vfs = createVFS(envFor(), { tenant, versioning: "enabled" });
@@ -401,7 +401,7 @@ describe("Phase 9 — cross-version dedup (I9) + chunk reclamation", () => {
   });
 });
 
-describe("Phase 9 — inline tier (no shard call)", () => {
+describe("inline tier (no shard call)", () => {
   it("small payload (<INLINE_LIMIT) goes inline; readFile returns exact bytes", async () => {
     const tenant = "ver-inline";
     const vfs = createVFS(envFor(), { tenant, versioning: "enabled" });
@@ -438,7 +438,7 @@ describe("Phase 9 — inline tier (no shard call)", () => {
   });
 });
 
-describe("Phase 9 — listVersions performance (large history)", () => {
+describe("listVersions performance (large history)", () => {
   it("listVersions over 200 versions returns sorted in <100ms", async () => {
     // 10k is too slow for the test suite (would take many seconds
     // per write). 200 still proves the index works — without the
@@ -462,7 +462,7 @@ describe("Phase 9 — listVersions performance (large history)", () => {
   });
 });
 
-describe("Phase 9 — head-version idempotency", () => {
+describe("head-version idempotency", () => {
   it("rapid back-to-back writes each create a distinct version", async () => {
     const tenant = "ver-rapid";
     const vfs = createVFS(envFor(), { tenant, versioning: "enabled" });
@@ -481,7 +481,7 @@ describe("Phase 9 — head-version idempotency", () => {
   });
 });
 
-describe("Phase 9 — restoreVersion vs swept chunks (audit C2 regression)", () => {
+describe("restoreVersion vs swept chunks (audit C2 regression)", () => {
   it("restoreVersion of a version whose chunks were swept throws ENOENT (never silently corrupts)", async () => {
     const tenant = "ver-c2-regression";
     const vfs = createVFS(envFor(), { tenant, versioning: "enabled" });

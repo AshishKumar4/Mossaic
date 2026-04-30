@@ -2,10 +2,10 @@ import { describe, it, expect } from "vitest";
 import { SELF, env, runInDurableObject } from "cloudflare:test";
 
 /**
- * Phase 7 — HTTP fallback acceptance gate.
+ * HTTP fallback acceptance gate.
  *
- * Drives the Phase 7 HTTP fallback (worker/routes/vfs.ts) end-to-end:
- *   1. Operator-side: mint a VFS token via signVFSToken (Phase 4).
+ * Drives the HTTP fallback (worker/routes/vfs.ts) end-to-end:
+ *   1. Operator-side: mint a VFS token via signVFSToken.
  *   2. Consumer-side: createMossaicHttpClient({ url, apiKey: token })
  *      with a fetcher that routes through `SELF.fetch` (the
  *      vitest-pool-workers in-process Worker — same code path that
@@ -303,8 +303,8 @@ describe("HTTP fallback security / scope guards", () => {
   });
 });
 
-// ── Phase 13 — multipart envelope for metadata/tags/version on bytes ───
-describe("Phase 13 — HTTP writeFile multipart envelope (metadata/tags/version parity)", () => {
+// ── multipart envelope for metadata/tags/version on bytes ───
+describe("HTTP writeFile multipart envelope (metadata/tags/version parity)", () => {
   it("HTTP writeFile (bytes + multipart) applies metadata + tags", async () => {
     const vfs = await client("default", "http-multipart-meta");
     const payload = new TextEncoder().encode("photo bytes go here");
@@ -312,7 +312,7 @@ describe("Phase 13 — HTTP writeFile multipart envelope (metadata/tags/version 
       metadata: { camera: "x100", iso: 400 },
       tags: ["urgent", "client/acme"],
     });
-    // Confirm via listFiles (Phase 12 indexed list, paginated).
+    // Confirm via listFiles.
     const page = await vfs.listFiles({ includeMetadata: true });
     const f = page.items.find((i) => i.path === "/photo.bin");
     expect(f).toBeDefined();
@@ -339,7 +339,7 @@ describe("Phase 13 — HTTP writeFile multipart envelope (metadata/tags/version 
     });
     // The HTTP listVersions route doesn't currently surface `label` /
     // `userVisible`; verify directly via raw SQL in the DO. (Extending
-    // the HTTP route is a follow-up and out of scope for Phase 13.)
+    // the HTTP route is a follow-up and out of scope for.)
     const row = await runInDurableObject(tenantStub, async (_inst, state) => {
       return state.storage.sql
         .exec(
@@ -399,7 +399,7 @@ describe("HTTP fallback latency (informational)", () => {
 
   it("EACCES error subclass is also reachable on the client surface", async () => {
     // Sanity: confirm EACCES is exported from @mossaic/sdk and is a
-    // VFSFsError subclass. Phase 7 doesn't add new EACCES throws but
+    // VFSFsError subclass. doesn't add new EACCES throws but
     // the export must remain stable.
     expect(typeof EACCES).toBe("function");
     expect(new EACCES().code).toBe("EACCES");

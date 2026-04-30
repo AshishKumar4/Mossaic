@@ -1,5 +1,5 @@
 /**
- * E2E C — Streaming + 50MB SHA round-trip + Phase 13 stream metadata
+ * E2E C — Streaming + 50MB SHA round-trip + stream metadata
  * (5 cases).
  *
  * The HTTP fallback does NOT support createReadStream/createWriteStream
@@ -13,7 +13,7 @@ import { createHash } from "node:crypto";
 import { freshTenant, type TenantCtx } from "./helpers/tenant.js";
 import { hasSecret, requireSecret } from "./helpers/env.js";
 
-describe.skipIf(!hasSecret())("C — Streaming + 50MB SHA + Phase 13 metadata", () => {
+describe.skipIf(!hasSecret())("C — Streaming + 50MB SHA + metadata", () => {
   beforeAll(() => requireSecret());
 
   let ctx: TenantCtx;
@@ -105,7 +105,7 @@ describe.skipIf(!hasSecret())("C — Streaming + 50MB SHA + Phase 13 metadata", 
     expect(m.chunkCount).toBeGreaterThanOrEqual(20);
   }, 600_000);
 
-  it("C.4 — Phase 13 stream metadata commit (multipart envelope)", async () => {
+  it("C.4 — stream metadata commit (multipart envelope)", async () => {
     const payload = new TextEncoder().encode("phase 13 metadata payload");
     await ctx.vfs.writeFile("/c4.bin", payload, {
       mimeType: "application/octet-stream",

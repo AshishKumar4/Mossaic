@@ -1,5 +1,5 @@
 /**
- * E2E L — Phase 16 multipart parallel transfer (live).
+ * E2E L — multipart parallel transfer (live).
  *
  * Skipped unless `MOSSAIC_E2E_JWT_SECRET` is set. When set, runs
  * against the live Mossaic Service worker (defaults to the
@@ -18,7 +18,7 @@
  *   L.4  Endgame trigger fires: tag a slow synthetic chunk via a
  *        small `concurrency.max` and large file; verify endgame
  *        flag flips during onProgress reporting.
- *   L.5  Encrypted parallel upload: combine Phase 15 chunkTransform
+ *   L.5  Encrypted parallel upload: combine chunkTransform
  *        with parallelUpload; readFile via parallelDownload +
  *        chunkTransform decrypts to original bytes.
  *   L.6  Concurrent uploads to different paths: 4 parallelUploads
@@ -70,7 +70,7 @@ const MB = 1_048_576;
 
 // ─── Suite ─────────────────────────────────────────────────────────────
 
-describe.skipIf(!hasSecret())("L — Phase 16 multipart (live)", () => {
+describe.skipIf(!hasSecret())("L — multipart (live)", () => {
   beforeAll(() => requireSecret());
 
   let ctx: TenantCtx;
@@ -205,7 +205,7 @@ describe.skipIf(!hasSecret())("L — Phase 16 multipart (live)", () => {
     120_000
   );
 
-  // L.5 — Encrypted parallel upload with Phase 15 chunkTransform.
+  // L.5 — Encrypted parallel upload with chunkTransform.
   it(
     "L.5 — encrypted parallelUpload + parallelDownload round-trip",
     async () => {

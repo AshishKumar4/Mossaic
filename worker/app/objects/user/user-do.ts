@@ -18,8 +18,8 @@ import { UserDOCore } from "@core/objects/user/user-do-core";
  * Typed projection of a `files` table row. Exposed for callers of
  * {@link UserDO.appGetFile}; matches the snake_case column names of
  * the underlying SQLite schema so the App routes can pass it
- * straight through to legacy wire shapes (e.g. the public share
- * endpoint at `/api/shared/:token/photos`).
+ * straight through to wire shapes that expect the column naming
+ * (e.g. the public share endpoint at `/api/shared/:token/photos`).
  */
 export interface AppFileRow {
   file_id: string;
@@ -317,7 +317,7 @@ export class UserDO extends UserDOCore {
     return getQuota(this, userId);
   }
 
-  // ── Internal aggregator (was inline in legacy fetch) ─────────────
+  // ── Internal aggregator ──────────────────────────────────────────
 
   private getUserStats(userId: string): UserStats {
     // Total files and storage

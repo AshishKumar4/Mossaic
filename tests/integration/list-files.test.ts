@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
 
 /**
- * Phase 12 — indexed listFiles + cursor pagination.
+ * indexed listFiles + cursor pagination.
  *
  * Pinned invariants:
  *   L1.  Empty tenant: empty items, no cursor.
@@ -35,7 +35,7 @@ function userStub(tenant: string) {
   return E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName(vfsUserDOName(NS, tenant)));
 }
 
-describe("Phase 12 — listFiles basic (L1, L2, L7, L9)", () => {
+describe("listFiles basic (L1, L2, L7, L9)", () => {
   it("empty tenant returns empty items, no cursor", async () => {
     const vfs = createVFS(envFor(), { tenant: "p12-list-empty" });
     const r = await vfs.listFiles();
@@ -95,7 +95,7 @@ describe("Phase 12 — listFiles basic (L1, L2, L7, L9)", () => {
   });
 });
 
-describe("Phase 12 — cursor security (L3, L4)", () => {
+describe("cursor security (L3, L4)", () => {
   it("tampered cursor → EINVAL", async () => {
     const tenant = "p12-list-cursor-tamper";
     const vfs = createVFS(envFor(), { tenant });
@@ -121,7 +121,7 @@ describe("Phase 12 — cursor security (L3, L4)", () => {
   });
 });
 
-describe("Phase 12 — listFiles tags (L5)", () => {
+describe("listFiles tags (L5)", () => {
   it("AND semantics: only files with ALL tags", async () => {
     const tenant = "p12-list-tags-and";
     const vfs = createVFS(envFor(), { tenant });
@@ -152,7 +152,7 @@ describe("Phase 12 — listFiles tags (L5)", () => {
   });
 });
 
-describe("Phase 12 — metadata filter (L8)", () => {
+describe("metadata filter (L8)", () => {
   it("filters to rows whose metadata matches", async () => {
     const tenant = "p12-list-meta";
     const vfs = createVFS(envFor(), { tenant });
@@ -171,7 +171,7 @@ describe("Phase 12 — metadata filter (L8)", () => {
   });
 });
 
-describe("Phase 12 — concurrent insert during pagination (L6)", () => {
+describe("concurrent insert during pagination (L6)", () => {
   it("inserting newer files between pages does not corrupt page 2", async () => {
     const tenant = "p12-list-concurrent";
     const vfs = createVFS(envFor(), { tenant });
@@ -207,7 +207,7 @@ describe("Phase 12 — concurrent insert during pagination (L6)", () => {
   });
 });
 
-describe("Phase 12 — performance smoke (L10)", () => {
+describe("performance smoke (L10)", () => {
   it("1k-file default listFiles under 500ms (Miniflare soft gate)", async () => {
     const tenant = "p12-list-perf";
     const stub = userStub(tenant);

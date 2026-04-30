@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { SELF, env } from "cloudflare:test";
 
 /**
- * Phase 13.5 — public Yjs WebSocket upgrade route.
+ * public Yjs WebSocket upgrade route.
  *
  * Pins the contract of `worker/core/routes/vfs-yjs-ws.ts`:
  *   1. Missing Bearer → 401 EACCES.
@@ -30,7 +30,7 @@ async function mint(ns: string, tenant: string, sub?: string): Promise<string> {
   return signVFSToken(TEST_ENV, { ns, tenant, sub });
 }
 
-describe("Phase 13.5 — public /api/vfs/yjs/ws upgrade route", () => {
+describe("public /api/vfs/yjs/ws upgrade route", () => {
   it("rejects without Authorization (no Bearer)", async () => {
     const r = await SELF.fetch(
       "https://mossaic.test/api/vfs/yjs/ws?path=/x",

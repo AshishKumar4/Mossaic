@@ -1,5 +1,5 @@
 /**
- * Phase 14 workspace-consumer fixture.
+ * workspace-consumer fixture.
  *
  * Pinned invariants:
  *   - `@mossaic/sdk` resolves via the `workspace` exports condition
@@ -29,7 +29,7 @@ interface Env extends MossaicEnv {
   // (Workspace-fixture-specific bindings could go here.)
 }
 
-// Phase 15: a fixed test-fixture encryption config. This is for
+// a fixed test-fixture encryption config. This is for
 // fixture/demo use ONLY — never use a hard-coded master key in
 // production. Real consumers derive it from KMS or a password via
 // `deriveMasterFromPassword` (see @mossaic/sdk/encryption).
@@ -54,7 +54,7 @@ export default {
       const got = await vfs.readFile("/hello.txt", { encoding: "utf8" });
       return new Response(got, { status: 200 });
     }
-    // Phase 15: encrypted writeFile + readFile demo. The same VFS
+    // encrypted writeFile + readFile demo. The same VFS
     // instance does both — encryption config is per-VFS, scoped to
     // this tenant.
     if (req.method === "POST" && url.pathname === "/seed-encrypted") {

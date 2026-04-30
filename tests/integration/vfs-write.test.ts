@@ -6,7 +6,7 @@ import {
 } from "cloudflare:test";
 
 /**
- * Phase 3 — Write-side VFS RPC integration tests.
+ * Write-side VFS RPC integration tests.
  *
  * Drives the write-side typed RPC surface (vfsWriteFile, vfsUnlink,
  * vfsMkdir, vfsRmdir, vfsRename, vfsChmod, vfsSymlink,
@@ -42,7 +42,7 @@ const E = env as unknown as E;
 /**
  * Seed a UserDO via the App's `appHandleSignup` typed RPC to
  * materialize the quota row + the user_id we'll use as
- * scope.tenant. Phase 17 replaced the legacy `/signup` JSON router
+ * scope.tenant. replaced the legacy `/signup` JSON router
  * with the typed RPC; behaviour is bit-for-bit identical (same
  * `handleSignup` helper underneath).
  */

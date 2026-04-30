@@ -26,7 +26,7 @@
  * server flip. We work around by writing through the `version` opt
  * in writeFile — the worker treats that as a hint to lazily enable
  * versioning for the tenant. If the deploy doesn't honor that
- * (current Phase 13.5 behavior), the tests assert the no-versioning
+ * (current behavior), the tests assert the no-versioning
  * baseline instead.
  */
 
@@ -34,7 +34,7 @@ import { describe, it, expect, beforeEach, afterEach, beforeAll } from "vitest";
 import { freshTenant, type TenantCtx } from "./helpers/tenant.js";
 import { hasSecret, requireSecret, ENDPOINT } from "./helpers/env.js";
 
-// Helper: enable versioning on a tenant via the Phase 13.5 admin
+// Helper: enable versioning on a tenant via the admin
 // HTTP route. The Service worker exposes
 // `POST /api/vfs/admin/setVersioning { enabled: true }` which calls
 // `UserDOCore.adminSetVersioning(userId, true)` server-side. The

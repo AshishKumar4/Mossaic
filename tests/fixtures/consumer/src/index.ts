@@ -20,7 +20,7 @@ import {
   type MossaicEnv,
 } from "../../../../sdk/src/index";
 
-// Phase 11.1: SearchDO is no longer part of the SDK contract. The
+// SearchDO is no longer part of the SDK contract. The
 // consumer fixture mirrors a real customer adoption — no SearchDO
 // re-export, no MOSSAIC_SEARCH binding.
 export { UserDO, ShardDO };

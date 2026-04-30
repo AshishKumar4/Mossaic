@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { pathFromParentId, pathFromFileId } from "../../src/lib/path-utils";
 
 /**
- * Phase 17.6 — `path-utils.ts` tests.
+ * `path-utils.ts` tests.
  *
  *   P1. `pathFromParentId(null, "foo.jpg")` returns `/foo.jpg`.
  *   P2. `pathFromParentId("folder-id", "foo.jpg")` returns
@@ -13,7 +13,7 @@ import { pathFromParentId, pathFromFileId } from "../../src/lib/path-utils";
  *       `path` field).
  */
 
-describe("Phase 17.6 — path/parentId reconciliation", () => {
+describe("path/parentId reconciliation", () => {
   it("P1 — pathFromParentId(null, 'foo.jpg') → '/foo.jpg'", () => {
     expect(pathFromParentId(null, "foo.jpg")).toBe("/foo.jpg");
   });

@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
 
 /**
- * Phase 4 — Stream + low-level escape-hatch RPC tests.
+ * Stream + low-level escape-hatch RPC tests.
  *
  * Coverage (sdk-impl-plan §5.3, §8 bottom-of-list):
  *   - vfsCreateReadStream over inlined files (single-chunk inline path)
@@ -20,7 +20,7 @@ import { env, runInDurableObject } from "cloudflare:test";
  *   - backpressure: ReadableStream pulls one chunk at a time on demand
  *
  * All tests use the new vfs:default:<userId> DO naming pattern that
- * Phase 4 introduced. Direct DO RPC: tests grab a stub via
+ * introduced. Direct DO RPC: tests grab a stub via
  * env.MOSSAIC_USER.idFromName(vfsUserDOName(...)) and call the new methods.
  */
 
@@ -39,7 +39,7 @@ const NS = "default";
 
 /**
  * Get a UserDO stub for a given test tenant id. The DO is named via
- * the Phase 4 vfsUserDOName pattern so the test mirrors what an SDK
+ * the vfsUserDOName pattern so the test mirrors what an SDK
  * consumer's createVFS({ tenant }) would do.
  */
 function userStubFor(tenant: string, sub?: string) {
@@ -678,7 +678,7 @@ describe("vfsOpenManifest + vfsReadChunk", () => {
 // Shard binding: the streams use vfsShardDOName, not the legacy name.
 // ───────────────────────────────────────────────────────────────────────
 
-describe("Phase 4 shard naming wired through stream paths", () => {
+describe("shard naming wired through stream paths", () => {
   it("chunks land on vfs:default:<tenant>:s<idx> shards, not the legacy shard:<userId>:<idx>", async () => {
     const tenant = "shard-naming";
     const stub = userStubFor(tenant);
@@ -718,8 +718,8 @@ describe("Phase 4 shard naming wired through stream paths", () => {
   });
 });
 
-// ── Phase 13 — stream commit accepts metadata/tags/version ─────────────
-describe("Phase 13 — createWriteStream applies metadata + tags + version at commit", () => {
+// ── stream commit accepts metadata/tags/version ─────────────
+describe("createWriteStream applies metadata + tags + version at commit", () => {
   it("createWriteStream applies metadata + tags at commit", async () => {
     const tenant = "p13-stream-meta";
     const stub = userStubFor(tenant);

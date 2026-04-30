@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { SELF, env } from "cloudflare:test";
 
 /**
- * Phase 16 — Multipart parallel transfer integration tests.
+ * Multipart parallel transfer integration tests.
  *
  * Drives the full HTTP surface end-to-end via SELF.fetch:
  *   - begin → put × N → finalize happy path
@@ -150,7 +150,7 @@ function chunkOf(seed: number, size: number): Uint8Array {
   return buf;
 }
 
-describe("Phase 16 — multipart routes", () => {
+describe("multipart routes", () => {
   // ───────────────────────────────────────────────────────────────────
   // Begin / put / finalize happy path
   // ───────────────────────────────────────────────────────────────────
@@ -800,11 +800,11 @@ describe("Phase 16 — multipart routes", () => {
   });
 
   // ───────────────────────────────────────────────────────────────────
-  // Phase 15 composition: per-chunk encrypted envelopes
+  // composition: per-chunk encrypted envelopes
   // ───────────────────────────────────────────────────────────────────
 
-  it("composes with Phase 15 — per-chunk envelopes round-trip", async () => {
-    // We don't need the actual encryption pipeline — Phase 16 transport
+  it("composes with per-chunk envelopes round-trip", async () => {
+    // We don't need the actual encryption pipeline — transport
     // is opaque to envelope contents. We simulate by passing arbitrary
     // bytes that play the role of envelopes; the server hashes them
     // verbatim and the round-trip recovers them.
@@ -817,7 +817,7 @@ describe("Phase 16 — multipart routes", () => {
       // Note: we don't pass `encryption` opts here because that triggers
       // server-side mode-monotonic enforcement; the test exercises the
       // transport-only composition. The dedicated encryption tests in
-      // Step 9 sub-agent (b) drive the full Phase 15 pipeline.
+      // Step 9 sub-agent (b) drive the full pipeline.
     });
     // Pretend each chunk is an "envelope" (opaque bytes).
     const env0 = new Uint8Array([0xff, 0xfe, ...chunkOf(0, 98)]);
