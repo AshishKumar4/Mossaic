@@ -23,6 +23,9 @@ export default defineConfig({
   },
   test: {
     include: ["tests/**/*.test.ts"],
+    // Exclude the Playwright browser suite — different runner
+    // (`@playwright/test`), driven by `pnpm test:e2e:browser`.
+    exclude: ["tests/e2e/browser/**"],
     testTimeout: 60_000,
     hookTimeout: 60_000,
     // Limit parallelism — live tests share a global rate-limit budget

@@ -104,7 +104,11 @@ export class HttpVFS implements VFSClient {
     // Trim trailing slash to make path joining predictable.
     this.base = opts.url.replace(/\/$/, "");
     this.apiKeyProvider = opts.apiKey;
-    this.fetcher = opts.fetcher ?? fetch;
+    // Bind to globalThis when defaulting to the platform `fetch` —
+    // browser DOM `fetch` requires `this === Window` and would
+    // otherwise throw `Illegal invocation` when invoked off the
+    // HttpVFS instance.
+    this.fetcher = opts.fetcher ?? fetch.bind(globalThis);
     this.promises = this;
   }
 

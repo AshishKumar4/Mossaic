@@ -28,3 +28,9 @@ lean/.lake/
 
 # Local-only docs (audit reports, planning notes)
 local/
+
+# Playwright browser E2E
+cli/test-results/
+cli/playwright-report/
+playwright-report/
+test-results/
