@@ -7,6 +7,7 @@ import {
   type ReactNode,
 } from "react";
 import { api } from "./api";
+import { resetTransferClient } from "./transfer-client";
 
 interface AuthState {
   token: string | null;
@@ -66,6 +67,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const logout = useCallback(() => {
+    // Drop the cached canonical-VFS HttpVFS client + cached VFS token.
+    // The next post-login transfer rebuilds against a fresh token.
+    resetTransferClient();
     setState({ token: null, userId: null, email: null });
   }, []);
 

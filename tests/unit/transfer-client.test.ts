@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach } from "vitest";
 import {
   getTransferClient,
   resetTransferClient,
@@ -6,70 +6,100 @@ import {
 import { api } from "../../src/lib/api";
 
 /**
- * Phase 17.6 — `transfer-client.ts` factory tests.
+ * `transfer-client.ts` factory tests.
  *
- *   T1. `getTransferClient()` constructs an HttpVFS configured for
- *       the App's `/api/upload/multipart` and `/api/download` routes.
+ *   T1. `getTransferClient()` constructs a canonical HttpVFS that
+ *       targets `/api/vfs/multipart/*` and `/api/vfs/chunk/*`.
  *   T2. The cached client is returned on subsequent calls (singleton).
  *   T3. `resetTransferClient()` clears the cache; the next call
- *       rebuilds against the current `api.getToken()`.
- *   T4. `getTransferClient()` throws when no token is set on `api`.
+ *       rebuilds against a fresh VFS token.
+ *   T4. `getTransferClient()` rejects when no App session JWT is
+ *       set on `api` (auth-bridge mint requires the session).
  *
- * The tests stub `window.location.origin` because the SPA factory
- * uses it for the `url` field. workerd doesn't expose `window`
- * natively; we provide a minimal stand-in.
+ * The factory is async because the auth-bridge mint requires a
+ * network round-trip. The token round-trip is stubbed via a
+ * `globalThis.fetch` shim so the test runs without network.
+ *
+ * `window.location.origin` is stubbed because workerd doesn't
+ * expose `window` natively; the SPA factory uses it for the `url`
+ * field.
  */
 
-// Inject a `window` stub so `window.location.origin` works in workerd.
-const origGlobal = globalThis as { window?: { location: { origin: string } } };
+const origGlobal = globalThis as {
+  window?: { location: { origin: string } };
+  fetch?: typeof fetch;
+};
 const previousWindow = origGlobal.window;
+const previousFetch = origGlobal.fetch;
+
+/**
+ * Install a minimal stub for `globalThis.fetch` that responds to the
+ * auth-bridge mint endpoint (`/api/auth/vfs-token`) with a
+ * deterministic token + future expiry. Other URLs are unhandled
+ * (the tests below don't exercise them).
+ */
+function installFetchStub(token: string, expiresAtMs: number): void {
+  origGlobal.fetch = (async (
+    input: RequestInfo | URL,
+    _init?: RequestInit
+  ): Promise<Response> => {
+    const url = typeof input === "string" ? input : input.toString();
+    if (url.endsWith("/api/auth/vfs-token")) {
+      return new Response(JSON.stringify({ token, expiresAtMs }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return new Response("not stubbed", { status: 500 });
+  }) as typeof fetch;
+}
+
 beforeEach(() => {
   origGlobal.window = { location: { origin: "https://app.example.com" } };
   resetTransferClient();
   api.setToken(null);
 });
 
-// Restore after the suite — tests run sequentially in vitest-pool-workers.
-const restoreWindow = (): void => {
-  if (previousWindow === undefined) {
-    delete origGlobal.window;
-  } else {
-    origGlobal.window = previousWindow;
-  }
+// Restore after suite (tests run sequentially in vitest-pool-workers).
+const restoreGlobals = (): void => {
+  if (previousWindow === undefined) delete origGlobal.window;
+  else origGlobal.window = previousWindow;
+  if (previousFetch === undefined) delete origGlobal.fetch;
+  else origGlobal.fetch = previousFetch;
 };
 
-describe("Phase 17.6 — getTransferClient / resetTransferClient", () => {
-  it("T1 — getTransferClient builds an HttpVFS against the App's JWT + override routes", () => {
-    api.setToken("test-jwt-abc");
-    const c = getTransferClient();
+describe("transfer-client — getTransferClient / resetTransferClient", () => {
+  it("T1 — getTransferClient builds a canonical HttpVFS authenticated by a bridge-minted VFS token", async () => {
+    api.setToken("session-jwt-abc");
+    installFetchStub("vfs-token-xyz", Date.now() + 15 * 60 * 1000);
+    const c = await getTransferClient();
     expect(c).toBeDefined();
     expect(typeof c.multipartBegin).toBe("function");
-    // Confirm the override is in effect by inspecting what the
-    // client's URL builder produces. The internal routing isn't
-    // public, so we exercise it via a second test (B2 in
-    // http-base-override.test.ts) — here we confirm the factory
-    // constructed the client without throwing.
   });
 
-  it("T2 — same instance returned on subsequent calls (cached)", () => {
-    api.setToken("test-jwt-abc");
-    const a = getTransferClient();
-    const b = getTransferClient();
+  it("T2 — same instance returned on subsequent calls (cached)", async () => {
+    api.setToken("session-jwt-abc");
+    installFetchStub("vfs-token-xyz", Date.now() + 15 * 60 * 1000);
+    const a = await getTransferClient();
+    const b = await getTransferClient();
     expect(a).toBe(b);
   });
 
-  it("T3 — resetTransferClient drops the cache; next call rebuilds with current token", () => {
-    api.setToken("token-1");
-    const a = getTransferClient();
+  it("T3 — resetTransferClient drops the cache; next call rebuilds with a fresh token", async () => {
+    api.setToken("session-jwt-abc");
+    installFetchStub("vfs-token-1", Date.now() + 15 * 60 * 1000);
+    const a = await getTransferClient();
+    // Reset and re-mint with a different token; the next
+    // getTransferClient must build a NEW HttpVFS instance.
     resetTransferClient();
-    api.setToken("token-2");
-    const b = getTransferClient();
+    installFetchStub("vfs-token-2", Date.now() + 15 * 60 * 1000);
+    const b = await getTransferClient();
     expect(a).not.toBe(b);
   });
 
-  it("T4 — getTransferClient throws when no token is set", () => {
+  it("T4 — getTransferClient rejects when no App session JWT is set", async () => {
     api.setToken(null);
-    expect(() => getTransferClient()).toThrow(/no API token/);
-    restoreWindow();
+    await expect(getTransferClient()).rejects.toThrow();
+    restoreGlobals();
   });
 });

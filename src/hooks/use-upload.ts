@@ -94,7 +94,7 @@ export function useUpload(onComplete?: () => void) {
 
       try {
         const result = await parallelUpload(
-          getTransferClient(),
+          await getTransferClient(),
           pathFromParentId(parentId, file.name),
           file,
           {
