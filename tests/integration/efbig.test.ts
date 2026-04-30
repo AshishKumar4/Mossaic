@@ -39,11 +39,15 @@ import { READFILE_MAX, WRITEFILE_MAX } from "@shared/inline";
 
 interface E {
   MOSSAIC_USER: DurableObjectNamespace;
+  MOSSAIC_SHARD: DurableObjectNamespace;
 }
 const E = env as unknown as E;
 
 function makeEnv(): MossaicEnv {
-  return { MOSSAIC_USER: E.MOSSAIC_USER as MossaicEnv["MOSSAIC_USER"] };
+  return {
+    MOSSAIC_USER: E.MOSSAIC_USER as MossaicEnv["MOSSAIC_USER"],
+    MOSSAIC_SHARD: E.MOSSAIC_SHARD as unknown as MossaicEnv["MOSSAIC_SHARD"],
+  };
 }
 
 describe("EFBIG enforcement", () => {

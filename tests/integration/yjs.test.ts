@@ -61,7 +61,10 @@ const E = env as unknown as E;
 const NS_DEFAULT = "default";
 
 function envFor(): MossaicEnv {
-  return { MOSSAIC_USER: E.MOSSAIC_USER as MossaicEnv["MOSSAIC_USER"] };
+  return {
+    MOSSAIC_USER: E.MOSSAIC_USER as MossaicEnv["MOSSAIC_USER"],
+    MOSSAIC_SHARD: E.MOSSAIC_SHARD as unknown as MossaicEnv["MOSSAIC_SHARD"],
+  };
 }
 
 function userStub(tenant: string, sub?: string) {

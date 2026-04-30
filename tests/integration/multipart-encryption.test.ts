@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { SELF, env } from "cloudflare:test";
+import type { UserDO } from "@app/objects/user/user-do";
 
 /**
  * × composition tests.

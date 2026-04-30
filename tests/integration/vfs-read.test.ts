@@ -16,6 +16,7 @@ import { INLINE_LIMIT } from "@shared/inline";
 
 interface E {
   MOSSAIC_USER: DurableObjectNamespace<UserDO>;
+  MOSSAIC_SHARD: DurableObjectNamespace;
 }
 const E = env as unknown as E;
 

@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
+import { listVersionsVia } from "./helpers";
 
 /**
  * Step 2 — server-side encryption metadata + RPC stamp-through.
@@ -38,12 +39,16 @@ import { vfsUserDOName } from "@core/lib/utils";
 
 interface E {
   MOSSAIC_USER: DurableObjectNamespace<UserDO>;
+  MOSSAIC_SHARD: DurableObjectNamespace;
 }
 const E = env as unknown as E;
 const NS = "default";
 
 function envFor(): MossaicEnv {
-  return { MOSSAIC_USER: E.MOSSAIC_USER as MossaicEnv["MOSSAIC_USER"] };
+  return {
+    MOSSAIC_USER: E.MOSSAIC_USER as MossaicEnv["MOSSAIC_USER"],
+    MOSSAIC_SHARD: E.MOSSAIC_SHARD as unknown as MossaicEnv["MOSSAIC_SHARD"],
+  };
 }
 function userStub(tenant: string) {
   return E.MOSSAIC_USER.get(
@@ -232,7 +237,7 @@ describe("server schema + RPC stamping", () => {
       encryption: { mode: "convergent", keyId: "key1" },
     });
 
-    const versions = await stub.vfsListVersions(scope, "/v.bin", {});
+    const versions = await listVersionsVia(stub, scope, "/v.bin", {});
     expect(versions.length).toBeGreaterThanOrEqual(2);
     for (const v of versions) {
       expect(v.encryption?.mode).toBe("convergent");

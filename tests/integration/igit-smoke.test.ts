@@ -29,11 +29,15 @@ import { createVFS, type MossaicEnv } from "../../sdk/src/index";
 
 interface E {
   MOSSAIC_USER: DurableObjectNamespace;
+  MOSSAIC_SHARD: DurableObjectNamespace;
 }
 const E = env as unknown as E;
 
 function makeEnv(): MossaicEnv {
-  return { MOSSAIC_USER: E.MOSSAIC_USER as MossaicEnv["MOSSAIC_USER"] };
+  return {
+    MOSSAIC_USER: E.MOSSAIC_USER as MossaicEnv["MOSSAIC_USER"],
+    MOSSAIC_SHARD: E.MOSSAIC_SHARD as unknown as MossaicEnv["MOSSAIC_SHARD"],
+  };
 }
 
 describe("isomorphic-git end-to-end against @mossaic/sdk VFS", () => {

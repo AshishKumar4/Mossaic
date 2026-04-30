@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { SELF, env, runInDurableObject } from "cloudflare:test";
+import { listVersionsVia } from "./helpers";
 
 /**
  * Phase 27 — multipart × versioning correctness.
@@ -31,9 +32,11 @@ import { SELF, env, runInDurableObject } from "cloudflare:test";
 import { signVFSToken } from "@core/lib/auth";
 import { hashChunk } from "@shared/crypto";
 import { vfsUserDOName } from "@core/lib/utils";
+import type { UserDO } from "@app/objects/user/user-do";
 
 interface E {
-  MOSSAIC_USER: DurableObjectNamespace;
+  MOSSAIC_USER: DurableObjectNamespace<UserDO>;
+  MOSSAIC_SHARD: DurableObjectNamespace;
   JWT_SECRET?: string;
 }
 const TEST_ENV = env as unknown as E;
@@ -258,7 +261,7 @@ describe("multipart × versioning — Phase 27 correct semantics (MV1, MV3)", ()
     const payload = makePayload(0xb2);
     await multipartWrite(tenant, "/big.bin", payload);
 
-    const versions = await stub.vfsListVersions(
+    const versions = await listVersionsVia(stub, 
       { ns: NS, tenant },
       "/big.bin"
     );
@@ -289,7 +292,7 @@ describe("multipart × versioning — overwrite preserves history (MV2)", () => 
     // 1. Two writeFile passes — DO insert file_versions rows.
     await stub.vfsWriteFile(scope, "/p.bin", new TextEncoder().encode("v1"));
     await stub.vfsWriteFile(scope, "/p.bin", new TextEncoder().encode("v2"));
-    const before = await stub.vfsListVersions(scope, "/p.bin");
+    const before = await listVersionsVia(stub, scope, "/p.bin");
     expect(before.length).toBe(2);
 
     // 2. Multipart-overwrite — Phase 27 must preserve prior history.
@@ -297,7 +300,7 @@ describe("multipart × versioning — overwrite preserves history (MV2)", () => 
     await multipartWrite(tenant, "/p.bin", payload);
 
     // 3. Phase 27 — listVersions returns ≥3 (v1, v2, multipart).
-    const list = await stub.vfsListVersions(scope, "/p.bin");
+    const list = await listVersionsVia(stub, scope, "/p.bin");
     expect(list.length).toBe(3);
     // Newest-first ordering — multipart is the head.
     expect(list[0]!.size).toBe(payload.byteLength);
@@ -332,7 +335,7 @@ describe("multipart × versioning — restoreVersion (MV4)", () => {
     // 1. writeFile v1 — historical version we'll restore.
     const v1Bytes = new TextEncoder().encode("history v1 bytes");
     await stub.vfsWriteFile(scope, "/q.bin", v1Bytes);
-    const afterV1 = await stub.vfsListVersions(scope, "/q.bin");
+    const afterV1 = await listVersionsVia(stub, scope, "/q.bin");
     expect(afterV1.length).toBe(1);
     const v1Id = afterV1[0]!.versionId;
 
@@ -340,7 +343,7 @@ describe("multipart × versioning — restoreVersion (MV4)", () => {
     const payload = makePayload(0xd4);
     await multipartWrite(tenant, "/q.bin", payload);
 
-    const afterMP = await stub.vfsListVersions(scope, "/q.bin");
+    const afterMP = await listVersionsVia(stub, scope, "/q.bin");
     expect(afterMP.length).toBe(2);
 
     // 3. Restore v1 — chunks of v1 must still be reachable on shards.
@@ -352,7 +355,7 @@ describe("multipart × versioning — restoreVersion (MV4)", () => {
 
     // 5. listVersions now has 3 entries (v1, multipart, restore-of-v1
     //    inserted as a new version row pointing at v1's content).
-    const afterRestore = await stub.vfsListVersions(scope, "/q.bin");
+    const afterRestore = await listVersionsVia(stub, scope, "/q.bin");
     expect(afterRestore.length).toBe(3);
   });
 });

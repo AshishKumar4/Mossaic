@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { SELF, env, runInDurableObject } from "cloudflare:test";
+import type { UserDO } from "@app/objects/user/user-do";
 
 /**
  * HTTP fallback acceptance gate.
@@ -26,9 +27,11 @@ import {
   VFSFsError,
 } from "../../sdk/src/index";
 import { signVFSToken, signJWT } from "@core/lib/auth";
+import type { EnvCore } from "@shared/types";
 
 interface E {
-  MOSSAIC_USER: DurableObjectNamespace;
+  MOSSAIC_USER: DurableObjectNamespace<UserDO>;
+  MOSSAIC_SHARD: DurableObjectNamespace;
   JWT_SECRET?: string;
 }
 const TEST_ENV = env as unknown as E;
@@ -53,7 +56,16 @@ async function mintToken(
   tenant: string,
   sub?: string
 ): Promise<string> {
-  return signVFSToken(TEST_ENV, { ns, tenant, sub });
+  // Phase 29 — TEST_ENV's MOSSAIC_USER is parameterized over UserDO
+  // for the test stub-typing helpers, but `signVFSToken` accepts
+  // `EnvCore` whose namespaces are `DurableObjectNamespace`
+  // (un-parameterized). The runtime env carries the same bindings;
+  // cast through `EnvCore` to satisfy the structural mismatch.
+  return signVFSToken(TEST_ENV as unknown as EnvCore, {
+    ns,
+    tenant,
+    sub,
+  });
 }
 
 async function client(ns: string, tenant: string, sub?: string) {
@@ -228,7 +240,7 @@ describe("HTTP fallback security / scope guards", () => {
   it("legacy login JWT (no scope claim) is rejected → 401", async () => {
     // Mint a legacy login JWT (signJWT — has email, no scope claim).
     // The HTTP fallback must reject it.
-    const legacyToken = await signJWT(TEST_ENV, {
+    const legacyToken = await signJWT(TEST_ENV as unknown as EnvCore, {
       userId: "fake-user-id",
       email: "u@example.com",
     });
@@ -297,9 +309,12 @@ describe("HTTP fallback security / scope guards", () => {
 
   it("streams throw EINVAL on the HTTP client (v1 unsupported)", async () => {
     const vfs = await client("default", "http-streams");
-    await expect(vfs.createReadStream("/x")).rejects.toThrow(/EINVAL/);
-    await expect(vfs.createWriteStream("/x")).rejects.toThrow(/EINVAL/);
-    await expect(vfs.openReadStream("/x")).rejects.toThrow(/EINVAL/);
+    // HTTP fallback's stream methods take 0 args at the type level
+    // (they're documented as ENOTSUP/EINVAL in v1); call without
+    // the path arg.
+    await expect(vfs.createReadStream()).rejects.toThrow(/EINVAL/);
+    await expect(vfs.createWriteStream()).rejects.toThrow(/EINVAL/);
+    await expect(vfs.openReadStream()).rejects.toThrow(/EINVAL/);
   });
 });
 

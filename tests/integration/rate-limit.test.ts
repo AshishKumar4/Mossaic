@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
+import type { UserDO } from "@app/objects/user/user-do";
 
 /**
  * per-tenant rate limit enforcement.
@@ -15,12 +16,16 @@ import { createVFS, type MossaicEnv, EAGAIN, VFSFsError } from "../../sdk/src/in
 import { vfsUserDOName } from "@core/lib/utils";
 
 interface E {
-  MOSSAIC_USER: DurableObjectNamespace;
+  MOSSAIC_USER: DurableObjectNamespace<UserDO>;
+  MOSSAIC_SHARD: DurableObjectNamespace;
 }
 const E = env as unknown as E;
 
 function envFor(): MossaicEnv {
-  return { MOSSAIC_USER: E.MOSSAIC_USER as MossaicEnv["MOSSAIC_USER"] };
+  return {
+    MOSSAIC_USER: E.MOSSAIC_USER as MossaicEnv["MOSSAIC_USER"],
+    MOSSAIC_SHARD: E.MOSSAIC_SHARD as unknown as MossaicEnv["MOSSAIC_SHARD"],
+  };
 }
 
 /**
