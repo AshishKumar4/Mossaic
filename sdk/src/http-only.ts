@@ -89,6 +89,7 @@ export type {
   WriteFileOpts,
   CopyFileOpts,
   PatchMetadataOpts,
+  FileInfoOpts,
   ListFilesOpts,
   ListFilesItem,
   ListFilesPage,

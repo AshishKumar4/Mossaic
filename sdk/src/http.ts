@@ -656,6 +656,35 @@ export class HttpVFS implements VFSClient {
     };
   }
 
+  async fileInfo(
+    p: string,
+    opts: import("./vfs").FileInfoOpts = {}
+  ): Promise<import("./vfs").ListFilesItem> {
+    const res = await this.post(
+      "fileInfo",
+      { path: p, ...opts },
+      "stat",
+      p,
+      "json"
+    );
+    const raw = (await res.json()) as {
+      item: {
+        path: string;
+        pathId: string;
+        stat?: import("../../shared/vfs-types").VFSStatRaw;
+        metadata?: Record<string, unknown> | null;
+        tags: string[];
+      };
+    };
+    return {
+      path: raw.item.path,
+      pathId: raw.item.pathId,
+      stat: raw.item.stat ? new VFSStat(raw.item.stat) : undefined,
+      metadata: raw.item.metadata,
+      tags: raw.item.tags,
+    };
+  }
+
   async markVersion(
     p: string,
     versionId: string,

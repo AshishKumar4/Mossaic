@@ -1879,6 +1879,16 @@ export class UserDOCore extends DurableObject<Env> {
     return vfsListFiles(this, scope, opts);
   }
 
+  async vfsFileInfo(
+    scope: VFSScope,
+    path: string,
+    opts?: { includeStat?: boolean; includeMetadata?: boolean }
+  ): Promise<import("./list-files").ListFilesItemRaw> {
+    this.gateVfs(scope);
+    const { vfsFileInfo } = await import("./list-files");
+    return vfsFileInfo(this, scope, path, opts);
+  }
+
   // ── yjs-mode primitives ─────────────────────────────────────
 
   /**

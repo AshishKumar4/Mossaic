@@ -60,6 +60,11 @@ interface ListFilesOpts {
   includeMetadata?: boolean;
 }
 
+export interface FileInfoOpts {
+  includeStat?: boolean;
+  includeMetadata?: boolean;
+}
+
 const FILE_NODE_KIND = "file";
 
 export async function vfsListFiles(
@@ -166,6 +171,39 @@ export async function vfsListFiles(
     );
   }
   return { items, cursor: nextCursor };
+}
+
+export async function vfsFileInfo(
+  durableObject: UserDO,
+  scope: VFSScope,
+  path: string,
+  opts: FileInfoOpts = {}
+): Promise<ListFilesItemRaw> {
+  const userId = userIdFor(scope);
+  const pathMod = await import("./path-walk");
+  const resolved = pathMod.resolvePathFollow(durableObject, userId, path);
+  if (resolved.kind === "ENOENT") {
+    throw new VFSError("ENOENT", `fileInfo: path not found: ${path}`);
+  }
+  if (resolved.kind === "ENOTDIR") {
+    throw new VFSError("ENOTDIR", `fileInfo: path component is not a directory: ${path}`);
+  }
+  if (resolved.kind === "ELOOP") {
+    throw new VFSError("ELOOP", `fileInfo: too many symbolic links: ${path}`);
+  }
+  if (resolved.kind === "dir") {
+    throw new VFSError("EISDIR", `fileInfo: path is a directory: ${path}`);
+  }
+  const item = hydrateItem(
+    durableObject,
+    userId,
+    scope,
+    resolved.leafId,
+    opts.includeStat !== false,
+    opts.includeMetadata === true
+  );
+  if (!item) throw new VFSError("ENOENT", `fileInfo: path not found: ${path}`);
+  return item;
 }
 
 function clampLimit(n: number | undefined): number {
