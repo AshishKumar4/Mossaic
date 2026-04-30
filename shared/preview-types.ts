@@ -1,0 +1,121 @@
+/**
+ * Universal preview pipeline — wire shapes shared by worker, SDK, and
+ * SPA. Types live here so each consumer imports from a single source
+ * of truth (cleanliness rule 8: no duplicate type definitions).
+ */
+
+/**
+ * Standard variant labels. Resolve to fixed dimensions at the
+ * registry layer; consumers may also pass an explicit
+ * `{width, height?, fit?}` for arbitrary on-demand sizing.
+ *
+ *  - `thumb`    — gallery-grid sized; ~256×256 longest-edge cover.
+ *  - `medium`   — feed-card sized; ~768 longest-edge contain.
+ *  - `lightbox` — full-screen sized; ~1920 longest-edge contain.
+ */
+export type StandardVariant = "thumb" | "medium" | "lightbox";
+
+/** Image-fit semantics; mirrors the Cloudflare Images binding's `fit`. */
+export type FitMode = "cover" | "contain" | "scale-down";
+
+/** Custom-dimension variant. */
+export interface CustomVariant {
+  width: number;
+  height?: number;
+  fit?: FitMode;
+}
+
+export type Variant = StandardVariant | CustomVariant;
+
+/** Output formats supported across renderers. */
+export type PreviewFormat =
+  | "image/png"
+  | "image/webp"
+  | "image/avif"
+  | "image/svg+xml";
+
+export interface ReadPreviewOpts {
+  variant?: Variant;
+  format?: PreviewFormat;
+  /**
+   * Force a specific renderer by kind. Default: dispatched by
+   * `mimeType` via the registry. The registry returns ENOTSUP if
+   * the forced renderer's `canRender(mimeType)` is false.
+   */
+  renderer?: string;
+}
+
+export interface ReadPreviewResult {
+  /** Output bytes. */
+  bytes: Uint8Array;
+  /** Output MIME type. */
+  mimeType: string;
+  /** Output width in pixels. */
+  width: number;
+  /** Output height in pixels. */
+  height: number;
+  /** The original file's MIME type. */
+  sourceMimeType: string;
+  /** Identifier of the renderer that produced this output. */
+  rendererKind: string;
+  /**
+   * `true` when served from a pre-generated `file_variants` row;
+   * `false` when produced on-demand. Useful for tooling /
+   * observability — never affects rendered bytes.
+   */
+  fromVariantTable: boolean;
+}
+
+/** Input passed to every renderer. */
+export interface RenderInput {
+  /** Streaming source of original bytes. */
+  bytes: ReadableStream<Uint8Array>;
+  /** Original file's MIME type. */
+  mimeType: string;
+  /** Original file's name (extension drives icon-card fallback). */
+  fileName: string;
+  /** Original file's size in bytes (drives icon-card label). */
+  fileSize: number;
+}
+
+/** Resolved render options after standard-variant expansion. */
+export interface RenderOpts {
+  variant: Variant;
+  format: PreviewFormat;
+}
+
+/** Concrete render output. Mirrors the `ReadPreviewResult` data plane. */
+export interface RenderResult {
+  bytes: Uint8Array;
+  mimeType: string;
+  width: number;
+  height: number;
+}
+
+/**
+ * Per-row shape of `file_variants`. Mirrors the DDL in
+ * `worker/core/objects/user/user-do-core.ts:ensureInit`. SDK consumers
+ * never read this directly; tests do.
+ */
+export interface FileVariant {
+  fileId: string;
+  variantKind: string;
+  rendererKind: string;
+  chunkHash: string;
+  shardIndex: number;
+  mimeType: string;
+  width: number;
+  height: number;
+  byteSize: number;
+  createdAt: number;
+}
+
+/** Standard-variant → pixel-dimension map. Single source of truth. */
+export const STANDARD_VARIANT_DIMS: Record<
+  StandardVariant,
+  { width: number; height: number; fit: FitMode }
+> = {
+  thumb: { width: 256, height: 256, fit: "cover" },
+  medium: { width: 768, height: 768, fit: "contain" },
+  lightbox: { width: 1920, height: 1920, fit: "contain" },
+};

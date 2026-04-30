@@ -90,6 +90,44 @@ export interface ApiError {
 // https://developers.cloudflare.com/durable-objects/reference/durable-objects-migrations/
 
 /**
+ * Cloudflare Images binding. Surfaces the `IMAGES.input(stream).
+ * transform({...}).output({format})` builder. Marked `unknown`
+ * here because the binding's runtime type ships from
+ * `@cloudflare/workers-types`'s ambient declarations and we don't
+ * want to widen the SDK's surface to the full type. Renderers
+ * narrow at use-sites.
+ */
+export type ImagesBinding = {
+  input(stream: ReadableStream<Uint8Array>): {
+    transform(opts: {
+      width?: number;
+      height?: number;
+      fit?: "scale-down" | "contain" | "cover" | "crop" | "pad";
+      format?: "image/jpeg" | "image/png" | "image/webp" | "image/avif";
+      quality?: number;
+    }): {
+      output(opts: {
+        format: "image/jpeg" | "image/png" | "image/webp" | "image/avif";
+        quality?: number;
+      }): Promise<{
+        response(): Response;
+        contentType(): string;
+      }>;
+    };
+  };
+};
+
+/**
+ * Cloudflare Browser Run binding. Reserved for the deferred
+ * preview renderers (PDF page-1, video poster, Office). Phase 20
+ * wires the binding optionally; renderers requiring it fall through
+ * to the icon-card when the binding is absent.
+ */
+export type BrowserBinding = {
+  fetch: (request: Request) => Promise<Response>;
+};
+
+/**
  * Core VFS bindings. Service-mode worker and SDK library-mode
  * consumers satisfy this shape with two DO namespaces and (optionally)
  * a JWT secret for token issuance.
@@ -98,6 +136,10 @@ export interface EnvCore {
   MOSSAIC_USER: DurableObjectNamespace;
   MOSSAIC_SHARD: DurableObjectNamespace;
   JWT_SECRET?: string;
+  /** Cloudflare Images binding; optional — renderers fall through. */
+  IMAGES?: ImagesBinding;
+  /** Cloudflare Browser Run binding; optional — renderers fall through. */
+  BROWSER?: BrowserBinding;
 }
 
 /**

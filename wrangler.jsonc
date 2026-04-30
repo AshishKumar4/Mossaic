@@ -45,6 +45,15 @@
     ]
   },
 
+  // Universal preview pipeline. `IMAGES` powers the on-demand
+  // and pre-generated image renderer (resize / format conversion /
+  // HEIC decode). `BROWSER` is wired now for the deferred renderers
+  // (PDF page-1, video poster, Office docs) — the binding is
+  // optional at runtime; the renderers gracefully fall through to
+  // the generic icon-card when it's absent.
+  "images": { "binding": "IMAGES" },
+  "browser": { "binding": "BROWSER" },
+
   "migrations": [
     {
       "tag": "v1",
