@@ -92,6 +92,89 @@ export async function vfsUnlink(
   await hardDeleteFileRow(durableObject, userId, scope, r.leafId);
 }
 
+/**
+ * Phase 25 — `vfs.purge(path)`.
+ *
+ * Permanently destroy a path and ALL its history. Three-tier
+ * delete model the SDK exposes:
+ *
+ *   - `vfs.unlink(path)`  — POSIX-style. Versioning-on: writes a
+ *     tombstone version, leaves history. Versioning-off: hard
+ *     deletes the file row.
+ *   - `vfs.purge(path)`   — destructive cleanup. Drops every version
+ *     row + the files row + decrements ShardDO chunk refs for all
+ *     versions' chunks. Independent of versioning state. Acts like
+ *     a versioning-off `unlink` even when versioning is on.
+ *   - `archive(path)`     — RESERVED for Phase 25.1; will hide a
+ *     path from listings without destroying data. NOT implemented
+ *     yet — TODO doc-only.
+ *
+ * Use `vfs.purge` for compliance-style "right to be forgotten" or
+ * to clean up a specific tombstoned-head path. For sweeping a
+ * tenant-wide tombstone backlog, use `adminReapTombstonedHeads`
+ * (admin-tombstones.ts) which scales by SQL scan rather than
+ * per-path SDK calls.
+ *
+ * Does NOT throw if the path doesn't exist (idempotent — the user's
+ * intent "this path should not exist" is satisfied either way).
+ * Throws EISDIR / EINVAL like `unlink`.
+ */
+export async function vfsPurge(
+  durableObject: UserDO,
+  scope: VFSScope,
+  path: string
+): Promise<void> {
+  const userId = userIdFor(scope);
+  // resolveOrThrow throws ENOENT — purge is idempotent so we
+  // resolve manually and short-circuit on miss.
+  const { resolvePath } = await import("../path-walk");
+  const r = resolvePath(durableObject, userId, path);
+  if (r.kind === "ENOENT") return;
+  if (r.kind === "dir") {
+    throw new VFSError("EISDIR", `purge: is a directory: ${path}`);
+  }
+  if (r.kind !== "file" && r.kind !== "symlink") {
+    throw new VFSError("EINVAL", `purge: not a regular file: ${path}`);
+  }
+
+  // If versioning is on AND there are version rows, dropVersionRows
+  // does the per-version chunk fanout. After that the files row
+  // either auto-drops (when no versions remain — see
+  // vfs-versions.ts:626-631) or is dropped by hardDeleteFileRow as
+  // a belt-and-suspenders.
+  const fileId = r.leafId;
+  const versionRows = durableObject.sql
+    .exec(
+      "SELECT version_id FROM file_versions WHERE path_id = ?",
+      fileId
+    )
+    .toArray() as { version_id: string }[];
+
+  if (versionRows.length > 0) {
+    const { dropVersionRows } = await import("../vfs-versions");
+    await dropVersionRows(
+      durableObject,
+      scope,
+      userId,
+      fileId,
+      versionRows.map((v) => v.version_id)
+    );
+  }
+
+  // Yjs-mode rows have their bytes outside file_versions; same
+  // path as vfsUnlink's non-versioning branch.
+  if (r.kind === "file" && isYjsMode(durableObject, userId, fileId)) {
+    const { purgeYjs } = await import("../yjs");
+    await purgeYjs(durableObject, scope, fileId);
+  }
+
+  // Drop the files row + decrement file_chunks-driven refs (covers
+  // non-versioning rows AND any orphan chunk_refs that survived
+  // dropVersionRows). hardDeleteFileRow is itself idempotent w.r.t.
+  // an already-deleted row.
+  await hardDeleteFileRow(durableObject, userId, scope, fileId);
+}
+
 // ── mkdir / rmdir ──────────────────────────────────────────────────────
 
 /**
