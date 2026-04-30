@@ -97,6 +97,8 @@ flowchart LR
 
 Each tenant gets a dedicated **UserDO** (manifests, metadata + tags + indexed `listFiles`, HMAC pagination cursors, versioning, Yjs op-log + awareness relay) and a **dynamic pool of ShardDOs** that hold the chunk data. Chunks are placed deterministically via [rendezvous hashing](https://en.wikipedia.org/wiki/Rendezvous_hashing) — both client and server independently compute which shard holds any chunk with zero coordination.
 
+The pool starts at **32 ShardDOs per tenant** and grows by **+1 ShardDO per 5 GB stored**, so a tenant accumulating data widens its rendezvous space organically — `placeChunk` for new files routes ~1/(N+1) of new chunks to the freshly-added shard. Existing chunks stay pinned to their original shard via the `file_chunks.shard_index` recorded at write time, so growth never reshuffles already-stored data. Pool size is high-water-marked: deletes tick `quota.storage_used` down but never shrink the pool, because shrinking would orphan chunks pinned to the dropped shard indices. Wiring lives in `worker/core/objects/user/vfs/helpers.ts:376` (`recordWriteUsage`); pinned by `tests/integration/pool-growth.test.ts`.
+
 The same Hono router serves SDK consumers, the CLI, and the SPA via canonical `/api/vfs/*`. The App deployment adds a thin auth/photo-gallery surface on top; the Service deployment ships only the SDK-essential routes.
 
 ```mermaid
