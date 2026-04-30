@@ -29,21 +29,7 @@ export function jsonResponse<T>(data: T, status: number = 200): Response {
   return Response.json(data, { status });
 }
 
-/**
- * Build the UserDO name for a given userId.
- */
-export function userDOName(userId: string): string {
-  return `user:${userId}`;
-}
-
-/**
- * Build the ShardDO name.
- */
-export function shardDOName(userId: string, shardIndex: number): string {
-  return `shard:${userId}:${shardIndex}`;
-}
-
-// ── VFS DO naming (sdk-impl-plan §6) ───────────────────────────────────
+// ── VFS DO naming ──────────────────────────────────────────────────────
 //
 // The VFS uses a *new* DO name pattern that the legacy app does NOT
 // share: `vfs:${ns}:${tenant}[:${sub}]` for UserDO and

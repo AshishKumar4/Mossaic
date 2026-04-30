@@ -73,6 +73,26 @@ export class UserDO extends UserDOCore {
     return handleSignup(this, email, password);
   }
 
+  /**
+   * Initialize the per-tenant data DO with a default quota row.
+   *
+   * Called by `POST /api/auth/signup` immediately after the auth row
+   * lands on the `auth:<email>` DO. Without this, the canonical
+   * `vfs:default:<userId>` data DO has no quota row and analytics +
+   * `appGetQuota` return all-zero defaults forever — gallery still
+   * works but `storage_used` never tracks reality.
+   *
+   * Idempotent (`INSERT OR IGNORE`).
+   */
+  async appInitTenant(userId: string): Promise<void> {
+    this.ensureInit();
+    this.sql.exec(
+      `INSERT OR IGNORE INTO quota (user_id, storage_used, storage_limit, file_count, pool_size)
+       VALUES (?, 0, 107374182400, 0, 32)`,
+      userId
+    );
+  }
+
   /** Verify credentials. Returns userId+email on success; throws on failure. */
   async appHandleLogin(email: string, password: string): Promise<AuthResult> {
     this.ensureInit();

@@ -1,7 +1,7 @@
 import { Hono, type Context } from "hono";
 import type { EnvApp as Env } from "@shared/types";
 import { authMiddleware, signJWT, signVFSToken, VFSConfigError } from "@core/lib/auth";
-import { userStubByName } from "../lib/user-stub";
+import { userStub, userStubByName } from "../lib/user-stub";
 
 const auth = new Hono<{
   Bindings: Env;
@@ -71,6 +71,13 @@ auth.post("/signup", async (c) => {
     const message = err instanceof Error ? err.message : "Signup failed";
     return c.json({ error: message }, 400);
   }
+
+  // Initialize the canonical (`vfs:default:<userId>`) UserDO with a
+  // default quota row so subsequent `appGetQuota` / `appGetUserStats`
+  // calls return non-zero defaults instead of the all-zeroes fallback.
+  // The auth row stays on the `auth:<email>` DO; the quota row is
+  // duplicated to the data-side DO.
+  await userStub(c.env, result.userId).appInitTenant(result.userId);
 
   const tokenOrResp = await mintJWT(c, result);
   if (typeof tokenOrResp !== "string") return tokenOrResp;
