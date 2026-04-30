@@ -6,13 +6,15 @@ import {
 import type { RenderInput } from "@shared/preview-types";
 
 /**
- * Video-poster renderer (Phase 20 stub: delegates to icon-card).
+ * Video-poster renderer (currently delegates to icon-card; the
+ * Browser-Run upgrade will swap the body without changing the
+ * registry contract).
  *
  *   V1.  canRender accepts video/*.
  *   V2.  Output is the same bytes as iconCardRenderer for the same
- *        input (Phase 20 stub) — confirming stable degradation. Phase
- *        20.1 swaps the body in via `env.BROWSER`; this test will
- *        change there.
+ *        input — confirming stable degradation. The Browser-Run
+ *        upgrade will swap the body in via `env.BROWSER`; this
+ *        test will change there.
  */
 
 function fakeVideoInput(): RenderInput {
@@ -29,7 +31,7 @@ function fakeVideoInput(): RenderInput {
   };
 }
 
-describe("videoPosterRenderer (Phase 20 stub)", () => {
+describe("videoPosterRenderer (icon-card delegate)", () => {
   it("V1 — canRender accepts video/*", () => {
     expect(videoPosterRenderer.canRender("video/mp4")).toBe(true);
     expect(videoPosterRenderer.canRender("video/webm")).toBe(true);
@@ -38,7 +40,7 @@ describe("videoPosterRenderer (Phase 20 stub)", () => {
     expect(videoPosterRenderer.canRender("image/png")).toBe(false);
   });
 
-  it("V2 — Phase 20 stub returns icon-card output", async () => {
+  it("V2 — delegates to icon-card output", async () => {
     const env = {} as never;
     const fromVideo = await videoPosterRenderer.render(
       fakeVideoInput(),

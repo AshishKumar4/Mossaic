@@ -69,3 +69,5 @@ export {
   type VFSReadHandle,
   type VFSWriteHandle,
 } from "./vfs/streams";
+
+export { vfsReadPreview } from "./vfs/preview";

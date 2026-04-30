@@ -228,6 +228,10 @@ class BatchedLstatFs implements VFSClient {
     opts?: WriteFileOpts
   ) { return this.inner.createWriteStreamWithHandle(p, opts); }
   openManifest(p: string) { return this.inner.openManifest(p); }
+  openManifests(paths: string[]) { return this.inner.openManifests(paths); }
+  readPreview(p: string, opts?: Parameters<VFSClient["readPreview"]>[1]) {
+    return this.inner.readPreview(p, opts);
+  }
   readChunk(p: string, idx: number) {
     return this.inner.readChunk(p, idx);
   }

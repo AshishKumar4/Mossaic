@@ -17,8 +17,8 @@ import { iconCardRenderer } from "./renderers/icon-card";
 /**
  * Build the default registry. Returns a fresh instance per call so
  * tests can mutate without leaking state across cases. Production
- * callers (`vfsReadPreview`, `vfsFinalizeMultipart`) cache a single
- * instance per UserDO at the module scope where they import this.
+ * callers should prefer {@link defaultRegistry} which caches one
+ * shared instance per worker process.
  */
 export function buildDefaultRegistry(): RendererRegistry {
   const r = new RendererRegistry();
@@ -28,6 +28,20 @@ export function buildDefaultRegistry(): RendererRegistry {
   r.register(videoPosterRenderer);
   r.register(iconCardRenderer);
   return r;
+}
+
+/**
+ * Singleton registry shared by every server-side caller in a
+ * single worker process. Built lazily on first access; the
+ * registry is stateless after construction so concurrent reads
+ * are safe.
+ */
+let cachedRegistry: RendererRegistry | null = null;
+export function defaultRegistry(): RendererRegistry {
+  if (cachedRegistry === null) {
+    cachedRegistry = buildDefaultRegistry();
+  }
+  return cachedRegistry;
 }
 
 export { RendererRegistry } from "./registry";

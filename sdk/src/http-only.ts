@@ -79,6 +79,20 @@ export type {
   WriteHandle,
 } from "./streams";
 
+// Universal preview pipeline — type re-exports; the HTTP client's
+// `readPreview()` returns `ReadPreviewResult`.
+export type {
+  Variant,
+  StandardVariant,
+  CustomVariant,
+  FitMode,
+  PreviewFormat,
+  ReadPreviewOpts,
+  ReadPreviewResult,
+  FileVariant,
+} from "../../shared/preview-types";
+export { STANDARD_VARIANT_DIMS } from "../../shared/preview-types";
+
 export type {
   WriteFileOpts,
   CopyFileOpts,

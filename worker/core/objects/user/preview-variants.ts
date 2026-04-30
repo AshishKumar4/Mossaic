@@ -29,18 +29,21 @@ import { hashChunk } from "../../../../shared/crypto";
 import { vfsCreateReadStream } from "./vfs/streams";
 import { getPlacement } from "../../lib/placement-resolver";
 import {
-  buildDefaultRegistry,
+  defaultRegistry,
   RenderError,
-  type RendererRegistry,
 } from "../../lib/preview-pipeline";
 
-/** Stable per-process registry. Built once on first call. */
-let cachedRegistry: RendererRegistry | null = null;
-function defaultRegistry(): RendererRegistry {
-  if (cachedRegistry === null) {
-    cachedRegistry = buildDefaultRegistry();
-  }
-  return cachedRegistry;
+/**
+ * Encode a `Variant` to a stable string suitable for SQL row keys
+ * and refIds. Standard variants stringify to their label; custom
+ * variants encode dims + fit so identical custom requests across
+ * users dedupe.
+ */
+export function encodeVariantKey(v: Variant): string {
+  if (typeof v === "string") return v;
+  const h = v.height ?? v.width;
+  const fit = v.fit ?? "cover";
+  return `custom:w${v.width}h${h}${fit}`;
 }
 
 /**
@@ -186,7 +189,12 @@ export async function renderAndStoreVariant(
     .toArray()[0] as { pool_size: number } | undefined;
   const poolSize = poolRow?.pool_size ?? 32;
 
-  const refId = `${fileId}#variant#${variant}`;
+  // Encode the variant as a string for refId / row keying.
+  // Standard variants use their bare label (`thumb`/`medium`/
+  // `lightbox`); custom variants encode their dimensions so two
+  // requests for `{w:512,h:512,fit:"cover"}` share storage.
+  const variantKey = encodeVariantKey(variant);
+  const refId = `${fileId}#variant#${variantKey}`;
   const sIdx = getPlacement(scope).placeChunk(scope, refId, 0, poolSize);
   const shardName = getPlacement(scope).shardDOName(scope, sIdx);
   const env = durableObject.envPublic;
@@ -209,7 +217,7 @@ export async function renderAndStoreVariant(
         mime_type, width, height, byte_size, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     fileId,
-    variant,
+    variantKey,
     rendererKind,
     variantHash,
     sIdx,

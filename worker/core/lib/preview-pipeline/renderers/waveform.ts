@@ -4,12 +4,12 @@
  *
  * **Implementation strategy.** Native audio decoding (MP3 / Opus /
  * AAC) requires DSP infrastructure that's heavyweight to ship in a
- * Worker bundle. Phase 20 takes a structural shortcut: hash the
- * input bytes into a deterministic peak buffer. The result is a
- * stable visual silhouette per file (different files → different
- * silhouettes; same file → identical bytes-out). It IS NOT the
- * acoustic envelope — Phase 20.1 ships a real PCM peak extractor
- * once a small WASM decoder is vendored. The current renderer is
+ * Worker bundle. The current renderer takes a structural shortcut:
+ * hash the input bytes into a deterministic peak buffer. The
+ * result is a stable visual silhouette per file (different files
+ * → different silhouettes; same file → identical bytes-out). It
+ * IS NOT the acoustic envelope — a real PCM peak extractor would
+ * require vendoring a small WASM decoder. The current renderer is
  * usefully diagnostic ("this file is X" with stable visual hash)
  * and content-deterministic (the load-bearing property).
  *

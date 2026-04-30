@@ -345,6 +345,37 @@ And `fetchChunkByHash` switches from the canonical `POST /api/vfs/readChunk` to 
 
 ---
 
+## Universal preview pipeline
+
+`vfs.readPreview()` returns rendered preview bytes for any file the VFS holds — image, code, audio, video, or anything else. Variants are content-addressed, refcount-shared, and immutable-cached.
+
+```ts
+const preview = await vfs.readPreview("/photos/sunset.jpg", { variant: "thumb" });
+// {
+//   bytes: Uint8Array,                // image/webp or image/svg+xml
+//   mimeType: "image/webp",
+//   width: 256, height: 256,
+//   sourceMimeType: "image/jpeg",
+//   rendererKind: "image",
+//   fromVariantTable: false,          // true on cache hit
+// }
+```
+
+Standard variants: `"thumb"` (256² cover), `"medium"` (768² contain), `"lightbox"` (1920² contain). Custom variants accept `{width, height?, fit?}` and cache under a stable encoded key.
+
+Five built-in renderers dispatch by MIME: `image` (Cloudflare Images), `code-svg` (text/source), `waveform-svg` (audio), `video-poster` (video, Phase 20.1+), `icon-card` (universal fallback). Encrypted files throw `ENOTSUP` — server cannot render ciphertext.
+
+Batched manifests for galleries:
+
+```ts
+const results = await vfs.openManifests(["/a.jpg", "/b.jpg", "/c.jpg"]);
+// One round-trip; per-path errors come back as { ok: false, code, message }.
+```
+
+Full reference: [`docs/previews.md`](../docs/previews.md).
+
+---
+
 ## isomorphic-git
 
 `vfs.promises === vfs`, so the VFS instance is a valid isomorphic-git `fs` plugin directly:

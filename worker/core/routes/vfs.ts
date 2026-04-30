@@ -56,8 +56,11 @@ const vfs = new Hono<{
 /**
  * Auth middleware: extract Bearer token from Authorization, verify
  * via verifyVFSToken, populate c.var.scope with the validated scope.
+ *
+ * Exported so sibling route modules (e.g. `vfs-preview.ts`) reuse
+ * the same contract without duplicating the implementation.
  */
-const vfsAuth = (): MiddlewareHandler<{
+export const vfsAuth = (): MiddlewareHandler<{
   Bindings: Env;
   Variables: { scope: VFSScope };
 }> => async (c, next) => {
@@ -93,15 +96,19 @@ const vfsAuth = (): MiddlewareHandler<{
 vfs.use("*", vfsAuth());
 
 /** Resolve the typed UserDO stub for the verified scope. */
-function userStub(c: { env: Env; var: { scope: VFSScope } }): UserDOCore {
+export function userStub(c: { env: Env; var: { scope: VFSScope } }): UserDOCore {
   const scope = c.var.scope;
   const name = vfsUserDOName(scope.ns, scope.tenant, scope.sub);
   const id = c.env.MOSSAIC_USER.idFromName(name);
   return c.env.MOSSAIC_USER.get(id) as unknown as UserDOCore;
 }
 
-/** Map a thrown error to (status, body) for JSON responses. */
-function errToResponse(err: unknown): { status: number; body: { code: string; message: string } } {
+/**
+ * Map a thrown error to (status, body) for JSON responses.
+ *
+ * Exported so sibling route modules reuse the same status+code map.
+ */
+export function errToResponse(err: unknown): { status: number; body: { code: string; message: string } } {
   // VFSConfigError = JWT_SECRET missing on the deploy. Surface as 503
   // service-misconfigured (mirrors the auth-middleware path). Caught
   // here as defense-in-depth: post-auth handlers like listFiles can
@@ -167,7 +174,7 @@ function errToResponse(err: unknown): { status: number; body: { code: string; me
  * + path resolution already validate, so all we need here is type
  * coercion: body.path must be a string. Bad input → 400 EINVAL.
  */
-function expectPath(body: unknown): string {
+export function expectPath(body: unknown): string {
   const b = body as { path?: unknown };
   if (typeof b?.path !== "string") {
     throw Object.assign(new Error("EINVAL: body.path must be a string"), {

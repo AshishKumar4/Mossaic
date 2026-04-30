@@ -26,6 +26,10 @@
 import { VFSStat } from "./stats";
 import { mapServerError, MossaicUnavailableError, EINVAL } from "./errors";
 import type { OpenManifestResult, VFSStatRaw } from "../../shared/vfs-types";
+import type {
+  ReadPreviewOpts,
+  ReadPreviewResult,
+} from "../../shared/preview-types";
 import type { ReadHandle, WriteHandle } from "./streams";
 import type {
   VFSClient,
@@ -446,6 +450,94 @@ export class HttpVFS implements VFSClient {
     );
     const body = (await res.json()) as { manifest: OpenManifestResult };
     return body.manifest;
+  }
+
+  /**
+   * Batched manifest fetch via the dedicated `/api/vfs/manifests`
+   * route. One round-trip for N paths; per-path errors come back
+   * as `{ ok: false, code, message }` rather than throwing.
+   */
+  async openManifests(
+    paths: string[]
+  ): Promise<
+    (
+      | { ok: true; manifest: OpenManifestResult }
+      | { ok: false; code: string; message: string }
+    )[]
+  > {
+    const res = await this.post(
+      "manifests",
+      { paths },
+      "open",
+      undefined,
+      "json"
+    );
+    const body = (await res.json()) as {
+      manifests: (
+        | { ok: true; manifest: OpenManifestResult }
+        | { ok: false; code: string; message: string }
+      )[];
+    };
+    return body.manifests;
+  }
+
+  async readPreview(
+    p: string,
+    opts?: ReadPreviewOpts
+  ): Promise<ReadPreviewResult> {
+    const url = `${this.base}/api/vfs/readPreview`;
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${this.apiKey}`,
+      "Content-Type": "application/json",
+    };
+    const payload = JSON.stringify({
+      path: p,
+      variant: opts?.variant ?? "thumb",
+      format: opts?.format,
+      renderer: opts?.renderer,
+    });
+    let res: Response;
+    try {
+      res = await this.fetcher(url, {
+        method: "POST",
+        headers,
+        body: payload,
+      });
+    } catch (err) {
+      throw new MossaicUnavailableError({
+        message: `HTTP fetch to ${url} failed: ${(err as Error).message}`,
+      });
+    }
+    if (!res.ok) {
+      let pj: { code?: string; message?: string };
+      try {
+        pj = (await res.json()) as { code?: string; message?: string };
+      } catch {
+        pj = { message: `HTTP ${res.status} ${res.statusText}` };
+      }
+      const synthetic = Object.assign(
+        new Error(pj.message ?? `HTTP ${res.status}`),
+        { code: pj.code }
+      );
+      throw mapServerError(synthetic, { syscall: "open", path: p });
+    }
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const mimeType = res.headers.get("Content-Type") ?? "application/octet-stream";
+    const rendererKind = res.headers.get("X-Mossaic-Renderer") ?? "icon-card";
+    const cacheHdr = res.headers.get("X-Mossaic-Variant-Cache") ?? "miss";
+    const sourceMime =
+      res.headers.get("X-Mossaic-Source-Mime") ?? "application/octet-stream";
+    const widthHdr = res.headers.get("X-Mossaic-Width");
+    const heightHdr = res.headers.get("X-Mossaic-Height");
+    return {
+      bytes,
+      mimeType,
+      width: widthHdr === null ? 0 : parseInt(widthHdr, 10),
+      height: heightHdr === null ? 0 : parseInt(heightHdr, 10),
+      sourceMimeType: sourceMime,
+      rendererKind,
+      fromVariantTable: cacheHdr === "hit",
+    };
   }
 
   async readChunk(p: string, chunkIndex: number): Promise<Uint8Array> {

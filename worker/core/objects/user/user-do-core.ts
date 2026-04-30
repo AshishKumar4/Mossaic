@@ -17,6 +17,7 @@ import {
   vfsPullReadStream,
   vfsReadChunk,
   vfsReadFile,
+  vfsReadPreview,
   vfsReadlink,
   vfsReadManyStat,
   vfsReaddir,
@@ -36,6 +37,10 @@ import type {
   VFSScope,
   VFSStatRaw,
 } from "../../../../shared/vfs-types";
+import type {
+  ReadPreviewOpts,
+  ReadPreviewResult,
+} from "../../../../shared/preview-types";
 import { VFSError } from "../../../../shared/vfs-types";
 import { dedupePaths, type DedupeResult } from "./admin";
 // type-only import. The YjsRuntime class is loaded
@@ -1089,6 +1094,25 @@ export class UserDOCore extends DurableObject<Env> {
   ): Promise<Uint8Array> {
     this.gateVfs(scope);
     return vfsReadChunk(this, scope, path, chunkIndex);
+  }
+
+  /**
+   * readPreview() — universal preview pipeline entry. Resolves
+   * the file at `path`, dispatches the registered renderer for
+   * its MIME, and returns variant bytes inline. Variant rows are
+   * cached in `file_variants`; subsequent calls for the same
+   * (file, variant) hit the cache.
+   *
+   * Encrypted files throw `ENOTSUP` — server cannot render
+   * ciphertext. Custom variants render every call (no cache row).
+   */
+  async vfsReadPreview(
+    scope: VFSScope,
+    path: string,
+    opts: ReadPreviewOpts = {}
+  ): Promise<ReadPreviewResult> {
+    this.gateVfs(scope);
+    return vfsReadPreview(this, scope, path, opts);
   }
 
   // ── VFS RPC surface (write-side) ──────────────────────────────

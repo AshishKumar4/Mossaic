@@ -11,6 +11,7 @@ import galleryRoutes from "./routes/gallery";
 import sharedRoutes from "./routes/shared";
 import searchRoutes from "./routes/search";
 import vfsRoutes from "@core/routes/vfs";
+import vfsPreviewRoutes from "@core/routes/vfs-preview";
 import yjsWsRoutes from "@core/routes/vfs-yjs-ws";
 import multipartRoutes, { chunkDownload } from "@core/routes/multipart-routes";
 // App-pinned multipart route (`/api/upload/multipart/*`).
@@ -103,6 +104,10 @@ app.route("/api/vfs/multipart", multipartRoutes);
 // cacheable per-chunk download endpoint at
 // /api/vfs/chunk/:fileId/:idx — token-auth, immutable cache.
 app.route("/api/vfs", chunkDownload);
+// preview pipeline + batched manifests. Mounted BEFORE the
+// general /api/vfs fallback so the specific paths
+// `/readPreview` and `/manifests` take precedence.
+app.route("/api/vfs", vfsPreviewRoutes);
 // HTTP fallback for non-Worker consumers of the @mossaic/sdk.
 // Auth via Bearer VFS token (signVFSToken / verifyVFSToken). Routes
 // translate HTTP → typed UserDO RPC. The legacy app's /api/* surface

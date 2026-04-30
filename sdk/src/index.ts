@@ -106,6 +106,21 @@ export type {
   WriteHandle,
 } from "./streams";
 
+// Universal preview pipeline — types only; the renderer
+// implementations live in the worker (server-side rendering). SDK
+// consumers call `vfs.readPreview()` and receive `ReadPreviewResult`.
+export type {
+  Variant,
+  StandardVariant,
+  CustomVariant,
+  FitMode,
+  PreviewFormat,
+  ReadPreviewOpts,
+  ReadPreviewResult,
+  FileVariant,
+} from "../../shared/preview-types";
+export { STANDARD_VARIANT_DIMS } from "../../shared/preview-types";
+
 // Re-export the DO classes so consumer Workers can re-export them in
 // their own entry module — wrangler resolves DO bindings via the
 // consumer's main module's exports, not via npm dep graph.
