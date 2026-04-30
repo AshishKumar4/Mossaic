@@ -27,6 +27,7 @@ import {
   vfsStat,
   vfsSymlink,
   vfsUnlink,
+  vfsPurge,
   vfsWriteFile,
   type VFSReadHandle,
   type VFSWriteFileOpts,
@@ -1197,6 +1198,18 @@ export class UserDOCore extends DurableObject<Env> {
     return vfsUnlink(this, scope, path);
   }
 
+  /**
+   * purge() — Phase 25 destructive cleanup.
+   *
+   * Drops every version row + the `files` row + decrements ShardDO
+   * chunk refs for all versions' chunks. Independent of versioning
+   * state. Idempotent — calling on a non-existent path is a no-op.
+   */
+  async vfsPurge(scope: VFSScope, path: string): Promise<void> {
+    this.gateVfsWrite(scope);
+    return vfsPurge(this, scope, path);
+  }
+
   /** mkdir() — create folder; recursive flag walks intermediates. */
   async vfsMkdir(
     scope: VFSScope,
@@ -1795,6 +1808,34 @@ export class UserDOCore extends DurableObject<Env> {
   }
 
   /**
+   * Phase 25 — recovery primitive for tombstoned-head rows.
+   *
+   * Scans `files` rows whose `head_version_id` points at a
+   * `deleted=1` `file_versions` row and either drops them
+   * (`mode: "hardDelete"`, default for cleanup) or repoints head
+   * at the newest live predecessor (`mode: "walkBack"`, for
+   * recovery from accidental unlinks). Defaults to `dryRun: true`
+   * — pass `dryRun: false` explicitly to write.
+   *
+   * Idempotent. Safe to re-run after partial completion.
+   */
+  async adminReapTombstonedHeads(
+    userId: string,
+    scope: VFSScope,
+    opts: { mode: "hardDelete" | "walkBack"; dryRun?: boolean; limit?: number }
+  ): Promise<{
+    scanned: number;
+    hardDeleted: number;
+    walkedBack: number;
+    samplePathIds: string[];
+    dryRun: boolean;
+  }> {
+    this.ensureInit();
+    const { reapTombstonedHeads } = await import("./admin-tombstones");
+    return reapTombstonedHeads(this, userId, scope, opts);
+  }
+
+  /**
    * Pre-generate standard preview variants (`thumb`, `medium`,
    * `lightbox`) for a freshly-finalized file. Intended to run
    * inside the route layer's `c.executionCtx.waitUntil(...)` so
@@ -1891,7 +1932,11 @@ export class UserDOCore extends DurableObject<Env> {
   async vfsFileInfo(
     scope: VFSScope,
     path: string,
-    opts?: { includeStat?: boolean; includeMetadata?: boolean }
+    opts?: {
+      includeStat?: boolean;
+      includeMetadata?: boolean;
+      includeTombstones?: boolean;
+    }
   ): Promise<import("./list-files").ListFilesItemRaw> {
     this.gateVfs(scope);
     const { vfsFileInfo } = await import("./list-files");
