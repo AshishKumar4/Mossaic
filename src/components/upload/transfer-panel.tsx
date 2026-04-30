@@ -74,8 +74,16 @@ function TransferRow({
       ? Math.round((transfer.bytesTransferred / transfer.bytesTotal) * 100)
       : 0;
 
-  const isDone = transfer.completedChunks === transfer.totalChunks;
-  const hasFailed = transfer.failedChunks > 0;
+  // Terminal failure (transfer unrecoverable) takes priority over the
+  // partial-failed-chunks UI: the X button must appear so the user can
+  // dismiss + retry. `completedAt` keeps marking success.
+  const hasFailed =
+    transfer.failedAt !== undefined || transfer.failedChunks > 0;
+  const isTerminal =
+    transfer.completedAt !== undefined || transfer.failedAt !== undefined;
+  // Preserve the legacy "Complete" label only on actual success.
+  const isDone =
+    transfer.completedAt !== undefined && transfer.failedAt === undefined;
 
   return (
     <motion.div
@@ -97,7 +105,7 @@ function TransferRow({
                 : "bg-primary/15 text-primary"
           )}
         >
-          {isDone && !hasFailed ? (
+          {isDone ? (
             <CheckCircle2 className="h-3.5 w-3.5" />
           ) : hasFailed ? (
             <AlertCircle className="h-3.5 w-3.5" />
@@ -113,7 +121,7 @@ function TransferRow({
             <span className="truncate text-sm font-medium">
               {transfer.fileName}
             </span>
-            {isDone && (
+            {isTerminal && (
               <Button
                 variant="ghost"
                 size="icon"
@@ -132,12 +140,14 @@ function TransferRow({
               {formatBytes(transfer.bytesTransferred)} /{" "}
               {formatBytes(transfer.bytesTotal)}
             </span>
-            <span>
+            <span className={transfer.failedAt !== undefined ? "text-destructive" : undefined}>
               {isDone
                 ? "Complete"
-                : hasFailed
-                  ? `${transfer.failedChunks} failed`
-                  : `${formatBytes(transfer.throughputBps)}/s`}
+                : transfer.failedAt !== undefined
+                  ? (transfer.error ?? "Failed")
+                  : hasFailed
+                    ? `${transfer.failedChunks} failed`
+                    : `${formatBytes(transfer.throughputBps)}/s`}
             </span>
           </div>
         </div>

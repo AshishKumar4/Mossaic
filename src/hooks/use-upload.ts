@@ -4,7 +4,10 @@ import {
   type ChunkEvent,
   type TransferProgressEvent,
 } from "@mossaic/sdk/http";
-import { getTransferClient } from "@/lib/transfer-client";
+import {
+  getTransferClient,
+  resetTransferClient,
+} from "@/lib/transfer-client";
 import { pathFromParentId } from "@/lib/path-utils";
 import { addTransferStats } from "@/lib/transfer-stats";
 import { api } from "@/lib/api";
@@ -197,13 +200,35 @@ export function useUpload(onComplete?: () => void) {
         onComplete?.();
         return { fileId: result.fileId, failedCount: 0 };
       } catch (err) {
-        // Surface the failure on the transfer row; UI shows a retry
-        // affordance. We don't auto-retry at the hook layer; the SDK
-        // already retries individual chunks via its adaptive engine.
+        // Mark the transfer terminally failed so the UI shows the
+        // error state (red badge + clear-button affordance) instead
+        // of leaving the row stuck mid-progress. The SDK already
+        // retries individual chunks via its adaptive engine; reaching
+        // here means the entire transfer is unrecoverable from
+        // inside the hook (auth-bridge mint failed, finalize 4xx,
+        // network dropped, etc.).
+        const failedAt = Date.now();
+        const message =
+          err instanceof Error
+            ? err.message
+            : typeof err === "string"
+              ? err
+              : "Upload failed";
         updateTransfer(localId, (p) => ({
           ...p,
-          failedChunks: p.failedChunks + 1,
+          failedAt,
+          error: message,
+          // Bump failedChunks to surface the existing red-badge UI;
+          // upper-bound by totalChunks so the displayed count stays
+          // sane even if the failure happened pre-begin.
+          failedChunks: Math.max(p.failedChunks + 1, 1),
         }));
+        // Drop the cached HttpVFS so the NEXT upload re-mints a fresh
+        // VFS token. With the apiKey-callback rotation fix in place
+        // this is mostly belt-and-suspenders, but it ensures a
+        // pathological token-cache state can't pin every subsequent
+        // upload into the same failure.
+        resetTransferClient();
         throw err;
       }
     },
