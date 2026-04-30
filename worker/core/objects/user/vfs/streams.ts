@@ -95,6 +95,15 @@ export interface VFSReadHandle {
   size: number;
   /** number of chunks (0 for inlined files) */
   chunkCount: number;
+  /**
+   * server-authoritative chunkSize (bytes per chunk except possibly the
+   * last). Pinned at open-time so `vfsCreateReadStream`'s range math
+   * never has to re-query a stale `files.chunk_size` (which is 0 on
+   * versioned tenants — the cause of the readPreview NaN bug fixed in
+   * Phase 27.5). For inlined / yjs / empty files this is 0; the
+   * stream layer above must guard div-by-zero before using it.
+   */
+  chunkSize: number;
   /** true iff content lives in inline_data; chunkCount == 0 in that case */
   inlined: boolean;
   /**
@@ -106,6 +115,15 @@ export interface VFSReadHandle {
    * `files.inline_data` path).
    */
   versionId?: string;
+  /**
+   * Phase 27.5 — pre-materialized bytes for yjs-mode files. Yjs
+   * content lives in `yjs_oplog` + `yjs_checkpoints`, NOT in
+   * `file_chunks` / `version_chunks`. The stream surface materializes
+   * the live `Y.Doc` once at open-time and stashes the bytes here so
+   * `vfsPullReadStream` can serve them as if they were inlined. When
+   * present, `inlined === true` and `chunkCount === 0`.
+   */
+  inlineBytes?: Uint8Array;
 }
 
 /**
@@ -114,11 +132,11 @@ export interface VFSReadHandle {
  * the server (it's just a fileId + metadata snapshot) so the caller
  * can resume across invocations or fan out parallel pulls.
  */
-export function vfsOpenReadStream(
+export async function vfsOpenReadStream(
   durableObject: UserDO,
   scope: VFSScope,
   path: string
-): VFSReadHandle {
+): Promise<VFSReadHandle> {
   const userId = userIdFor(scope);
   const r = resolveOrThrow(durableObject, userId, path, /*follow*/ true);
   if (r.kind !== "file") {
@@ -134,11 +152,21 @@ export function vfsOpenReadStream(
   // non-tombstoned versioned tenants the handle's chunkCount/size
   // come from the head version row (which `vfsPullReadStream` then
   // resolves via `version_chunks`), matching `readFileVersioned`.
+  //
+  // Phase 27.5 — also pull `mode_yjs`, `chunk_size` (legacy), and the
+  // head version's `chunk_size` so the handle carries an
+  // authoritative chunkSize. The download/preview/stream paths
+  // previously called `getChunkSizeForHandle` which queried
+  // `files.chunk_size` — STALE (0) for versioned tenants — producing
+  // `Math.floor(0/0) === NaN` in `vfsCreateReadStream`. Pinning
+  // chunkSize at open-time eliminates that race.
   const row = durableObject.sql
     .exec(
-      `SELECT f.file_id, f.file_size, f.chunk_count, f.inline_data,
-              f.head_version_id, fv.deleted AS head_deleted,
-              fv.size AS head_size, fv.chunk_count AS head_chunk_count,
+      `SELECT f.file_id, f.file_size, f.chunk_size, f.chunk_count,
+              f.inline_data, f.mode_yjs, f.head_version_id,
+              fv.deleted AS head_deleted,
+              fv.size AS head_size, fv.chunk_size AS head_chunk_size,
+              fv.chunk_count AS head_chunk_count,
               fv.inline_data AS head_inline
          FROM files f
          LEFT JOIN file_versions fv
@@ -151,11 +179,14 @@ export function vfsOpenReadStream(
     | {
         file_id: string;
         file_size: number;
+        chunk_size: number;
         chunk_count: number;
         inline_data: ArrayBuffer | null;
+        mode_yjs: number;
         head_version_id: string | null;
         head_deleted: number | null;
         head_size: number | null;
+        head_chunk_size: number | null;
         head_chunk_count: number | null;
         head_inline: ArrayBuffer | null;
       }
@@ -167,14 +198,36 @@ export function vfsOpenReadStream(
       `openReadStream: head version is a tombstone for ${path}`
     );
   }
-  // Versioned tenant: source size + chunkCount from the head version,
-  // and pin `versionId` on the handle so `vfsPullReadStream` reads
-  // from `version_chunks` deterministically.
+
+  // Phase 27.5 — yjs-mode short-circuit. Yjs files persist as an
+  // op-log + checkpoint pair (`yjs_oplog` / `yjs_checkpoints`), NOT
+  // as `file_chunks` / `version_chunks`. Materialize the live Y.Doc
+  // once at open-time and serve it as a single inlined buffer. This
+  // matches `vfsReadFile`'s yjs short-circuit at reads.ts:468 and
+  // means `createReadStream` / `openManifest` / `readChunk` /
+  // `readPreview` all see consistent yjs bytes.
+  if (row.mode_yjs === 1) {
+    const { readYjsAsBytes } = await import("../yjs");
+    const bytes = await readYjsAsBytes(durableObject, scope, r.leafId);
+    return {
+      fileId: row.file_id,
+      size: bytes.byteLength,
+      chunkCount: 0,
+      chunkSize: 0,
+      inlined: true,
+      inlineBytes: bytes,
+    };
+  }
+
+  // Versioned tenant: source size + chunkCount + chunkSize from the
+  // head version, and pin `versionId` on the handle so
+  // `vfsPullReadStream` reads from `version_chunks` deterministically.
   if (row.head_version_id !== null) {
     return {
       fileId: row.file_id,
       size: row.head_size ?? 0,
       chunkCount: row.head_inline ? 0 : (row.head_chunk_count ?? 0),
+      chunkSize: row.head_inline ? 0 : (row.head_chunk_size ?? 0),
       inlined: !!row.head_inline,
       versionId: row.head_version_id,
     };
@@ -183,6 +236,7 @@ export function vfsOpenReadStream(
     fileId: row.file_id,
     size: row.file_size,
     chunkCount: row.inline_data ? 0 : row.chunk_count,
+    chunkSize: row.inline_data ? 0 : row.chunk_size,
     inlined: !!row.inline_data,
   };
 }
@@ -213,6 +267,13 @@ export async function vfsPullReadStream(
         "EINVAL",
         `pullReadStream: inlined file has no chunk index ${chunkIndex}`
       );
+    }
+    // Phase 27.5 — yjs-mode handle carries pre-materialized bytes
+    // captured at open-time. Serve directly without touching SQL.
+    if (handle.inlineBytes !== undefined) {
+      return range
+        ? sliceWithRange(handle.inlineBytes, range)
+        : handle.inlineBytes;
     }
     // Phase 25 Fix 11 — read inline bytes from the head version row
     // when the handle was opened for a versioned tenant; falls back
@@ -334,15 +395,30 @@ export async function vfsCreateReadStream(
   path: string,
   range?: { start?: number; end?: number }
 ): Promise<ReadableStream<Uint8Array>> {
-  const handle = vfsOpenReadStream(durableObject, scope, path);
+  const handle = await vfsOpenReadStream(durableObject, scope, path);
   const fileSize = handle.size;
-  const chunkSize = await getChunkSizeForHandle(durableObject, handle);
 
   const start = clampOffset(range?.start ?? 0, fileSize);
   const end = clampOffset(range?.end ?? fileSize, fileSize);
   if (end < start) {
     throw new VFSError("EINVAL", `range end < start: [${start}, ${end})`);
   }
+
+  // Phase 27.5 — empty-file fast path. A 0-byte file (legal: empty
+  // writeFile, or the post-resurrection placeholder) MUST emit zero
+  // chunks and close cleanly. Without this guard the chunked branch
+  // below computes `Math.floor(start / 0) === NaN` and the stream
+  // blocks forever or pulls a phantom chunk. Covers both
+  //   - 0-byte inlined  (fileSize=0, inlined=true, inlineBytes empty)
+  //   - 0-byte chunked  (fileSize=0, chunkCount=0, chunkSize=0)
+  if (fileSize === 0 || end === start) {
+    return new ReadableStream<Uint8Array>({
+      pull: (ctrl) => {
+        ctrl.close();
+      },
+    });
+  }
+
   if (handle.inlined) {
     return new ReadableStream<Uint8Array>({
       pull: async (ctrl) => {
@@ -351,6 +427,20 @@ export async function vfsCreateReadStream(
         ctrl.close();
       },
     });
+  }
+
+  // Phase 27.5 — chunkSize is now pinned on the handle at open-time
+  // (was: re-queried via `getChunkSizeForHandle` from `files` row,
+  // which is STALE for versioned tenants — root cause of the
+  // production readPreview NaN bug). For non-empty chunked files
+  // chunkSize MUST be >0; defend in depth so a corrupt schema row
+  // surfaces as EINVAL rather than NaN-propagation.
+  const chunkSize = handle.chunkSize;
+  if (!Number.isFinite(chunkSize) || chunkSize <= 0) {
+    throw new VFSError(
+      "EINVAL",
+      `createReadStream: invalid chunkSize ${chunkSize} for non-empty file ${path}`
+    );
   }
 
   // Compute first/last chunk indices that intersect the range.
@@ -388,17 +478,14 @@ function clampOffset(n: number, max: number): number {
   return Math.min(n, max);
 }
 
-async function getChunkSizeForHandle(
-  durableObject: UserDO,
-  handle: VFSReadHandle
-): Promise<number> {
-  if (handle.inlined) return handle.size;
-  const row = durableObject.sql
-    .exec("SELECT chunk_size FROM files WHERE file_id=?", handle.fileId)
-    .toArray()[0] as { chunk_size: number } | undefined;
-  if (!row) throw new VFSError("ENOENT", "createReadStream: file vanished");
-  return row.chunk_size;
-}
+// Phase 27.5 — `getChunkSizeForHandle` was REMOVED. It re-queried
+// `files.chunk_size` per createReadStream call, which is stale (0)
+// on versioned tenants — `Math.floor(0/0) === NaN` was the
+// production readPreview crash. The replacement is `handle.chunkSize`,
+// pinned at `vfsOpenReadStream` time from `version_chunks.chunk_size`
+// (versioned) or `files.chunk_size` (legacy). Yjs / inlined / empty
+// files carry chunkSize=0 and are routed away from chunk math
+// entirely by the empty-file fast path above.
 
 // ── Write stream (handle-based + WritableStream wrapper) ───────────────
 

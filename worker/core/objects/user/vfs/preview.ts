@@ -89,7 +89,8 @@ export async function vfsReadPreview(
   const fileRow = durableObject.sql
     .exec(
       `SELECT f.file_name, f.file_size, f.mime_type, f.encryption_mode,
-              f.head_version_id, fv.deleted AS head_deleted
+              f.head_version_id, fv.deleted AS head_deleted,
+              fv.size AS head_size
          FROM files f
          LEFT JOIN file_versions fv
            ON fv.path_id = f.file_id AND fv.version_id = f.head_version_id
@@ -105,6 +106,7 @@ export async function vfsReadPreview(
         encryption_mode: string | null;
         head_version_id: string | null;
         head_deleted: number | null;
+        head_size: number | null;
       }
     | undefined;
   if (!fileRow) {
@@ -128,7 +130,18 @@ export async function vfsReadPreview(
 
   const mimeType = fileRow.mime_type ?? "application/octet-stream";
   const fileName = fileRow.file_name;
-  const fileSize = fileRow.file_size;
+  // Phase 27.5 — when the tenant has versioning enabled, the
+  // truth-of-record for size is the head version row, not
+  // `files.file_size` (which `commitVersion` does NOT keep in sync).
+  // Renderers receive `fileSize` and use it for memory budgeting and
+  // decode validation; passing 0 (the stale legacy value) trips
+  // "RangeError: Invalid array length" / "input too small" inside
+  // sharp/exiftool. Falls back to `f.file_size` only on legacy /
+  // versioning-OFF tenants.
+  const fileSize =
+    fileRow.head_version_id !== null
+      ? (fileRow.head_size ?? 0)
+      : fileRow.file_size;
 
   // Renderer dispatch (read-only) tells us which `renderer_kind`
   // to look up in `file_variants`. The fallback chain in

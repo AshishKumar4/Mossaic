@@ -91,5 +91,26 @@ export interface ReadHandle {
   fileId: string;
   size: number;
   chunkCount: number;
+  /**
+   * server-authoritative chunk size, in bytes. 0 for inlined / yjs /
+   * empty files. Pinned by the worker at `vfsOpenReadStream` time so
+   * downstream chunk math is stable across concurrent writes.
+   */
+  chunkSize: number;
   inlined: boolean;
+  /**
+   * Phase 25 — when set, the worker resolves chunks via
+   * `version_chunks` keyed by this versionId. Captured at open-time
+   * so a concurrent write doesn't move the head out from under an
+   * in-flight stream. Undefined for non-versioned tenants.
+   */
+  versionId?: string;
+  /**
+   * Phase 27.5 — pre-materialized bytes for yjs-mode files. Yjs
+   * content lives in the op-log + checkpoint pair, NOT in
+   * file/version chunks; the worker materializes the live `Y.Doc`
+   * once at open-time and stashes the bytes here. When present,
+   * `inlined === true` and `chunkCount === 0`.
+   */
+  inlineBytes?: Uint8Array;
 }
