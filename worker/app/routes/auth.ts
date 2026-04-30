@@ -164,4 +164,84 @@ auth.post("/vfs-token", authMiddleware(), async (c) => {
   return c.json({ token, expiresAtMs });
 });
 
+/**
+ * DELETE /api/auth/account
+ *
+ * Self-service account deletion. Drops every byte the authenticated
+ * user has stored across UserDO + ShardDOs, then removes the auth
+ * row keyed by email so the credentials no longer exist.
+ *
+ * Two-DO purge — sequenced so a partial failure leaves the most
+ * benign state behind:
+ *   1. Wipe the data DO first (`vfs:default:<userId>`). This
+ *      hard-deletes every file row through the canonical
+ *      `hardDeleteFileRow` path, which dispatches `deleteChunks` RPCs
+ *      to each touched ShardDO. ShardDO chunk_refs are dropped, the
+ *      alarm sweeper picks up orphans within 30s. Quota row is
+ *      zeroed (not dropped — the row is part of the schema invariant
+ *      and a fresh signup would re-INSERT IGNORE it anyway).
+ *   2. Wipe the auth DO (`auth:<email>`). Removes the password hash;
+ *      a subsequent login attempt now 401s.
+ *
+ * Idempotent. Re-issuing DELETE on an already-deleted account is a
+ * no-op (both DOs return 0 rows affected).
+ *
+ * NO confirmation flow — the auth-gated JWT is the confirmation. The
+ * SPA (when one is wired up) can add a "type your email to confirm"
+ * UI step; the API itself is one-call. This is consistent with the
+ * existing absence of any other confirm-step on auth routes.
+ *
+ * Returns a summary so callers can verify the purge took effect.
+ */
+auth.delete("/account", authMiddleware(), async (c) => {
+  const userId = c.get("userId");
+  const email = c.get("email");
+
+  // Wipe data first. Best-effort — a failure here still allows the
+  // auth-row wipe to proceed so the credentials become unusable.
+  let dataReport: {
+    filesRemoved: number;
+    foldersRemoved: number;
+    versionsRemoved: number;
+    chunksRemovedFromShards: number;
+  } = {
+    filesRemoved: 0,
+    foldersRemoved: 0,
+    versionsRemoved: 0,
+    chunksRemovedFromShards: 0,
+  };
+  try {
+    dataReport = await userStub(c.env, userId).appWipeAccountData(userId);
+  } catch (err) {
+    console.error(
+      `appWipeAccountData failed for userId=${userId}: ${
+        err instanceof Error ? err.message : String(err)
+      }`
+    );
+  }
+
+  // Wipe auth row.
+  let authRemoved = false;
+  try {
+    const r = await userStubByName(c.env, `auth:${email}`).appWipeAuthRow(
+      email
+    );
+    authRemoved = r.removed;
+  } catch (err) {
+    console.error(
+      `appWipeAuthRow failed for email=${email}: ${
+        err instanceof Error ? err.message : String(err)
+      }`
+    );
+  }
+
+  return c.json({
+    ok: true,
+    userId,
+    email,
+    data: dataReport,
+    authRowRemoved: authRemoved,
+  });
+});
+
 export default auth;

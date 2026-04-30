@@ -147,6 +147,13 @@ export interface UserStats {
   totalFiles: number;
   totalStorageUsed: number;
   quotaLimit: number;
+  /**
+   * Server-authoritative shard pool size (Phase 23). 32 by default,
+   * grows by +1 per 5 GB stored via `recordWriteUsage`. Surfaced
+   * here so operators / verification scripts can observe pool growth
+   * without poking at the `quota` table directly.
+   */
+  poolSize: number;
   filesByStatus: UserFilesByStatus;
   mimeDistribution: MimeDistribution[];
   recentUploads: RecentUpload[];
