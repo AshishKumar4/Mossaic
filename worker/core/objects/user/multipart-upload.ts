@@ -54,7 +54,9 @@ import {
   poolSizeFor,
   recordWriteUsage,
   folderExists,
+  findLiveFile,
 } from "./vfs-ops";
+import { commitVersion, isVersioningEnabled } from "./vfs-versions";
 import {
   validateLabel,
   validateMetadata,
@@ -634,62 +636,206 @@ export async function vfsFinalizeMultipart(
     new TextEncoder().encode(chunkHashList.join(""))
   );
 
-  // 7. Batch-insert file_chunks rows. SQLite supports multi-row
-  //    VALUES; we go per-row in a tight loop because the DO's bound-
-  //    parameter limit is around 100 in practice, and this stays
-  //    inside one DO turn so it's still atomic.
-  for (let i = 0; i < session.total_chunks; i++) {
-    const row = collected.get(i)!;
-    durableObject.sql.exec(
-      `INSERT INTO file_chunks (file_id, chunk_index, chunk_hash, chunk_size, shard_index)
-       VALUES (?, ?, ?, ?, ?)`,
-      uploadId,
-      i,
-      row.hash,
-      row.size,
-      idxToShard[i]
-    );
-  }
-
-  // 8. Update tmp `files` row with size/file_hash/chunk_count. mode/
-  //    mime_type were stamped at begin and remain.
+  // Phase 27 — multipart × versioning. When versioning is enabled
+  // for this tenant, finalize must:
+  //   (a) write `version_chunks` (NOT `file_chunks`) keyed by a fresh
+  //       version id, recording shard_ref_id = uploadId so a future
+  //       `dropVersionRows` fan-out keys ShardDO `deleteChunks` with
+  //       the same refId the chunk PUTs used at upload time;
+  //   (b) call `commitVersion` to insert the file_versions row and
+  //       move `files.head_version_id` ATOMICALLY — the prior
+  //       version's row + chunks survive (the heart of the
+  //       Phase 27 fix);
+  //   (c) NOT call `commitRename` (whose hard-delete branch is what
+  //       silently destroyed prior history pre-Phase-27).
+  // The non-versioned branch is byte-equivalent to pre-Phase-27 —
+  // commitRename's hard-delete supersede is correct semantics for
+  // versioning-off tenants.
+  const versioning = isVersioningEnabled(durableObject, userId);
   const now = Date.now();
-  durableObject.sql.exec(
-    `UPDATE files
-        SET file_size = ?, chunk_count = ?, file_hash = ?, updated_at = ?
-      WHERE file_id = ?`,
-    totalSize,
-    session.total_chunks,
-    fileHash,
-    now,
-    uploadId
-  );
 
-  // 9. Apply commit-time payload (metadata, tags) BEFORE rename.
-  if (session.metadata_blob !== null) {
+  if (versioning) {
+    // Locate the pre-existing live row at (parent, leaf), if any. Its
+    // file_id is the stable `pathId` for this path's history; the
+    // multipart's tmp row will be discarded once the version is
+    // committed.
+    const liveRow = findLiveFile(
+      durableObject,
+      userId,
+      session.parent_id,
+      session.leaf
+    );
+    let pathId: string;
+    if (liveRow) {
+      // Existing path — reuse its identity. The new version attaches
+      // to it via `head_version_id`. The multipart tmp row is dropped
+      // at the end of this branch (its chunks now belong to the
+      // version, refid = uploadId).
+      pathId = liveRow.file_id;
+    } else {
+      // No prior path: promote the multipart tmp row to the live row
+      // by `commitRename`, making `tmpId` the path's permanent
+      // identity. Chunks were filed under `refId = uploadId = tmpId`
+      // at upload time; `pathId` therefore equals the refId, but the
+      // version below records `shard_ref_id = uploadId` explicitly
+      // so the GC path is uniform with the live-prior case.
+      await commitRename(
+        durableObject,
+        userId,
+        scope,
+        uploadId,
+        session.parent_id,
+        session.leaf
+      );
+      pathId = uploadId;
+    }
+
+    // Apply commit-time metadata + tags to the path's stable row,
+    // before the version is committed (so subsequent reads of the
+    // metadata-from-files denormalization match what the version
+    // captures).
+    if (session.metadata_blob !== null) {
+      durableObject.sql.exec(
+        "UPDATE files SET metadata = ? WHERE file_id = ?",
+        session.metadata_blob,
+        pathId
+      );
+    }
+    if (session.tags_json !== null) {
+      const tags = JSON.parse(session.tags_json) as string[];
+      const { replaceTags } = await import("./metadata-tags");
+      replaceTags(durableObject, userId, pathId, tags);
+    }
+
+    // Insert version_chunks rows for the newly-finalized version.
+    // The version_id is fresh; the chunks themselves already live on
+    // ShardDOs under refId = uploadId, recorded in shard_ref_id below.
+    const versionId = generateId();
+    for (let i = 0; i < session.total_chunks; i++) {
+      const row = collected.get(i)!;
+      durableObject.sql.exec(
+        `INSERT INTO version_chunks
+           (version_id, chunk_index, chunk_hash, chunk_size, shard_index)
+         VALUES (?, ?, ?, ?, ?)`,
+        versionId,
+        i,
+        row.hash,
+        row.size,
+        idxToShard[i]
+      );
+    }
+
+    // commitVersion: inserts the file_versions row AND atomically
+    // moves files.head_version_id to it. Prior versions / chunks
+    // remain — the data preservation invariant.
+    commitVersion(durableObject, {
+      pathId,
+      versionId,
+      userId,
+      size: totalSize,
+      mode: session.mode,
+      mtimeMs: now,
+      chunkSize: session.chunk_size,
+      chunkCount: session.total_chunks,
+      fileHash,
+      mimeType: session.mime_type,
+      inlineData: null,
+      userVisible: session.version_user_visible !== 0,
+      label: session.version_label,
+      shardRefId: uploadId,
+      encryption: session.encryption_mode !== null
+        ? {
+            mode: session.encryption_mode as "convergent" | "random",
+            keyId: session.encryption_key_id ?? undefined,
+          }
+        : undefined,
+    });
+
+    // When the prior live row was reused as `pathId`, the multipart
+    // tmp `files` row is now redundant. Drop it WITHOUT chunk
+    // fan-out: its chunks are owned by the new version_chunks rows
+    // (and the chunk_refs on shards remain valid under
+    // refId = uploadId). Calling `hardDeleteFileRow` here would
+    // dispatch `deleteChunks(uploadId)` to every shard and reap the
+    // chunks the version we just committed depends on.
+    if (liveRow) {
+      durableObject.sql.exec(
+        "DELETE FROM file_chunks WHERE file_id = ?",
+        uploadId
+      );
+      durableObject.sql.exec(
+        "DELETE FROM file_tags WHERE path_id = ?",
+        uploadId
+      );
+      durableObject.sql.exec(
+        "DELETE FROM files WHERE file_id = ?",
+        uploadId
+      );
+    }
+    // (no-prior-row case: commitRename already promoted the tmp row,
+    //  and the file_chunks / metadata / tags it carried are intact;
+    //  the row IS the path's identity so we keep it.)
+  } else {
+    // Non-versioned tenant — pre-Phase-27 behaviour preserved
+    // verbatim. commitRename hard-deletes any prior live row, which
+    // is correct semantics for versioning-off (no history to keep).
+
+    // 7. Batch-insert file_chunks rows. SQLite supports multi-row
+    //    VALUES; we go per-row in a tight loop because the DO's bound-
+    //    parameter limit is around 100 in practice, and this stays
+    //    inside one DO turn so it's still atomic.
+    for (let i = 0; i < session.total_chunks; i++) {
+      const row = collected.get(i)!;
+      durableObject.sql.exec(
+        `INSERT INTO file_chunks (file_id, chunk_index, chunk_hash, chunk_size, shard_index)
+         VALUES (?, ?, ?, ?, ?)`,
+        uploadId,
+        i,
+        row.hash,
+        row.size,
+        idxToShard[i]
+      );
+    }
+
+    // 8. Update tmp `files` row with size/file_hash/chunk_count. mode/
+    //    mime_type were stamped at begin and remain.
     durableObject.sql.exec(
-      "UPDATE files SET metadata = ? WHERE file_id = ?",
-      session.metadata_blob,
+      `UPDATE files
+          SET file_size = ?, chunk_count = ?, file_hash = ?, updated_at = ?
+        WHERE file_id = ?`,
+      totalSize,
+      session.total_chunks,
+      fileHash,
+      now,
       uploadId
     );
-  }
-  if (session.tags_json !== null) {
-    const tags = JSON.parse(session.tags_json) as string[];
-    const { replaceTags } = await import("./metadata-tags");
-    replaceTags(durableObject, userId, uploadId, tags);
-  }
 
-  // 10. Atomic supersede via existing commitRename. If a live row
-  //     exists at (parent, leaf), it's hard-deleted (chunks GC'd via
-  //     deleteChunks fan-out inside hardDeleteFileRow).
-  await commitRename(
-    durableObject,
-    userId,
-    scope,
-    uploadId,
-    session.parent_id,
-    session.leaf
-  );
+    // 9. Apply commit-time payload (metadata, tags) BEFORE rename.
+    if (session.metadata_blob !== null) {
+      durableObject.sql.exec(
+        "UPDATE files SET metadata = ? WHERE file_id = ?",
+        session.metadata_blob,
+        uploadId
+      );
+    }
+    if (session.tags_json !== null) {
+      const tags = JSON.parse(session.tags_json) as string[];
+      const { replaceTags } = await import("./metadata-tags");
+      replaceTags(durableObject, userId, uploadId, tags);
+    }
+
+    // 10. Atomic supersede via existing commitRename. If a live row
+    //     exists at (parent, leaf), it's hard-deleted (chunks GC'd via
+    //     deleteChunks fan-out inside hardDeleteFileRow).
+    await commitRename(
+      durableObject,
+      userId,
+      scope,
+      uploadId,
+      session.parent_id,
+      session.leaf
+    );
+  }
 
   // 11. Record bytes against quota + grow pool size if we crossed a
   //     5 GB boundary. Must run AFTER commitRename succeeds (we own
