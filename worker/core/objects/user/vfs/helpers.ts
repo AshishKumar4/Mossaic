@@ -351,6 +351,72 @@ export function poolSizeFor(durableObject: UserDO, userId: string): number {
 }
 
 /**
+ * Record bytes written / deleted against the canonical `quota` row,
+ * recompute the dynamic shard pool size from the new total, and write
+ * back a larger `pool_size` if `computePoolSize` says so. Pool size
+ * never shrinks — rendezvous redistribution would orphan chunks
+ * already pinned to higher shard indices.
+ *
+ * Called from every committed write/delete path:
+ *  - commitInlineTier (post-commitRename)
+ *  - commitChunkedTier (post-commitRename)
+ *  - vfsFinalizeMultipart (post-commitRename)
+ *  - hardDeleteFileRow (negative delta)
+ *  - vfsWriteFileVersioned (post-commitVersion)
+ *
+ * The next placement decision (next write, on the SAME UserDO turn or
+ * later) reads the updated pool_size via `poolSizeFor`. Existing
+ * chunks stay on their original shards because reads use the
+ * `file_chunks.shard_index` recorded at write time, not a live
+ * recomputation. Pool growth N→N+1 reroutes ~1/(N+1) of NEW writes
+ * to shard N; existing data is untouched.
+ *
+ * Idempotent quota-row creation: `INSERT OR IGNORE` then `UPDATE`.
+ */
+export function recordWriteUsage(
+  durableObject: UserDO,
+  userId: string,
+  deltaBytes: number,
+  deltaFiles: number
+): void {
+  // Ensure a quota row exists. The schema is created at ensureInit
+  // (`user-do-core.ts:172-179`) but a brand-new tenant's first
+  // write may run before any explicit row insert.
+  durableObject.sql.exec(
+    `INSERT OR IGNORE INTO quota (user_id, storage_used, storage_limit, file_count, pool_size)
+     VALUES (?, 0, 107374182400, 0, 32)`,
+    userId
+  );
+  durableObject.sql.exec(
+    `UPDATE quota SET storage_used = storage_used + ?, file_count = file_count + ? WHERE user_id = ?`,
+    deltaBytes,
+    deltaFiles,
+    userId
+  );
+  // Recompute pool size from the post-update total. We import lazily
+  // to keep this helper free of cross-module cycles when bundled.
+  const row = durableObject.sql
+    .exec(
+      "SELECT storage_used, pool_size FROM quota WHERE user_id = ?",
+      userId
+    )
+    .toArray()[0] as { storage_used: number; pool_size: number } | undefined;
+  if (!row) return;
+  // BASE_POOL=32, +1 per 5 GB stored. Inlined to avoid the
+  // shared/placement import (the helper is on the hot write path).
+  const BASE_POOL = 32;
+  const BYTES_PER_SHARD = 5 * 1024 * 1024 * 1024;
+  const newPool = BASE_POOL + Math.floor(Math.max(0, row.storage_used) / BYTES_PER_SHARD);
+  if (newPool > row.pool_size) {
+    durableObject.sql.exec(
+      "UPDATE quota SET pool_size = ? WHERE user_id = ?",
+      newPool,
+      userId
+    );
+  }
+}
+
+/**
  * Find the live (non-deleted, non-uploading) file row at (parentId, leaf).
  * Used by the commit-rename phase to identify a row to supersede.
  */
