@@ -151,15 +151,6 @@ export interface EnvApp extends EnvCore {
   SEARCH_DO: DurableObjectNamespace;
   ASSETS: Fetcher;
   AI?: Ai;
-  /**
-   * Feature flag for the SPA's `/api/upload/multipart/*` route.
-   * Defaults to ON. Set to "false" via
-   * `wrangler secret put FEATURE_VFS_UPLOAD_MULTIPART false` to
-   * disable the new path during a rollback; the SPA falls back to
-   * the legacy single-chunk `api.uploadInit/uploadChunk/uploadComplete`
-   * path (kept until the legacy-routes cleanup phase).
-   */
-  FEATURE_VFS_UPLOAD_MULTIPART?: string;
 }
 
 /**

@@ -99,8 +99,6 @@ export function useUpload(onComplete?: () => void) {
           file,
           {
             mimeType: file.type || "application/octet-stream",
-            // The App-side multipart route extracts parentId from
-            // metadata.parentId (see worker/app/routes/multipart.ts).
             metadata: { parentId, originalName: file.name },
             onChunkEvent: (e: ChunkEvent) => {
               updateTransfer(localId, (p) => {
