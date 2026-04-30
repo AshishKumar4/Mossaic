@@ -424,6 +424,40 @@ export async function vfsReadFile(
     throw new VFSError("EINVAL", `readFile: not a regular file: ${path}`);
   }
 
+  // Phase 25 Fix 12 — head-tombstone check BEFORE the yjs
+  // short-circuit. Pre-fix, a yjs-mode file whose head version was
+  // tombstoned (`unlink` under versioning-on) returned live yjs
+  // bytes here while `vfsStat` / `vfsExists` / `vfsListFiles` all
+  // reported the path as gone. Result: list/stat say "no", readFile
+  // says "yes" — a direct cross-surface contradiction. Now an
+  // explicit head-tombstone shortcuts to ENOENT regardless of mode.
+  // (An explicit `opts.versionId` for a non-tombstoned historical
+  // version still works through `readFileVersioned` below.)
+  const headRow = durableObject.sql
+    .exec(
+      `SELECT f.head_version_id, fv.deleted AS head_deleted
+         FROM files f
+         LEFT JOIN file_versions fv
+           ON fv.path_id = f.file_id AND fv.version_id = f.head_version_id
+        WHERE f.file_id=? AND f.user_id=?`,
+      r.leafId,
+      userId
+    )
+    .toArray()[0] as
+    | { head_version_id: string | null; head_deleted: number | null }
+    | undefined;
+  if (
+    headRow !== undefined &&
+    headRow.head_version_id !== null &&
+    headRow.head_deleted === 1 &&
+    opts.versionId === undefined
+  ) {
+    throw new VFSError(
+      "ENOENT",
+      "readFile: head version is a tombstone"
+    );
+  }
+
   // yjs-mode fork. If the file has mode_yjs=1 we MUST
   // materialize from the op log + checkpoint instead of file_chunks
   // / file_versions. Even if a head_version_id exists (compaction
@@ -441,13 +475,6 @@ export async function vfsReadFile(
   // Otherwise fall through to the file_chunks-based path
   // (preserves byte-equivalence for versioning-OFF tenants and for
   // legacy data written before versioning was ever enabled).
-  const headRow = durableObject.sql
-    .exec(
-      "SELECT head_version_id FROM files WHERE file_id=? AND user_id=?",
-      r.leafId,
-      userId
-    )
-    .toArray()[0] as { head_version_id: string | null } | undefined;
   const useVersioned =
     opts.versionId !== undefined || (headRow?.head_version_id ?? null) !== null;
   if (useVersioned) {
@@ -598,11 +625,24 @@ export function vfsOpenManifest(
   if (r.kind !== "file") {
     throw new VFSError("EINVAL", `openManifest: not a regular file: ${path}`);
   }
+  // Phase 25 Fix 10 — tombstone-consistency at the chunked-read
+  // boundary. The download-token path (`/api/vfs/download-token` →
+  // multipart-routes.ts) drives this RPC; without the head check
+  // the SDK could obtain a manifest pointing at legacy chunks for
+  // a path whose head has been tombstoned, then issue chunk GETs
+  // and stream stale bytes for an "unlinked" file. Same ENOENT
+  // semantics as `vfsStat` and `vfsReadFile`.
   const row = durableObject.sql
     .exec(
-      `SELECT file_id, file_size, chunk_size, chunk_count, inline_data
-         FROM files
-        WHERE file_id=? AND user_id=? AND status!='deleted'`,
+      `SELECT f.file_id, f.file_size, f.chunk_size, f.chunk_count,
+              f.inline_data, f.head_version_id, fv.deleted AS head_deleted,
+              fv.size AS head_size, fv.inline_data AS head_inline,
+              fv.chunk_size AS head_chunk_size,
+              fv.chunk_count AS head_chunk_count
+         FROM files f
+         LEFT JOIN file_versions fv
+           ON fv.path_id = f.file_id AND fv.version_id = f.head_version_id
+        WHERE f.file_id=? AND f.user_id=? AND f.status!='deleted'`,
       r.leafId,
       userId
     )
@@ -613,9 +653,62 @@ export function vfsOpenManifest(
         chunk_size: number;
         chunk_count: number;
         inline_data: ArrayBuffer | null;
+        head_version_id: string | null;
+        head_deleted: number | null;
+        head_size: number | null;
+        head_inline: ArrayBuffer | null;
+        head_chunk_size: number | null;
+        head_chunk_count: number | null;
       }
     | undefined;
   if (!row) throw new VFSError("ENOENT", "openManifest: file vanished");
+  if (row.head_version_id !== null && row.head_deleted === 1) {
+    throw new VFSError(
+      "ENOENT",
+      `openManifest: head version is a tombstone for ${path}`
+    );
+  }
+
+  // Versioned tenant path: read manifest from the head version's
+  // `version_chunks`, NOT the legacy `file_chunks`. The legacy
+  // columns on `files` aren't kept in sync after a versioned write
+  // (see `commitVersion` in vfs-versions.ts which writes to
+  // `file_versions` + `version_chunks` only).
+  if (row.head_version_id !== null) {
+    if (row.head_inline) {
+      return {
+        fileId: row.file_id,
+        size: row.head_inline.byteLength,
+        chunkSize: 0,
+        chunkCount: 0,
+        chunks: [],
+        inlined: true,
+      };
+    }
+    const verChunkRows = durableObject.sql
+      .exec(
+        `SELECT chunk_index, chunk_hash, chunk_size FROM version_chunks
+          WHERE version_id=? ORDER BY chunk_index`,
+        row.head_version_id
+      )
+      .toArray() as {
+      chunk_index: number;
+      chunk_hash: string;
+      chunk_size: number;
+    }[];
+    return {
+      fileId: row.file_id,
+      size: row.head_size ?? 0,
+      chunkSize: row.head_chunk_size ?? 0,
+      chunkCount: row.head_chunk_count ?? 0,
+      chunks: verChunkRows.map((c) => ({
+        index: c.chunk_index,
+        hash: c.chunk_hash,
+        size: c.chunk_size,
+      })),
+      inlined: false,
+    };
+  }
 
   if (row.inline_data) {
     return {
@@ -670,14 +763,84 @@ export async function vfsReadChunk(
   if (r.kind !== "file") {
     throw new VFSError("EINVAL", `readChunk: not a regular file: ${path}`);
   }
+  // Phase 25 Fix 10 — tombstone gate + versioned-byte-source.
+  // Without this, a download-token chunk fetch for a tombstoned-head
+  // path would silently stream legacy `file_chunks` bytes ("unlinked"
+  // data exposure). For non-tombstoned versioned tenants we also
+  // route through `version_chunks` so chunks reflect the head
+  // version, matching `readFileVersioned`.
   const inlineRow = durableObject.sql
     .exec(
-      `SELECT inline_data FROM files WHERE file_id=? AND user_id=? AND status!='deleted'`,
+      `SELECT f.inline_data, f.head_version_id,
+              fv.deleted AS head_deleted, fv.inline_data AS head_inline
+         FROM files f
+         LEFT JOIN file_versions fv
+           ON fv.path_id = f.file_id AND fv.version_id = f.head_version_id
+        WHERE f.file_id=? AND f.user_id=? AND f.status!='deleted'`,
       r.leafId,
       userId
     )
-    .toArray()[0] as { inline_data: ArrayBuffer | null } | undefined;
+    .toArray()[0] as
+    | {
+        inline_data: ArrayBuffer | null;
+        head_version_id: string | null;
+        head_deleted: number | null;
+        head_inline: ArrayBuffer | null;
+      }
+    | undefined;
   if (!inlineRow) throw new VFSError("ENOENT", "readChunk: file vanished");
+  if (inlineRow.head_version_id !== null && inlineRow.head_deleted === 1) {
+    throw new VFSError(
+      "ENOENT",
+      `readChunk: head version is a tombstone for ${path}`
+    );
+  }
+  // Versioned tenant: use head version's inline / chunks.
+  if (inlineRow.head_version_id !== null) {
+    if (inlineRow.head_inline) {
+      if (chunkIndex !== 0) {
+        throw new VFSError(
+          "EINVAL",
+          `readChunk: inlined file has no chunk index ${chunkIndex}`
+        );
+      }
+      return new Uint8Array(inlineRow.head_inline);
+    }
+    const verChunkRow = durableObject.sql
+      .exec(
+        `SELECT chunk_hash, chunk_size, shard_index FROM version_chunks
+          WHERE version_id=? AND chunk_index=?`,
+        inlineRow.head_version_id,
+        chunkIndex
+      )
+      .toArray()[0] as
+      | { chunk_hash: string; chunk_size: number; shard_index: number }
+      | undefined;
+    if (!verChunkRow) {
+      throw new VFSError(
+        "ENOENT",
+        `readChunk: no chunk at index ${chunkIndex}`
+      );
+    }
+    const env = durableObject.envPublic;
+    const shardName = vfsShardDOName(
+      scope.ns,
+      scope.tenant,
+      scope.sub,
+      verChunkRow.shard_index
+    );
+    const stub = env.MOSSAIC_SHARD.get(env.MOSSAIC_SHARD.idFromName(shardName));
+    const res = await stub.fetch(
+      new Request(`http://internal/chunk/${verChunkRow.chunk_hash}`)
+    );
+    if (!res.ok) {
+      throw new VFSError(
+        "ENOENT",
+        `readChunk: chunk data missing on shard ${verChunkRow.shard_index}`
+      );
+    }
+    return new Uint8Array(await res.arrayBuffer());
+  }
   if (inlineRow.inline_data) {
     if (chunkIndex !== 0) {
       throw new VFSError(

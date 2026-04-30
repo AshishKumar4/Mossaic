@@ -97,6 +97,15 @@ export interface VFSReadHandle {
   chunkCount: number;
   /** true iff content lives in inline_data; chunkCount == 0 in that case */
   inlined: boolean;
+  /**
+   * Phase 25 — when set, `vfsPullReadStream` resolves chunks via
+   * `version_chunks` keyed by this versionId (and inline bytes from
+   * the head version row). Captured at open-time so a concurrent
+   * write doesn't move the head out from under an in-flight stream.
+   * Undefined for non-versioned tenants (legacy `file_chunks` /
+   * `files.inline_data` path).
+   */
+  versionId?: string;
 }
 
 /**
@@ -118,11 +127,23 @@ export function vfsOpenReadStream(
       `openReadStream: not a regular file: ${path}`
     );
   }
+  // Phase 25 Fix 11 — tombstone gate + versioned-byte-source.
+  // Without this, any caller of `vfsCreateReadStream` (HTTP fallback
+  // download, SDK `createReadStream`) on a tombstoned-head path
+  // streams legacy `file_chunks` bytes for an "unlinked" file. For
+  // non-tombstoned versioned tenants the handle's chunkCount/size
+  // come from the head version row (which `vfsPullReadStream` then
+  // resolves via `version_chunks`), matching `readFileVersioned`.
   const row = durableObject.sql
     .exec(
-      `SELECT file_id, file_size, chunk_count, inline_data
-         FROM files
-        WHERE file_id=? AND user_id=? AND status='complete'`,
+      `SELECT f.file_id, f.file_size, f.chunk_count, f.inline_data,
+              f.head_version_id, fv.deleted AS head_deleted,
+              fv.size AS head_size, fv.chunk_count AS head_chunk_count,
+              fv.inline_data AS head_inline
+         FROM files f
+         LEFT JOIN file_versions fv
+           ON fv.path_id = f.file_id AND fv.version_id = f.head_version_id
+        WHERE f.file_id=? AND f.user_id=? AND f.status='complete'`,
       r.leafId,
       userId
     )
@@ -132,9 +153,32 @@ export function vfsOpenReadStream(
         file_size: number;
         chunk_count: number;
         inline_data: ArrayBuffer | null;
+        head_version_id: string | null;
+        head_deleted: number | null;
+        head_size: number | null;
+        head_chunk_count: number | null;
+        head_inline: ArrayBuffer | null;
       }
     | undefined;
   if (!row) throw new VFSError("ENOENT", "openReadStream: file vanished");
+  if (row.head_version_id !== null && row.head_deleted === 1) {
+    throw new VFSError(
+      "ENOENT",
+      `openReadStream: head version is a tombstone for ${path}`
+    );
+  }
+  // Versioned tenant: source size + chunkCount from the head version,
+  // and pin `versionId` on the handle so `vfsPullReadStream` reads
+  // from `version_chunks` deterministically.
+  if (row.head_version_id !== null) {
+    return {
+      fileId: row.file_id,
+      size: row.head_size ?? 0,
+      chunkCount: row.head_inline ? 0 : (row.head_chunk_count ?? 0),
+      inlined: !!row.head_inline,
+      versionId: row.head_version_id,
+    };
+  }
   return {
     fileId: row.file_id,
     size: row.file_size,
@@ -170,6 +214,23 @@ export async function vfsPullReadStream(
         `pullReadStream: inlined file has no chunk index ${chunkIndex}`
       );
     }
+    // Phase 25 Fix 11 — read inline bytes from the head version row
+    // when the handle was opened for a versioned tenant; falls back
+    // to legacy `files.inline_data` for non-versioned.
+    if (handle.versionId !== undefined) {
+      const vrow = durableObject.sql
+        .exec(
+          "SELECT inline_data FROM file_versions WHERE path_id=? AND version_id=?",
+          handle.fileId,
+          handle.versionId
+        )
+        .toArray()[0] as { inline_data: ArrayBuffer | null } | undefined;
+      if (!vrow || !vrow.inline_data) {
+        throw new VFSError("ENOENT", "pullReadStream: version inline missing");
+      }
+      const buf = new Uint8Array(vrow.inline_data);
+      return range ? sliceWithRange(buf, range) : buf;
+    }
     const row = durableObject.sql
       .exec(
         "SELECT inline_data FROM files WHERE file_id=? AND user_id=? AND status='complete'",
@@ -195,16 +256,31 @@ export async function vfsPullReadStream(
     );
   }
 
-  const chunkRow = durableObject.sql
-    .exec(
-      `SELECT chunk_hash, chunk_size, shard_index FROM file_chunks
-        WHERE file_id=? AND chunk_index=?`,
-      handle.fileId,
-      chunkIndex
-    )
-    .toArray()[0] as
-    | { chunk_hash: string; chunk_size: number; shard_index: number }
-    | undefined;
+  // Versioned tenant: chunks come from `version_chunks` keyed by
+  // the handle's pinned `versionId`. Falls back to legacy
+  // `file_chunks` for non-versioned.
+  const chunkRow =
+    handle.versionId !== undefined
+      ? (durableObject.sql
+          .exec(
+            `SELECT chunk_hash, chunk_size, shard_index FROM version_chunks
+              WHERE version_id=? AND chunk_index=?`,
+            handle.versionId,
+            chunkIndex
+          )
+          .toArray()[0] as
+          | { chunk_hash: string; chunk_size: number; shard_index: number }
+          | undefined)
+      : (durableObject.sql
+          .exec(
+            `SELECT chunk_hash, chunk_size, shard_index FROM file_chunks
+              WHERE file_id=? AND chunk_index=?`,
+            handle.fileId,
+            chunkIndex
+          )
+          .toArray()[0] as
+          | { chunk_hash: string; chunk_size: number; shard_index: number }
+          | undefined);
   if (!chunkRow) {
     throw new VFSError(
       "ENOENT",
