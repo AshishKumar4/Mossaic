@@ -708,12 +708,53 @@ export async function vfsFinalizeMultipart(
     })
   );
 
+  // 12. Reconstruct the absolute path from (parent_id, leaf) so the
+  //     route layer can dispatch follow-on side effects
+  //     (preview pre-gen via ctx.waitUntil) without re-querying.
+  const finalizedPath = reconstructFinalizedPath(
+    durableObject,
+    userId,
+    session.parent_id,
+    session.leaf
+  );
+
   return {
     fileId: uploadId,
     size: totalSize,
     chunkCount: session.total_chunks,
     fileHash,
+    path: finalizedPath,
+    mimeType: session.mime_type,
+    isEncrypted: session.encryption_mode !== null,
   };
+}
+
+/**
+ * Walk the `folders` parent_id chain to reconstruct an absolute path
+ * for a just-finalized file. Capped at 256 hops to defend against
+ * pathological cycles in malformed rows.
+ */
+function reconstructFinalizedPath(
+  durableObject: UserDO,
+  userId: string,
+  parentId: string | null,
+  leaf: string
+): string {
+  const segments: string[] = [leaf];
+  let cursor: string | null = parentId;
+  for (let i = 0; i < 256 && cursor !== null; i++) {
+    const row = durableObject.sql
+      .exec(
+        "SELECT parent_id, name FROM folders WHERE folder_id = ? AND user_id = ?",
+        cursor,
+        userId
+      )
+      .toArray()[0] as { parent_id: string | null; name: string } | undefined;
+    if (!row) break;
+    segments.unshift(row.name);
+    cursor = row.parent_id ?? null;
+  }
+  return "/" + segments.join("/");
 }
 
 /**

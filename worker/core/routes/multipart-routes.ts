@@ -211,11 +211,29 @@ mp.post("/finalize", async (c) => {
         400
       );
     }
-    const r = await userStub(c).vfsFinalizeMultipart(
+    const stub = userStub(c);
+    const r = await stub.vfsFinalizeMultipart(
       c.var.scope,
       body.uploadId,
       body.chunkHashList
     );
+    // Pre-generate standard preview variants in the background so
+    // the user's first gallery click hits a warm cache. Skipped
+    // server-side for empty / encrypted files via
+    // `preGenerateStandardVariants`'s gate. Best-effort: the routine
+    // catches per-variant failures internally.
+    if (r.size > 0 && !r.isEncrypted) {
+      c.executionCtx.waitUntil(
+        stub.adminPreGenerateStandardVariants(c.var.scope, {
+          fileId: r.fileId,
+          path: r.path,
+          mimeType: r.mimeType,
+          fileName: r.path.split("/").pop() ?? r.fileId,
+          fileSize: r.size,
+          isEncrypted: r.isEncrypted,
+        })
+      );
+    }
     return c.json(r);
   } catch (err) {
     const r = errToResponse(err);
