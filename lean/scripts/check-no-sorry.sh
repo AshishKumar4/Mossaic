@@ -9,6 +9,12 @@
 # with `axiom` (modulo whitespace) — that catches every project-level
 # declaration. Kernel axioms (`Classical.choice`, `propext`, `Quot.sound`)
 # live in core Lean, not in our project, so they don't appear in the grep.
+#
+# Phase 24: the previous version of this script silently whitelisted
+# `AES_GCM_IND_CPA`. That axiom has been REMOVED (its conclusion was
+# `True`, making it logically vacuous). The whitelist is now empty by
+# default; any future `axiom` addition fails the gate immediately, no
+# silent allowance.
 
 set -euo pipefail
 
@@ -17,8 +23,8 @@ cd "$(dirname "$0")/.."
 # 1. Run lake build and capture sorry warnings.
 output=$(lake build 2>&1 || true)
 
-# Filter for files we care about (must-have only).
-must_have_pattern='Mossaic/Vfs/(Common|Tenant|Refcount|Gc|AtomicWrite|Versioning|Encryption|Multipart)\.lean|Mossaic/Generated/(ShardDO|UserDO|Placement)\.lean'
+# Filter for files we care about (everything under Mossaic/).
+must_have_pattern='Mossaic/Vfs/(Common|Tenant|Refcount|Gc|AtomicWrite|Versioning|Encryption|Multipart|Quota|Preview)\.lean|Mossaic/Generated/(ShardDO|UserDO|Placement)\.lean'
 
 sorry_warnings=$(echo "$output" | grep -E "declaration uses .sorry." | grep -E "$must_have_pattern" || true)
 
@@ -28,17 +34,15 @@ if [[ -n "$sorry_warnings" ]]; then
   exit 1
 fi
 
-# 2. Project axioms.
+# 2. Project axioms. Phase 24: the whitelist is intentionally EMPTY.
 #
-# Phase 15: a single whitelisted axiom is permitted by name —
-# `AES_GCM_IND_CPA` in `Mossaic/Vfs/Encryption.lean`. This is the
-# standard cryptographic-literature result (NIST SP 800-38D, McGrew
-# & Viega 2004) and matches the F* + miTLS / EverCrypt practice of
-# axiomatising AES-GCM as an AEAD primitive.
-#
-# Any future axiom addition requires updating this whitelist (manual,
-# audited).
-WHITELISTED_AXIOMS=("AES_GCM_IND_CPA")
+# If you need to add a literature axiom (e.g., a cryptographic
+# assumption), it MUST be (a) named, (b) PR-reviewed, and (c) added
+# to this whitelist explicitly with a justification comment. The
+# previous silent allowance for `AES_GCM_IND_CPA` was removed in
+# Phase 24 because that axiom's conclusion was `True`, making it a
+# no-op declaration that lent false credibility.
+WHITELISTED_AXIOMS=()
 
 # Find every axiom declaration in proof files. The project pattern
 # `^axiom <name>` or `^[[:space:]]+axiom <name>`.
@@ -46,10 +50,9 @@ all_axioms_raw=$(grep -rnE '^axiom |^[[:space:]]+axiom ' Mossaic/ || true)
 if [[ -n "$all_axioms_raw" ]]; then
   unauthorized=""
   while IFS= read -r line; do
-    # Extract axiom name: format is "<file>:<line>:<indent>axiom NAME ..."
     name=$(echo "$line" | sed -E 's/.*axiom +([A-Za-z_][A-Za-z0-9_]*).*/\1/')
     is_whitelisted=0
-    for w in "${WHITELISTED_AXIOMS[@]}"; do
+    for w in "${WHITELISTED_AXIOMS[@]:+${WHITELISTED_AXIOMS[@]}}"; do
       if [[ "$name" == "$w" ]]; then
         is_whitelisted=1
         break
@@ -60,9 +63,13 @@ if [[ -n "$all_axioms_raw" ]]; then
     fi
   done <<< "$all_axioms_raw"
   if [[ -n "$unauthorized" ]]; then
-    echo "FAIL: project-level axiom declarations not in whitelist:"
+    echo "FAIL: project-level axiom declarations found (no whitelist active):"
     echo "$unauthorized"
-    echo "Whitelisted: ${WHITELISTED_AXIOMS[*]}"
+    if [[ ${#WHITELISTED_AXIOMS[@]} -eq 0 ]]; then
+      echo "Whitelist is intentionally empty (Phase 24 cleanup)."
+    else
+      echo "Whitelisted: ${WHITELISTED_AXIOMS[*]}"
+    fi
     exit 1
   fi
 fi

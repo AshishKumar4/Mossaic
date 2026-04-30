@@ -2,97 +2,131 @@
 
 Mathlib4-backed formal verification of Mossaic VFS invariants in Lean 4.
 
-**Status:** All six target invariants compile with **zero `sorry`** and **zero project `axiom`** declarations. The only axioms used are Lean's three kernel axioms: `propext`, `Classical.choice`, `Quot.sound` (plus Mathlib's transitive use of them).
+**Status (Phase 24 honest accounting):** zero `sorry`, zero project axioms (the previous `AES_GCM_IND_CPA` axiom — whose conclusion was `True`, making it logically vacuous — has been removed). The only axioms used are Lean's three kernel axioms: `propext`, `Classical.choice`, `Quot.sound`, plus Mathlib's transitive use of them.
 
 ```bash
 cd lean && lake build
-# Build completed successfully (575 jobs).
+# Build completed successfully.
 ```
 
 ```bash
 grep -rnE '^axiom|^[[:space:]]+axiom' lean/Mossaic/  # → empty
-grep -rn 'sorry' lean/Mossaic/ | grep -v '\-\-'      # → empty
+grep -rn '\bsorry\b' lean/Mossaic/ | grep -v '^[^:]*:[0-9]*:[[:space:]]*--' | grep -v '`sorry`'  # → empty
 ```
 
-## What is proved
+## What is proved (Phase 24 inventory)
 
 ### I1 — Refcount validity (must-have, **proved**)
 
-Invariant `validState` (now four-clause, including the numerical equality):
+Invariant `validState` (four-clause, including the numerical equality):
 
   - **(S1)** `chunks` are unique by hash.
   - **(S2)** `chunk_refs` are unique by composite key.
   - **(S3)** Every `chunk_refs` row's hash has a corresponding `chunks` row.
-  - **(S4)** For every chunk row, `refCount = countP (·.chunkHash = c.hash) refs` (the **numerical** equality, proved using `Mathlib.Data.List.Count`).
+  - **(S4)** For every chunk row, `refCount = countP (·.chunkHash = c.hash) refs` (numerical equality, proved using `Mathlib.Data.List.Count`).
 
-Theorem: [`Mossaic.Vfs.Refcount.step_preserves_validState`](Mossaic/Vfs/Refcount.lean) — fully unconditional.
-
-The previous build of this directory carried (S4) only as an axiom. The Mathlib4 dependency replaces that axiom with a proof using `List.countP`, `List.countP_append`, `List.countP_cons`, `List.countP_eq_zero`, `List.count_eq_countP`, `List.countP_filter`, `List.countP_congr`, and direct induction on the dropped-refs list inside `deleteChunks`.
-
-Corollary: [`Mossaic.Vfs.Refcount.refCount_zero_implies_no_refs`](Mossaic/Vfs/Refcount.lean) — chunks with `refCount = 0` have zero live refs to their hash. This is the load-bearing fact for I5.
+Theorem: [`Mossaic.Vfs.Refcount.step_preserves_validState`](Mossaic/Vfs/Refcount.lean) — fully unconditional. Plus 40 helpers + Phase 12 copyFile theorems.
 
 ### I3 — Tenant isolation (must-have, **proved**)
 
-Distinct tenants under valid scope produce distinct DO instance names — both `vfsUserDOName` and `vfsShardDOName`.
-
-Theorems:
-  - [`Mossaic.Vfs.Tenant.userName_inj`](Mossaic/Vfs/Tenant.lean)
-  - [`Mossaic.Vfs.Tenant.shardName_inj_fixed_idx`](Mossaic/Vfs/Tenant.lean)
-  - [`Mossaic.Vfs.Tenant.cross_tenant_isolation`](Mossaic/Vfs/Tenant.lean)
-  - [`Mossaic.Vfs.Tenant.cross_tenant_user_isolation`](Mossaic/Vfs/Tenant.lean)
-
-Reduces to char-list-level colon-separator splitting. The `[A-Za-z0-9._-]{1,128}` token charset (no `:`) carries the load.
+Distinct tenants under valid scope produce distinct DO instance names — both `vfsUserDOName` and `vfsShardDOName`. 15 theorems in [`Mossaic/Vfs/Tenant.lean`](Mossaic/Vfs/Tenant.lean). Reduces to char-list-level colon-separator splitting.
 
 ### I5 — GC safety (must-have, **proved**, NO axiom)
 
   - **(G1)** `alarm` only hard-deletes chunks with `refCount = 0` — unconditional.
-  - **(G3)** `alarm` preserves `validState` — **now unconditional** (was axiom-conditional in v1; the I1 numerical equality made the missing piece derivable).
+  - **(G3)** `alarm` preserves `validState` — unconditional (uses the I1 numerical equality).
   - **(G4)** Resurrection is preserved.
 
-Theorems:
-  - [`Mossaic.Vfs.Gc.alarm_only_deletes_zero_refCount`](Mossaic/Vfs/Gc.lean)
-  - [`Mossaic.Vfs.Gc.alarm_preserves_validState`](Mossaic/Vfs/Gc.lean)
-  - [`Mossaic.Vfs.Gc.alarm_unmarks_resurrected`](Mossaic/Vfs/Gc.lean)
+10 theorems in [`Mossaic/Vfs/Gc.lean`](Mossaic/Vfs/Gc.lean).
 
-### I2 — Atomic-write linearizability (now **proved**)
+### I2 — Atomic-write linearizability (**proved**)
 
-Mossaic's writeFile is a temp-id-then-rename sequence:
-  - (W1) Insert `_vfs_tmp_<id>` row with `status = uploading`.
-  - (W2) Insert chunk rows tagged by tmp file_id.
-  - (W3) Atomic `commitRename`: flips status to `complete` and renames file_name.
+The temp-id-then-rename pipeline. `readFile` chunks are always sourced from a single, well-defined file_id (no torn reads). 11 theorems in [`Mossaic/Vfs/AtomicWrite.lean`](Mossaic/Vfs/AtomicWrite.lean).
 
-`readFile path` filters on `status = complete ∧ file_name = path`, then fetches all chunks tagged by THAT file_id. We prove:
+### I4 — Versioning sortedness & monotonicity (**proved**)
 
-  - [`Mossaic.Vfs.AtomicWrite.readFile_unchanged_under_beginWrite`](Mossaic/Vfs/AtomicWrite.lean) — during (W1)/(W2), readFile returns the same as before.
-  - [`Mossaic.Vfs.AtomicWrite.readFile_no_torn_state`](Mossaic/Vfs/AtomicWrite.lean) — readFile chunks are always sourced from a single, well-defined file_id (no mixing).
-  - [`Mossaic.Vfs.AtomicWrite.readFile_post_commit_well_formed`](Mossaic/Vfs/AtomicWrite.lean) — after commitRename, readFile result is structurally well-formed.
+`listVersions_sorted` (V1) via `List.pairwise_mergeSort`. `insertVersion_max_ge` (V3). Phase 12 user_visible monotonicity (T7.5). 13 theorems in [`Mossaic/Vfs/Versioning.lean`](Mossaic/Vfs/Versioning.lean).
 
-Caveat: the proofs assume each `Op` in the model is atomic, which mirrors Cloudflare's documented "single-threaded fetch handler" guarantee. We do not prove the runtime semantics themselves.
+### I7 — Pool growth (Phase 24 NEW)
 
-### I4 — Versioning sortedness & monotonicity (now **proved**)
+  - `pool_size_monotone` — `recordWriteUsage` never shrinks `pool_size`.
+  - `pool_growth_threshold` — post-update equals `max(prior, BASE_POOL + ⌊storage_used / 5GB⌋)`.
+  - `pool_growth_at_5GB_boundary` — crossing a 5 GB boundary grows the pool by exactly 1.
+  - `placement_immutability_under_resize` — chunks recorded at write time stay findable post-resize.
+  - `stored_shard_within_resized_pool` — recorded shard indices remain in-bounds after pool growth.
+  - `storage_used_monotone`, `file_count_monotone` — quota counters monotone under writes.
 
-  - [`Mossaic.Vfs.Versioning.listVersions_sorted`](Mossaic/Vfs/Versioning.lean) — `listVersions` output is `Pairwise (a.mtimeMs ≥ b.mtimeMs)`. Proved via `Mathlib.Data.List.Sort.List.pairwise_mergeSort` and `Mathlib.Data.List.Pairwise.List.Pairwise.sublist`.
-  - [`Mossaic.Vfs.Versioning.insertVersion_max_ge`](Mossaic/Vfs/Versioning.lean) — after `insertVersion mtime`, `maxMtime ≥ mtime`.
+10 theorems in [`Mossaic/Vfs/Quota.lean`](Mossaic/Vfs/Quota.lean).
+
+### I8 — Preview pipeline / file_variants (Phase 24 NEW)
+
+  - `stepVariant_preserves_validState` — every variant op preserves PK uniqueness.
+  - `cascade_delete_drops_all` — deleting a file drops all its variants.
+  - `cascade_delete_preserves_other_files` — file deletion does NOT touch other files' variants.
+  - `variant_chunk_putChunk_preserves_shard_validState` — variant chunks register through the same refcount machinery as primary chunks; transitively preserved.
+  - `reachable_validVariantState` — any sequence of variant ops from empty preserves the invariant.
+
+13 theorems in [`Mossaic/Vfs/Preview.lean`](Mossaic/Vfs/Preview.lean).
+
+### Encryption — refcount-blindness only (Phase 24 cleanup)
+
+Phase 24 removed 4 vacuous-`True` theorems and the `AES_GCM_IND_CPA` "axiom" whose conclusion was also `True`. The cryptographic claims they pretended to formalise (IND-CPA, convergent leakage, cross-tenant non-leakage, encryption-preserves-tenant-isolation) belong in `docs/encryption-security-claims.md` with literature citations, NOT in Lean.
+
+The one remaining theorem in [`Mossaic/Vfs/Encryption.lean`](Mossaic/Vfs/Encryption.lean):
+
+  - `refcount_invariant_under_encryption` — the chunk-refcount state machine is encryption-blind. Direct reduction to `step_preserves_validState`.
+
+### Multipart — supersession + idempotence (Phase 24 cleanup)
+
+Phase 24 removed 5 vacuous-`True` theorems (`finalize_atomic_commit`, `session_token_unforgeability`, `multipart_alarm_idempotent`, `composition_with_phase15`, `phase16_axiom_budget`). Their docstrings claimed serious results that were not formalised; the formal content was `True`. The remaining theorems in [`Mossaic/Vfs/Multipart.lean`](Mossaic/Vfs/Multipart.lean):
+
+  - `putChunkMultipart_idempotent` — same-hash retry preserves `validState`.
+  - `putChunkMultipart_supersedes_safely` — coarse supersession (drop-all-refs-for-fileId + put new) preserves `validState`.
+  - `putChunkMultipart_supersedes_safely_finegrained` — finer-grained supersession with explicit prior-hash existence premise.
+  - `multipart_refcount_valid` — induction over a list of multipart ops preserves `validState`.
+  - `multipart_put_changes_state` — non-vacuity witness.
 
 ### I6 — UNIQUE serialization (deferred — out of scope, unchanged)
 
-Would require modeling SQLite's UNIQUE INDEX semantics including SAVEPOINT rollback. Out of scope; documented limitation.
+Would require modeling SQLite's UNIQUE INDEX semantics including SAVEPOINT rollback. Documented limitation.
+
+## Phase 24 changes vs. previous version
+
+  - **Removed 1 project axiom** (`AES_GCM_IND_CPA`, vacuous).
+  - **Removed 9 `True := by trivial` theorems** (4 in Encryption.lean, 5 in Multipart.lean).
+  - **Added 1 finer-grained supersession theorem** (`putChunkMultipart_supersedes_safely_finegrained`).
+  - **Added 2 new modules** (`Quota.lean` for pool growth, `Preview.lean` for file_variants).
+  - **Removed silent whitelist** in `check-no-sorry.sh` — the whitelist array is now explicitly empty; any future axiom addition fails the gate.
+  - **Refreshed citations** for 3 stale-line-range theorems and 5 stale module-LoC headers.
+
+## Theorem totals (Phase 24 post-cleanup)
+
+| Module | Theorems | Notes |
+|---|--:|---|
+| `Common.lean` | 1 | UniqueBy.nil. |
+| `Tenant.lean` | 15 | I3 tenant isolation. |
+| `Refcount.lean` | 41 | I1, including Phase 12 copyFile + metadata. |
+| `Gc.lean` | 10 | I5 GC safety. |
+| `AtomicWrite.lean` | 11 | I2 linearizability. |
+| `Versioning.lean` | 13 | I4 sortedness + Phase 12 user_visible. |
+| `Encryption.lean` | 1 | refcount-blindness only (was 5 + 1 axiom; 4 + axiom removed). |
+| `Multipart.lean` | 5 | 3 invariance + 1 finer-grained + 1 liveness witness (was 8; 5 vacuous removed, 1 added). |
+| `Quota.lean` | 10 | NEW — pool-growth correctness. |
+| `Preview.lean` | 15 | NEW — file_variants invariants. |
+| `Generated/Placement.lean` | 0 | Documentation. |
+| `Generated/ShardDO.lean` | 3 | Re-exports. |
+| `Generated/UserDO.lean` | 3 | Re-exports. |
+| **Total** | **128** | |
+
+Plus **0 project axioms** (down from 1) and **0 sorrys**.
 
 ## Architecture: Mathlib4 + TSLean-inspired modeling
 
-This work is **architecturally inspired by [AshishKumar4/TSLean](https://github.com/AshishKumar4/TSLean)** but does **not** depend on it as a runtime.
+Architecturally inspired by [AshishKumar4/TSLean](https://github.com/AshishKumar4/TSLean) but does NOT depend on it as a runtime. Hand-written state-machine model + `Generated/` delegation pattern. `omega` / `decide` / `simp` proof style.
 
-What we adopt from TSLean:
-  - Hand-written state-machine model + `Generated/` delegation pattern.
-  - `omega` / `decide` / `simp` proof style.
+Mathlib4 v4.29.0 lets us prove the numerical refcount equality (`List.countP`-based) and the listVersions sortedness (`List.pairwise_mergeSort`) directly, without recourse to project axioms.
 
-What we add over TSLean (it does not use Mathlib):
-  - **Mathlib4 v4.29.0** as a dep. This is the key change vs. v1 of this directory: it lets us prove the numerical refcount equality (`List.countP`-based) and the listVersions sortedness (`List.pairwise_mergeSort`) directly, without recourse to project axioms.
-
-Why we still **don't** vendor TSLean's transpiler:
-  - Mossaic's DOs use raw SQL via `ctx.storage.sql` extensively; TSLean's transpiler can't model SQL semantics.
-
-## Layout
+## Layout (post-Phase-24)
 
 ```
 lean/
@@ -100,7 +134,7 @@ lean/
 ├── lakefile.lean                   (Mathlib v4.29.0 dependency)
 ├── lean-toolchain                  (leanprover/lean4:v4.29.0)
 ├── lake-manifest.json              (auto-generated; pinned)
-├── Mossaic.lean                    (root, re-exports)
+├── Mossaic.lean                    (root, re-exports all 11 modules)
 ├── Mossaic/
 │   ├── Vfs/
 │   │   ├── Common.lean             (Hash/PathId/TimeMs aliases, UniqueBy)
@@ -108,13 +142,17 @@ lean/
 │   │   ├── Refcount.lean           (I1, full numerical equality)
 │   │   ├── Gc.lean                 (I5, no axiom)
 │   │   ├── AtomicWrite.lean        (I2, full linearizability)
-│   │   └── Versioning.lean         (I4, full sortedness via Mathlib)
+│   │   ├── Versioning.lean         (I4, full sortedness via Mathlib)
+│   │   ├── Encryption.lean         (refcount-blindness only — Phase 24 cleanup)
+│   │   ├── Multipart.lean          (idempotence + supersession — Phase 24 cleanup)
+│   │   ├── Quota.lean              (Phase 24 NEW: pool-growth correctness)
+│   │   └── Preview.lean            (Phase 24 NEW: file_variants invariants)
 │   └── Generated/
 │       ├── ShardDO.lean            (re-exports for shard-do.ts)
 │       ├── UserDO.lean             (re-exports for user-do.ts)
 │       └── Placement.lean          (architectural cross-ref)
 └── scripts/
-    ├── check-no-sorry.sh           (verifies must-have proofs sorry-free)
+    ├── check-no-sorry.sh           (verifies sorry-free + zero project axioms)
     └── check-xrefs.sh              (verifies @lean-invariant TS comments resolve)
 ```
 
@@ -129,6 +167,8 @@ Every TS function with a proven invariant carries a `@lean-invariant` JSDoc tag.
   - **Wall-clock alarm timeliness.** Alarm is modeled as an externally-triggered Op.
   - **SQLite engine.** UNIQUE INDEX, SAVEPOINT, transactional atomicity are SQLite properties — not Mossaic's TS — and are not modeled.
   - **Workers concurrent-subrequest cap.** Out of scope.
+  - **Cryptographic primitives.** AES-GCM IND-CPA, HMAC-SHA-256 PRF, etc. — these are literature-axiomatised in security-properties docs, not in Lean.
+  - **Renderer registration order, concurrency caps.** Runtime-level invariants; out of Lean scope.
 
 ## How to extend a proof
 
@@ -141,13 +181,7 @@ Every TS function with a proven invariant carries a `@lean-invariant` JSDoc tag.
 
 ## Mathlib build performance
 
-`lake build` cold-cache without Mathlib is ~30s. With Mathlib v4.29.0:
-
-  - **First-ever build (no cache):** ~20-40 minutes (Mathlib has ~5800 source files).
-  - **First build with `lake exe cache get` (Azure CDN cache):** ~3-5 minutes.
-  - **Warm cache (incremental):** ~2-5 seconds.
-
-The CI workflow uses the official mathlib4 cache via `cd .lake/packages/mathlib && lake exe cache get`.
+`lake build` first-ever build (no cache): ~20-40 min (Mathlib has ~5800 files). With `lake exe cache get` (Azure CDN cache): ~3-5 min. Warm cache (incremental): ~2-5 sec.
 
 ## CI
 

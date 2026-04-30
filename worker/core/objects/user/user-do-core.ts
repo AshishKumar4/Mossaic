@@ -688,6 +688,15 @@ export class UserDOCore extends DurableObject<Env> {
     //   by `vfsUnlink` (see worker/core/objects/user/vfs/write-commit.ts).
     //
     // Idempotent CREATE TABLE; no migration tag.
+    //
+    // @lean-invariant Mossaic.Vfs.Preview.stepVariant_preserves_validState
+    //   Lean proves all variant ops (insert / delete / cascadeFileDelete)
+    //   preserve the PK uniqueness invariant. See
+    //   `lean/Mossaic/Vfs/Preview.lean :: stepVariant_preserves_validState`.
+    // @lean-invariant Mossaic.Vfs.Preview.cascade_delete_drops_all
+    //   Lean proves CASCADE-delete drops every variant row for the
+    //   deleted file_id. See
+    //   `lean/Mossaic/Vfs/Preview.lean :: cascade_delete_drops_all`.
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS file_variants (
         file_id        TEXT NOT NULL,

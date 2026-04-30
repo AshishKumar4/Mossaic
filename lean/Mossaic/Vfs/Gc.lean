@@ -2,7 +2,8 @@
 Mossaic.Vfs.Gc — I5: Garbage collection safety. Mathlib-backed, NO AXIOM.
 
 Models:
-  worker/core/objects/shard/shard-do.ts (777 LoC)
+  worker/core/objects/shard/shard-do.ts (821 LoC)
+    — alarm sweeper (lines 716-810)
     — alarm sweeper: hard-delete after 30s grace
     — scheduleSweep: alarm-set on first soft-mark
     — soft-mark: ref_count=0 stamps deleted_at; alarm reaps later

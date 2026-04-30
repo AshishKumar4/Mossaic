@@ -2,12 +2,12 @@
 Mossaic.Vfs.Tenant — I3: Tenant isolation.
 
 Models:
-  worker/core/lib/utils.ts (132 LoC)
-    — validateVfsToken (character class enforcement)
-    — vfsUserDOName (canonical UserDO name builder)
-    — vfsShardDOName (canonical ShardDO name builder)
-  shared/vfs-types.ts:10-17     (VFSScope)
-  tests/integration/tenant-isolation.test.ts:77-86 (`:` rejection test)
+  worker/core/lib/utils.ts (118 LoC)
+    — validateVfsToken (character class enforcement, lines 47-56)
+    — vfsUserDOName (canonical UserDO name builder, lines 73-85)
+    — vfsShardDOName (canonical ShardDO name builder, lines 103-117)
+  shared/vfs-types.ts            (VFSScope)
+  tests/integration/tenant-isolation.test.ts (`:` rejection test)
 
 Audit reference: /workspace/local/audit-report.md §I3 (verdict: Pass).
 
@@ -45,7 +45,7 @@ structure VFSScope where
   sub    : Option String
   deriving DecidableEq, Repr
 
-/-- Per worker/core/lib/utils.ts:55-78, a scope token must be a non-empty
+/-- Per worker/core/lib/utils.ts:47-56, a scope token must be a non-empty
 ASCII string of length ≤ 128 drawn from `[A-Za-z0-9._-]`. The crucial
 exclusion for cross-tenant isolation is the colon `:`; everything else
 is just hygiene. -/
@@ -153,14 +153,14 @@ theorem string_split_at_colon (a b x y : String)
 -- ─── DO name builders ───────────────────────────────────────────────────
 
 /-- UserDO instance name. Mirrors `vfsUserDOName` in
-worker/core/lib/utils.ts:82-94: `vfs:{ns}:{tenant}` or `vfs:{ns}:{tenant}:{sub}`. -/
+worker/core/lib/utils.ts:73-85: `vfs:{ns}:{tenant}` or `vfs:{ns}:{tenant}:{sub}`. -/
 def userName (sc : VFSScope) : String :=
   match sc.sub with
   | none   => "vfs:" ++ sc.ns ++ ":" ++ sc.tenant
   | some s => "vfs:" ++ sc.ns ++ ":" ++ sc.tenant ++ ":" ++ s
 
 /-- ShardDO instance name. Mirrors `vfsShardDOName` in
-worker/core/lib/utils.ts:106-121: `userName(sc) + ":s" + idx`. -/
+worker/core/lib/utils.ts:103-117: `userName(sc) + ":s" + idx`. -/
 def shardName (sc : VFSScope) (idx : Nat) : String :=
   userName sc ++ ":s" ++ toString idx
 

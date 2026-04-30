@@ -372,6 +372,17 @@ export function poolSizeFor(durableObject: UserDO, userId: string): number {
  * to shard N; existing data is untouched.
  *
  * Idempotent quota-row creation: `INSERT OR IGNORE` then `UPDATE`.
+ *
+ * @lean-invariant Mossaic.Vfs.Quota.pool_size_monotone
+ *   Lean proves `recordWriteUsage` never shrinks `pool_size`. See
+ *   `lean/Mossaic/Vfs/Quota.lean :: pool_size_monotone`.
+ * @lean-invariant Mossaic.Vfs.Quota.pool_growth_threshold
+ *   Lean proves the post-update `pool_size` equals
+ *   `max(prior, BASE_POOL + ⌊storage_used / BYTES_PER_SHARD⌋)`.
+ *   See `lean/Mossaic/Vfs/Quota.lean :: pool_growth_threshold`.
+ * @lean-invariant Mossaic.Vfs.Quota.pool_growth_at_5GB_boundary
+ *   Lean proves crossing a 5 GB threshold grows the pool by exactly 1.
+ *   See `lean/Mossaic/Vfs/Quota.lean :: pool_growth_at_5GB_boundary`.
  */
 export function recordWriteUsage(
   durableObject: UserDO,
