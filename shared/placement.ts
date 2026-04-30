@@ -52,22 +52,6 @@ export function placeChunk(
 }
 
 /**
- * Place all chunks of a file and return a map of chunkIndex → shardIndex.
- */
-export function placeFile(
-  userId: string,
-  fileId: string,
-  chunkCount: number,
-  poolSize: number
-): Map<number, number> {
-  const placement = new Map<number, number>();
-  for (let i = 0; i < chunkCount; i++) {
-    placement.set(i, placeChunk(userId, fileId, i, poolSize));
-  }
-  return placement;
-}
-
-/**
  * Compute pool size based on total storage used.
  */
 export function computePoolSize(storageUsedBytes: number): number {
