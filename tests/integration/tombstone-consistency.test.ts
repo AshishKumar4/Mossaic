@@ -516,6 +516,86 @@ describe("Phase 25 — tombstone consistency", () => {
     }
   });
 
+  it("19. openManifest on tombstoned head throws ENOENT", async () => {
+    const tenant = "tc-openmanifest-tomb";
+    const stub = userStubFor(tenant);
+    const vfs = createVFS(envFor(), { tenant, versioning: "enabled" });
+    await vfs.writeFile("/m.txt", new Uint8Array(20 * 1024).fill(7));
+    await vfs.unlink("/m.txt");
+
+    // openManifest goes through the typed RPC; verify it surfaces
+    // ENOENT for a tombstoned head, matching stat/readFile.
+    const scope = { ns: NS, tenant };
+    await expect(
+      stub.vfsOpenManifest(scope, "/m.txt")
+    ).rejects.toThrow(/ENOENT|tombstone/);
+  });
+
+  it("20. createReadStream on tombstoned head throws ENOENT", async () => {
+    const tenant = "tc-createreadstream-tomb";
+    const vfs = createVFS(envFor(), { tenant, versioning: "enabled" });
+    await vfs.writeFile("/s.txt", new Uint8Array(20 * 1024).fill(7));
+    await vfs.unlink("/s.txt");
+
+    // createReadStream → vfsOpenReadStream → throws ENOENT.
+    await expect(vfs.createReadStream("/s.txt")).rejects.toBeInstanceOf(
+      ENOENT
+    );
+  });
+
+  it("21. yjs-mode readFile on tombstoned head throws ENOENT (no stale bytes)", async () => {
+    const tenant = "tc-yjs-tomb";
+    const vfs = createVFS(envFor(), { tenant, versioning: "enabled" });
+    await vfs.writeFile("/y.md", enc.encode(""));
+    await vfs.setYjsMode("/y.md", true);
+    // Write something through the yjs path so there are live bytes
+    // hiding inside yjs_oplog; this is the trap pre-fix readFile
+    // would expose.
+    await vfs.writeFile("/y.md", enc.encode("hello yjs"));
+
+    // Sanity: readFile returns the live yjs bytes pre-unlink.
+    const before = new TextDecoder().decode(await vfs.readFile("/y.md"));
+    expect(before).toBe("hello yjs");
+
+    // Unlink under versioning. Pre-fix: readFile still returned bytes.
+    // Post-fix: ENOENT, matching stat/exists.
+    await vfs.unlink("/y.md");
+
+    expect(await vfs.exists("/y.md")).toBe(false);
+    await expect(vfs.stat("/y.md")).rejects.toBeInstanceOf(ENOENT);
+    await expect(vfs.readFile("/y.md")).rejects.toBeInstanceOf(ENOENT);
+  });
+
+  it("22. consistency: every listFiles result is openManifest-able + createReadStream-able", async () => {
+    const tenant = "tc-list-stream-consistency";
+    const vfs = createVFS(envFor(), { tenant, versioning: "enabled" });
+    const stub = userStubFor(tenant);
+
+    await vfs.writeFile("/live1.bin", new Uint8Array(20 * 1024).fill(1));
+    await vfs.writeFile("/live2.bin", new Uint8Array(20 * 1024).fill(2));
+    await vfs.writeFile("/dead.bin", new Uint8Array(20 * 1024).fill(3));
+    await vfs.unlink("/dead.bin");
+
+    const listed = await vfs.listFiles({ includeStat: true });
+    expect(listed.items.length).toBe(2);
+
+    const scope = { ns: NS, tenant };
+    for (const item of listed.items) {
+      // Every listed path MUST openManifest without throwing.
+      const manifest = await stub.vfsOpenManifest(scope, item.path);
+      expect(manifest.fileId).toBe(item.pathId);
+      expect(manifest.size).toBe(20 * 1024);
+      // And createReadStream-open must not throw the tombstone
+      // error (we don't drain bytes here — the workers test pool's
+      // cross-DO ReadableStream behaviour is unrelated to this
+      // invariant; the open-handle check is what gates tombstones).
+      // The negative case (tombstoned-head) is covered by test 20.
+      await expect(
+        vfs.createReadStream(item.path)
+      ).resolves.toBeDefined();
+    }
+  });
+
   it("18. vfs.purge on a versioned path drops every version + files row", async () => {
     const tenant = "tc-purge";
     const vfs = createVFS(envFor(), { tenant, versioning: "enabled" });
