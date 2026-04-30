@@ -77,11 +77,23 @@ export async function vfsReadPreview(
   // Pull the file's metadata in one query. encryption_mode gates
   // the entire pipeline; mime_type drives renderer dispatch;
   // file_name + file_size feed the renderer's RenderInput.
+  //
+  // Phase 25 — tombstone-consistency. Also pull `head_version_id`
+  // so we can refuse readPreview on a tombstoned-head row, matching
+  // `vfsStat` / `vfsReadFile` semantics (helpers.ts:245,
+  // reads.ts:305-311). Without this check, an SPA gallery
+  // thumbnail load on an unlinked-under-versioning file would
+  // attempt to render bytes that aren't there and 500. The
+  // user-visible failure mode is a sea of broken thumbnails until
+  // the listing also stops surfacing the tombstoned row.
   const fileRow = durableObject.sql
     .exec(
-      `SELECT file_name, file_size, mime_type, encryption_mode
-         FROM files
-        WHERE file_id = ? AND user_id = ? AND status != 'deleted'`,
+      `SELECT f.file_name, f.file_size, f.mime_type, f.encryption_mode,
+              f.head_version_id, fv.deleted AS head_deleted
+         FROM files f
+         LEFT JOIN file_versions fv
+           ON fv.path_id = f.file_id AND fv.version_id = f.head_version_id
+        WHERE f.file_id = ? AND f.user_id = ? AND f.status != 'deleted'`,
       fileId,
       userId
     )
@@ -91,12 +103,20 @@ export async function vfsReadPreview(
         file_size: number;
         mime_type: string | null;
         encryption_mode: string | null;
+        head_version_id: string | null;
+        head_deleted: number | null;
       }
     | undefined;
   if (!fileRow) {
     throw new VFSError(
       "ENOENT",
       `readPreview: file row missing for ${path}`
+    );
+  }
+  if (fileRow.head_version_id !== null && fileRow.head_deleted === 1) {
+    throw new VFSError(
+      "ENOENT",
+      `readPreview: head version is a tombstone for ${path}`
     );
   }
   if (fileRow.encryption_mode !== null) {
