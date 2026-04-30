@@ -119,48 +119,29 @@ describe("UserDO schema migrations", () => {
     });
   });
 
-  it("legacy rows (no inline_data) read back with default node_kind='file' and inlineData=null", async () => {
-    const stub = userStub("migration:legacy");
+  it("file rows without explicit mode read back with the 0o644 default", async () => {
+    const stub = userStub("migration:defaults");
 
-    // Signup to get a user, then create a file via the App's typed
-    // RPCs. The new columns should be auto-populated with defaults —
-    // `node_kind='file'`, `inline_data=NULL`, `mode=420`.
-    const { userId } = await stub.appHandleSignup(
-      "legacy@example.com",
-      "password123"
-    );
+    // Drive a canonical write that doesn't pass `mode`. The schema's
+    // file_mode column default (420 = 0o644) must apply.
+    const tenant = "migration-defaults";
+    const scope = { ns: "default", tenant } as const;
+    const payload = new Uint8Array(20_000); // chunked tier (>16KB)
+    for (let i = 0; i < payload.length; i++) payload[i] = i & 0xff;
 
-    const created = await stub.appCreateFile(
-      userId,
-      "legacy.txt",
-      11,
-      "text/plain",
-      null
-    );
+    await stub.vfsWriteFile(scope, "/file.bin", payload, {
+      mimeType: "application/octet-stream",
+    });
 
-    // Record one chunk + complete
-    await stub.appRecordChunk(
-      created.fileId,
-      0,
-      "deadbeef".repeat(8),
-      11,
-      0
-    );
-    await stub.appCompleteFile(
-      created.fileId,
-      "feedface".repeat(8),
-      userId,
-      11
-    );
+    const stat = await stub.vfsStat(scope, "/file.bin");
+    expect(stat.type).toBe("file");
+    expect(stat.mode).toBe(420);
+    expect(stat.size).toBe(20_000);
 
-    // Read back the manifest — should include the new fields with defaults.
-    const manifest = await stub.appGetFileManifest(created.fileId);
-    expect(manifest).not.toBeNull();
-    expect(manifest!.mode).toBe(420);
-    expect(manifest!.nodeKind).toBe("file");
-    expect(manifest!.symlinkTarget).toBeNull();
-    expect(manifest!.inlineData).toBeNull();
-    expect(manifest!.chunks).toHaveLength(1);
+    // Manifest path returns chunks (not inlined) for the >16KB tier.
+    const manifest = await stub.vfsOpenManifest(scope, "/file.bin");
+    expect(manifest.inlined).toBe(false);
+    expect(manifest.chunks.length).toBeGreaterThan(0);
   });
 });
 

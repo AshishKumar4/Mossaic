@@ -2,8 +2,6 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import type { EnvApp as Env } from "@shared/types";
 import authRoutes from "./routes/auth";
-import uploadRoutes from "./routes/upload";
-import downloadRoutes from "./routes/download";
 import filesRoutes from "./routes/files";
 import foldersRoutes from "./routes/folders";
 import analyticsRoutes from "./routes/analytics";
@@ -55,8 +53,6 @@ app.use(
 
 // Mount API routes
 app.route("/api/auth", authRoutes);
-app.route("/api/upload", uploadRoutes);
-app.route("/api/download", downloadRoutes);
 app.route("/api/files", filesRoutes);
 app.route("/api/folders", foldersRoutes);
 app.route("/api/analytics", analyticsRoutes);

@@ -10,29 +10,14 @@ import type {
 import type { UserFile, FileManifest, Folder, QuotaInfo } from "@shared/types";
 import { handleSignup, handleLogin, type AuthResult } from "./auth";
 import {
-  createFile,
-  recordChunk,
-  completeFile,
   getFileManifest,
   listFiles,
   deleteFile,
   getFile,
 } from "./files";
 import { createFolder, listFolders, getFolderPath } from "./folders";
-import { getQuota, checkQuota, updateUsage } from "./quota";
+import { getQuota, updateUsage } from "./quota";
 import { UserDOCore } from "@core/objects/user/user-do-core";
-
-/**
- * Shape returned by {@link UserDO.appCreateFile}. Mirrors the
- * legacy `/files/create` JSON response so the SPA's
- * `UploadInitResponse` shape is preserved end-to-end.
- */
-export interface AppCreateFileResult {
-  fileId: string;
-  chunkSize: number;
-  chunkCount: number;
-  poolSize: number;
-}
 
 /**
  * Typed projection of a `files` table row. Exposed for callers of
@@ -69,37 +54,12 @@ export interface AppFileRow {
  * ShardDO) and v2 (SearchDO). The runtime DO namespace is keyed by
  * (script, class_name) so storage on the existing app at
  * mossaic.ashishkumarsingh.com is untouched.
- *
- * ── `_legacyFetch` removal ───────────────────────────────
- *
- * Historically, all app-only operations were dispatched through a
- * hand-rolled JSON router named `_legacyFetch` (193 byte-pinned
- * lines, sha256 `4c6eb84925cd8b34298aa92a5201c6e8074defb4527c3bbb1d2c677f9f2c8e70`).
- * Routes called `stub.fetch("http://internal/files/create", ...)` and
- * parsed the JSON reply.
- *
- * That handler is gone. The typed-RPC methods on this class
- * (`appHandleSignup`, `appCreateFile`, etc.) replace it.
- * App routes call them directly as `stub.appCreateFile(...)`,
- * eliminating one JSON parse + one URL allocation per call and
- * making the surface type-checked end-to-end.
- *
- * The byte-pinned hash is intentionally retired because every caller
- * has been migrated; the unreachable code is removed rather than
- * preserved as dead bytes. Callers that still address the old
- * `http://internal/...` URLs (none exist in this tree) would now
- * receive 404 from `super.fetch(request)`.
- *
- * Production data is unaffected: the typed RPCs hit the same SQLite
- * tables (`auth`, `files`, `file_chunks`, `folders`, `quota`) on the
- * same DO instance via the same helpers.
  */
 export class UserDO extends UserDOCore {
   /**
    * Override Core's `fetch` to surface the WebSocket upgrade path
    * through `super.fetch` (Yjs collab WS). Non-WS HTTP requests fall
-   * through to Core's default 404 — the legacy JSON router that
-   * handled them was retired with the App-on-SDK refactor.
+   * through to Core's default 404.
    */
   override async fetch(request: Request): Promise<Response> {
     return super.fetch(request);
@@ -108,12 +68,9 @@ export class UserDO extends UserDOCore {
   // ── App-only RPCs ────────────────────────────────────────────────
   //
   // All methods below are TYPED RPCs callable from App routes via
-  // `stub.appXxx(...)` over the DO RPC binding. They replace the
-  // legacy `_legacyFetch` JSON router 1:1 in semantics.
-  //
-  // Each method calls `this.ensureInit()` so first-touch on a fresh
-  // DO instance materializes the schema, exactly like the legacy
-  // path did (preserves first-signup behavior on a brand-new user).
+  // `stub.appXxx(...)` over the DO RPC binding. Each calls
+  // `this.ensureInit()` so first-touch on a fresh DO instance
+  // materializes the schema.
 
   /** Create user, hash password, insert quota row. Returns userId+email. */
   async appHandleSignup(email: string, password: string): Promise<AuthResult> {
@@ -125,51 +82,6 @@ export class UserDO extends UserDOCore {
   async appHandleLogin(email: string, password: string): Promise<AuthResult> {
     this.ensureInit();
     return handleLogin(this, email, password);
-  }
-
-  /**
-   * Insert a new uploading-state file row. Returns chunk spec + the
-   * user's current pool size for placement. Throws on quota exceeded.
-   */
-  async appCreateFile(
-    userId: string,
-    fileName: string,
-    fileSize: number,
-    mimeType: string,
-    parentId: string | null
-  ): Promise<AppCreateFileResult> {
-    this.ensureInit();
-    if (!checkQuota(this, userId, fileSize)) {
-      throw new Error("Quota exceeded");
-    }
-    return createFile(this, userId, fileName, fileSize, mimeType, parentId);
-  }
-
-  /** Record a successfully-uploaded chunk in `file_chunks`. */
-  async appRecordChunk(
-    fileId: string,
-    chunkIndex: number,
-    chunkHash: string,
-    chunkSize: number,
-    shardIndex: number
-  ): Promise<void> {
-    this.ensureInit();
-    recordChunk(this, fileId, chunkIndex, chunkHash, chunkSize, shardIndex);
-  }
-
-  /**
-   * Flip status='complete' on the file row, stamp file_hash, and bump
-   * the user's quota row by the file size.
-   */
-  async appCompleteFile(
-    fileId: string,
-    fileHash: string,
-    userId: string,
-    fileSize: number
-  ): Promise<void> {
-    this.ensureInit();
-    completeFile(this, fileId, fileHash);
-    updateUsage(this, userId, fileSize, 1);
   }
 
   /** Read the file row + its chunks for download manifest. */
