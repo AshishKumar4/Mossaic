@@ -46,6 +46,51 @@ function getSecret(env: Env): Uint8Array {
 }
 
 /**
+ * Resolve the optional rotation-window previous secret. Returns null
+ * when `JWT_SECRET_PREVIOUS` is unset or empty (the steady-state).
+ *
+ * During a graceful rotation, the operator deploys with both env vars
+ * set: `JWT_SECRET` = NEW value, `JWT_SECRET_PREVIOUS` = OLD value.
+ * `verifyJWT` / `verifyVFSToken` accept tokens signed with EITHER
+ * secret; signing always uses the NEW one. After every issued token's
+ * TTL has elapsed (~30 d / 15 m), the operator unsets
+ * `JWT_SECRET_PREVIOUS` and the rotation is complete with zero
+ * dropped sessions. See OPERATIONS.md §6.10.
+ */
+function getPreviousSecretMaybe(env: Env): Uint8Array | null {
+  const prev = env.JWT_SECRET_PREVIOUS;
+  if (typeof prev !== "string" || prev.length === 0) return null;
+  return new TextEncoder().encode(prev);
+}
+
+/**
+ * Verify a token against the current secret first, falling through to
+ * `JWT_SECRET_PREVIOUS` when set and the current verification rejects.
+ *
+ * Returns the verified jose payload on success, or `null` on any
+ * failure (bad signature against both secrets, expired, malformed).
+ * Throws `VFSConfigError` (propagated from `getSecret`) when the
+ * primary secret is unset.
+ */
+async function verifyAgainstSecrets(
+  env: Env,
+  token: string
+): Promise<{ payload: import("jose").JWTPayload } | null> {
+  const current = getSecret(env);
+  try {
+    return await jwtVerify(token, current);
+  } catch {
+    const previous = getPreviousSecretMaybe(env);
+    if (previous === null) return null;
+    try {
+      return await jwtVerify(token, previous);
+    } catch {
+      return null;
+    }
+  }
+}
+
+/**
  * Resolve the secret used to HMAC listFiles cursors. Same source as
  * `JWT_SECRET` (we deliberately reuse the one Workers secret rather
  * than introducing a second). Throws `VFSConfigError` on
@@ -99,18 +144,14 @@ export async function verifyJWT(
   env: Env,
   token: string
 ): Promise<{ userId: string; email: string } | null> {
-  // Resolve the secret OUTSIDE the try/catch so a missing JWT_SECRET
-  // surfaces as VFSConfigError (503) instead of being silently swallowed
-  // as "invalid token" (which would map to 401 and leak no signal that
-  // the deploy is mis-configured).
-  const secret = getSecret(env);
-  try {
-    const { payload } = await jwtVerify(token, secret);
-    if (!payload.sub || !payload.email) return null;
-    return { userId: payload.sub, email: payload.email as string };
-  } catch {
-    return null;
-  }
+  // Multi-secret aware. `verifyAgainstSecrets` resolves the primary
+  // secret OUTSIDE its inner try/catch so a missing JWT_SECRET still
+  // surfaces as VFSConfigError (503) instead of a silent 401.
+  const result = await verifyAgainstSecrets(env, token);
+  if (result === null) return null;
+  const { payload } = result;
+  if (!payload.sub || !payload.email) return null;
+  return { userId: payload.sub, email: payload.email as string };
 }
 
 /**
@@ -210,23 +251,21 @@ export async function verifyVFSToken(
   env: Env,
   token: string
 ): Promise<VFSTokenPayload | null> {
-  // Same rationale as verifyJWT: resolve the secret OUTSIDE the catch
-  // so a missing JWT_SECRET surfaces as VFSConfigError up to the route
-  // and turns into a 503, not a silent 401 "invalid token".
-  const secret = getSecret(env);
-  try {
-    const { payload } = await jwtVerify(token, secret);
-    if (payload.scope !== "vfs") return null;
-    if (typeof payload.ns !== "string" || payload.ns.length === 0) return null;
-    if (typeof payload.tn !== "string" || payload.tn.length === 0) return null;
-    const sub =
-      typeof payload.sub === "string" && payload.sub.length > 0
-        ? payload.sub
-        : undefined;
-    return { ns: payload.ns, tn: payload.tn, sub, scope: "vfs" };
-  } catch {
-    return null;
-  }
+  // Multi-secret aware. `verifyAgainstSecrets` raises VFSConfigError
+  // when the primary secret is unset (→ 503 at the route); on
+  // signature mismatch against the current secret it falls through
+  // to JWT_SECRET_PREVIOUS when set.
+  const result = await verifyAgainstSecrets(env, token);
+  if (result === null) return null;
+  const { payload } = result;
+  if (payload.scope !== "vfs") return null;
+  if (typeof payload.ns !== "string" || payload.ns.length === 0) return null;
+  if (typeof payload.tn !== "string" || payload.tn.length === 0) return null;
+  const sub =
+    typeof payload.sub === "string" && payload.sub.length > 0
+      ? payload.sub
+      : undefined;
+  return { ns: payload.ns, tn: payload.tn, sub, scope: "vfs" };
 }
 
 // ── multipart session + download tokens ──────────────────────

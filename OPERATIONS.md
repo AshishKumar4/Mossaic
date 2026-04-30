@@ -273,30 +273,35 @@ Subrequest budget per Mossaic invocation:
 4. After fix-up, force a sweeper alarm: `state.storage.setAlarm(Date.now() + 1000)`.
 5. Postmortem: which RPC sequence failed? Was there a workerd error, an EAGAIN, or a transient network issue? Patch the call site to retry-with-bound or to record the orphan for retry.
 
-### 5.4 — Cursor key (JWT_SECRET) rotation
+### 5.4 — `JWT_SECRET` rotation (hard cutover)
 
-**When**: every 90 days, OR immediately after any suspected exposure.
+> **For zero-downtime rotation** see §6.10 — the multi-secret graceful
+> path is now the recommended procedure. Hard cutover (this section)
+> is reserved for emergency rotations after a suspected secret
+> exposure where invalidating every outstanding token IS the goal.
 
-**Effect of rotation**:
+**When (hard cutover)**: emergency rotations only — confirmed leak, key
+material compromise, or a regulatory deadline that doesn't accommodate
+the 30-day TTL drain window.
 
-- All outstanding VFS-bearer tokens become invalid (401 from `/api/vfs/*`). Clients must re-fetch tokens from the operator.
-- All outstanding **listFiles cursors** become invalid (EINVAL on next page). Clients must restart pagination.
-- All outstanding **`@mossaic/cli` profiles** with the old secret become invalid; operators must re-run `mossaic auth setup --secret <newvalue>` on their workstations.
-- No data loss. No downtime if the new secret is published BEFORE clients refresh tokens.
+**Effect of a hard rotation** (every active session breaks):
+
+- Every outstanding VFS-bearer token returns 401 from `/api/vfs/*`.
+- Every outstanding **listFiles cursor** returns EINVAL on next page.
+- Every outstanding **`@mossaic/cli` profile** must re-run
+  `mossaic auth setup --secret <newvalue>`.
+- Every active SPA session is logged out (the App's session JWT is
+  signed under the same secret).
+- No data loss; full re-login is required.
 
 **Procedure**:
 
-1. Generate the new secret: `openssl rand -base64 48` (or `node -e "console.log(require('crypto').randomBytes(48).toString('base64url'))"`).
-2. Decide the cutover window. Notify SDK consumers: "tokens issued before <T> will be rejected after <T+grace>."
-3. `wrangler secret put JWT_SECRET <newvalue>`. Wait <60 s for propagation.
-4. **Choose scope** carefully:
-   - **Service-mode only** (`-c deployments/service/wrangler.jsonc`): rotates the `mossaic-core` deploy that serves SDK consumers + the CLI. Photo-app users are unaffected.
-   - **App-mode only** (root `wrangler.jsonc`): rotates `mossaic.ashishkumarsingh.com`; **every active photo-app user is logged out** and must re-login. Schedule a maintenance window.
-   - **Both**: required if the same secret is shared across deploys. Run service-mode first, then app-mode within the maintenance window.
-5. (Optional) For a graceful rollover, deploy a 2-secret variant temporarily — Mossaic does NOT support this natively today. The hard cutover is the supported flow.
-6. Re-issue tokens to consumers via `signVFSToken(env, ...)` calls.
-7. Update operator workstations: `mossaic auth setup --secret <newvalue> --tenant <existing> --name <existing>`.
-8. Monitor 401 rate; spike + decay over the rollover window is expected.
+1. Generate the new secret: `openssl rand -base64 48`.
+2. `wrangler secret put JWT_SECRET <newvalue>`. Wait ≤ 60 s for
+   propagation.
+3. Notify SDK consumers + photo-app users that re-auth is required.
+4. Monitor 401 rate; spike + decay over the rollover window is
+   expected as clients re-auth.
 
 **rotation history**:
 
@@ -646,6 +651,84 @@ Tenant isolation is preserved end-to-end: a token minted under
 userId A cannot read userId B's VFS — `vfsAuth` middleware on the
 canonical routes derives the scope from the token claims, and the
 UserDO's path resolution is per-tenant SQL.
+
+## 6.10 Graceful `JWT_SECRET` rotation (zero-downtime)
+
+`verifyJWT` and `verifyVFSToken` are multi-secret aware. They accept
+tokens signed with EITHER `env.JWT_SECRET` (current) OR
+`env.JWT_SECRET_PREVIOUS` (rotation-window-only). Signing always uses
+`env.JWT_SECRET`. This lets operators rotate the signing material
+without invalidating any outstanding session.
+
+### 6.10.1 — When to use this path
+
+- Routine 90-day rotation (recommended cadence).
+- Coordinated handoff between operator teams.
+- Any scenario where you do NOT want to log every active SPA user
+  out + force every CLI profile re-setup.
+
+For emergency rotations (confirmed leak), use the hard cutover in
+§5.4 — invalidating every outstanding token IS the point there.
+
+### 6.10.2 — Procedure
+
+1. **Generate the new secret**:
+   ```bash
+   openssl rand -base64 48
+   ```
+2. **Stage the previous-secret slot** (deploys both env vars):
+   ```bash
+   wrangler secret put JWT_SECRET_PREVIOUS  # paste the CURRENT JWT_SECRET value
+   ```
+   Verify `wrangler secret list` shows both `JWT_SECRET` and
+   `JWT_SECRET_PREVIOUS`.
+3. **Promote the new secret**:
+   ```bash
+   wrangler secret put JWT_SECRET  # paste the NEW value
+   ```
+   At this point: `JWT_SECRET = NEW`, `JWT_SECRET_PREVIOUS = OLD`.
+   Tokens signed under either secret verify successfully.
+4. **Wait for the drain window**:
+   - Session JWTs (App session): default `JWT_EXPIRATION_MS` ≈ 30
+     days. Check `shared/constants.ts`.
+   - VFS Bearer tokens (auth-bridge mints): 15 minutes.
+   - The longer of the two governs the wait. Default 30 days for
+     session JWTs is the practical floor; for stricter posture
+     reduce `JWT_EXPIRATION_MS` ahead of time.
+5. **Drop the previous-secret slot**:
+   ```bash
+   wrangler secret delete JWT_SECRET_PREVIOUS
+   ```
+   Rotation is complete; old-secret tokens are now rejected. The
+   integrity of the rotation rests on accurate timing of step 5
+   (premature deletion logs out unrefreshed sessions).
+
+### 6.10.3 — Verification
+
+After step 3, both forms verify; after step 5, only new forms verify:
+
+```bash
+# After step 3, both should succeed.
+curl -H "Authorization: Bearer <token-signed-under-OLD-secret>" \
+     https://mossaic.ashishkumarsingh.com/api/files
+curl -H "Authorization: Bearer <token-signed-under-NEW-secret>" \
+     https://mossaic.ashishkumarsingh.com/api/files
+
+# After step 5, the OLD form returns 401.
+```
+
+### 6.10.4 — Pitfalls
+
+- **Don't reverse the order** in step 2/3. Setting `JWT_SECRET = NEW`
+  before staging `JWT_SECRET_PREVIOUS = OLD` invalidates every
+  outstanding token between the two `wrangler secret put` calls
+  (~60s propagation each).
+- **`JWT_SECRET_PREVIOUS` left set indefinitely** widens the verify
+  surface. Schedule step 5 explicitly; do not "set and forget."
+- **App-mode + Service-mode are independent deploys** if the same
+  secret is shared across both, repeat the procedure for each
+  deploy. Mossaic's default single-deploy posture (App mounts both
+  surfaces) requires only one rotation.
 
 ## 7. Sign-off (per-deploy)
 

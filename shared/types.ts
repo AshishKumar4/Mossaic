@@ -135,6 +135,16 @@ export interface EnvCore {
   MOSSAIC_USER: DurableObjectNamespace;
   MOSSAIC_SHARD: DurableObjectNamespace;
   JWT_SECRET?: string;
+  /**
+   * Optional second JWT secret used during a graceful rotation window.
+   * `verifyJWT` / `verifyVFSToken` accept tokens signed with EITHER
+   * `JWT_SECRET` or `JWT_SECRET_PREVIOUS`; signing always uses
+   * `JWT_SECRET` (the new value). Set just before rotating, then
+   * unset after every issued token's TTL has elapsed (default ~30
+   * days for session tokens, 15 minutes for VFS tokens). See
+   * OPERATIONS.md §6.10 — "Graceful JWT_SECRET rotation".
+   */
+  JWT_SECRET_PREVIOUS?: string;
   /** Cloudflare Images binding; optional — renderers fall through. */
   IMAGES?: ImagesBinding;
   /** Cloudflare Browser Run binding; optional — renderers fall through. */

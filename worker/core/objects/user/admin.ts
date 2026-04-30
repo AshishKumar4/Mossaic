@@ -67,15 +67,12 @@ export interface DedupeResult {
  *
  * `scope` carries the multi-tenant routing for ShardDO fan-out — the
  * deleted_chunks RPC needs (ns, tenant, sub) so it hits the right
- * vfs:${ns}:${tenant}[:${sub}]:s${idx} ShardDO instances. For legacy
- * data written through the user-facing app (NOT the VFS), the shard
- * names are the OLD pattern `shard:${userId}:${idx}` — those callers
- * should pass scope=null and let the routine use the legacy naming.
+ * vfs:${ns}:${tenant}[:${sub}]:s${idx} ShardDO instances.
  */
 export async function dedupePaths(
   durableObject: UserDO,
   userId: string,
-  scope: VFSScope | null = null
+  scope: VFSScope
 ): Promise<DedupeResult> {
   const result: DedupeResult = {
     fileDupesResolved: 0,
@@ -226,18 +223,13 @@ export async function dedupePaths(
  * GC path from commitRename, but here the file_id is the
  * old loser, not a freshly-superseded one.
  *
- * `scope` selects the shard name pattern:
- *   - scope null → legacy `shard:${userId}:${idx}` instances
- *     (rows written by the user-facing app pre-VFS)
- *   - scope set  → vfs:${ns}:${tenant}[:${sub}]:s${idx} instances
- *
  * Sequential RPCs (no parallel) so a transient shard error doesn't
  * fan out to all touched shards at once.
  */
 async function hardDeleteLoser(
   durableObject: UserDO,
   userId: string,
-  scope: VFSScope | null,
+  scope: VFSScope,
   fileId: string
 ): Promise<void> {
   const shardRows = durableObject.sql
@@ -253,10 +245,14 @@ async function hardDeleteLoser(
   const env = durableObject.envPublic;
   const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
   for (const { shard_index } of shardRows) {
-    const shardName = scope
-      ? vfsShardDOName(scope.ns, scope.tenant, scope.sub, shard_index)
-      : `shard:${userId}:${shard_index}`;
+    const shardName = vfsShardDOName(
+      scope.ns,
+      scope.tenant,
+      scope.sub,
+      shard_index
+    );
     const stub = shardNs.get(shardNs.idFromName(shardName));
     await stub.deleteChunks(fileId);
   }
+  void userId; // retained in signature for symmetry with peer admin helpers
 }

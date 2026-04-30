@@ -1739,20 +1739,19 @@ export class UserDOCore extends DurableObject<Env> {
 
   // ── admin tooling ────────────────────────────────────────────
   //
-  // Operator-only RPC. Not exposed through the legacy /api/* routes
-  // and not surfaced on the SDK's VFS class. Holders of the binding
-  // can call it directly via stub.adminDedupePaths(userId, scope?)
-  // when migrating legacy data that pre-dates the UNIQUE
-  // partial index.
+  // Operator-only RPC. Not exposed through public /api/* routes and
+  // not surfaced on the SDK's VFS class. Holders of the binding can
+  // call it directly via `stub.adminDedupePaths(userId, scope)` when
+  // migrating data that pre-dates the UNIQUE partial index.
 
   /**
-   * Resolve legacy duplicate (parent_id, name) rows for a user.
-   * Returns counts + index status. See worker/objects/user/admin.ts
-   * for the algorithm and atomicity properties.
+   * Resolve duplicate (parent_id, name) rows for a user. Returns counts
+   * + index status. See worker/objects/user/admin.ts for the algorithm
+   * and atomicity properties.
    */
   async adminDedupePaths(
     userId: string,
-    scope: VFSScope | null = null
+    scope: VFSScope
   ): Promise<DedupeResult> {
     this.ensureInit();
     return dedupePaths(this, userId, scope);
