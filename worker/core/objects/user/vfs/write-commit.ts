@@ -438,20 +438,60 @@ export interface VFSWriteFileOpts {
   encryption?: { mode: "convergent" | "random"; keyId?: string };
 }
 
-export async function vfsWriteFile(
+/**
+ * Resolved + validated write-commit input. Produced by
+ * {@link prepareWriteCommit} and consumed by both
+ * {@link commitInlineTier} and {@link commitChunkedTier}.
+ *
+ * All input validation has already happened by the time a `WriteCommitPlan`
+ * exists — so `executeWriteCommit` can focus on storage-layer ordering
+ * (insert tmp row → push chunks → commitRename → post-commit side
+ * effects) without re-validating.
+ */
+export interface WriteCommitPlan {
+  userId: string;
+  parentId: string | null;
+  leaf: string;
+  mode: number;
+  mimeType: string;
+  /** Pre-validated, encoded metadata blob (or undefined for "no change"). */
+  metadataEncoded: Uint8Array | null | undefined;
+  /** Pre-validated tag set (undefined → unchanged). */
+  tags: readonly string[] | undefined;
+  /** Optional encryption stamp (mode-history monotonicity already enforced). */
+  encryption: { mode: "convergent" | "random"; keyId?: string } | undefined;
+  /** Wall-clock millisecond timestamp captured before any SQL touches the row. */
+  now: number;
+}
+
+/**
+ * Validate caller-supplied write opts and resolve the canonical target.
+ *
+ * Throws VFSError BEFORE any SQL touches the row:
+ * - `EFBIG` if `data` exceeds WRITEFILE_MAX.
+ * - `EISDIR` if the target path is a directory.
+ * - `EINVAL` from metadata/tags/version validators on cap violation.
+ * - `EBADF` from `enforceModeMonotonic` when the encryption mode
+ *   disagrees with the existing path's history.
+ *
+ * Returns a {@link WriteCommitPlan} that the tier-specific commit
+ * helpers consume. Idempotent: calling twice with the same args
+ * resolves the same plan (modulo `now`).
+ */
+async function prepareWriteCommit(
   durableObject: UserDO,
   scope: VFSScope,
   path: string,
-  data: Uint8Array,
-  opts: VFSWriteFileOpts = {}
-): Promise<void> {
+  byteLength: number,
+  opts: VFSWriteFileOpts
+): Promise<WriteCommitPlan> {
   const userId = userIdFor(scope);
   const { parentId, leaf } = resolveParent(durableObject, userId, path);
 
-  if (data.byteLength > WRITEFILE_MAX) {
+  if (byteLength > WRITEFILE_MAX) {
     throw new VFSError(
       "EFBIG",
-      `writeFile: ${data.byteLength} > WRITEFILE_MAX ${WRITEFILE_MAX}`
+      `writeFile: ${byteLength} > WRITEFILE_MAX ${WRITEFILE_MAX}`
     );
   }
   if (folderExists(durableObject, userId, parentId, leaf)) {
@@ -489,182 +529,119 @@ export async function vfsWriteFile(
     enforceModeMonotonic(durableObject, userId, parentId, leaf, undefined);
   }
 
-  const mode = opts.mode ?? 0o644;
-  const mimeType = opts.mimeType ?? "application/octet-stream";
-  const now = Date.now();
+  return {
+    userId,
+    parentId,
+    leaf,
+    mode: opts.mode ?? 0o644,
+    mimeType: opts.mimeType ?? "application/octet-stream",
+    metadataEncoded,
+    tags: opts.tags,
+    encryption: opts.encryption,
+    now: Date.now(),
+  };
+}
 
-  // yjs-mode fork. If the target file already exists
-  // and has mode_yjs=1, route the bytes through the YjsRuntime.
-  // Semantics (Option A): the `data` Uint8Array becomes the new
-  // value of the Y.Text("content") inside the doc, emitted as a
-  // single CRDT update under origin "writeFile". Versioning fork
-  // is bypassed here — yjs op log + periodic checkpoints ARE the
-  // history; compaction (not writeFile) creates Mossaic version
-  // rows when versioning is also enabled.
-  //
-  // Use IFNULL on parent_id to make the lookup work for files at
-  // the root (parent_id is NULL there) — bare `=` against NULL
-  // never matches in SQL. Status filter mirrors findLiveFile but
-  // only excludes 'deleted'/'uploading' tombstones; 'complete'
-  // matches.
-  {
-    const existing = durableObject.sql
-      .exec(
-        `SELECT file_id, mode_yjs FROM files
-           WHERE user_id=? AND IFNULL(parent_id,'')=IFNULL(?,'')
-             AND file_name=? AND status='complete'`,
-        userId,
-        parentId,
-        leaf
-      )
-      .toArray()[0] as
-      | { file_id: string; mode_yjs: number }
-      | undefined;
-    if (existing && existing.mode_yjs === 1) {
-      const { writeYjsBytes } = await import("../yjs");
-      await writeYjsBytes(
-        durableObject,
-        scope,
-        userId,
-        existing.file_id,
-        poolSizeFor(durableObject, userId),
-        data
-      );
-      // apply metadata/tags to the yjs-mode file. Version
-      // opts are ignored on yjs files — the op log IS the history;
-      // explicit checkpoints come from `flush()` ().
-      // stamp encryption columns if opts.encryption is set.
-      await applyPhase12SideEffects(
-        durableObject,
-        userId,
-        existing.file_id,
-        metadataEncoded,
-        opts.tags,
-        Date.now(),
-        opts.encryption
-      );
-      return;
-    }
-  }
+/**
+ * Execute the inline-tier commit: insert a tmp `files` row carrying the
+ * full payload in `inline_data`, atomically rename it to the target
+ * leaf via {@link commitRename}, then apply post-commit side effects
+ * (metadata, tags, encryption stamp).
+ *
+ * Two-phase commit pattern: insert with tmp name first so concurrent
+ * readers either see the prior file or the new one — never a
+ * half-formed inline_data row at the live name.
+ */
+async function commitInlineTier(
+  durableObject: UserDO,
+  scope: VFSScope,
+  plan: WriteCommitPlan,
+  data: Uint8Array
+): Promise<void> {
+  const tmpId = generateId();
+  const tmpName = `_vfs_tmp_${tmpId}`;
+  durableObject.sql.exec(
+    `INSERT INTO files (file_id, user_id, parent_id, file_name, file_size, file_hash, mime_type, chunk_size, chunk_count, pool_size, status, created_at, updated_at, mode, node_kind, inline_data)
+     VALUES (?, ?, ?, ?, ?, '', ?, 0, 0, ?, 'uploading', ?, ?, ?, 'file', ?)`,
+    tmpId,
+    plan.userId,
+    plan.parentId,
+    tmpName,
+    data.byteLength,
+    plan.mimeType,
+    poolSizeFor(durableObject, plan.userId),
+    plan.now,
+    plan.now,
+    plan.mode,
+    data
+  );
+  // H1: schedule the stale-upload sweep so this row is reclaimed
+  // even if commitRename never runs (DO crash mid-method).
+  await durableObject.scheduleStaleUploadSweep();
+  await commitRename(
+    durableObject,
+    plan.userId,
+    scope,
+    tmpId,
+    plan.parentId,
+    plan.leaf
+  );
+  await applyPhase12SideEffects(
+    durableObject,
+    plan.userId,
+    tmpId,
+    plan.metadataEncoded,
+    plan.tags,
+    plan.now,
+    plan.encryption
+  );
+}
 
-  // versioning fork. When the tenant has versioning ON,
-  // every writeFile creates a new file_versions row referenced by
-  // a per-version synthetic shard key, and the `files` row is just
-  // the stable identity that holds the head pointer. When OFF,
-  // behavior is byte-equivalent to (no version rows
-  // touched, no head pointer used).
-  if (isVersioningEnabled(durableObject, userId)) {
-    return vfsWriteFileVersioned(
-      durableObject,
-      scope,
-      userId,
-      parentId,
-      leaf,
-      data,
-      mode,
-      mimeType,
-      now,
-      {
-        metadataEncoded,
-        tags: opts.tags,
-        versionUserVisible: opts.version?.userVisible ?? true,
-        versionLabel: opts.version?.label,
-        encryption: opts.encryption,
-      }
-    );
-  }
-
-  // ── Inline tier ──
-  if (data.byteLength <= INLINE_LIMIT) {
-    // Two-phase commit pattern: insert with tmp name, then rename to
-    // the real leaf so concurrent readers either see the prior file or
-    // the new one — never a half-formed inline_data on the live name.
-    // For inline, the "stream" is empty so we can do it in two SQL
-    // statements with no async work in between.
-    const tmpId = generateId();
-    const tmpName = `_vfs_tmp_${tmpId}`;
-    durableObject.sql.exec(
-      `INSERT INTO files (file_id, user_id, parent_id, file_name, file_size, file_hash, mime_type, chunk_size, chunk_count, pool_size, status, created_at, updated_at, mode, node_kind, inline_data)
-       VALUES (?, ?, ?, ?, ?, '', ?, 0, 0, ?, 'uploading', ?, ?, ?, 'file', ?)`,
-      tmpId,
-      userId,
-      parentId,
-      tmpName,
-      data.byteLength,
-      mimeType,
-      poolSizeFor(durableObject, userId),
-      now,
-      now,
-      mode,
-      data
-    );
-    // H1: schedule the stale-upload sweep so this row is reclaimed
-    // even if commitRename never runs (DO crash mid-method).
-    await durableObject.scheduleStaleUploadSweep();
-    await commitRename(durableObject, userId, scope, tmpId, parentId, leaf);
-    // post-commit side effects. The canonical pathId after
-    // commitRename is `tmpId` (the row was renamed in-place; the
-    // file_id stayed the same — see commitRename UPDATE). Apply
-    // metadata + tags now.
-    await applyPhase12SideEffects(
-      durableObject,
-      userId,
-      tmpId,
-      metadataEncoded,
-      opts.tags,
-      now,
-      opts.encryption
-    );
-    return;
-  }
-
-  // ── Chunked tier ──
-  // EFBIG is already enforced above against WRITEFILE_MAX (100 MB).
-  // The previous redundant READFILE_MAX gate has been folded; both caps
-  // are equal so a writeFile that succeeds is always readable via
-  // readFile. For larger workloads use createWriteStream (memory-bounded
-  // streaming) or, on the read side, openManifest + readChunk.
+/**
+ * Execute the chunked-tier commit: chunk `data`, fan out PUTs to
+ * ShardDOs with bounded concurrency (8 lanes), record `file_chunks`,
+ * stamp `file_hash`, atomically rename, apply post-commit side
+ * effects.
+ *
+ * H3: parallel chunk PUTs. Concurrency cap = 8 (same rationale as the
+ * read path: stays well inside the Workers concurrent-subrequest limit
+ * and saturates typical bandwidth). Per-chunk file_chunks INSERT is
+ * sync SQL inside the DO single-thread so SQL ordering is preserved
+ * without coordination.
+ *
+ * On any throw mid-stream, {@link abortTempFile} reclaims the tmp row
+ * + already-pushed chunks so we never leak storage on a failed write.
+ */
+async function commitChunkedTier(
+  durableObject: UserDO,
+  scope: VFSScope,
+  plan: WriteCommitPlan,
+  data: Uint8Array
+): Promise<void> {
   const { chunkSize, chunkCount } = computeChunkSpec(data.byteLength);
   const tmpId = generateId();
   const tmpName = `_vfs_tmp_${tmpId}`;
-  const poolSize = poolSizeFor(durableObject, userId);
+  const poolSize = poolSizeFor(durableObject, plan.userId);
 
   durableObject.sql.exec(
     `INSERT INTO files (file_id, user_id, parent_id, file_name, file_size, file_hash, mime_type, chunk_size, chunk_count, pool_size, status, created_at, updated_at, mode, node_kind)
      VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, ?, 'uploading', ?, ?, ?, 'file')`,
     tmpId,
-    userId,
-    parentId,
+    plan.userId,
+    plan.parentId,
     tmpName,
     data.byteLength,
-    mimeType,
+    plan.mimeType,
     chunkSize,
     chunkCount,
     poolSize,
-    now,
-    now,
-    mode
+    plan.now,
+    plan.now,
+    plan.mode
   );
-  // H1: schedule stale-upload sweep so a crash mid-streaming reclaims
-  // this row + its chunk_refs.
   await durableObject.scheduleStaleUploadSweep();
 
-  // Chunk + place + putChunk per chunk. Any throw aborts via abortTempFile.
-  //
-  // H3: parallel chunk PUTs with bounded concurrency. The previous
-  // serial loop capped throughput at one ShardDO RPC per chunk (~10–30
-  // ms each); 100 chunks took 1–3 s. The hash + put + record triple
-  // is parallelisable because each chunk is independent (no
-  // cross-chunk shared state), and the per-chunk file_chunks INSERT
-  // is sync SQL inside the DO single-thread so SQL ordering is
-  // preserved without coordination.
-  //
-  // Concurrency cap = 8 (same rationale as the read path: stays well
-  // inside the Workers concurrent-subrequest limit and saturates
-  // typical bandwidth).
   const env = durableObject.envPublic;
-  // Cast the un-parameterized namespace to the typed one so .putChunk RPC
-  // resolves. (See hardDeleteFileRow for the same pattern on deleteChunks.)
   const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
   const fileHashParts = new Array<string>(chunkCount);
   try {
@@ -678,7 +655,7 @@ export async function vfsWriteFile(
       const sIdx = placeChunk(userIdFor(scope), tmpId, i, poolSize);
       const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, sIdx);
       const stub = shardNs.get(shardNs.idFromName(shardName));
-      await stub.putChunk(hash, slice, tmpId, i, userId);
+      await stub.putChunk(hash, slice, tmpId, i, plan.userId);
       durableObject.sql.exec(
         `INSERT OR REPLACE INTO file_chunks (file_id, chunk_index, chunk_hash, chunk_size, shard_index)
          VALUES (?, ?, ?, ?, ?)`,
@@ -703,9 +680,7 @@ export async function vfsWriteFile(
     }
     await Promise.all(lanes);
   } catch (err) {
-    // Abort: hard-delete the tmp row + dispatch deleteChunks for any
-    // chunks already pushed.
-    await abortTempFile(durableObject, userId, scope, tmpId);
+    await abortTempFile(durableObject, plan.userId, scope, tmpId);
     throw err;
   }
 
@@ -718,18 +693,108 @@ export async function vfsWriteFile(
     tmpId
   );
 
-  await commitRename(durableObject, userId, scope, tmpId, parentId, leaf);
-  // post-commit side effects on the chunked-tier write.
-  // stamp encryption columns when present.
+  await commitRename(
+    durableObject,
+    plan.userId,
+    scope,
+    tmpId,
+    plan.parentId,
+    plan.leaf
+  );
   await applyPhase12SideEffects(
     durableObject,
-    userId,
+    plan.userId,
     tmpId,
-    metadataEncoded,
-    opts.tags,
-    now,
-    opts.encryption
+    plan.metadataEncoded,
+    plan.tags,
+    plan.now,
+    plan.encryption
   );
+}
+
+export async function vfsWriteFile(
+  durableObject: UserDO,
+  scope: VFSScope,
+  path: string,
+  data: Uint8Array,
+  opts: VFSWriteFileOpts = {}
+): Promise<void> {
+  const plan = await prepareWriteCommit(
+    durableObject,
+    scope,
+    path,
+    data.byteLength,
+    opts
+  );
+
+  // yjs-mode fork. If the target file already exists with mode_yjs=1,
+  // route the bytes through YjsRuntime: the data becomes the new value
+  // of Y.Text("content") under origin "writeFile". Versioning fork is
+  // bypassed — the yjs op log IS the history; explicit checkpoints
+  // come from compaction (not from writeFile).
+  const yjsRow = durableObject.sql
+    .exec(
+      `SELECT file_id, mode_yjs FROM files
+         WHERE user_id=? AND IFNULL(parent_id,'')=IFNULL(?,'')
+           AND file_name=? AND status='complete'`,
+      plan.userId,
+      plan.parentId,
+      plan.leaf
+    )
+    .toArray()[0] as { file_id: string; mode_yjs: number } | undefined;
+  if (yjsRow && yjsRow.mode_yjs === 1) {
+    const { writeYjsBytes } = await import("../yjs");
+    await writeYjsBytes(
+      durableObject,
+      scope,
+      plan.userId,
+      yjsRow.file_id,
+      poolSizeFor(durableObject, plan.userId),
+      data
+    );
+    await applyPhase12SideEffects(
+      durableObject,
+      plan.userId,
+      yjsRow.file_id,
+      plan.metadataEncoded,
+      plan.tags,
+      Date.now(),
+      plan.encryption
+    );
+    return;
+  }
+
+  // Versioning fork. With versioning ON, every writeFile creates a
+  // new file_versions row + per-version synthetic shard key; the
+  // `files` row is just the stable identity holding the head pointer.
+  if (isVersioningEnabled(durableObject, plan.userId)) {
+    return vfsWriteFileVersioned(
+      durableObject,
+      scope,
+      plan.userId,
+      plan.parentId,
+      plan.leaf,
+      data,
+      plan.mode,
+      plan.mimeType,
+      plan.now,
+      {
+        metadataEncoded: plan.metadataEncoded,
+        tags: plan.tags,
+        versionUserVisible: opts.version?.userVisible ?? true,
+        versionLabel: opts.version?.label,
+        encryption: plan.encryption,
+      }
+    );
+  }
+
+  // Tier dispatch. The inline tier embeds bytes in `files.inline_data`
+  // (≤ INLINE_LIMIT); the chunked tier fans out to ShardDOs via
+  // bounded-concurrency PUTs.
+  if (data.byteLength <= INLINE_LIMIT) {
+    return commitInlineTier(durableObject, scope, plan, data);
+  }
+  return commitChunkedTier(durableObject, scope, plan, data);
 }
 
 /**
