@@ -60,6 +60,52 @@ export class UserDO extends UserDOCore {
     return super.fetch(request);
   }
 
+  /**
+   * Override Core's alarm to chain through the App-side search-index
+   * reconciler (Phase 23 Blindspot fix). Core's alarm sweeps tmp
+   * upload rows + expired multipart sessions; the App layer adds a
+   * sweep of `indexed_at IS NULL` files to catch cases where the
+   * SPA crashed between `multipart/finalize` and the index POST.
+   *
+   * The reconciler is best-effort: any error is logged and swallowed
+   * so it never blocks Core's alarm reschedule logic.
+   */
+  override async alarm(): Promise<void> {
+    await super.alarm();
+    try {
+      const { reconcileUnindexedFiles } = await import(
+        "../../routes/search"
+      );
+      const scope = (this as unknown as {
+        loadScope(): { tenant: string; sub?: string } | null;
+      }).loadScope();
+      if (scope === null) return;
+      const userId =
+        scope.sub !== undefined ? `${scope.tenant}::${scope.sub}` : scope.tenant;
+      const env = this.envPublic as unknown as EnvApp;
+      const { reconciled } = await reconcileUnindexedFiles(env, userId, 25);
+      if (reconciled > 0) {
+        // Re-arm a soonish alarm so we drain backlog without
+        // waiting for the next ambient tick. Core's alarm
+        // already sets a 60s reschedule when its own batches
+        // fill, so this is the AT-LEAST cadence; it's safe to
+        // also set here because the storage API takes the
+        // earlier of competing alarms.
+        const cur = await this.ctx.storage.getAlarm();
+        const target = Date.now() + 60_000;
+        if (cur === null || cur > target) {
+          await this.ctx.storage.setAlarm(target);
+        }
+      }
+    } catch (err) {
+      console.warn(
+        `index reconciler alarm hook failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+    }
+  }
+
   // ── App-only RPCs ────────────────────────────────────────────────
   //
   // All methods below are TYPED RPCs callable from App routes via
@@ -335,6 +381,73 @@ export class UserDO extends UserDOCore {
   async appGetQuota(userId: string): Promise<QuotaInfo> {
     this.ensureInit();
     return getQuota(this, userId);
+  }
+
+  // ── Search-index reconciler (Phase 23 Blindspot fix) ──────────────
+  //
+  // The SPA's POST /api/index/file is fire-and-forget on
+  // `executionCtx.waitUntil`. If the SPA crashes between
+  // `multipart/finalize` and the index POST, OR if the worker isolate
+  // is evicted mid-`indexFile`, the file lands in canonical VFS but
+  // is never search-indexed → silent search miss for the file's
+  // lifetime.
+  //
+  // The reconciler closes the gap: every committed file gets an
+  // `indexed_at` timestamp on success; periodic alarm sweeps the
+  // `indexed_at IS NULL` set and re-fires `indexFile`.
+
+  /**
+   * Mark a file as successfully indexed. Called from `indexFile`
+   * after both text-space and CLIP-space (when applicable) upserts
+   * complete without error.
+   */
+  async appMarkFileIndexed(fileId: string): Promise<void> {
+    this.ensureInit();
+    this.sql.exec(
+      "UPDATE files SET indexed_at = ? WHERE file_id = ?",
+      Date.now(),
+      fileId
+    );
+  }
+
+  /**
+   * Return up to `limit` files that are committed (status='complete')
+   * but have not yet been search-indexed. Ordered oldest-first to
+   * give freshly-uploaded files some grace before the reconciler
+   * picks them up; this keeps reconciler load low under steady-state
+   * (where most files index promptly via the SPA callback).
+   */
+  async appListUnindexedFiles(
+    userId: string,
+    limit: number
+  ): Promise<
+    Array<{
+      file_id: string;
+      file_name: string;
+      mime_type: string;
+      file_size: number;
+    }>
+  > {
+    this.ensureInit();
+    const rows = this.sql
+      .exec(
+        `SELECT file_id, file_name, mime_type, file_size
+         FROM files
+         WHERE user_id = ?
+           AND status = 'complete'
+           AND indexed_at IS NULL
+         ORDER BY created_at ASC
+         LIMIT ?`,
+        userId,
+        Math.min(Math.max(1, limit), 100)
+      )
+      .toArray() as Array<{
+        file_id: string;
+        file_name: string;
+        mime_type: string;
+        file_size: number;
+      }>;
+    return rows;
   }
 
   // ── Internal aggregator ──────────────────────────────────────────

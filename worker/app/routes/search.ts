@@ -502,6 +502,64 @@ export async function indexFile(
       console.error("CLIP indexing failed:", err);
     }
   }
+
+  // Phase 23 Blindspot fix: stamp indexed_at so the reconciler
+  // doesn't re-queue this file. We mark on a best-effort basis: if
+  // the text-space upsert succeeded the file is searchable, even
+  // when CLIP failed. The reconciler errs on the side of NOT
+  // re-running for already-marked files (it filters
+  // `indexed_at IS NULL`), so partial-CLIP-failure won't be retried.
+  // That's acceptable — CLIP recovery is a separate (admin) flow.
+  try {
+    await userStub(env, userId).appMarkFileIndexed(fileId);
+  } catch (err) {
+    console.error("appMarkFileIndexed failed:", err);
+  }
+}
+
+/**
+ * Search-index reconciler (Phase 23 Blindspot fix).
+ *
+ * Sweeps the per-tenant `indexed_at IS NULL` set and re-fires
+ * `indexFile` for each. Bounded `limit` (default 25) keeps a single
+ * sweep cheap; the alarm cadence determines steady-state catch-up.
+ *
+ * Idempotent: re-indexing an already-indexed file is just a vector
+ * upsert under the same id (overwrites with identical embeddings).
+ *
+ * Returns the count of files re-fired so the caller can decide
+ * whether to schedule a follow-up sweep sooner.
+ */
+export async function reconcileUnindexedFiles(
+  env: Env,
+  userId: string,
+  limit: number = 25
+): Promise<{ reconciled: number }> {
+  const stub = userStub(env, userId);
+  const rows = await stub.appListUnindexedFiles(userId, limit);
+  for (const row of rows) {
+    // Run sequentially — concurrent indexFile bursts would compete
+    // for the same Workers AI / vector binding budget. Reconciler
+    // pace is intentionally slow.
+    try {
+      await indexFile(
+        env,
+        userId,
+        row.file_id,
+        row.file_name,
+        row.mime_type,
+        row.file_size
+      );
+    } catch (err) {
+      // Bounded log; the alarm will retry on the next tick.
+      console.warn(
+        `reconcileUnindexedFiles: ${row.file_id} failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+    }
+  }
+  return { reconciled: rows.length };
 }
 
 export default search;
