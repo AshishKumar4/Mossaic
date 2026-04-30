@@ -25,6 +25,7 @@ import {
   resolveOrThrow,
   resolveParent,
   userIdFor,
+  findLiveFile,
 } from "./helpers";
 import {
   abortTempFile,
@@ -745,6 +746,129 @@ export async function vfsCommitWriteStream(
     }
   }
 
+  // Phase 27 Fix 6 — commit-write-stream × versioning.
+  // Pre-fix this called `commitRename` unconditionally, which under
+  // versioning ON hard-deleted any prior live row at the target —
+  // destroying its history (same bug class as multipart finalize).
+  // Post-fix: under versioning ON, route through `commitVersion`
+  // analogously to multipart-versioned-finalize. The chunks already
+  // live on ShardDOs under refId=tmpId; we mirror them into
+  // version_chunks and stamp shard_ref_id=tmpId so the future
+  // dropVersionRows fan-out finds them.
+  const versioning = isVersioningEnabled(durableObject, userId);
+
+  if (versioning) {
+    // Find existing path identity, if any.
+    const liveRow = findLiveFile(
+      durableObject,
+      userId,
+      handle.parentId,
+      handle.leaf
+    );
+    let pathId: string;
+    if (liveRow) {
+      pathId = liveRow.file_id;
+    } else {
+      // No prior path — promote the tmp row to live via commitRename
+      // (it has no supersede target to hard-delete in this branch).
+      await commitRename(
+        durableObject,
+        userId,
+        scope,
+        handle.tmpId,
+        handle.parentId,
+        handle.leaf
+      );
+      pathId = handle.tmpId;
+    }
+
+    // Snapshot the tmp row's final file_chunks into version_chunks
+    // for a fresh versionId. The chunks themselves remain on
+    // ShardDOs under refId=tmpId; shard_ref_id below preserves
+    // that key for future GC.
+    const tmpChunks = durableObject.sql
+      .exec(
+        "SELECT chunk_index, chunk_hash, chunk_size, shard_index FROM file_chunks WHERE file_id=? ORDER BY chunk_index",
+        handle.tmpId
+      )
+      .toArray() as {
+      chunk_index: number;
+      chunk_hash: string;
+      chunk_size: number;
+      shard_index: number;
+    }[];
+    const final = durableObject.sql
+      .exec(
+        "SELECT file_size, chunk_size, chunk_count, mime_type, mode FROM files WHERE file_id=?",
+        handle.tmpId
+      )
+      .toArray()[0] as
+      | {
+          file_size: number;
+          chunk_size: number;
+          chunk_count: number;
+          mime_type: string;
+          mode: number;
+        }
+      | undefined;
+    if (!final) {
+      throw new VFSError(
+        "ENOENT",
+        "commitWriteStream: tmp row vanished mid-commit"
+      );
+    }
+    const versionId = generateId();
+    for (const c of tmpChunks) {
+      durableObject.sql.exec(
+        `INSERT INTO version_chunks
+           (version_id, chunk_index, chunk_hash, chunk_size, shard_index)
+         VALUES (?, ?, ?, ?, ?)`,
+        versionId,
+        c.chunk_index,
+        c.chunk_hash,
+        c.chunk_size,
+        c.shard_index
+      );
+    }
+    commitVersion(durableObject, {
+      pathId,
+      versionId,
+      userId,
+      size: final.file_size,
+      mode: final.mode,
+      mtimeMs: Date.now(),
+      chunkSize: final.chunk_size,
+      chunkCount: final.chunk_count,
+      fileHash,
+      mimeType: final.mime_type,
+      inlineData: null,
+      userVisible: co?.versionUserVisible ?? true,
+      label: co?.versionLabel ?? null,
+      metadata: co?.metadataEncoded ?? null,
+      shardRefId: handle.tmpId,
+    });
+
+    // When the prior live row was reused as pathId, drop the now-
+    // redundant tmp files row WITHOUT chunk fan-out (chunks belong
+    // to the new version under refId=tmpId).
+    if (liveRow) {
+      durableObject.sql.exec(
+        "DELETE FROM file_chunks WHERE file_id = ?",
+        handle.tmpId
+      );
+      durableObject.sql.exec(
+        "DELETE FROM file_tags WHERE path_id = ?",
+        handle.tmpId
+      );
+      durableObject.sql.exec(
+        "DELETE FROM files WHERE file_id = ?",
+        handle.tmpId
+      );
+    }
+    return;
+  }
+
+  // Versioning OFF — pre-Phase-27 behaviour preserved.
   await commitRename(
     durableObject,
     userId,
@@ -753,52 +877,6 @@ export async function vfsCommitWriteStream(
     handle.parentId,
     handle.leaf
   );
-
-  // version row creation. Streaming writes don't go through
-  // commitVersion (the versioned write path is content-addressed by
-  // hash; streaming uses tmp-file-id refs). For tenants with versioning
-  // enabled, we add a post-commit version row capturing the file_hash
-  // + size + label + visibility flag, mirroring writeFile's contract.
-  // The chunks themselves are already placed under the path_id (the
-  // post-rename file_id == tmpId) which provides the dedup boundary.
-  if (co?.versionLabel !== undefined || co?.versionUserVisible !== undefined) {
-    if (isVersioningEnabled(durableObject, userId)) {
-      const final = durableObject.sql
-        .exec(
-          "SELECT file_id, file_size, chunk_size, chunk_count, mime_type, mode FROM files WHERE file_id=?",
-          handle.tmpId
-        )
-        .toArray()[0] as
-        | {
-            file_id: string;
-            file_size: number;
-            chunk_size: number;
-            chunk_count: number;
-            mime_type: string;
-            mode: number;
-          }
-        | undefined;
-      if (final) {
-        const versionId = generateId();
-        commitVersion(durableObject, {
-          pathId: final.file_id,
-          versionId,
-          userId,
-          size: final.file_size,
-          mode: final.mode,
-          mtimeMs: Date.now(),
-          chunkSize: final.chunk_size,
-          chunkCount: final.chunk_count,
-          fileHash,
-          mimeType: final.mime_type,
-          inlineData: null,
-          userVisible: co.versionUserVisible ?? true,
-          label: co.versionLabel,
-          metadata: co.metadataEncoded ?? null,
-        });
-      }
-    }
-  }
 }
 
 /**
