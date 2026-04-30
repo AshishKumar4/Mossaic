@@ -488,6 +488,18 @@ vfs.post("/unlink", async (c) => {
   }
 });
 
+vfs.post("/purge", async (c) => {
+  try {
+    const body = await c.req.json<{ path: string }>();
+    const path = expectPath(body);
+    await userStub(c).vfsPurge(c.var.scope, path);
+    return c.json({ ok: true });
+  } catch (err) {
+    const r = errToResponse(err);
+    return c.json(r.body, r.status as 400);
+  }
+});
+
 vfs.post("/mkdir", async (c) => {
   try {
     const body = await c.req.json<{
@@ -860,6 +872,7 @@ const listFilesHandler = async (
       direction?: "asc" | "desc";
       includeStat?: boolean;
       includeMetadata?: boolean;
+      includeTombstones?: boolean;
     }>();
     const r = await userStub(c).vfsListFiles(c.var.scope, body);
     return c.json(r);
@@ -877,11 +890,13 @@ vfs.post("/fileInfo", async (c) => {
       path: string;
       includeStat?: boolean;
       includeMetadata?: boolean;
+      includeTombstones?: boolean;
     }>();
     const path = expectPath(body);
     const item = await userStub(c).vfsFileInfo(c.var.scope, path, {
       includeStat: body.includeStat,
       includeMetadata: body.includeMetadata,
+      includeTombstones: body.includeTombstones,
     });
     return c.json({ item });
   } catch (err) {

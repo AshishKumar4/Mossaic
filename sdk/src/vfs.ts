@@ -76,6 +76,21 @@ export interface VFSClient {
     opts?: WriteFileOpts
   ): Promise<void>;
   unlink(p: string): Promise<void>;
+  /**
+   * Phase 25 — destructive cleanup.
+   *
+   * Drops the file row + every version + decrements ShardDO chunk
+   * refs. Independent of versioning state — acts like a
+   * versioning-off `unlink` even when versioning is on. Idempotent.
+   *
+   * Three-tier delete model:
+   *  - `unlink(path)`  — POSIX-style (versioned tombstone if
+   *    versioning is on; hard delete if off).
+   *  - `purge(path)`   — wipe all history for one path.
+   *  - `archive(path)` — RESERVED for Phase 25.1; not yet
+   *    implemented.
+   */
+  purge(p: string): Promise<void>;
   mkdir(
     p: string,
     opts?: { recursive?: boolean; mode?: number }
@@ -211,6 +226,7 @@ export interface UserDOClient {
     }
   ): Promise<void>;
   vfsUnlink(scope: VFSScope, path: string): Promise<void>;
+  vfsPurge(scope: VFSScope, path: string): Promise<void>;
   vfsMkdir(
     scope: VFSScope,
     path: string,
@@ -632,6 +648,17 @@ export interface ListFilesOpts {
   includeStat?: boolean;
   /** Default false (size pressure). */
   includeMetadata?: boolean;
+  /**
+   * Default `false`. When `true`, results include rows whose head
+   * version is a tombstone (`file_versions.deleted = 1`). Steady-
+   * state consumers must NEVER set this — the default mirrors
+   * `vfsStat`/`vfsReadFile`/`vfsExists` which all treat a
+   * tombstoned head as ENOENT, so listing surfaces stay stat-able.
+   * Reserved for admin/recovery flows that need to enumerate
+   * tombstoned-head rows for cleanup (e.g.
+   * `adminReapTombstonedHeads`).
+   */
+  includeTombstones?: boolean;
 }
 
 export interface FileInfoOpts {
@@ -639,6 +666,14 @@ export interface FileInfoOpts {
   includeStat?: boolean;
   /** Default false (size pressure). */
   includeMetadata?: boolean;
+  /**
+   * Phase 25 — default `false`. When `true`, a path resolving to
+   * a row whose head version is tombstoned still returns the
+   * fileInfo metadata instead of throwing ENOENT. Reserved for
+   * admin/recovery flows; the steady-state SDK consumer must
+   * never set this.
+   */
+  includeTombstones?: boolean;
 }
 
 /** a single row returned by listFiles. */
@@ -981,6 +1016,14 @@ export class VFS implements VFSClient {
     await this.ensureVersioning();
     try {
       await this.user().vfsUnlink(this.scope(), p);
+    } catch (err) {
+      throw mapServerError(err, { path: p, syscall: "unlink" });
+    }
+  }
+
+  async purge(p: string): Promise<void> {
+    try {
+      await this.user().vfsPurge(this.scope(), p);
     } catch (err) {
       throw mapServerError(err, { path: p, syscall: "unlink" });
     }
