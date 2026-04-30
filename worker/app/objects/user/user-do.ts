@@ -21,19 +21,6 @@ import {
 import { createFolder, listFolders, getFolderPath } from "./folders";
 import { getQuota, checkQuota, updateUsage } from "./quota";
 import { UserDOCore } from "@core/objects/user/user-do-core";
-// multipart upload helpers (App-side variants).
-import {
-  appBeginMultipart as appBeginMultipartImpl,
-  appAbortMultipart as appAbortMultipartImpl,
-  appFinalizeMultipart as appFinalizeMultipartImpl,
-  appGetMultipartStatus as appGetMultipartStatusImpl,
-  appOpenManifest as appOpenManifestImpl,
-  type AppBeginMultipartOpts,
-} from "./multipart";
-import type {
-  MultipartBeginResponse,
-  MultipartFinalizeResponse,
-} from "@shared/multipart";
 
 /**
  * Shape returned by {@link UserDO.appCreateFile}. Mirrors the
@@ -183,72 +170,6 @@ export class UserDO extends UserDOCore {
     this.ensureInit();
     completeFile(this, fileId, fileHash);
     updateUsage(this, userId, fileSize, 1);
-  }
-
-  // ── multipart upload RPCs (legacy schema) ──────────────
-  //
-  // Mirror the canonical `vfsBeginMultipart`/`vfsFinalizeMultipart`/
-  // `vfsAbortMultipart`/`vfsGetMultipartStatus`/`vfsOpenManifest`
-  // surface but adapted to the App's legacy `files`/`file_chunks`
-  // schema and `legacyAppPlacement` shard naming. The App-pinned
-  // multipart route at `/api/upload/multipart/*` calls these via the
-  // typed DO RPC binding.
-
-  /** begin a multipart upload session against legacy schema. */
-  async appBeginMultipart(
-    userId: string,
-    path: string,
-    opts: AppBeginMultipartOpts
-  ): Promise<MultipartBeginResponse> {
-    this.ensureInit();
-    return appBeginMultipartImpl(this, userId, path, opts);
-  }
-
-  /** abort a multipart upload session. Idempotent. */
-  async appAbortMultipart(
-    userId: string,
-    uploadId: string
-  ): Promise<{ ok: true }> {
-    this.ensureInit();
-    return appAbortMultipartImpl(this, userId, uploadId);
-  }
-
-  /** finalize a multipart upload — verify + flip to complete. */
-  async appFinalizeMultipart(
-    userId: string,
-    uploadId: string,
-    chunkHashList: readonly string[]
-  ): Promise<MultipartFinalizeResponse> {
-    this.ensureInit();
-    return appFinalizeMultipartImpl(this, userId, uploadId, chunkHashList);
-  }
-
-  /** probe the status of an open multipart session. */
-  async appGetMultipartStatus(
-    userId: string,
-    uploadId: string
-  ): Promise<{
-    landed: number[];
-    total: number;
-    bytesUploaded: number;
-    expiresAtMs: number;
-  }> {
-    this.ensureInit();
-    return appGetMultipartStatusImpl(this, userId, uploadId);
-  }
-
-  /** open a download manifest for a finalized App file. */
-  async appOpenManifest(fileId: string): Promise<{
-    fileId: string;
-    size: number;
-    chunkSize: number;
-    chunkCount: number;
-    chunks: Array<{ index: number; hash: string; size: number }>;
-    inlined: boolean;
-    mimeType: string;
-  }> {
-    this.ensureInit();
-    return appOpenManifestImpl(this, fileId);
   }
 
   /** Read the file row + its chunks for download manifest. */
