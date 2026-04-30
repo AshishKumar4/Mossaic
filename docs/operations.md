@@ -77,7 +77,9 @@ Per-tenant rate limit (default 100 ops/s, burst 200). Either back off the client
 
 ## Graceful `JWT_SECRET` rotation (zero-downtime)
 
-`verifyJWT` and `verifyVFSToken` accept tokens signed with **either** `env.JWT_SECRET` (current) or `env.JWT_SECRET_PREVIOUS` (rotation-window-only). Signing always uses `env.JWT_SECRET`. This lets you rotate without invalidating any outstanding session.
+All four verifiers — `verifyJWT`, `verifyVFSToken`, `verifyVFSMultipartToken`, and `verifyVFSDownloadToken` — accept tokens signed with **either** `env.JWT_SECRET` (current) or `env.JWT_SECRET_PREVIOUS` (rotation-window-only). Signing always uses `env.JWT_SECRET`. This lets you rotate without invalidating any outstanding session JWT, VFS-Bearer token, in-flight multipart upload session, or pre-minted download URL.
+
+**Phase 23 (2026-04) extension**: pre-Phase-23, only `verifyJWT` + `verifyVFSToken` honored `JWT_SECRET_PREVIOUS`. Multipart and download tokens were checked against `JWT_SECRET` only, so a rotation killed in-flight uploads and pre-minted shareable links. Phase 23 fixed both call sites — see `worker/core/lib/auth.ts:346` and `:435`.
 
 1. **Generate the new secret**:
    ```bash
