@@ -63,6 +63,7 @@ export interface VFSClient {
   exists(p: string): Promise<boolean>;
   readlink(p: string): Promise<string>;
   readManyStat(paths: string[]): Promise<(VFSStat | null)[]>;
+  fileInfo(p: string, opts?: FileInfoOpts): Promise<ListFilesItem>;
 
   // Writes
   writeFile(
@@ -221,6 +222,17 @@ export interface UserDOClient {
       tags: string[];
     }>;
     cursor?: string;
+  }>;
+  vfsFileInfo(
+    scope: VFSScope,
+    path: string,
+    opts?: FileInfoOpts
+  ): Promise<{
+    path: string;
+    pathId: string;
+    stat?: VFSStatRaw;
+    metadata?: Record<string, unknown> | null;
+    tags: string[];
   }>;
   /** Phase 10: flip the per-file Yjs-mode bit. */
   vfsSetYjsMode(
@@ -578,6 +590,13 @@ export interface ListFilesOpts {
   orderBy?: "mtime" | "name" | "size";
   /** Default 'desc' for mtime/size, 'asc' for name. */
   direction?: "asc" | "desc";
+  /** Default true. */
+  includeStat?: boolean;
+  /** Default false (size pressure). */
+  includeMetadata?: boolean;
+}
+
+export interface FileInfoOpts {
   /** Default true. */
   includeStat?: boolean;
   /** Default false (size pressure). */
@@ -1124,6 +1143,21 @@ export class VFS implements VFSClient {
       tags: r.tags,
     }));
     return { items, cursor: raw.cursor };
+  }
+
+  async fileInfo(p: string, opts: FileInfoOpts = {}): Promise<ListFilesItem> {
+    try {
+      const raw = await this.user().vfsFileInfo(this.scope(), p, opts);
+      return {
+        path: raw.path,
+        pathId: raw.pathId,
+        stat: raw.stat ? new VFSStat(raw.stat) : undefined,
+        metadata: raw.metadata,
+        tags: raw.tags,
+      };
+    } catch (err) {
+      throw mapServerError(err, { path: p, syscall: "stat" });
+    }
   }
 
   /**

@@ -198,6 +198,9 @@ class BatchedLstatFs implements VFSClient {
   exists(p: string) { return this.inner.exists(p); }
   readlink(p: string) { return this.inner.readlink(p); }
   readManyStat(paths: string[]) { return this.inner.readManyStat(paths); }
+  fileInfo(p: string, opts?: Parameters<VFSClient["fileInfo"]>[1]) {
+    return this.inner.fileInfo(p, opts);
+  }
   writeFile(
     p: string,
     data: Uint8Array | string,
