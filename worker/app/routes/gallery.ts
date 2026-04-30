@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import type { EnvApp as Env } from "@shared/types";
 import { authMiddleware } from "@core/lib/auth";
-import { legacyAppPlacement } from "@shared/placement";
+import { createVFS } from "@mossaic/sdk";
 import { userStub } from "../lib/user-stub";
 
 const gallery = new Hono<{
@@ -14,8 +14,6 @@ gallery.use("*", authMiddleware());
 /**
  * GET /api/gallery/photos
  * List all image files across all folders, sorted by date descending.
- *
- * typed RPC `appGetGalleryPhotos`.
  */
 gallery.get("/photos", async (c) => {
   const userId = c.get("userId");
@@ -25,103 +23,71 @@ gallery.get("/photos", async (c) => {
 
 /**
  * GET /api/gallery/image/:fileId
- * Serve a full image by reassembling all chunks. Streams the response
- * for single-chunk images; concatenates for multi-chunk.
- *
- * typed RPC `appGetFileManifest` replaces the legacy fetch
- * indirection. ShardDO addressing stays on the legacy
- * `shard:userId:idx` namespace.
- *
- * Future: replace the multi-chunk concat with `vfs.createReadStream`
- * once ShardDO data is migrated (/ §5.9). For now the
- * legacy concat preserves byte-equality with the existing live
- * deploy.
+ * Serve the original image bytes via canonical `vfs.readFile(path)`.
+ * Browser-side cached for 1 hour.
  */
 gallery.get("/image/:fileId", async (c) => {
-  return serveImage(c.env, c.get("userId"), c.req.param("fileId"), 3600);
+  return serveImage(c.env, c.get("userId"), c.req.param("fileId"), {
+    cacheSeconds: 3600,
+    variant: null,
+  });
 });
 
 /**
  * GET /api/gallery/thumbnail/:fileId
- * Same content as /image but with a 24h Cache-Control. The browser
- * resizes via object-fit: cover.
+ * Serve a pre-rendered `thumb` variant via canonical
+ * `vfs.readPreview(path, { variant: "thumb" })`. Cached for 24 hours.
  */
 gallery.get("/thumbnail/:fileId", async (c) => {
-  return serveImage(c.env, c.get("userId"), c.req.param("fileId"), 86400);
+  return serveImage(c.env, c.get("userId"), c.req.param("fileId"), {
+    cacheSeconds: 86400,
+    variant: "thumb",
+  });
 });
 
 /**
- * Shared helper: fetch the manifest, then either single-chunk-stream
- * or multi-chunk-concat the bytes back as the response body. Sets
- * private Cache-Control with the supplied max-age.
+ * Resolve fileId → path → bytes. `variant` selects between the original
+ * file (`null`) and a renderer-produced variant (`"thumbnail"`); the
+ * caller-controlled `cacheSeconds` flows into the response.
  */
 async function serveImage(
   env: Env,
   userId: string,
   fileId: string,
-  maxAge: number
+  opts: { cacheSeconds: number; variant: "thumb" | null }
 ): Promise<Response> {
-  const manifest = await userStub(env, userId).appGetFileManifest(fileId);
-  if (!manifest) {
+  const resolved = await userStub(env, userId).appGetFilePath(fileId);
+  if (!resolved) {
     return Response.json({ error: "File not found" }, { status: 404 });
   }
+  const { path, mimeType } = resolved;
 
-  const cacheHeaders = {
-    "Content-Type": manifest.mimeType,
-    "Cache-Control": `private, max-age=${maxAge}`,
-  };
-
-  // Single chunk — stream directly without buffering.
-  if (manifest.chunks.length === 1) {
-    const chunk = manifest.chunks[0];
-    const shardId = env.MOSSAIC_SHARD.idFromName(
-      legacyAppPlacement.shardDOName({ ns: "default", tenant: userId }, chunk.shardIndex)
-    );
-    const shardStub = env.MOSSAIC_SHARD.get(shardId);
-    const chunkRes = await shardStub.fetch(
-      new Request(`http://internal/chunk/${chunk.hash}`)
-    );
-    if (!chunkRes.ok) {
-      return Response.json({ error: "Chunk data not found" }, { status: 404 });
+  const vfs = createVFS(env, { tenant: userId });
+  try {
+    if (opts.variant === "thumb") {
+      const result = await vfs.readPreview(path, { variant: "thumb" });
+      return new Response(result.bytes, {
+        headers: {
+          "Content-Type": result.mimeType,
+          "Cache-Control": `private, max-age=${opts.cacheSeconds}`,
+        },
+      });
     }
-    return new Response(chunkRes.body, {
+    const bytes = await vfs.readFile(path);
+    return new Response(bytes, {
       headers: {
-        ...cacheHeaders,
-        "Content-Length": manifest.fileSize.toString(),
+        "Content-Type": mimeType,
+        "Content-Length": String(bytes.byteLength),
+        "Cache-Control": `private, max-age=${opts.cacheSeconds}`,
       },
     });
-  }
-
-  // Multi-chunk — fetch and concatenate.
-  const chunkBuffers: ArrayBuffer[] = [];
-  for (const chunk of manifest.chunks.sort((a, b) => a.index - b.index)) {
-    const shardId = env.MOSSAIC_SHARD.idFromName(
-      legacyAppPlacement.shardDOName({ ns: "default", tenant: userId }, chunk.shardIndex)
-    );
-    const shardStub = env.MOSSAIC_SHARD.get(shardId);
-    const chunkRes = await shardStub.fetch(
-      new Request(`http://internal/chunk/${chunk.hash}`)
-    );
-    if (!chunkRes.ok) {
-      return Response.json({ error: "Chunk data not found" }, { status: 404 });
+  } catch (err) {
+    const code = (err as { code?: string }).code;
+    if (code === "ENOENT") {
+      return Response.json({ error: "File not found" }, { status: 404 });
     }
-    chunkBuffers.push(await chunkRes.arrayBuffer());
+    throw err;
   }
-
-  const totalSize = chunkBuffers.reduce((sum, buf) => sum + buf.byteLength, 0);
-  const combined = new Uint8Array(totalSize);
-  let offset = 0;
-  for (const buf of chunkBuffers) {
-    combined.set(new Uint8Array(buf), offset);
-    offset += buf.byteLength;
-  }
-
-  return new Response(combined, {
-    headers: {
-      ...cacheHeaders,
-      "Content-Length": totalSize.toString(),
-    },
-  });
 }
 
 export default gallery;

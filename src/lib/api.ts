@@ -270,6 +270,19 @@ class ApiClient {
       providers: { text: string; clip: string };
     }>("/search/reindex", { method: "POST", body: JSON.stringify({}) });
   }
+
+  /**
+   * Notify the App that a file was just written via canonical
+   * `/api/vfs/multipart/finalize`. The App resolves the path to a
+   * fileId and schedules semantic indexing (text + CLIP). Call from
+   * `useUpload` after `parallelUpload` resolves.
+   */
+  async postIndexFile(path: string): Promise<{ ok: boolean; fileId: string }> {
+    return this.request<{ ok: boolean; fileId: string }>("/index/file", {
+      method: "POST",
+      body: JSON.stringify({ path }),
+    });
+  }
 }
 
 export class ApiError extends Error {

@@ -7,6 +7,7 @@ import {
 import { getTransferClient } from "@/lib/transfer-client";
 import { pathFromParentId } from "@/lib/path-utils";
 import { addTransferStats } from "@/lib/transfer-stats";
+import { api } from "@/lib/api";
 import type {
   TransferProgress,
   ChunkProgress,
@@ -92,10 +93,11 @@ export function useUpload(onComplete?: () => void) {
           })
       );
 
+      const uploadPath = pathFromParentId(parentId, file.name);
       try {
         const result = await parallelUpload(
           await getTransferClient(),
-          pathFromParentId(parentId, file.name),
+          uploadPath,
           file,
           {
             mimeType: file.type || "application/octet-stream",
@@ -181,6 +183,17 @@ export function useUpload(onComplete?: () => void) {
         };
         setCompletedStats((prev) => [statsEntry, ...prev.slice(0, 19)]);
         addTransferStats(statsEntry);
+
+        // Notify the App about the new VFS row so it can schedule
+        // semantic indexing. Failure is non-fatal — the upload itself
+        // succeeded; the user just won't see this file in search until
+        // the next reindex sweep.
+        try {
+          await api.postIndexFile(uploadPath);
+        } catch (err) {
+          console.warn("postIndexFile failed (non-fatal):", err);
+        }
+
         onComplete?.();
         return { fileId: result.fileId, failedCount: 0 };
       } catch (err) {

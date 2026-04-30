@@ -116,10 +116,117 @@ export class UserDO extends UserDOCore {
   }
 
   /**
-   * Raw file row read (used by the public `/api/shared/...` route
-   * and the upload-complete handler). Returns the snake_case columns
-   * unchanged (the DB rows are passed through with no rename so the
-   * shape matches what the legacy SQL helpers produce).
+   * Resolve an absolute VFS path to its `files` row. The canonical
+   * write path inserts file rows keyed by (user_id, parent_id,
+   * file_name); this is the inverse — used by the `/api/index/file`
+   * SPA callback to translate the just-written path back to a fileId
+   * for the search-index pipeline.
+   */
+  async appResolveFileByPath(
+    userId: string,
+    path: string
+  ): Promise<AppFileRow | null> {
+    this.ensureInit();
+    if (!path.startsWith("/")) return null;
+
+    // Walk segments — descend through `folders` for each non-leaf,
+    // then read the `files` row for the leaf.
+    const segments = path.split("/").filter((s) => s.length > 0);
+    if (segments.length === 0) return null;
+    const leafName = segments[segments.length - 1];
+    const dirSegments = segments.slice(0, -1);
+
+    let parentId: string | null = null;
+    for (const dir of dirSegments) {
+      const folderRow = this.sql
+        .exec(
+          "SELECT folder_id FROM folders WHERE user_id = ? AND IFNULL(parent_id, '') = IFNULL(?, '') AND name = ?",
+          userId,
+          parentId,
+          dir
+        )
+        .toArray()[0] as { folder_id: string } | undefined;
+      if (!folderRow) return null;
+      parentId = folderRow.folder_id;
+    }
+
+    const fileRow = this.sql
+      .exec(
+        "SELECT * FROM files WHERE user_id = ? AND IFNULL(parent_id, '') = IFNULL(?, '') AND file_name = ? AND status != 'deleted'",
+        userId,
+        parentId,
+        leafName
+      )
+      .toArray()[0] as Record<string, unknown> | undefined;
+    if (!fileRow) return null;
+
+    return {
+      file_id: fileRow.file_id as string,
+      user_id: fileRow.user_id as string,
+      parent_id: (fileRow.parent_id as string | null) ?? null,
+      file_name: fileRow.file_name as string,
+      file_size: fileRow.file_size as number,
+      file_hash: (fileRow.file_hash as string) ?? "",
+      mime_type: fileRow.mime_type as string,
+      chunk_size: (fileRow.chunk_size as number) ?? 0,
+      chunk_count: (fileRow.chunk_count as number) ?? 0,
+      pool_size: (fileRow.pool_size as number) ?? 32,
+      status: fileRow.status as string,
+      created_at: fileRow.created_at as number,
+      updated_at: fileRow.updated_at as number,
+      deleted_at: (fileRow.deleted_at as number | null) ?? null,
+    };
+  }
+
+  /**
+   * Reconstruct the absolute VFS path + mimeType for a `files.file_id`
+   * by walking the `parent_id` chain through the `folders` table.
+   * Returns null when the file row is missing or soft-deleted.
+   *
+   * Used by gallery + shared-album routes to translate the App's
+   * fileId-keyed URLs (`GET /api/gallery/image/:fileId`) into the
+   * `path` + `mimeType` that the canonical VFS read APIs need.
+   */
+  async appGetFilePath(
+    fileId: string
+  ): Promise<{ path: string; mimeType: string } | null> {
+    this.ensureInit();
+    const fileRow = this.sql
+      .exec(
+        "SELECT parent_id, file_name, mime_type FROM files WHERE file_id = ? AND status != 'deleted'",
+        fileId
+      )
+      .toArray()[0] as
+      | { parent_id: string | null; file_name: string; mime_type: string }
+      | undefined;
+    if (!fileRow) return null;
+
+    const segments: string[] = [fileRow.file_name];
+    let cursor: string | null = fileRow.parent_id ?? null;
+    // Bound the walk — practical hierarchies stay shallow; the cap
+    // protects against pathological cycles in malformed rows.
+    for (let i = 0; i < 256 && cursor !== null; i++) {
+      const folderRow = this.sql
+        .exec(
+          "SELECT parent_id, name FROM folders WHERE folder_id = ?",
+          cursor
+        )
+        .toArray()[0] as { parent_id: string | null; name: string } | undefined;
+      if (!folderRow) return null; // dangling parent_id
+      segments.unshift(folderRow.name);
+      cursor = folderRow.parent_id ?? null;
+    }
+    return {
+      path: "/" + segments.join("/"),
+      mimeType: fileRow.mime_type ?? "application/octet-stream",
+    };
+  }
+
+  /**
+   * Raw file row read (used by the public `/api/shared/...` route).
+   * Returns the snake_case columns unchanged so callers can pass it
+   * straight through to wire shapes that expect the SQLite column
+   * naming.
    */
   async appGetFile(fileId: string): Promise<AppFileRow | null> {
     this.ensureInit();

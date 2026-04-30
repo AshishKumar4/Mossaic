@@ -3,7 +3,7 @@ import type { EnvApp as Env } from "@shared/types";
 import type { SearchResult, ProviderStatus, VectorSpace } from "@shared/embedding-types";
 import { classifyResultType, isClipIndexable, isImageMime } from "@shared/embedding-types";
 import { authMiddleware } from "@core/lib/auth";
-import { legacyAppPlacement } from "@shared/placement";
+import { createVFS } from "@mossaic/sdk";
 import { userStub } from "../lib/user-stub";
 import {
   createEmbeddingProviders,
@@ -337,8 +337,8 @@ export function buildEmbeddingText(
 }
 
 /**
- * Fetch full file bytes by reassembling chunks from ShardDOs.
- * Used for CLIP image indexing. Returns null on failure.
+ * Fetch full file bytes via canonical `vfs.readFile(path)`. Used for
+ * CLIP image indexing. Returns null on failure.
  */
 async function fetchFileBytes(
   env: Env,
@@ -346,39 +346,10 @@ async function fetchFileBytes(
   fileId: string
 ): Promise<Uint8Array | null> {
   try {
-    const manifest = await userStub(env, userId).appGetFileManifest(fileId);
-    if (!manifest) return null;
-
-    // Single chunk — fast path
-    if (manifest.chunks.length === 1) {
-      const chunk = manifest.chunks[0];
-      const shardId = env.MOSSAIC_SHARD.idFromName(legacyAppPlacement.shardDOName({ ns: "default", tenant: userId }, chunk.shardIndex));
-      const shardStub = env.MOSSAIC_SHARD.get(shardId);
-      const chunkRes = await shardStub.fetch(
-        new Request(`http://internal/chunk/${chunk.hash}`)
-      );
-      if (!chunkRes.ok) return null;
-      return new Uint8Array(await chunkRes.arrayBuffer());
-    }
-
-    // Multi-chunk — reassemble
-    const sortedChunks = manifest.chunks.sort((a, b) => a.index - b.index);
-    const combined = new Uint8Array(manifest.fileSize);
-    let offset = 0;
-
-    for (const chunk of sortedChunks) {
-      const shardId = env.MOSSAIC_SHARD.idFromName(legacyAppPlacement.shardDOName({ ns: "default", tenant: userId }, chunk.shardIndex));
-      const shardStub = env.MOSSAIC_SHARD.get(shardId);
-      const chunkRes = await shardStub.fetch(
-        new Request(`http://internal/chunk/${chunk.hash}`)
-      );
-      if (!chunkRes.ok) return null;
-      const buf = new Uint8Array(await chunkRes.arrayBuffer());
-      combined.set(buf, offset);
-      offset += buf.byteLength;
-    }
-
-    return combined;
+    const resolved = await userStub(env, userId).appGetFilePath(fileId);
+    if (!resolved) return null;
+    const vfs = createVFS(env, { tenant: userId });
+    return await vfs.readFile(resolved.path);
   } catch (err) {
     console.error("Failed to fetch file bytes:", err);
     return null;
