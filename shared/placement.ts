@@ -29,6 +29,24 @@ function placementScore(
  * Determine which shard index holds a specific chunk.
  * FULLY DETERMINISTIC: depends only on (userId, fileId, chunkIndex, poolSize).
  * No network calls. No state lookups.
+ *
+ * Phase 28.1 — TODO: cap-aware placement. The current implementation
+ * picks the pure-rendezvous winner with no fullness check, so a
+ * shard that's at the soft cap (9 GB) keeps receiving chunks until
+ * pool growth (Phase 23 `recordWriteUsage`) widens the rendezvous
+ * space. Pool growth IS the primary capacity mechanism, but in a
+ * burst-write scenario where many chunks land before the next 5 GB
+ * boundary trips, individual shards could approach the workerd
+ * SQLite ceiling.
+ *
+ * The Phase 28 follow-up will accept an optional `skip?: Set<number>`
+ * (shards over softCap, populated from the `monitorShardCapacity`
+ * cache) and fall over to next-best rendezvous score. Backward
+ * compat: when `skip` is absent or empty, behaviour is unchanged
+ * (deterministic). For now, the warning at
+ * `worker/core/objects/user/shard-capacity.ts` gives operators
+ * visibility into approaching-cap conditions before any user-visible
+ * write failure.
  */
 export function placeChunk(
   userId: string,
