@@ -3,16 +3,10 @@ import { describe, it, expect } from "vitest";
 /**
  * Surface parity between `@mossaic/sdk` (root) and `@mossaic/sdk/http`.
  *
- * Background: the two entry points were drifting — the root entry
- * exported `EBADF`, `ENOTSUP`, encryption types, and the `Placement`
- * abstraction; the `/http` entry did not. CLI consumers import from
- * `@mossaic/sdk/http` (Node-safe — no `cloudflare:workers` virtual)
- * and could not do `instanceof EBADF` even though the server throws
- * that code on encryption-mode mismatch.
- *
- * The two entries diverge ONLY in DO-class re-exports and the
+ * The two entry points diverge ONLY in DO-class re-exports and the
  * `createVFS` factory (both Worker-runtime-only). Every other
- * value/type export is mirrored.
+ * value/type export is mirrored — error classes, transfer engine,
+ * HTTP client, token helpers, hash + chunking constants.
  */
 
 import * as sdk from "../../sdk/src/index";
@@ -54,10 +48,6 @@ describe("SDK surface parity — `@mossaic/sdk` vs `@mossaic/sdk/http`", () => {
 
   it("error helpers — isLikelyUnavailable is shared", () => {
     expect(sdk.isLikelyUnavailable).toBe(sdkHttp.isLikelyUnavailable);
-  });
-
-  it("placement abstraction — canonicalPlacement is shared", () => {
-    expect(sdk.canonicalPlacement).toBe(sdkHttp.canonicalPlacement);
   });
 
   it("transfer engine — parallelUpload/parallelDownload are shared", () => {

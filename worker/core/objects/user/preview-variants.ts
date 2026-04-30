@@ -27,7 +27,9 @@ import type {
 } from "../../../../shared/preview-types";
 import { hashChunk } from "../../../../shared/crypto";
 import { vfsCreateReadStream } from "./vfs/streams";
-import { getPlacement } from "../../lib/placement-resolver";
+import { vfsShardDOName } from "../../lib/utils";
+import { placeChunk } from "../../../../shared/placement";
+import { userIdFor } from "./vfs/helpers";
 import {
   defaultRegistry,
   RenderError,
@@ -195,8 +197,8 @@ export async function renderAndStoreVariant(
   // requests for `{w:512,h:512,fit:"cover"}` share storage.
   const variantKey = encodeVariantKey(variant);
   const refId = `${fileId}#variant#${variantKey}`;
-  const sIdx = getPlacement(scope).placeChunk(scope, refId, 0, poolSize);
-  const shardName = getPlacement(scope).shardDOName(scope, sIdx);
+  const sIdx = placeChunk(userIdFor(scope), refId, 0, poolSize);
+  const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, sIdx);
   const env = durableObject.envPublic;
   const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
   const shardStub = shardNs.get(shardNs.idFromName(shardName));

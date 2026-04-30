@@ -42,6 +42,7 @@ import type {
   ReadPreviewResult,
 } from "../../../../shared/preview-types";
 import { VFSError } from "../../../../shared/vfs-types";
+import { vfsShardDOName } from "../../lib/utils";
 import { dedupePaths, type DedupeResult } from "./admin";
 // type-only import. The YjsRuntime class is loaded
 // lazily via `await import("./yjs")` inside `getYjsRuntime()` so
@@ -1627,14 +1628,13 @@ export class UserDOCore extends DurableObject<Env> {
     // Resolve each row to its envelope bytes via the ShardDO.
     const env = this.envPublic;
     const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace;
-    const { getPlacement } = await import("../../lib/placement-resolver");
     const rows: {
       seq: number;
       kind: "op" | "checkpoint";
       envelope: Uint8Array;
     }[] = [];
     for (const row of oprows) {
-      const shardName = getPlacement(scope).shardDOName(scope, row.shard_index);
+      const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, row.shard_index);
       const stub = shardNs.get(shardNs.idFromName(shardName));
       // Read via the HTTP chunk endpoint. The ShardDO's GET /chunk/:hash
       // route serves the raw bytes (which are envelopes for encrypted
