@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
+import type { UserDO } from "@app/objects/user/user-do";
 import { vfsUserDOName } from "@core/lib/utils";
 
 /**
@@ -31,7 +32,8 @@ import { vfsUserDOName } from "@core/lib/utils";
 import { findVariantRow } from "@core/objects/user/preview-variants";
 
 interface E {
-  MOSSAIC_USER: DurableObjectNamespace;
+  MOSSAIC_USER: DurableObjectNamespace<UserDO>;
+  MOSSAIC_SHARD: DurableObjectNamespace;
 }
 const E = env as unknown as E;
 const NS = "default";

@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
+import type { UserDO } from "@app/objects/user/user-do";
 import { vfsUserDOName } from "@core/lib/utils";
+import { listVersionsVia } from "./helpers";
 
 /**
  * Phase 28 Fix 3 — commitVersion preserves encryption stamp on tombstone.
@@ -31,7 +33,8 @@ import { vfsUserDOName } from "@core/lib/utils";
  */
 
 interface E {
-  MOSSAIC_USER: DurableObjectNamespace;
+  MOSSAIC_USER: DurableObjectNamespace<UserDO>;
+  MOSSAIC_SHARD: DurableObjectNamespace;
 }
 const E = env as unknown as E;
 const NS = "default";
@@ -59,7 +62,7 @@ describe("Phase 28 Fix 3 — encryption stamp preserved on tombstone", () => {
     await stub.vfsWriteFile(scope, "/secret.bin", enc.encode("payload-1"), {
       encryption: { mode: "convergent" },
     });
-    const beforeUnlink = await stub.vfsListVersions(scope, "/secret.bin");
+    const beforeUnlink = await listVersionsVia(stub, scope, "/secret.bin");
     expect(beforeUnlink.length).toBe(1);
     expect(beforeUnlink[0]!.encryption).toBeTruthy();
     expect(beforeUnlink[0]!.encryption!.mode).toBe("convergent");

@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
+import type { UserDO } from "@app/objects/user/user-do";
 import { vfsUserDOName, vfsShardDOName } from "@core/lib/utils";
 import {
   monitorShardCapacity,
@@ -27,7 +28,7 @@ import type { ShardDO } from "@core/objects/shard/shard-do";
  */
 
 interface E {
-  MOSSAIC_USER: DurableObjectNamespace;
+  MOSSAIC_USER: DurableObjectNamespace<UserDO>;
   MOSSAIC_SHARD: DurableObjectNamespace<ShardDO>;
 }
 const E = env as unknown as E;
