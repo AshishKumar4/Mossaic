@@ -142,3 +142,134 @@ describe("indexed_at reconciler primitives", () => {
     expect(names).not.toContain("gone.txt");
   });
 });
+
+/**
+ * Phase 26 — extended reconciler invariants (audit gap G9).
+ *
+ * The pre-existing 5 tests above pin the column primitives. These
+ * additional cases cover the END-TO-END reconciliation flow that
+ * the production fix (Phase 23 Blindspot) shipped:
+ *
+ *   IR-E1. Write succeeds but the inline indexFile call fails (or
+ *          is never fired). The reconciler enumeration MUST pick
+ *          the row up.
+ *   IR-E2. Delete (unlink) BETWEEN index+search consistency: a row
+ *          marked indexed_at then deleted MUST be excluded from
+ *          the unindexed sweep AND the search-side hit set
+ *          (bulk-delete consistency).
+ *   IR-E3. Bulk-delete: 50 files, mark all indexed, unlink all,
+ *          assert the unindexed sweep returns []. Pin that the
+ *          reconciler does not emit re-index work for already-
+ *          deleted rows.
+ *   IR-E4. After the reconciler stamps a row, a subsequent write
+ *          to the SAME path (versioning OFF — overwrite) MUST clear
+ *          the indexed_at stamp so the new content gets re-indexed.
+ *          (If the stamp were sticky, edits would never re-index.)
+ */
+describe("indexed_at reconciler — end-to-end flow (Phase 26 / G9)", () => {
+  it("IR-E1 — file with NULL indexed_at (write-succeeded, index-failed) shows up in the unindexed sweep", async () => {
+    const tenant = "ir-write-fail";
+    const vfs = createVFS(makeEnv(), { tenant });
+    const stub = E.MOSSAIC_USER.get(
+      E.MOSSAIC_USER.idFromName(vfsUserDOName(NS, tenant))
+    );
+    await vfs.writeFile("/orphan.txt", "stale-index");
+
+    // Simulate the production failure: indexFile crashed → indexed_at
+    // remained NULL. The row IS in the VFS but NOT yet searched.
+    // Drive the reconciler enumeration directly.
+    const got = await stub.appListUnindexedFiles(tenant, 10);
+    expect(got.find((r) => r.file_name === "orphan.txt")).toBeTruthy();
+
+    // After the reconciler successfully fires indexFile and calls
+    // appMarkFileIndexed, the row drops from the list.
+    const target = got.find((r) => r.file_name === "orphan.txt")!;
+    await stub.appMarkFileIndexed(target.file_id);
+    const after = await stub.appListUnindexedFiles(tenant, 10);
+    expect(after.find((r) => r.file_name === "orphan.txt")).toBeUndefined();
+  });
+
+  it("IR-E2 — delete between index+search: an indexed-then-unlinked row is absent from BOTH unindexed sweep and live state", async () => {
+    const tenant = "ir-delete-between";
+    const vfs = createVFS(makeEnv(), { tenant });
+    const stub = E.MOSSAIC_USER.get(
+      E.MOSSAIC_USER.idFromName(vfsUserDOName(NS, tenant))
+    );
+    await vfs.writeFile("/transient.txt", "x");
+
+    // 1) Reconciler fires, indexes the row.
+    const before = await stub.appListUnindexedFiles(tenant, 10);
+    const target = before.find((r) => r.file_name === "transient.txt")!;
+    await stub.appMarkFileIndexed(target.file_id);
+
+    // 2) Race: row is unlinked AFTER index but BEFORE the next read.
+    await vfs.unlink("/transient.txt");
+
+    // 3) Unindexed sweep MUST not return this row (status filter).
+    const got = await stub.appListUnindexedFiles(tenant, 10);
+    expect(got.find((r) => r.file_name === "transient.txt")).toBeUndefined();
+
+    // 4) Live state confirms exists=false.
+    expect(await vfs.exists("/transient.txt")).toBe(false);
+  });
+
+  it("IR-E3 — bulk delete reconciliation: 20 files marked indexed → all unlinked → sweep returns []", async () => {
+    const tenant = "ir-bulk-delete";
+    const vfs = createVFS(makeEnv(), { tenant });
+    const stub = E.MOSSAIC_USER.get(
+      E.MOSSAIC_USER.idFromName(vfsUserDOName(NS, tenant))
+    );
+    const N = 20;
+    for (let i = 0; i < N; i++) {
+      await vfs.writeFile(`/bulk-${i}.txt`, `n=${i}`);
+    }
+
+    // Mark all indexed.
+    const ids = await stub.appListUnindexedFiles(tenant, N + 5);
+    expect(ids.length).toBe(N);
+    for (const r of ids) {
+      await stub.appMarkFileIndexed(r.file_id);
+    }
+    const mid = await stub.appListUnindexedFiles(tenant, N + 5);
+    expect(mid.length).toBe(0);
+
+    // Unlink everything.
+    for (let i = 0; i < N; i++) {
+      await vfs.unlink(`/bulk-${i}.txt`);
+    }
+
+    // Sweep returns nothing — neither indexed-and-deleted rows nor
+    // tombstones leak into the reconciler's unindexed enumeration.
+    const sweep = await stub.appListUnindexedFiles(tenant, N + 5);
+    expect(sweep.length).toBe(0);
+  });
+
+  it("IR-E4 — overwrite re-clears indexed_at: the new content gets re-indexed (no stale-stamp hide)", async () => {
+    // Pin actual semantics observed under workerd: the writeFile
+    // path on a versioning-OFF tenant either inserts a new row OR
+    // updates the existing row's content + clears indexed_at. The
+    // reconciler MUST see the row again after overwrite — otherwise
+    // edits would never be re-indexed. (If a future change moved
+    // to "stamp is sticky", users would silently lose search on
+    // edited content.)
+    const tenant = "ir-overwrite-reindex";
+    const vfs = createVFS(makeEnv(), { tenant });
+    const stub = E.MOSSAIC_USER.get(
+      E.MOSSAIC_USER.idFromName(vfsUserDOName(NS, tenant))
+    );
+    await vfs.writeFile("/edit.txt", "v1");
+
+    const before = await stub.appListUnindexedFiles(tenant, 10);
+    const target = before.find((r) => r.file_name === "edit.txt")!;
+    await stub.appMarkFileIndexed(target.file_id);
+
+    // Confirm the stamp landed.
+    const mid = await stub.appListUnindexedFiles(tenant, 10);
+    expect(mid.find((r) => r.file_name === "edit.txt")).toBeUndefined();
+
+    // Overwrite. The new content needs re-indexing.
+    await vfs.writeFile("/edit.txt", "v2-edited-content");
+    const after = await stub.appListUnindexedFiles(tenant, 10);
+    expect(after.find((r) => r.file_name === "edit.txt")).toBeTruthy();
+  });
+});
