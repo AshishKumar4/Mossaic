@@ -864,6 +864,25 @@ const listFilesHandler = async (
 vfs.post("/list", listFilesHandler);
 vfs.post("/listFiles", listFilesHandler);
 
+vfs.post("/fileInfo", async (c) => {
+  try {
+    const body = await c.req.json<{
+      path: string;
+      includeStat?: boolean;
+      includeMetadata?: boolean;
+    }>();
+    const path = expectPath(body);
+    const item = await userStub(c).vfsFileInfo(c.var.scope, path, {
+      includeStat: body.includeStat,
+      includeMetadata: body.includeMetadata,
+    });
+    return c.json({ item });
+  } catch (err) {
+    const r = errToResponse(err);
+    return c.json(r.body, r.status as 400);
+  }
+});
+
 const markVersionHandler = async (
   c: import("hono").Context<{ Bindings: Env; Variables: { scope: VFSScope } }>
 ) => {
