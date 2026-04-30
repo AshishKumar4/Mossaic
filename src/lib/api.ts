@@ -163,24 +163,10 @@ class ApiClient {
     );
   }
 
-  // Upload + Download
-  //
-  // the SPA's chunked transfer pipeline collapsed onto
-  // `@mossaic/sdk` 's `parallelUpload` / `parallelDownload` (see
-  // `src/hooks/use-upload.ts` + `src/hooks/use-download.ts`). The
-  // `uploadInit` / `uploadChunk` / `uploadComplete` / `getManifest` /
-  // `downloadChunk` methods are gone — the SDK drives the
-  // entire transfer through `/api/upload/multipart/*` (App-pinned
-  // bridge) and `/api/download/chunk/*` (legacy chunk download
-  // endpoint, addressed via `chunkFetchBaseOverride`).
-  //
-  // The legacy single-chunk routes on the App
-  // (`/api/upload/init`, `/api/upload/chunk/*`,
-  // `/api/upload/complete/*`, `/api/download/manifest/*`,
-  // `/api/download/chunk/*`) remain mounted on the worker for
-  // back-compat during the rollout window. A follow-up cleanup
-  // (deferred 1–2 weeks post-stability) deletes the unused legacy
-  // upload routes and their typed RPCs.
+  // Upload + download flow through `@mossaic/sdk` 's `parallelUpload`
+  // / `parallelDownload` against canonical `/api/vfs/multipart/*` and
+  // `/api/vfs/readChunk` — see `src/hooks/use-{upload,download}.ts`.
+  // No bespoke upload/download methods on this client.
 
   // Analytics
   async getAnalytics(): Promise<AnalyticsOverview> {
