@@ -630,7 +630,7 @@ if ((stat.mode & VFS_MODE_YJS_BIT) !== 0) {
 - **Awareness is relay-only and never persisted.** The server forwards awareness frames between connected editors but never writes them to SQLite. On DO eviction the per-pathId Awareness instance resets; clients re-broadcast their state on reconnect (this is the same behavior as a vanilla y-websocket server).
 - **`YDocHandle` shape.** `{ doc: Y.Doc, awareness: Awareness, synced: Promise<void>, close(): Promise<void>, flush({ label? }): Promise<{ versionId, checkpointSeq }>, onClose(cb), onError(cb) }`. Note: there is no `handle.on("sync")` or `handle.on("update")` event-emitter surface. Subscribe to `doc` and `awareness` instances directly via their respective `on(...)` methods.
 
-## End-to-end encryption (opt-in, )
+## End-to-end encryption (opt-in)
 
 Mossaic optionally encrypts file content with AES-GCM-256 before it leaves the consumer Worker. The Mossaic server NEVER decrypts user data — it stores opaque envelopes and the per-file `(encryption_mode, encryption_key_id)` columns. Loss of the master key = permanent data loss; there is no recovery path.
 
