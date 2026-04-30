@@ -7,14 +7,9 @@ import type {
   ShardDistribution,
   GalleryPhoto,
 } from "../../types";
-import type { UserFile, FileManifest, Folder, QuotaInfo } from "@shared/types";
+import type { UserFile, Folder, QuotaInfo } from "@shared/types";
 import { handleSignup, handleLogin, type AuthResult } from "./auth";
-import {
-  getFileManifest,
-  listFiles,
-  deleteFile,
-  getFile,
-} from "./files";
+import { listFiles, deleteFile, getFile } from "./files";
 import { createFolder, listFolders, getFolderPath } from "./folders";
 import { getQuota, updateUsage } from "./quota";
 import { UserDOCore } from "@core/objects/user/user-do-core";
@@ -82,12 +77,6 @@ export class UserDO extends UserDOCore {
   async appHandleLogin(email: string, password: string): Promise<AuthResult> {
     this.ensureInit();
     return handleLogin(this, email, password);
-  }
-
-  /** Read the file row + its chunks for download manifest. */
-  async appGetFileManifest(fileId: string): Promise<FileManifest | null> {
-    this.ensureInit();
-    return getFileManifest(this, fileId);
   }
 
   /** Folder contents (files + sub-folders). */
@@ -260,15 +249,6 @@ export class UserDO extends UserDOCore {
   ): Promise<Folder> {
     this.ensureInit();
     return createFolder(this, userId, name, parentId);
-  }
-
-  /** Folders sharing a parent. */
-  async appListFolders(
-    userId: string,
-    parentId: string | null
-  ): Promise<Folder[]> {
-    this.ensureInit();
-    return listFolders(this, userId, parentId);
   }
 
   /** Breadcrumb path from root to the given folderId. */
