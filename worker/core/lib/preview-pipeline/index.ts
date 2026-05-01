@@ -9,6 +9,7 @@
 
 import { RendererRegistry } from "./registry";
 import { imageRenderer } from "./renderers/image";
+import { imagePassthroughRenderer } from "./renderers/image-passthrough";
 import { codeRenderer } from "./renderers/code";
 import { waveformRenderer } from "./renderers/waveform";
 import { videoPosterRenderer } from "./renderers/video-poster";
@@ -19,10 +20,18 @@ import { iconCardRenderer } from "./renderers/icon-card";
  * tests can mutate without leaking state across cases. Production
  * callers should prefer {@link defaultRegistry} which caches one
  * shared instance per worker process.
+ *
+ * Order matters for `dispatchByMime`: `imageRenderer` is registered
+ * BEFORE `imagePassthroughRenderer`, so an `image/*` mime always
+ * dispatches to the resize renderer first; passthrough is reached
+ * only via `dispatchByKind("image-passthrough")` from the
+ * EMOSSAIC_UNAVAILABLE fallback path in `renderAndStoreVariant`.
+ * The icon-card universal fallback stays last.
  */
 export function buildDefaultRegistry(): RendererRegistry {
   const r = new RendererRegistry();
   r.register(imageRenderer);
+  r.register(imagePassthroughRenderer);
   r.register(codeRenderer);
   r.register(waveformRenderer);
   r.register(videoPosterRenderer);
@@ -48,6 +57,7 @@ export { RendererRegistry } from "./registry";
 export type { Renderer } from "./types";
 export { RenderError } from "./types";
 export { imageRenderer } from "./renderers/image";
+export { imagePassthroughRenderer } from "./renderers/image-passthrough";
 export { codeRenderer } from "./renderers/code";
 export { waveformRenderer } from "./renderers/waveform";
 export { videoPosterRenderer } from "./renderers/video-poster";

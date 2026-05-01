@@ -47,12 +47,21 @@
 
   // Universal preview pipeline. `IMAGES` powers the on-demand
   // and pre-generated image renderer (resize / format conversion /
-  // HEIC decode). `BROWSER` is wired now for the deferred renderers
-  // (PDF page-1, video poster, Office docs) — the binding is
-  // optional at runtime; the renderers gracefully fall through to
-  // the generic icon-card when it's absent.
+  // HEIC decode). When IMAGES is unbound and the source is itself
+  // an image MIME, preview returns the original bytes (Phase 39 A3
+  // fallback) — only non-image types fall through to icon-card.
+  //
+  // BROWSER (Browser Run) was removed in Phase 39 — it never had a
+  // production code path wired (deferred renderers were out-of-scope)
+  // and kept the Worker on a billing tier it didn't need.
   "images": { "binding": "IMAGES" },
-  "browser": { "binding": "BROWSER" },
+
+  // Phase 39 A1: bump per-invocation subrequest budget.
+  // Cloudflare's paid-plan default is 1000 (raised to 10K in Feb 2026,
+  // configurable up to 10M). Setting 100K here gives headroom for
+  // multipart fan-out + per-chunk-encryption + parallel decode without
+  // tripping the soft cap. Free tier ignores this and stays at 50.
+  "limits": { "subrequests": 100000 },
 
   "migrations": [
     {
