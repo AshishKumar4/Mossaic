@@ -503,6 +503,30 @@ export class UserDOCore extends DurableObject<Env> {
       )
     `);
 
+    // Phase 32 Fix 4 \u2014 skip-full-shard placement.
+    //
+    // Persistent per-shard byte-count cache. Refreshed every
+    // ~30 min by `monitorShardCapacity` from the alarm path.
+    // \`placeChunk\` reads this table to construct a `fullShards`
+    // skip-set: rendezvous winners that are at-or-over the soft
+    // cap fall over to the next-best score so writes never land
+    // on a near-capacity shard. Backward-compat: empty cache
+    // (no rows) \u2192 `placeChunk` is byte-equivalent to the
+    // pre-Phase-32 deterministic top-1 winner; the test pool +
+    // brand-new tenants exhibit identical placement until the
+    // first capacity poll runs.
+    //
+    // Cold-cache scenarios (no entry for a particular shard)
+    // are treated as \"not full\" \u2014 better to write to an
+    // un-measured shard than to refuse the write under-spec'd.
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS shard_storage_cache (
+        shard_index   INTEGER PRIMARY KEY,
+        bytes_stored  INTEGER NOT NULL,
+        refreshed_at  INTEGER NOT NULL
+      )
+    `);
+
     // ── metadata + tags + version label/visibility ─────────────
     //
     // Schema-only additions delivered via the existing idempotent

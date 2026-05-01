@@ -8,7 +8,8 @@ import { WRITEFILE_MAX } from "../../../../../shared/inline";
 import { hashChunk } from "../../../../../shared/crypto";
 import { computeChunkSpec } from "../../../../../shared/chunking";
 import { generateId, vfsShardDOName } from "../../../lib/utils";
-import { placeChunk } from "../../../../../shared/placement";
+import { placeChunk, POOL_FULL } from "../../../../../shared/placement";
+import { loadFullShards } from "../shard-capacity";
 import {
   commitVersion,
   isVersioningEnabled,
@@ -662,7 +663,27 @@ export async function vfsAppendWriteStream(
 
   const hash = await hashChunk(data);
   // Phase 32 Fix 2 \u2014 use server-recorded pool_size, not handle.
-  const sIdx = placeChunk(userIdFor(scope), handle.tmpId, chunkIndex, row.pool_size);
+  // Phase 32 Fix 4 \u2014 honor the skip-full-shard cache so a
+  // streaming append never sends bytes to a near-cap shard. Pool
+  // growth on all-full is handled in `vfsWriteFile`'s chunked
+  // tier; for the streaming path, hitting POOL_FULL surfaces as
+  // an EBUSY (the SDK's append loop will retry the chunk after
+  // the next alarm refreshes the cache, by which point pool
+  // growth in another write may have added headroom).
+  const fullShards = loadFullShards(durableObject);
+  const sIdx = placeChunk(
+    userIdFor(scope),
+    handle.tmpId,
+    chunkIndex,
+    row.pool_size,
+    fullShards
+  );
+  if (sIdx === POOL_FULL) {
+    throw new VFSError(
+      "EBUSY",
+      "appendWriteStream: every shard at soft cap; pool growth required"
+    );
+  }
   const env = durableObject.envPublic;
   const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
   const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, sIdx);

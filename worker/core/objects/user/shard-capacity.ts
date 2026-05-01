@@ -43,8 +43,17 @@ import { vfsShardDOName } from "../../lib/utils";
 /** Soft cap matches `ShardDO.getStorageBytes`'s published value. */
 const SOFT_CAP_BYTES = 9 * 1024 * 1024 * 1024;
 
-/** Min interval between capacity polls (1h). */
-const CHECK_INTERVAL_MS = 60 * 60 * 1000;
+/**
+ * Min interval between capacity polls.
+ *
+ * Phase 32 Fix 4 \u2014 lowered from 1h \u2192 30 min so the cache
+ * tracking shard fullness for `placeChunk`'s skip logic stays
+ * fresh. A shard at 8.5 GB is still well below the soft cap on
+ * one poll and over it on the next; tighter cadence shrinks the
+ * window where a near-full shard receives extra writes that
+ * could push it past the runtime SQLite ceiling.
+ */
+const CHECK_INTERVAL_MS = 30 * 60 * 1000;
 
 export interface ShardCapacitySnapshot {
   shardIndex: number;
@@ -118,6 +127,27 @@ export async function monitorShardCapacity(
     })
   );
 
+  // Phase 32 Fix 4 \u2014 persist into shard_storage_cache. Reachable
+  // shards have their measured bytes recorded; transient
+  // failures (bytesStored = -1 sentinel from the catch above) are
+  // skipped \u2014 the next poll retries. INSERT OR REPLACE keeps
+  // the row count bounded by poolSize; refreshed_at is updated
+  // every poll so a stale-cache check could cull entries older
+  // than CHECK_INTERVAL_MS \xd7 2 (not implemented this phase \u2014
+  // pool_size shrinking is forbidden, so stale rows are at worst
+  // cosmetic).
+  for (const s of snapshots) {
+    if (s.bytesStored < 0) continue;
+    durableObject.sql.exec(
+      `INSERT OR REPLACE INTO shard_storage_cache
+         (shard_index, bytes_stored, refreshed_at)
+       VALUES (?, ?, ?)`,
+      s.shardIndex,
+      s.bytesStored,
+      now
+    );
+  }
+
   // Structured warning per offending shard. Logpush picks these up
   // with grep-friendly fields. We log per-shard rather than batched
   // so the operator can see the histogram (which shards are hot,
@@ -134,12 +164,12 @@ export async function monitorShardCapacity(
           bytesStored: s.bytesStored,
           softCapBytes: SOFT_CAP_BYTES,
           uniqueChunks: s.uniqueChunks,
-          // Phase 28.1 will turn this into a placement-skip;
-          // until then the operator should verify pool growth is
-          // active for the tenant (`quota.pool_size` should grow
-          // by 1 per 5 GB stored — see Phase 23
-          // `recordWriteUsage`).
-          phase: "28-warning-only",
+          // Phase 32 Fix 4 \u2014 placement skips this shard. Pool
+          // growth (Phase 23 `recordWriteUsage`) is still the
+          // primary capacity mechanism; this warning surfaces
+          // shards that are at-cap so operators can verify
+          // growth is keeping pace.
+          phase: "32-cap-aware",
         })
       );
     }
@@ -153,3 +183,27 @@ export async function monitorShardCapacity(
  * value the warning fires at.
  */
 export const SHARD_SOFT_CAP_BYTES = SOFT_CAP_BYTES;
+
+/**
+ * Phase 32 Fix 4 \u2014 read the persisted full-shard set from
+ * `shard_storage_cache`. Each caller of `placeChunk` invokes
+ * this once per write batch (one SQL query per batch \u2014
+ * negligible) and threads the resulting set through every
+ * `placeChunk` call in the batch. Cold cache (no rows) returns
+ * an empty set, which preserves the deterministic placement
+ * fast path in `placeChunk`.
+ */
+export function loadFullShards(
+  durableObject: UserDOCore
+): ReadonlySet<number> {
+  const rows = durableObject.sql
+    .exec(
+      "SELECT shard_index FROM shard_storage_cache WHERE bytes_stored >= ?",
+      SOFT_CAP_BYTES
+    )
+    .toArray() as { shard_index: number }[];
+  if (rows.length === 0) return EMPTY_FULL_SHARDS;
+  return new Set(rows.map((r) => r.shard_index));
+}
+
+const EMPTY_FULL_SHARDS: ReadonlySet<number> = new Set<number>();

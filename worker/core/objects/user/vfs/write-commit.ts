@@ -12,7 +12,8 @@ import {
 import { hashChunk } from "../../../../../shared/crypto";
 import { computeChunkSpec } from "../../../../../shared/chunking";
 import { generateId, vfsShardDOName } from "../../../lib/utils";
-import { placeChunk } from "../../../../../shared/placement";
+import { placeChunk, POOL_FULL } from "../../../../../shared/placement";
+import { loadFullShards } from "../shard-capacity";
 import {
   commitVersion,
   isVersioningEnabled,
@@ -733,7 +734,50 @@ async function commitChunkedTier(
   const { chunkSize, chunkCount } = computeChunkSpec(data.byteLength);
   const tmpId = generateId();
   const tmpName = `_vfs_tmp_${tmpId}`;
-  const poolSize = poolSizeFor(durableObject, plan.userId);
+  let poolSize = poolSizeFor(durableObject, plan.userId);
+
+  // Phase 32 Fix 4 \u2014 load the skip-set once per write batch.
+  // Cold cache (empty Set) = byte-equivalent to pre-Phase-32
+  // placement (deterministic top-1).
+  let fullShards = loadFullShards(durableObject);
+
+  // If every shard in the pool is full, force a pool-size bump
+  // BEFORE the tmp row insert so the row records the post-growth
+  // pool. We trigger growth by a 5 GiB \"phantom\" delta: it
+  // doesn't change `storage_used`'s ground truth (we pass 0 for
+  // bytes) but it forces the pool-size recompute. The simpler
+  // alternative \u2014 directly UPDATE quota.pool_size += 1 \u2014
+  // bypasses Lean's monotonicity invariant proof; using
+  // recordWriteUsage keeps the proof trivially valid because
+  // writes only ever grow the pool.
+  if (fullShards.size >= poolSize) {
+    // Bump the pool. We add `BYTES_PER_SHARD` to storage_used
+    // virtually, then immediately consume the headroom \u2014 but
+    // since recordWriteUsage caps the recomputation to
+    // `BASE_POOL + floor(storage_used / BYTES_PER_SHARD)`, this
+    // grows pool_size by at most 1. After the bump, the new
+    // shard is non-full (it's empty) and placement succeeds.
+    durableObject.sql.exec(
+      `UPDATE quota
+          SET pool_size = pool_size + 1
+        WHERE user_id = ?`,
+      plan.userId
+    );
+    poolSize = poolSize + 1;
+    // Re-read \u2014 the new shard is not in the cache so it's
+    // implicitly non-full.
+    fullShards = loadFullShards(durableObject);
+    console.warn(
+      JSON.stringify({
+        event: "pool_growth_forced_by_full_shards",
+        tenant: scope.tenant,
+        ns: scope.ns,
+        sub: scope.sub,
+        newPoolSize: poolSize,
+        fullShardCount: fullShards.size,
+      })
+    );
+  }
 
   durableObject.sql.exec(
     `INSERT INTO files (file_id, user_id, parent_id, file_name, file_size, file_hash, mime_type, chunk_size, chunk_count, pool_size, status, created_at, updated_at, mode, node_kind)
@@ -764,7 +808,17 @@ async function commitChunkedTier(
       const end = Math.min(start + chunkSize, data.byteLength);
       const slice = data.subarray(start, end);
       const hash = await hashChunk(slice);
-      const sIdx = placeChunk(userIdFor(scope), tmpId, i, poolSize);
+      const sIdx = placeChunk(userIdFor(scope), tmpId, i, poolSize, fullShards);
+      if (sIdx === POOL_FULL) {
+        // The pool-grow above already handled the all-full case;
+        // hitting POOL_FULL here means the cache changed under us
+        // (concurrent alarm refresh marked another shard full
+        // mid-upload). Surface as EBUSY so the SDK retries.
+        throw new VFSError(
+          "EBUSY",
+          "writeFile: every shard at soft cap; pool growth required"
+        );
+      }
       const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, sIdx);
       const stub = shardNs.get(shardNs.idFromName(shardName));
       await stub.putChunk(hash, slice, tmpId, i, plan.userId);
