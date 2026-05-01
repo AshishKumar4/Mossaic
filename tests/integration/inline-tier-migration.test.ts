@@ -22,6 +22,17 @@ import { INLINE_LIMIT, INLINE_TIER_CAP } from "@shared/inline";
  *   IT3. Counter decrements on delete (file_size <= INLINE_LIMIT).
  *   IT4. Cap crossed → falls through to chunked tier (chunk_count > 0).
  *   IT5. Pre-existing inline rows are still readable past the cap.
+ *
+ * Phase 32.5 BUG #1 + BUG #2 regression cases:
+ *   IT6. Overwrite of inline file decrements counter (BUG #1).
+ *        Pre-fix: hardDeleteFileRow gate was `status === 'complete'`,
+ *        but commitRename flips to 'deleted' BEFORE invoking
+ *        hardDeleteFileRow on the displaced row. Counter was
+ *        never decremented on overwrite.
+ *   IT7. Versioning-on dropVersions decrements counter (BUG #2).
+ *        Pre-fix: dropVersionRows had no decrement path. Versioning
+ *        tenants accumulated monotonic inflation per dropped
+ *        inline version.
  */
 
 interface E {
@@ -182,5 +193,100 @@ describe("Phase 32 Fix 5 — inline tier graceful migration", () => {
 
     // INLINE_LIMIT exists for tests' confidence in the constant.
     expect(INLINE_LIMIT).toBeGreaterThan(0);
+  });
+
+  it("IT6 \u2014 BUG #1: overwrite of inline file decrements counter", async () => {
+    const tenant = "it6-overwrite-decrement";
+    const stub = E.MOSSAIC_USER.get(
+      E.MOSSAIC_USER.idFromName(vfsUserDOName(NS, tenant))
+    );
+    const scope = { ns: NS, tenant };
+
+    // Two distinct sizes so we can tell whether the overwrite
+    // properly substituted (counter == size of new) or drifted
+    // (counter == size of new + size of old).
+    const small = new Uint8Array(512).fill(1);
+    const large = new Uint8Array(4096).fill(2);
+
+    await stub.vfsWriteFile(scope, "/over.bin", small);
+    await stub.vfsWriteFile(scope, "/over.bin", large);
+
+    const used = await runInDurableObject(stub, async (_inst, state) => {
+      const r = state.storage.sql
+        .exec(
+          "SELECT COALESCE(inline_bytes_used, 0) AS used FROM quota WHERE user_id = ?",
+          tenant
+        )
+        .toArray()[0] as { used: number } | undefined;
+      return r?.used ?? 0;
+    });
+    // Pre-BUG-#1-fix this would have been 512 + 4096 = 4608.
+    expect(used).toBe(4096);
+
+    // Overwrite again with a smaller file \u2014 counter shrinks.
+    const tiny = new Uint8Array(128).fill(3);
+    await stub.vfsWriteFile(scope, "/over.bin", tiny);
+
+    const usedFinal = await runInDurableObject(stub, async (_inst, state) => {
+      const r = state.storage.sql
+        .exec(
+          "SELECT COALESCE(inline_bytes_used, 0) AS used FROM quota WHERE user_id = ?",
+          tenant
+        )
+        .toArray()[0] as { used: number } | undefined;
+      return r?.used ?? 0;
+    });
+    expect(usedFinal).toBe(128);
+  });
+
+  it("IT7 \u2014 BUG #2: dropVersions decrements counter for inline versions", async () => {
+    const tenant = "it7-drop-versions";
+    const stub = E.MOSSAIC_USER.get(
+      E.MOSSAIC_USER.idFromName(vfsUserDOName(NS, tenant))
+    );
+    const scope = { ns: NS, tenant };
+    const userId = tenant; // no sub
+
+    // Enable versioning for this tenant.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (stub as any).adminSetVersioning(userId, true);
+
+    // Three writes \u2192 three inline versions of a path.
+    const sizes = [100, 200, 300];
+    for (const sz of sizes) {
+      const data = new Uint8Array(sz).fill(sz & 0xff);
+      await stub.vfsWriteFile(scope, "/v.bin", data);
+    }
+
+    const before = await runInDurableObject(stub, async (_inst, state) => {
+      const r = state.storage.sql
+        .exec(
+          "SELECT COALESCE(inline_bytes_used, 0) AS used FROM quota WHERE user_id = ?",
+          userId
+        )
+        .toArray()[0] as { used: number } | undefined;
+      return r?.used ?? 0;
+    });
+    expect(before).toBe(100 + 200 + 300);
+
+    // Drop everything except the head (keepLast: 1) \u2014 should
+    // reap 2 inline versions worth of bytes (the older 100 and
+    // 200).
+    const result = await stub.vfsDropVersions(scope, "/v.bin", {
+      keepLast: 1,
+    });
+    expect(result.dropped).toBe(2);
+
+    const after = await runInDurableObject(stub, async (_inst, state) => {
+      const r = state.storage.sql
+        .exec(
+          "SELECT COALESCE(inline_bytes_used, 0) AS used FROM quota WHERE user_id = ?",
+          userId
+        )
+        .toArray()[0] as { used: number } | undefined;
+      return r?.used ?? 0;
+    });
+    // Only the most-recent (300-byte) version remains.
+    expect(after).toBe(300);
   });
 });

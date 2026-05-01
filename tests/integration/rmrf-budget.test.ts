@@ -17,6 +17,12 @@ import type { ShardDO } from "@core/objects/shard/shard-do";
  *   RB2. rmrf of 30 chunked files completes in bounded
  *        subrequests; all rows reaped after drain loop.
  *   RB3. ShardDO.deleteManyChunks idempotent on missing fileIds.
+ *
+ * Phase 32.5 Fix 3 (BATCH_LIMIT branch):
+ *   RB4. Versioning-ON tenant rmrf processes >30 files per call.
+ *        The versioning branch tombstones in-place (no shard
+ *        fan-out) so BATCH_LIMIT is raised to 200; this test
+ *        proves the higher limit is in effect.
  */
 
 interface E {
@@ -107,5 +113,48 @@ describe("Phase 32 Fix 3 — rmrf subrequest budget", () => {
     await stub.getStorageBytes(); // ensureInit
     const r = await stub.deleteManyChunks(["nonexistent-1", "nonexistent-2"]);
     expect(r.marked).toBe(0);
+  });
+
+  it("RB4 \u2014 versioning-ON tenant rmrf processes >30 files per call", async () => {
+    const tenant = "rb4-versioning-batch";
+    const stub = E.MOSSAIC_USER.get(
+      E.MOSSAIC_USER.idFromName(vfsUserDOName(NS, tenant))
+    );
+    const scope = { ns: NS, tenant };
+    const userId = tenant;
+
+    // Enable versioning so rmrf takes the tombstone-in-place
+    // branch (no shard fan-out, BATCH_LIMIT raised to 200).
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (stub as any).adminSetVersioning(userId, true);
+
+    await stub.vfsMkdir(scope, "/dv", { recursive: true });
+    // 50 tiny files \u2014 enough to prove >30 are processed in one
+    // call (would have required 2 calls under the old BATCH_LIMIT=30).
+    for (let i = 0; i < 50; i++) {
+      await stub.vfsWriteFile(scope, `/dv/f${i}.txt`, new Uint8Array([i]));
+    }
+
+    const first = await stub.vfsRemoveRecursive(scope, "/dv");
+    // Either the call completed (`done=true` because 50 \u2264 200)
+    // OR \u2014 if the limit wasn't raised \u2014 it would return
+    // done=false and 20 files would remain. Assert the high-limit
+    // path: completion in one call.
+    expect(first.done).toBe(true);
+
+    // Tombstones, not metadata deletion: every path now resolves
+    // as ENOENT for non-versioned reads. Verify by counting
+    // tombstoned-head rows (file_name suffix \`.tombstoned-\`).
+    const tombs = await runInDurableObject(stub, async (_inst, state) => {
+      return (
+        state.storage.sql
+          .exec(
+            "SELECT COUNT(*) AS n FROM files WHERE user_id = ? AND file_name LIKE '%.tombstoned-%'",
+            userId
+          )
+          .toArray()[0] as { n: number }
+      ).n;
+    });
+    expect(tombs).toBe(50);
   });
 });
