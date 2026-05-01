@@ -31,6 +31,7 @@ import { vfsCreateReadStream } from "./vfs/streams";
 import { vfsShardDOName } from "../../lib/utils";
 import { placeChunk } from "../../../../shared/placement";
 import { userIdFor } from "./vfs/helpers";
+import { READFILE_MAX } from "../../../../shared/inline";
 import {
   defaultRegistry,
   RenderError,
@@ -159,9 +160,42 @@ export async function renderAndStoreVariant(
   headVersionId: string | null
 ): Promise<{ row: VariantRow; bytes: Uint8Array; result: RenderResult }> {
   const registry = defaultRegistry();
-  const renderer = registry.dispatchByMime(mimeType);
+  let renderer = registry.dispatchByMime(mimeType);
+
+  // Phase 52 P3 #6 — defensive size cap.
+  //
+  // The renderers (image-resize, image-passthrough, code-svg,
+  // waveform, video-poster, icon-card) all buffer the source bytes
+  // into memory before producing output. The IMAGES binding has its
+  // own ~50 MB input cap, but the other renderers (image-passthrough
+  // in particular) have no upstream cap — a tenant who uploaded a
+  // 500 MB image and asked for its preview when IMAGES is unbound
+  // would buffer the full 500 MB in Worker memory and OOM the
+  // invocation. `vfsCreateReadStream` doesn't gate on size (streams
+  // serve any size); the gate has to live here.
+  //
+  // Above READFILE_MAX (100 MB), we short-circuit to icon-card
+  // regardless of MIME. The icon-card renderer drains the source
+  // stream defensively (to avoid leaking the read lock) but doesn't
+  // use the bytes — it produces SVG from filename + size metadata
+  // only. Cost: O(file_size) bytes streamed from ShardDO into the
+  // renderer just to be discarded; still O(100 MB) for a 500 MB
+  // file because ShardDO chunks paginate as the renderer reads.
+  // (We could optimise by passing fileSize directly to icon-card
+  // and skipping the stream entirely, but that's a separate concern;
+  // the OOM is the load-bearing fix here.)
+  if (fileSize > READFILE_MAX) {
+    const iconCard = registry.dispatchByKind("icon-card");
+    if (iconCard !== null) {
+      renderer = iconCard;
+    }
+    // If icon-card is missing from a custom registry, fall through
+    // to the primary renderer's OOM — the operator's choice to
+    // omit the universal fallback is theirs to own.
+  }
   // Track which renderer ACTUALLY produced the bytes. Starts as
-  // the primary; flips on EMOSSAIC_UNAVAILABLE fallback so the
+  // the primary (or icon-card if size-capped); flips on
+  // EMOSSAIC_UNAVAILABLE fallback so the
   // persisted `renderer_kind` column matches reality (a future
   // cache lookup keys on this).
   let usedRendererKind: string = renderer.kind;

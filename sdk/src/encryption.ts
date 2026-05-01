@@ -65,9 +65,18 @@ export class ENCRYPTION_REQUIRED extends VFSFsError {
 }
 
 /**
- * Typed wrapper for "decryption failed" (auth-tag mismatch, malformed
- * envelope, wrong master key). Always surfaces as EINVAL to match
- * Node.js' error code for "data appears corrupt".
+ * Typed wrapper for AES-GCM auth-tag mismatch — the canonical "wrong
+ * key (or wrong tenantSalt, or auth-tag-tampered ciphertext)" signal.
+ *
+ * Surfaces as EINVAL to match Node.js' error code for "data appears
+ * corrupt". Preserves `cause` so consumers who care about the
+ * underlying Error can drill in.
+ *
+ * Phase 52 P3 #3: this class is now narrowly scoped. Envelope
+ * structural errors (truncation, unsupported version, AAD-tag
+ * cross-purpose mismatch) surface as {@link CORRUPT_ENVELOPE} —
+ * those are NOT key-rotation problems and operators
+ * debugging "WRONG_KEY storms" need to know the difference.
  */
 export class WRONG_KEY extends VFSFsError {
   readonly cause?: unknown;
@@ -75,10 +84,45 @@ export class WRONG_KEY extends VFSFsError {
     super("EINVAL", {
       ...(opts.syscall !== undefined ? { syscall: opts.syscall } : {}),
       ...(opts.path !== undefined ? { path: opts.path } : {}),
-      message: "EINVAL: decryption failed (wrong master key, salt, or corrupt envelope)",
+      message: "EINVAL: decryption failed (wrong master key, wrong tenantSalt, or auth-tag-tampered ciphertext)",
     });
     this.name = "WRONG_KEY";
     if (opts.cause !== undefined) this.cause = opts.cause;
+  }
+}
+
+/**
+ * Typed wrapper for envelope STRUCTURAL failure — bytes don't decode
+ * as a valid Mossaic envelope (truncated, unsupported version, AAD
+ * cross-purpose mismatch, malformed tail).
+ *
+ * Phase 52 P3 #3: pre-Phase-52 these surfaced as `WRONG_KEY` which
+ * sent operators chasing key-rotation hypotheses for what was
+ * actually a storage-corruption / replay / version-mismatch event.
+ * Disambiguation lets dashboards alert separately on
+ * "auth-tag mismatches" (key-rotation pressure) vs "envelope
+ * corruption" (storage durability / replay-attack pressure).
+ *
+ * Inherits from {@link WRONG_KEY} so existing `instanceof WRONG_KEY`
+ * call-sites keep working — corruption is a strict subset of "the
+ * read failed and you should treat the bytes as untrusted". The
+ * `name` differs (`CORRUPT_ENVELOPE` vs `WRONG_KEY`) so logging /
+ * metrics dashboards can split the streams.
+ */
+export class CORRUPT_ENVELOPE extends WRONG_KEY {
+  constructor(opts: { syscall?: string; path?: string; cause?: unknown } = {}) {
+    super(opts);
+    this.name = "CORRUPT_ENVELOPE";
+    // Override the message inherited from WRONG_KEY to reflect the
+    // actual failure mode. (The `code` stays EINVAL — both classes
+    // map to the same HTTP status / typed error code.)
+    Object.defineProperty(this, "message", {
+      value:
+        "EINVAL: decryption failed (envelope corrupt: truncated, unsupported version, or AAD cross-purpose mismatch)",
+      enumerable: false,
+      writable: true,
+      configurable: true,
+    });
   }
 }
 
@@ -124,10 +168,28 @@ export async function encryptPayload(
 }
 
 /**
- * Decrypt a single envelope payload back to plaintext. Auth-tag /
- * malformed-envelope failures are re-mapped to a typed
- * {@link WRONG_KEY} so consumers can disambiguate from generic
- * EINVAL surfaces.
+ * Decrypt a single envelope payload back to plaintext.
+ *
+ * Phase 52 P3 #3 — error discrimination. Pre-Phase-52, every failure
+ * was re-mapped to {@link WRONG_KEY}, which made operator dashboards
+ * conflate auth-tag mismatches (= key rotation / re-keying pressure)
+ * with envelope corruption (= storage durability / replay-attack /
+ * version-mismatch pressure). They have different remediations.
+ *
+ * Now:
+ *  - WebCrypto AES-GCM auth-tag mismatch → {@link WRONG_KEY}.
+ *    Cause: wrong masterKey, wrong tenantSalt, or auth-tag-tampered
+ *    ciphertext. Operators see a spike → check key rotation.
+ *  - Envelope structure failure (unpackEnvelope throws, AAD tag
+ *    cross-purpose, missing plaintextHash, etc.) →
+ *    {@link CORRUPT_ENVELOPE}. Cause: storage corruption, version
+ *    skew, replay attack, AAD context mix-up. Operators see a
+ *    spike → check storage durability + version compatibility.
+ *
+ * `CORRUPT_ENVELOPE` extends `WRONG_KEY` so existing
+ * `instanceof WRONG_KEY` consumers keep working — a corrupt envelope
+ * IS still "decryption failed, don't trust the bytes". The
+ * additional class name lets monitoring split the alarm streams.
  */
 export async function decryptPayload(
   envelope: Uint8Array,
@@ -144,8 +206,52 @@ export async function decryptPayload(
       expectedAadTag: aadTag,
     });
   } catch (cause) {
-    throw new WRONG_KEY({ ...ctx, cause });
+    // Distinguish by error shape. AES-GCM auth-tag mismatches
+    // surface as `OperationError` from WebCrypto (or DOMException
+    // with name "OperationError" depending on runtime). Everything
+    // else originated in our own `throw new Error(...)` calls
+    // inside unpackEnvelope / decryptChunk's structural validation.
+    if (isAesGcmAuthFailure(cause)) {
+      throw new WRONG_KEY({ ...ctx, cause });
+    }
+    throw new CORRUPT_ENVELOPE({ ...ctx, cause });
   }
+}
+
+/**
+ * AES-GCM auth-tag failures from WebCrypto have a distinctive
+ * shape across runtimes:
+ *  - workerd / Cloudflare Workers: throws `Error` with a message
+ *    containing "OperationError" or "decryption failed".
+ *  - Node 19+ / browser: throws `DOMException` with name
+ *    "OperationError".
+ *  - Older runtimes (legacy Edge): may throw an empty Error.
+ *
+ * Our own structural failures all throw `new Error("decryptChunk: …")`
+ * or `new Error("unpackEnvelope: …")` — distinctive prefixes. Anything
+ * NOT matching one of those prefixes AND coming from
+ * `crypto.subtle.decrypt` (which is the only async-await call inside
+ * decryptChunkPure) is treated as auth failure.
+ */
+function isAesGcmAuthFailure(err: unknown): boolean {
+  if (typeof err !== "object" || err === null) return false;
+  const e = err as { name?: unknown; message?: unknown };
+  // Structural / our-own throws have message prefixes we control.
+  // Anything matching one of those is NOT AES-GCM auth failure.
+  if (typeof e.message === "string") {
+    if (
+      e.message.startsWith("decryptChunk:") ||
+      e.message.startsWith("unpackEnvelope:")
+    ) {
+      return false;
+    }
+  }
+  // DOMException / Error shape from WebCrypto.
+  if (e.name === "OperationError") return true;
+  // workerd / Node fallback: Error with a message we don't
+  // recognise. Treat as AES-GCM auth failure (the most common
+  // residual case once structural failures are filtered).
+  return true;
 }
 
 /**

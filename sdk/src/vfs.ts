@@ -556,13 +556,23 @@ export interface UserDOClient {
    * client supplies a checkpoint envelope (encrypted state-as-update)
    * + the expected `next_seq` for CAS. Server appends the checkpoint
    * atomically and drops oplog rows below it.
+   *
+   * Phase 52 P3 #8 — `opts.userVisible: true` emits a user-visible
+   * `file_versions` row when versioning is enabled for the tenant
+   * (mirroring the plain-yjs `vfsFlushYjs` semantics). The optional
+   * label gives the version a ≤128-char human label.
    */
   vfsCompactEncryptedYjs(
     scope: VFSScope,
     path: string,
     checkpointEnvelope: Uint8Array,
-    expectedNextSeq: number
-  ): Promise<{ checkpointSeq: number; opsReaped: number }>;
+    expectedNextSeq: number,
+    opts?: { userVisible?: boolean; label?: string }
+  ): Promise<{
+    checkpointSeq: number;
+    opsReaped: number;
+    versionId?: string;
+  }>;
   /**
    * read raw oplog rows for a yjs-mode file. Used by the
    * client-side compactor to fetch encrypted op envelopes for
@@ -2014,9 +2024,13 @@ export class VFS implements VFSClient {
    * @returns checkpoint seq + ops reaped, or `null` if the file is
    *   plaintext (compaction is server-driven there)
    */
-  async compactYjs(p: string): Promise<{
+  async compactYjs(
+    p: string,
+    opts?: { userVisible?: boolean; label?: string }
+  ): Promise<{
     checkpointSeq: number;
     opsReaped: number;
+    versionId?: string;
   } | null> {
     if (!this.opts.encryption) {
       // Plaintext yjs files compact server-side; nothing to do.
@@ -2081,12 +2095,16 @@ export class VFS implements VFSClient {
           "yj"
         );
 
-        // Step 5: submit with CAS.
+        // Step 5: submit with CAS. Forward Phase 52 P3 #8 opts so a
+        // user-visible flush emits a `file_versions` row on
+        // versioning-on tenants — mirrors the plain-yjs
+        // `vfsFlushYjs` semantics.
         const result = await this.user().vfsCompactEncryptedYjs(
           this.scope(),
           p,
           checkpointEnvelope,
-          expectedNextSeq
+          expectedNextSeq,
+          opts
         );
         return result;
       } catch (err) {

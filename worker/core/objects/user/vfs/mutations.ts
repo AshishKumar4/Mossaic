@@ -1,4 +1,5 @@
 import type { UserDOCore as UserDO } from "../user-do-core";
+import type { ShardDO } from "../../shard/shard-do";
 import {
   VFSError,
   type VFSScope,
@@ -7,7 +8,9 @@ import { generateId, vfsShardDOName } from "../../../lib/utils";
 import { normalizePath, VFSPathError } from "../../../../../shared/vfs-paths";
 import {
   commitVersion,
+  dropVersionRows,
   isVersioningEnabled,
+  shardRefId,
 } from "../vfs-versions";
 import {
   bumpFolderRevision,
@@ -526,65 +529,67 @@ export async function vfsRename(
     );
   }
   if (dstFile) {
-    // Under versioning-on, replace-overwrite must NOT hard-delete
-    // the displaced file's history. The semantics
-    // mirror what `unlink` does on a versioned tenant: the
-    // displaced row's chunks survive, accessible via
-    // `listVersions` + `restoreVersion`. We tombstone the
-    // displaced path instead of hard-deleting it.
+    // Phase 52 P1-2 fix — rename overwrite under versioning ON
+    // PRESERVES the destination path's history.
+    //
+    // Pre-Phase-52 behaviour (audit Phase 35 P1-2): the displaced
+    // file_id was tombstoned via commitVersion(deleted=true) AND
+    // renamed to `<file_id>.tombstoned-<ts>` to free the unique
+    // index slot, then the src row was moved into that slot. The
+    // path A's history (rows under file_id `fA`) became orphaned:
+    //   - listVersions(A) resolved to the NEW occupant (formerly
+    //     `fB`), returning its history not A's.
+    //   - The synthetic name `<fA>.tombstoned-<ts>` was filtered
+    //     from listFiles by the tombstone-head guard.
+    //   - No public API took a file_id, so fA's a1/a2/etc.
+    //     versions were unreachable except via the
+    //     `adminReapTombstonedHeads({mode:"walkBack"})` recovery
+    //     primitive — operator-only.
+    //
+    // Phase 52 fix: instead of moving the src row INTO A's slot,
+    // we IMPORT src's content as a NEW VERSION on A's history.
+    // After this:
+    //   - A's path_id (= fA) stays put. Path A still resolves to
+    //     fA, preserving the row's archival/tag/encryption stamps.
+    //   - fA's history grows: [a1, a2, …, b_imported_as_head].
+    //     listVersions(A) returns the full chain.
+    //   - readFile(A) returns the imported content (the new head).
+    //   - Source row fB is reaped via dropVersionRows so its
+    //     ShardDO chunk_refs decrement and its files-row drops.
+    //     Source path B becomes ENOENT.
+    //
+    // S3-style + POSIX-rename merged: the destination path keeps
+    // its identity AND grows its history; the source path
+    // ceases to exist (matches POSIX rename's "src no longer
+    // visible at src"). Inline + chunked tiers handled
+    // structurally identical to copy-file.ts:copyVersioned.
     if (isVersioningEnabled(durableObject, userId)) {
-      // Tombstone the displaced row via commitVersion(deleted=true)
-      // — same shape as `vfsUnlink`'s versioning fork.
-      const { commitVersion } = await import("../vfs-versions");
-      const now = Date.now();
-      const tombId = generateId();
-      commitVersion(durableObject, {
-        pathId: dstFile.file_id,
-        versionId: tombId,
+      await renameOverwriteVersioned(
+        durableObject,
+        scope,
         userId,
-        size: 0,
-        mode: 0,
-        mtimeMs: now,
-        chunkSize: 0,
-        chunkCount: 0,
-        fileHash: "",
-        mimeType: "application/octet-stream",
-        inlineData: null,
-        deleted: true,
-      });
-      // Free the unique-index slot by renaming the displaced row.
-      // The path the displaced file_id appears at no longer
-      // matches `(dstParent, dstLeaf)`; subsequent listings filter
-      // it via the tombstone-head consistency check. A suffix
-      // keeps it unique per path-tombstone-event.
-      durableObject.sql.exec(
-        "UPDATE files SET file_name = ?, updated_at = ? WHERE file_id = ?",
-        `${dstFile.file_id}.tombstoned-${now}`,
-        now,
+        srcR.leafId,
         dstFile.file_id
       );
-      // Now move src into the freed slot.
-      durableObject.sql.exec(
-        "UPDATE files SET parent_id=?, file_name=?, updated_at=? WHERE file_id=? AND user_id=?",
-        dstParent,
-        dstLeaf,
-        now,
-        srcR.leafId,
-        userId
-      );
+      // After renameOverwriteVersioned: fA's `files` row stays
+      // put (unchanged parent_id, file_name, file_id), with a
+      // fresh head version pointing at the migrated content.
+      // fB is gone. Bump src + dst parents so directory listings
+      // refresh; src parent in particular bumps because fB's row
+      // disappeared from it.
       insertAuditLog(durableObject, {
         op: "rename",
         actor: userId,
-        target: srcR.leafId,
+        target: dstFile.file_id, // the path_id that now owns the content
         payload: JSON.stringify({
           src,
           dst,
-          replacedFileId: dstFile.file_id,
-          replacedTombId: tombId,
+          srcFileId: srcR.leafId, // reaped
+          dstFileId: dstFile.file_id, // preserved
           versioning: true,
+          historyPreserved: true,
         }),
       });
-      // Bump src + dst parents (de-dup'd when same).
       bumpRenameParents(durableObject, userId, srcParent, dstParent);
       return;
     }
@@ -687,6 +692,411 @@ function bumpRenameParents(
   bumpFolderRevision(durableObject, userId, srcParent);
   if (srcParent !== dstParent) {
     bumpFolderRevision(durableObject, userId, dstParent);
+  }
+}
+
+// ── rename overwrite under versioning ON ───────────────────────────────
+
+/**
+ * Phase 52 P1-2 fix: rename(srcPath → dstPath) overwriting an
+ * existing destination on a versioning-ON tenant.
+ *
+ * Migrates the source row's HEAD content as a new version on the
+ * destination's existing path_id, so dst's history is preserved:
+ *
+ *   Before:  /A.txt → fA = [a1, a2 (head)]
+ *            /B.txt → fB = [b1 (head)]
+ *
+ *   After:   /A.txt → fA = [a1, a2, b_imported_as_v3 (head)]
+ *            /B.txt → ENOENT (fB hard-dropped)
+ *
+ * Inline tier (src.inline_data IS NOT NULL): the inline bytes are
+ * copied verbatim into the new file_versions row's `inline_data`
+ * column. ZERO ShardDO interaction — same shape as
+ * copyInline in copy-file.ts.
+ *
+ * Chunked tier (src head version has version_chunks rows): we
+ * refbump each chunk under the destination's new
+ * `${dstFileId}#${newVersionId}` shard ref, mirror the
+ * version_chunks rows, then commitVersion on dstFileId. Refbump
+ * happens BEFORE the source rows are dropped so a chunk shared
+ * between src and dst keeps its refcount ≥ 1 across the swap.
+ *
+ * Source teardown: after the new version commits on dstFileId,
+ * we call dropVersionRows on EVERY version under fB (the source
+ * file_id). dropVersionRows handles ShardDO refcount fan-out per
+ * version, including multipart-finalized versions whose
+ * `shard_ref_id` was `uploadId` not `${pathId}#${versionId}`.
+ *
+ * The source `files` row drops automatically when
+ * dropVersionRows reaps the last version (vfs-versions.ts:626-631).
+ *
+ * Failure modes:
+ *  - Pre-flight chunksAlive check fails → throws ENOENT, no state
+ *    changed (matches copy-file.ts).
+ *  - putChunk refbump fails partway → version_chunks rows are
+ *    reaped via best-effort DELETE; the new version_id was never
+ *    committed so dst's history is untouched. Throws the original
+ *    error to the caller.
+ *  - dropVersionRows for source fails (rare — ShardDO transient):
+ *    the new version on dstFileId is already committed, dst's
+ *    history is correct. Source's `files` row + history rows are
+ *    intentionally left intact for a future retry by
+ *    adminReapTombstonedHeads / dropVersions / vfsPurge. We do
+ *    NOT throw — the rename's user-visible contract ("dst now
+ *    holds src's content") is satisfied; the leak is bounded.
+ */
+async function renameOverwriteVersioned(
+  durableObject: UserDO,
+  scope: VFSScope,
+  userId: string,
+  srcFileId: string,
+  dstFileId: string
+): Promise<void> {
+  // Read src head metadata. We need the head version's content
+  // and the src `files`-row metadata (mode, mime_type, etc.) for
+  // commitVersion's args.
+  const srcRow = durableObject.sql
+    .exec(
+      `SELECT file_id, file_size, file_hash, mime_type, mode,
+              chunk_size, chunk_count, head_version_id, inline_data
+         FROM files
+        WHERE file_id = ? AND user_id = ?`,
+      srcFileId,
+      userId
+    )
+    .toArray()[0] as
+    | {
+        file_id: string;
+        file_size: number;
+        file_hash: string;
+        mime_type: string;
+        mode: number;
+        chunk_size: number;
+        chunk_count: number;
+        head_version_id: string | null;
+        inline_data: ArrayBuffer | null;
+      }
+    | undefined;
+  if (!srcRow) {
+    // Defensive: src vanished between resolveOrThrow and now. The
+    // outer rename caller already guards via resolveOrThrow; this
+    // branch is unreachable under DO single-thread but satisfies
+    // the type system.
+    throw new VFSError("ENOENT", `rename: source vanished: ${srcFileId}`);
+  }
+
+  // Resolve the head version row for the src. Versioning-ON
+  // semantics: head_version_id IS NOT NULL and points at a
+  // non-tombstone row. Versioning-OFF rows that reach this branch
+  // (rare — caller guards on isVersioningEnabled) have
+  // head_version_id NULL; we then synthesise one from the
+  // legacy `files` columns + an in-place-promoted chunk manifest.
+  let srcHead:
+    | {
+        versionId: string;
+        size: number;
+        mode: number;
+        chunkSize: number;
+        chunkCount: number;
+        fileHash: string;
+        mimeType: string;
+        inlineData: ArrayBuffer | null;
+      }
+    | null = null;
+  if (srcRow.head_version_id) {
+    const v = durableObject.sql
+      .exec(
+        `SELECT version_id, size, mode, chunk_size, chunk_count,
+                file_hash, mime_type, inline_data
+           FROM file_versions
+          WHERE path_id = ? AND version_id = ?`,
+        srcFileId,
+        srcRow.head_version_id
+      )
+      .toArray()[0] as
+      | {
+          version_id: string;
+          size: number;
+          mode: number;
+          chunk_size: number;
+          chunk_count: number;
+          file_hash: string;
+          mime_type: string;
+          inline_data: ArrayBuffer | null;
+        }
+      | undefined;
+    if (!v) {
+      throw new VFSError(
+        "ENOENT",
+        `rename: src head version not found: ${srcFileId}#${srcRow.head_version_id}`
+      );
+    }
+    srcHead = {
+      versionId: v.version_id,
+      size: v.size,
+      mode: v.mode,
+      chunkSize: v.chunk_size,
+      chunkCount: v.chunk_count,
+      fileHash: v.file_hash,
+      mimeType: v.mime_type,
+      inlineData: v.inline_data,
+    };
+  } else {
+    // Legacy un-versioned src row on a versioning-ON tenant: rare
+    // but possible (src predates versioning enablement). Use the
+    // `files` columns directly. We don't synthesize a fresh head
+    // version_id — we just use srcFileId as the manifest key for
+    // the chunked tier (file_chunks rather than version_chunks).
+    srcHead = {
+      versionId: "", // sentinel — chunked branch uses file_chunks instead
+      size: srcRow.file_size,
+      mode: srcRow.mode,
+      chunkSize: srcRow.chunk_size,
+      chunkCount: srcRow.chunk_count,
+      fileHash: srcRow.file_hash,
+      mimeType: srcRow.mime_type,
+      inlineData: srcRow.inline_data,
+    };
+  }
+
+  const newVersionId = generateId();
+  const now = Date.now();
+
+  // ── Inline tier ──────────────────────────────────────────────────────
+  if (srcHead.inlineData !== null) {
+    commitVersion(durableObject, {
+      pathId: dstFileId,
+      versionId: newVersionId,
+      userId,
+      size: srcHead.size,
+      mode: srcHead.mode,
+      mtimeMs: now,
+      chunkSize: 0,
+      chunkCount: 0,
+      fileHash: srcHead.fileHash,
+      mimeType: srcHead.mimeType,
+      inlineData: new Uint8Array(srcHead.inlineData),
+      userVisible: true,
+    });
+    // Drop src history + files row (no shard fan-out — inline).
+    await reapSourceVersionedRow(durableObject, scope, userId, srcFileId);
+    return;
+  }
+
+  // ── Chunked tier ─────────────────────────────────────────────────────
+  // Read src head version's chunks. If the src is a legacy
+  // un-versioned row on a versioning-ON tenant (srcHead.versionId
+  // === ""), pull from `file_chunks`; otherwise from `version_chunks`.
+  const srcChunks = (
+    srcHead.versionId === ""
+      ? durableObject.sql.exec(
+          `SELECT chunk_index, chunk_hash, chunk_size, shard_index
+             FROM file_chunks WHERE file_id = ? ORDER BY chunk_index`,
+          srcFileId
+        )
+      : durableObject.sql.exec(
+          `SELECT chunk_index, chunk_hash, chunk_size, shard_index
+             FROM version_chunks WHERE version_id = ? ORDER BY chunk_index`,
+          srcHead.versionId
+        )
+  ).toArray() as {
+    chunk_index: number;
+    chunk_hash: string;
+    chunk_size: number;
+    shard_index: number;
+  }[];
+
+  if (srcChunks.length === 0) {
+    // Empty file (size 0, no chunks). Just commit an empty version
+    // — no shard interaction needed.
+    commitVersion(durableObject, {
+      pathId: dstFileId,
+      versionId: newVersionId,
+      userId,
+      size: srcHead.size,
+      mode: srcHead.mode,
+      mtimeMs: now,
+      chunkSize: srcHead.chunkSize,
+      chunkCount: srcHead.chunkCount,
+      fileHash: srcHead.fileHash,
+      mimeType: srcHead.mimeType,
+      inlineData: null,
+      userVisible: true,
+    });
+    await reapSourceVersionedRow(durableObject, scope, userId, srcFileId);
+    return;
+  }
+
+  // Pre-flight: verify every src chunk is alive on its shard
+  // before we start mutating refs. A swept chunk would manifest
+  // as a missing file post-rename; surface ENOENT pre-emptively.
+  const env = durableObject.envPublic;
+  const shardNs =
+    env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
+  {
+    const byShard = new Map<number, string[]>();
+    for (const c of srcChunks) {
+      const arr = byShard.get(c.shard_index) ?? [];
+      arr.push(c.chunk_hash);
+      byShard.set(c.shard_index, arr);
+    }
+    await Promise.all(
+      Array.from(byShard.entries()).map(async ([shardIndex, hashes]) => {
+        const shardName = vfsShardDOName(
+          scope.ns,
+          scope.tenant,
+          scope.sub,
+          shardIndex
+        );
+        const stub = shardNs.get(shardNs.idFromName(shardName));
+        const { alive } = await stub.chunksAlive(hashes);
+        if (alive.length !== hashes.length) {
+          const aliveSet = new Set(alive);
+          const missing = hashes.filter((h) => !aliveSet.has(h));
+          throw new VFSError(
+            "ENOENT",
+            `rename: source chunks swept on shard ${shardIndex}: ${missing
+              .slice(0, 3)
+              .join(",")}${missing.length > 3 ? "..." : ""}`
+          );
+        }
+      })
+    );
+  }
+
+  // Refbump each chunk under the destination's new shardRef and
+  // mirror version_chunks rows under newVersionId. Same shape as
+  // copy-file.ts:copyVersioned chunked branch.
+  const newRefId = shardRefId(dstFileId, newVersionId);
+  try {
+    const byShard = new Map<number, typeof srcChunks>();
+    for (const c of srcChunks) {
+      const arr = byShard.get(c.shard_index) ?? [];
+      arr.push(c);
+      byShard.set(c.shard_index, arr);
+    }
+    await Promise.all(
+      Array.from(byShard.entries()).map(async ([sIdx, chunks]) => {
+        const shardName = vfsShardDOName(
+          scope.ns,
+          scope.tenant,
+          scope.sub,
+          sIdx
+        );
+        const stub = shardNs.get(shardNs.idFromName(shardName));
+        for (const c of chunks) {
+          // Empty buffer: chunk already exists on this shard
+          // (chunksAlive pre-flight guarantees), so the dedup
+          // branch in writeChunkInternal short-circuits and
+          // INCREMENTS the refcount under newRefId. No bytes
+          // travel on the wire.
+          await stub.putChunk(
+            c.chunk_hash,
+            new Uint8Array(0),
+            newRefId,
+            c.chunk_index,
+            userId
+          );
+          durableObject.sql.exec(
+            `INSERT INTO version_chunks
+               (version_id, chunk_index, chunk_hash, chunk_size, shard_index)
+             VALUES (?, ?, ?, ?, ?)`,
+            newVersionId,
+            c.chunk_index,
+            c.chunk_hash,
+            c.chunk_size,
+            c.shard_index
+          );
+        }
+      })
+    );
+  } catch (err) {
+    // Best-effort cleanup of any landed version_chunks rows. The
+    // putChunk refbumps that succeeded leak chunk_refs under
+    // newRefId — they'll be reclaimed by the shard's alarm sweep
+    // when the user re-attempts and the failed shard recovers,
+    // OR by adminReapOrphanRefs (Phase 47) on the next sweep.
+    durableObject.sql.exec(
+      "DELETE FROM version_chunks WHERE version_id = ?",
+      newVersionId
+    );
+    throw err;
+  }
+
+  commitVersion(durableObject, {
+    pathId: dstFileId,
+    versionId: newVersionId,
+    userId,
+    size: srcHead.size,
+    mode: srcHead.mode,
+    mtimeMs: now,
+    chunkSize: srcHead.chunkSize,
+    chunkCount: srcHead.chunkCount,
+    fileHash: srcHead.fileHash,
+    mimeType: srcHead.mimeType,
+    inlineData: null,
+    userVisible: true,
+    shardRefId: newRefId,
+  });
+  await reapSourceVersionedRow(durableObject, scope, userId, srcFileId);
+}
+
+/**
+ * Reap the source `files` row + every version it owns + decrement
+ * ShardDO chunk_refs for every (shard_ref_id) the source's versions
+ * accumulated. Called from `renameOverwriteVersioned` after the
+ * destination's new version is committed.
+ *
+ * Versioning-on src: dropVersionRows over EVERY version_id under
+ * srcFileId. dropVersionRows handles per-version shard fan-out and
+ * drops the `files` row when no versions remain.
+ *
+ * Versioning-off src (legacy un-versioned row promoted onto a
+ * versioning-on tenant): no version_chunks rows; the chunks live in
+ * `file_chunks` and ShardDO chunk_refs are keyed by `srcFileId`
+ * directly. Use `hardDeleteFileRow` which knows about that shape.
+ */
+async function reapSourceVersionedRow(
+  durableObject: UserDO,
+  scope: VFSScope,
+  userId: string,
+  srcFileId: string
+): Promise<void> {
+  const versions = durableObject.sql
+    .exec(
+      "SELECT version_id FROM file_versions WHERE path_id = ? AND user_id = ?",
+      srcFileId,
+      userId
+    )
+    .toArray() as { version_id: string }[];
+  if (versions.length > 0) {
+    await dropVersionRows(
+      durableObject,
+      scope,
+      userId,
+      srcFileId,
+      versions.map((v) => v.version_id)
+    );
+    // dropVersionRows drops the files row once liveCount === 0.
+    // Defensive: if a non-versioning legacy row ALSO had file_chunks
+    // (a cross-mode edge case from a tenant that toggled versioning
+    // mid-stream), reap them too.
+    const stillHasFiles = durableObject.sql
+      .exec(
+        "SELECT 1 FROM files WHERE file_id = ? AND user_id = ?",
+        srcFileId,
+        userId
+      )
+      .toArray();
+    if (stillHasFiles.length > 0) {
+      await hardDeleteFileRow(durableObject, userId, scope, srcFileId);
+    }
+  } else {
+    // No version rows — legacy un-versioned src row. Use the
+    // canonical hardDeleteFileRow path which handles file_chunks
+    // + ShardDO refs keyed by srcFileId.
+    await hardDeleteFileRow(durableObject, userId, scope, srcFileId);
   }
 }
 

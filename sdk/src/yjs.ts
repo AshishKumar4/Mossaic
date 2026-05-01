@@ -570,12 +570,40 @@ export async function openYDoc(
       versionId: string | null;
       checkpointSeq: number;
     }> {
-      // call the typed RPC. The compaction snapshot
-      // captures whatever the live Y.Doc currently holds — local
-      // edits made on this handle are streamed to the server via
-      // the open WebSocket BEFORE flush() runs (each Yjs update
-      // is emitted synchronously by `doc.transact`), so the
-      // compaction sees them.
+      // The compaction snapshot captures whatever the live Y.Doc
+      // currently holds — local edits made on this handle are
+      // streamed to the server via the open WebSocket BEFORE
+      // flush() runs (each Yjs update is emitted synchronously
+      // by `doc.transact`), so the compaction sees them.
+      //
+      // Encrypted files: route to `compactYjs` (Phase 52 P3 #8)
+      // because the server can't materialise an encrypted Y.Doc
+      // — the client has to build the checkpoint envelope locally
+      // and submit it via the encrypted-compact RPC. We pass
+      // `userVisible: true` so versioning-on tenants get a
+      // `file_versions` row mirroring the plain-yjs path.
+      //
+      // Plaintext files: server-driven `compact` does the same
+      // thing on the server side.
+      if (encryptionConfig) {
+        const result = await vfs.compactYjs(path, {
+          userVisible: true,
+          label: flushOpts?.label,
+        });
+        if (result === null) {
+          // Defensive: compactYjs returned null (which happens if
+          // the SDK's encryption config is missing OR if stat
+          // claims the file is plaintext). On the encrypted-handle
+          // path neither should happen — but if it does, fall
+          // back to the plain server-driven flush so the caller
+          // still gets a checkpoint.
+          return vfs._flushYjs(path, flushOpts);
+        }
+        return {
+          versionId: result.versionId ?? null,
+          checkpointSeq: result.checkpointSeq,
+        };
+      }
       return vfs._flushYjs(path, flushOpts);
     },
     onClose(cb) {
