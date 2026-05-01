@@ -75,3 +75,8 @@ export {
 } from "./vfs/streams";
 
 export { vfsReadPreview } from "./vfs/preview";
+
+export {
+  vfsResolveCacheKey,
+  type CacheResolveResult,
+} from "./vfs/cache-resolve";

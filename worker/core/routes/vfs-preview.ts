@@ -26,6 +26,12 @@ import type { EnvCore as Env } from "../../../shared/types";
 import type { VFSScope, OpenManifestResult } from "../../../shared/vfs-types";
 import type { ReadPreviewOpts, Variant } from "../../../shared/preview-types";
 import { vfsAuth, userStub, errToResponse, expectPath } from "./vfs";
+import {
+  edgeCacheKeyPart,
+  edgeCacheLookup,
+  edgeCachePut,
+} from "../lib/edge-cache";
+import { userIdFor } from "../objects/user/vfs/helpers";
 
 const preview = new Hono<{
   Bindings: Env;
@@ -82,7 +88,75 @@ preview.post("/readPreview", async (c) => {
     const variant =
       body.variant === undefined ? "thumb" : expectVariant(body.variant);
 
-    const result = await userStub(c).vfsReadPreview(c.var.scope, path, {
+    // Phase 36b \u2014 Workers Cache for variant bytes.
+    //
+    // Pre-flight `vfsResolveCacheKey` returns the cache-bust
+    // state in one cheap SQL JOIN: (fileId, headVersionId,
+    // updatedAt, encryption stamp). The cache key folds in the
+    // variant + format + renderer descriptors so different
+    // variants of the same file land on different keys, and
+    // every write that bumps headVersionId / updatedAt /
+    // encryption stamp lands on a fresh key (old key expires).
+    //
+    // Cache.match runs AFTER vfsAuth() (above) so a cached
+    // response never serves an unauthenticated request.
+    //
+    // Encrypted files surface ENOTSUP from the underlying RPC
+    // (preview.ts:124) \u2014 we don't pre-cache them. The cache key
+    // includes the encryption fingerprint so a tenant who
+    // toggles encryption between writes lands on a different key.
+    const stub = userStub(c);
+    const ck = await stub.vfsResolveCacheKey(c.var.scope, path);
+
+    const variantKeyPart =
+      typeof variant === "string"
+        ? variant
+        : `c-${variant.width}x${variant.height ?? 0}-${variant.fit ?? "any"}`;
+    const formatPart = body.format ?? "auto";
+    const rendererPart = body.renderer ?? "auto";
+    const encPart = edgeCacheKeyPart(
+      `${ck.encryptionMode ?? ""}|${ck.encryptionKeyId ?? ""}`
+    );
+    // Use headVersionId when set (versioning ON / multipart
+    // committed); fall back to updatedAt for non-versioned
+    // tenants. Either way the part advances on every write.
+    const versionPart = ck.headVersionId ?? `t${ck.updatedAt}`;
+
+    const cacheOpts = {
+      surfaceTag: "preview" as const,
+      namespace: userIdFor(c.var.scope),
+      fileId: ck.fileId,
+      updatedAt: ck.updatedAt,
+      extraKeyParts: [
+        versionPart,
+        variantKeyPart,
+        formatPart,
+        rendererPart,
+        encPart,
+      ],
+      cacheControl: "public, max-age=31536000, immutable",
+      waitUntil: c.executionCtx.waitUntil.bind(c.executionCtx),
+    };
+
+    const cached = await edgeCacheLookup(cacheOpts);
+    if (cached) {
+      // Conditional response: honour If-None-Match against the
+      // cached ETag too. Streamlines the 304 path on warm hits.
+      const ifNoneMatch = c.req.header("If-None-Match");
+      const cachedEtag = cached.headers.get("ETag");
+      if (ifNoneMatch !== null && cachedEtag !== null && ifNoneMatch === cachedEtag) {
+        return new Response(null, {
+          status: 304,
+          headers: {
+            ETag: cachedEtag,
+            "Cache-Control": "public, max-age=31536000, immutable",
+          },
+        });
+      }
+      return cached;
+    }
+
+    const result = await stub.vfsReadPreview(c.var.scope, path, {
       variant,
       format: body.format,
       renderer: body.renderer,
@@ -110,16 +184,16 @@ preview.post("/readPreview", async (c) => {
       });
     }
 
-    return new Response(result.bytes, {
+    const fresh = new Response(result.bytes, {
       status: 200,
       headers: {
         "Content-Type": result.mimeType,
         "Content-Length": String(result.bytes.byteLength),
         ETag: etag,
-        // Variants are content-addressed — the bytes for a given
-        // ETag never change. Year-long immutable cache is safe; on
-        // re-render the chunk_hash changes and the ETag changes
-        // with it, busting any intermediary cache.
+        // Variants are content-addressed \u2014 the bytes for a given
+        // ETag never change. Year-long immutable cache is safe;
+        // on re-render the chunk_hash changes and the ETag
+        // changes with it, busting any intermediary cache.
         "Cache-Control": "public, max-age=31536000, immutable",
         "X-Mossaic-Renderer": result.rendererKind,
         "X-Mossaic-Variant-Cache": result.fromVariantTable
@@ -130,6 +204,8 @@ preview.post("/readPreview", async (c) => {
         "X-Mossaic-Height": String(result.height),
       },
     });
+    edgeCachePut(cacheOpts, fresh);
+    return fresh;
   } catch (err) {
     const r = errToResponse(err);
     return c.json(r.body, r.status as 400);

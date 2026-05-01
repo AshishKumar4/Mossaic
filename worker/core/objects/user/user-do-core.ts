@@ -23,6 +23,7 @@ import {
   vfsReaddir,
   vfsRemoveRecursive,
   vfsRename,
+  vfsResolveCacheKey,
   vfsRmdir,
   vfsStat,
   vfsSymlink,
@@ -31,6 +32,7 @@ import {
   vfsArchive,
   vfsUnarchive,
   vfsWriteFile,
+  type CacheResolveResult,
   type VFSReadHandle,
   type VFSWriteFileOpts,
   type VFSWriteHandle,
@@ -1371,6 +1373,24 @@ export class UserDOCore extends DurableObject<Env> {
   ): Promise<ReadPreviewResult> {
     this.gateVfs(scope);
     return vfsReadPreview(this, scope, path, opts);
+  }
+
+  /**
+   * Phase 36b \u2014 cheap pre-flight for cache-key construction.
+   * Returns the bust state (fileId, headVersionId, updatedAt,
+   * encryption stamp) for `path` in one SQL JOIN. Routes that
+   * wrap reads in `caches.default` call this BEFORE the heavy
+   * RPC so they can build a deterministic cache key.
+   *
+   * Throws ENOENT for missing paths; EISDIR for directories.
+   * Symlinks are followed to their direct file target.
+   */
+  async vfsResolveCacheKey(
+    scope: VFSScope,
+    path: string
+  ): Promise<CacheResolveResult> {
+    this.gateVfs(scope);
+    return vfsResolveCacheKey(this, scope, path);
   }
 
   // ── VFS RPC surface (write-side) ──────────────────────────────

@@ -4,7 +4,7 @@ import type { EnvApp as Env } from "@shared/types";
 import { authMiddleware } from "@core/lib/auth";
 import { createVFS } from "@mossaic/sdk";
 import { userStub } from "../lib/user-stub";
-import { edgeCacheServe } from "../lib/edge-cache";
+import { edgeCacheServe } from "@core/lib/edge-cache";
 
 const gallery = new Hono<{
   Bindings: Env;

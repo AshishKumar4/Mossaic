@@ -34,6 +34,49 @@ shard horizontally too \u2014 see Phase 32b.
 
 ## Phase 32.5 \u2014 Quota desync correction (LANDED)
 ## Phase 36 \u2014 Versioned accounting consolidation (LANDED)
+## Phase 36b \u2014 Cacheable surfaces complete + staleness audit (LANDED)
+
+Phase 36b extended Phase 36's edge-cache helper to the three
+deferred surfaces (readPreview, readChunk, openManifest) and
+migrated the legacy chunk-download endpoint to share the same
+helper. Now SEVEN surfaces use one cache convention:
+
+  - GET /api/gallery/thumbnail/:fileId   (Phase 36)
+  - GET /api/gallery/image/:fileId       (Phase 36)
+  - GET /api/shared/:token/image/:fileId (Phase 36)
+  - POST /api/vfs/readPreview            (Phase 36b NEW)
+  - POST /api/vfs/readChunk              (Phase 36b NEW)
+  - POST /api/vfs/openManifest           (Phase 36b NEW)
+  - GET /api/vfs/chunk/:fileId/:idx      (Phase 36b MIGRATED)
+
+Cache-key shape across all seven:
+  https://<surfaceTag>.mossaic.local/<namespace>/<fileId>/<updatedAt>[/<...extras>]
+
+  - surfaceTag distinguishes endpoints (gthumb / gimg / simg /
+    preview / chunk / manifest).
+  - namespace is `<userId>` for private; `<payload.tn>` for
+    download-token endpoints.
+  - updatedAt comes from files.updated_at, advances on every
+    write that mutates response state.
+  - extras encode version part (headVersionId or t<updatedAt>),
+    variant kind/format/renderer, encryption fingerprint
+    (fnv1a folded), chunk index, chunk hash \u2014 whichever apply
+    to the surface.
+
+Pre-flight RPC: vfsResolveCacheKey returns
+(fileId, headVersionId, updatedAt, encryption stamp) in one
+SQL JOIN; routes call it before the heavy operation to build
+deterministic keys.
+
+Staleness audit at local/cache-staleness-audit.md walks every
+surface and every mutation type. Verdict: HOLDS for all seven.
+Cache-key-versioning beats active invalidation \u2014 races produce
+orphaned cache entries that expire per their TTL, never
+serve stale responses.
+
+Tests: 18 new cases at tests/integration/edge-cache.test.ts
+pin the additional bust signals + the vfsResolveCacheKey RPC
+contract. 23 cases total.
 
 Phase 36 closed the deferred work below. The summary lives here
 so future operators can read this single doc and understand the

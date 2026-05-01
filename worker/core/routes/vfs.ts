@@ -5,6 +5,11 @@ import { verifyVFSToken, VFSConfigError } from "../lib/auth";
 import { vfsUserDOName } from "../lib/utils";
 import type { UserDOCore } from "../objects/user/user-do-core";
 import type { VFSScope } from "../../../shared/vfs-types";
+import {
+  edgeCacheLookup,
+  edgeCachePut,
+} from "../lib/edge-cache";
+import { userIdFor } from "../objects/user/vfs/helpers";
 
 /**
  * HTTP fallback for non-Worker consumers (browsers, Node servers,
@@ -732,8 +737,46 @@ vfs.post("/openManifest", async (c) => {
   try {
     const body = await c.req.json<{ path: string }>();
     const path = expectPath(body);
-    const m = await userStub(c).vfsOpenManifest(c.var.scope, path);
-    return c.json({ manifest: m });
+
+    // Phase 36b \u2014 Workers Cache for manifest JSON.
+    //
+    // Manifests are tiny (a few KB at most) but a gallery scroll
+    // fans out 50+ openManifest + readPreview calls. The cache
+    // skips the path-walk + manifest-read RPC for already-fetched
+    // (path, head) pairs.
+    //
+    // Cache key: (userId, fileId, headVersionId|updatedAt).
+    // Bust signals: every commitVersion / commitInlineTier /
+    // rename / metadata change bumps either headVersionId or
+    // updatedAt; both flow into the key.
+    const stub = userStub(c);
+    const ck = await stub.vfsResolveCacheKey(c.var.scope, path);
+    const versionPart = ck.headVersionId ?? `t${ck.updatedAt}`;
+    const cacheOpts = {
+      surfaceTag: "manifest" as const,
+      namespace: userIdFor(c.var.scope),
+      fileId: ck.fileId,
+      updatedAt: ck.updatedAt,
+      extraKeyParts: [versionPart],
+      cacheControl: "private, max-age=31536000, immutable",
+      waitUntil: c.executionCtx.waitUntil.bind(c.executionCtx),
+    };
+    const cached = await edgeCacheLookup(cacheOpts);
+    if (cached) return cached;
+
+    const m = await stub.vfsOpenManifest(c.var.scope, path);
+    const fresh = new Response(JSON.stringify({ manifest: m }), {
+      status: 200,
+      headers: {
+        "Content-Type": "application/json",
+        // Manifest is keyed on (fileId, headVersionId) which is
+        // immutable for a given version. Year-long cache safe;
+        // overwrites land on a different key.
+        "Cache-Control": "private, max-age=31536000, immutable",
+      },
+    });
+    edgeCachePut(cacheOpts, fresh);
+    return fresh;
   } catch (err) {
     const r = errToResponse(err);
     return c.json(r.body, r.status as 400);
@@ -750,15 +793,50 @@ vfs.post("/readChunk", async (c) => {
         400
       );
     }
-    const buf = await userStub(c).vfsReadChunk(
+
+    // Phase 36b \u2014 Workers Cache for chunk bytes.
+    //
+    // Chunks are content-addressed by SHA-256 hash so the
+    // bytes for a (fileId, chunkIndex, headVersionId) triple are
+    // immutable. Use the same per-user namespace pattern as
+    // readPreview / openManifest \u2014 cross-tenant requests will
+    // miss-and-refill rather than share entries (the chunks
+    // themselves dedup at the ShardDO layer; cache duplication
+    // is bounded by cache eviction).
+    //
+    // Cache key includes chunkIndex so (file_id, chunk_idx_0)
+    // and (file_id, chunk_idx_1) are different entries.
+    const stub = userStub(c);
+    const ck = await stub.vfsResolveCacheKey(c.var.scope, path);
+    const versionPart = ck.headVersionId ?? `t${ck.updatedAt}`;
+    const cacheOpts = {
+      surfaceTag: "chunk" as const,
+      namespace: userIdFor(c.var.scope),
+      fileId: ck.fileId,
+      updatedAt: ck.updatedAt,
+      extraKeyParts: [versionPart, `i${body.chunkIndex}`],
+      cacheControl: "public, max-age=31536000, immutable",
+      waitUntil: c.executionCtx.waitUntil.bind(c.executionCtx),
+    };
+    const cached = await edgeCacheLookup(cacheOpts);
+    if (cached) return cached;
+
+    const buf = await stub.vfsReadChunk(
       c.var.scope,
       path,
       body.chunkIndex
     );
-    return new Response(buf, {
+    const fresh = new Response(buf, {
       status: 200,
-      headers: { "Content-Type": "application/octet-stream" },
+      headers: {
+        "Content-Type": "application/octet-stream",
+        // Per-version per-chunk-index immutable. Overwrites
+        // create a new headVersionId \u2192 different cache key.
+        "Cache-Control": "public, max-age=31536000, immutable",
+      },
     });
+    edgeCachePut(cacheOpts, fresh);
+    return fresh;
   } catch (err) {
     const r = errToResponse(err);
     return c.json(r.body, r.status as 400);
