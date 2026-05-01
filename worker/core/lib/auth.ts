@@ -476,3 +476,146 @@ export async function verifyVFSDownloadToken(
     return null;
   }
 }
+
+// ── Album-share tokens (P0-1 fix) ───────────────────────────────────
+//
+// Public album sharing requires a token a non-authenticated reader
+// can present to GET /api/shared/:token/photos and image bytes.
+// The pre-fix shape was `base64(JSON({ userId, fileIds, albumName }))`
+// — UNSIGNED, anyone could forge it. This is the HMAC-signed
+// replacement.
+//
+// Wire shape: HS256 JWT keyed off the same `JWT_SECRET` as the rest
+// of the auth surface. The `scope: "vfs-share"` sentinel rejects
+// `vfs` / `vfs-mp` / `vfs-dl` cross-purpose forgery (RFC 8725 §2.8
+// scope-binding pattern). Carries:
+//   - userId: tenant the share belongs to (drives DO routing)
+//   - fileIds: file_ids the share grants access to
+//   - albumName: human label echoed back to the consumer
+//   - jti: per-share random nonce so the operator can revoke a
+//     specific share without rotating the global secret (future
+//     work — current verify treats jti as opaque, future
+//     `share_revocations` table can blocklist by jti)
+// Standard claims: iat, exp.
+//
+// Default TTL: 90 days. Rotation: pre-fix tokens are unsigned and
+// will fail `verifyShareToken`; users re-share to mint new tokens.
+// Multi-secret aware via `verifyAgainstSecrets` so JWT_SECRET
+// rotation doesn't kill in-flight shares.
+
+export const VFS_SHARE_SCOPE = "vfs-share" as const;
+
+/** Default TTL for share tokens — 90 days. */
+export const SHARE_TOKEN_DEFAULT_TTL_MS = 90 * 24 * 60 * 60 * 1000;
+
+/** Wire shape of the parsed share token. */
+export interface ShareTokenPayload {
+  scope: typeof VFS_SHARE_SCOPE;
+  /** Owner of the shared content. Drives DO routing. */
+  userId: string;
+  /** file_ids granted by this share. */
+  fileIds: string[];
+  /** Human-readable album label, echoed by /photos. */
+  albumName: string;
+  /** Per-share random nonce for future revocation by jti. */
+  jti: string;
+  /** Issued-at (seconds since epoch). */
+  iat: number;
+  /** Expiry (seconds since epoch). */
+  exp: number;
+}
+
+/**
+ * Sign a share token. Called by the auth-gated mint route
+ * (`POST /api/auth/share-token`) with the authenticated session's
+ * userId — the route is the single source of truth for whose
+ * content can be shared.
+ *
+ * The `jti` (random 96-bit nonce) lets a future revocation list
+ * blocklist specific share-events without affecting other shares.
+ */
+export async function signShareToken(
+  env: Env,
+  payload: { userId: string; fileIds: readonly string[]; albumName: string },
+  ttlMs: number = SHARE_TOKEN_DEFAULT_TTL_MS
+): Promise<{ token: string; expiresAtMs: number; jti: string }> {
+  const secret = getSecret(env);
+  if (typeof payload.userId !== "string" || payload.userId.length === 0) {
+    throw new Error("signShareToken: userId required");
+  }
+  if (!Array.isArray(payload.fileIds) || payload.fileIds.length === 0) {
+    throw new Error("signShareToken: fileIds must be a non-empty array");
+  }
+  if (typeof payload.albumName !== "string") {
+    throw new Error("signShareToken: albumName must be a string");
+  }
+  // 96-bit random nonce (12 bytes → 24 hex chars). Plenty for jti
+  // collision resistance; leaves token wire size manageable.
+  const jtiBytes = new Uint8Array(12);
+  crypto.getRandomValues(jtiBytes);
+  const jti = Array.from(jtiBytes)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+  const expiresAtMs = Date.now() + ttlMs;
+  const token = await new SignJWT({
+    scope: VFS_SHARE_SCOPE,
+    userId: payload.userId,
+    fileIds: [...payload.fileIds],
+    albumName: payload.albumName,
+    jti,
+  })
+    .setProtectedHeader({ alg: "HS256" })
+    .setIssuedAt()
+    .setExpirationTime(Math.floor(expiresAtMs / 1000))
+    .sign(secret);
+  return { token, expiresAtMs, jti };
+}
+
+/**
+ * Verify a share token. Returns parsed payload or null on any
+ * failure (bad signature, expired, missing claims, wrong scope).
+ *
+ * Multi-secret aware: tokens minted under the OLD JWT_SECRET stay
+ * valid through a rotation window — see `OPERATIONS.md` §6.10.
+ *
+ * The `scope === "vfs-share"` check is the load-bearing guard;
+ * a `vfs` / `vfs-mp` / `vfs-dl` token replayed here is rejected.
+ */
+export async function verifyShareToken(
+  env: Env,
+  token: string
+): Promise<ShareTokenPayload | null> {
+  const result = await verifyAgainstSecrets(env, token);
+  if (result === null) return null;
+  try {
+    const { payload } = result;
+    if (payload.scope !== VFS_SHARE_SCOPE) return null;
+    if (typeof payload.userId !== "string" || payload.userId.length === 0)
+      return null;
+    if (!Array.isArray(payload.fileIds) || payload.fileIds.length === 0)
+      return null;
+    // Validate every fileId is a non-empty string. A token that
+    // smuggled a non-string into the array would otherwise pass
+    // through to the route and into appGetFile, where its behavior
+    // would be undefined. Reject early.
+    for (const fid of payload.fileIds) {
+      if (typeof fid !== "string" || fid.length === 0) return null;
+    }
+    if (typeof payload.albumName !== "string") return null;
+    if (typeof payload.jti !== "string" || payload.jti.length === 0)
+      return null;
+    const iat = typeof payload.iat === "number" ? payload.iat : 0;
+    const exp = typeof payload.exp === "number" ? payload.exp : 0;
+    return {
+      scope: VFS_SHARE_SCOPE,
+      userId: payload.userId,
+      fileIds: payload.fileIds as string[],
+      albumName: payload.albumName,
+      jti: payload.jti,
+      iat,
+      exp,
+    };
+  } catch {
+    return null;
+  }
+}

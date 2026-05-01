@@ -255,6 +255,105 @@ export class ShardDO extends DurableObject<Env> {
     );
   }
 
+  /**
+   * Atomic chunk-ref restoration (P1-1 fix).
+   *
+   * Pre-fix `restoreVersion` split a `chunksAlive` pre-flight + a
+   * `putChunk(empty)` per chunk into two RPCs. Between the two,
+   * a concurrent `dropVersions` of an unrelated version could
+   * decrement chunk_refs on a shared chunk to zero, soft-mark it,
+   * and let the alarm sweeper reap it during the grace window —
+   * leaving `restoreVersion`'s subsequent `putChunk(empty)` to
+   * either (a) hit the 0-byte cold-path defense and throw partway,
+   * leaking already-bumped chunk_refs under `newRefId`, or (b)
+   * succeed under a swept-then-resurrected chunk row (the
+   * resurrection-aware logic at writeChunkInternal:484-487 saves
+   * data correctness, but the partial-state cleanup is messy).
+   *
+   * `restoreChunkRef` collapses both steps into a single ShardDO
+   * RPC, atomic per DO turn (synchronous SQL only, no awaits):
+   *
+   *   1. Verify chunk row exists AND is alive (`deleted_at IS NULL`)
+   *      AND `ref_count >= 1`. If any condition fails, throw an
+   *      explicit ENOENT — the caller maps to a clean
+   *      `restoreVersion: source chunks swept` error.
+   *   2. INSERT OR IGNORE a fresh chunk_refs row keyed by
+   *      `(chunkHash, newRefId, chunkIndex)`. If the INSERT was
+   *      a no-op (already-exists; idempotent re-restore), do NOT
+   *      bump ref_count — same shape as writeChunkInternal's dedup
+   *      path uses `changes()` to gate the bump.
+   *   3. Bump `ref_count` only on actual INSERT.
+   *
+   * No await between steps 1, 2, 3 → atomic per DO turn → no
+   * concurrent `dropVersions` can sweep a chunk between our check
+   * and our ref bump. The audit C2 race (chunksAlive + putChunk
+   * split) is structurally impossible by construction here.
+   *
+   * Returns `{ status }` — `"restored"` on a fresh ref bump,
+   * `"already_referenced"` on idempotent re-restore.
+   *
+   * @lean-invariant Mossaic.Vfs.Refcount.restoreChunkRef_atomic
+   *   The chunk_invariant_preserved Lean theorem extends to this
+   *   operation: it bumps ref_count at most by 1, only when a new
+   *   chunk_refs row is inserted. The atomicity guarantee is per
+   *   DO turn, mirroring writeChunkInternal's dedup branch.
+   */
+  async restoreChunkRef(
+    chunkHash: string,
+    newRefId: string,
+    chunkIndex: number,
+    userId: string
+  ): Promise<{ status: "restored" | "already_referenced" }> {
+    this.ensureInit();
+    // Step 1 — verify chunk is alive. The composite condition
+    // mirrors `chunksAlive`: present, not soft-marked, ref_count
+    // ≥ 1. A swept chunk (deleted_at NOT NULL) is unsafe to
+    // restore against — even if the alarm hasn't reaped yet, a
+    // concurrent sweep within the same turn could.
+    const live = this.sql
+      .exec(
+        `SELECT 1 FROM chunks
+          WHERE hash = ? AND deleted_at IS NULL AND ref_count >= 1
+          LIMIT 1`,
+        chunkHash
+      )
+      .toArray();
+    if (live.length === 0) {
+      throw new Error(
+        `ENOENT: restoreChunkRef: chunk ${chunkHash} is not alive on this shard`
+      );
+    }
+
+    // Step 2 — idempotent INSERT. INSERT OR IGNORE sets `changes()`
+    // to 0 if the row already exists (re-restore of the same
+    // version_id), 1 on fresh insert.
+    this.sql.exec(
+      `INSERT OR IGNORE INTO chunk_refs (chunk_hash, file_id, chunk_index, user_id)
+       VALUES (?, ?, ?, ?)`,
+      chunkHash,
+      newRefId,
+      chunkIndex,
+      userId
+    );
+    const inserted =
+      (
+        this.sql.exec("SELECT changes() AS n").toArray()[0] as {
+          n: number;
+        }
+      ).n > 0;
+
+    // Step 3 — bump ref_count only on fresh insert. Mirrors
+    // writeChunkInternal's dedup branch.
+    if (inserted) {
+      this.sql.exec(
+        "UPDATE chunks SET ref_count = ref_count + 1 WHERE hash = ?",
+        chunkHash
+      );
+      return { status: "restored" };
+    }
+    return { status: "already_referenced" };
+  }
+
   // ── multipart staging-aware put ────────────────────────────
   //
   // Same semantics as `putChunk` PLUS:

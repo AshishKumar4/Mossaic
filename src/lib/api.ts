@@ -204,7 +204,32 @@ class ApiClient {
     return this.token ? { Authorization: `Bearer ${this.token}` } : {};
   }
 
-  // Shared albums (public — no auth)
+  // Shared albums
+
+  /**
+   * Mint a server-signed (HMAC-SHA256, JWT_SECRET-keyed) share
+   * token for the authenticated user. Pre-fix the SPA minted these
+   * client-side as `btoa(JSON.stringify({...}))` — UNSIGNED, anyone
+   * could forge them. Now the server is the only signer; the
+   * route is auth-gated so users can only share files they own.
+   *
+   * Returns `{ token, expiresAtMs, jti }`. The jti is reserved for
+   * future per-share revocation; the SPA can opt to retain it.
+   */
+  async mintShareToken(
+    fileIds: string[],
+    albumName: string
+  ): Promise<{ token: string; expiresAtMs: number; jti: string }> {
+    return this.request<{ token: string; expiresAtMs: number; jti: string }>(
+      "/auth/share-token",
+      {
+        method: "POST",
+        body: JSON.stringify({ fileIds, albumName }),
+      }
+    );
+  }
+
+  // Public — no auth on the read side; the HMAC-signed token IS the auth.
   async getSharedAlbumPhotos(
     token: string
   ): Promise<SharedAlbumPhotosResponse> {

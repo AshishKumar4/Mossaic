@@ -1,6 +1,12 @@
 import { Hono, type Context } from "hono";
 import type { EnvApp as Env } from "@shared/types";
-import { authMiddleware, signJWT, signVFSToken, VFSConfigError } from "@core/lib/auth";
+import {
+  authMiddleware,
+  signJWT,
+  signShareToken,
+  signVFSToken,
+  VFSConfigError,
+} from "@core/lib/auth";
 import { userStub, userStubByName } from "../lib/user-stub";
 
 const auth = new Hono<{
@@ -162,6 +168,73 @@ auth.post("/vfs-token", authMiddleware(), async (c) => {
     throw err;
   }
   return c.json({ token, expiresAtMs });
+});
+
+/**
+ * POST /api/auth/share-token
+ *
+ * Mint an HMAC-signed album-share token for the authenticated user.
+ * Body: `{ fileIds: string[], albumName: string }`. The userId is
+ * lifted from the verified session JWT — clients cannot share files
+ * they do not own.
+ *
+ * P0-1 fix: the SPA used to mint share tokens client-side as
+ * `btoa(JSON.stringify({...}))` which was unsigned and forgeable.
+ * The server now mints HMAC-signed JWTs so `/api/shared/:token/*`
+ * can verify the share is genuine.
+ *
+ * Returns the signed token + expiresAtMs so the SPA can render
+ * a TTL-aware UI.
+ */
+auth.post("/share-token", authMiddleware(), async (c) => {
+  const userId = c.get("userId");
+  let body: { fileIds?: unknown; albumName?: unknown };
+  try {
+    body = await c.req.json<{ fileIds: unknown; albumName: unknown }>();
+  } catch {
+    return c.json({ error: "Body must be JSON" }, 400);
+  }
+  const albumName =
+    typeof body.albumName === "string" ? body.albumName : "";
+  if (
+    !Array.isArray(body.fileIds) ||
+    body.fileIds.length === 0 ||
+    !body.fileIds.every((id) => typeof id === "string" && id.length > 0)
+  ) {
+    return c.json(
+      { error: "fileIds must be a non-empty array of strings" },
+      400
+    );
+  }
+  // Cap the fileIds list to keep the token bounded — share tokens
+  // are URL-embedded, and an unbounded list here would let a single
+  // mint produce a multi-MB URL. 1000 photos per album is generous;
+  // larger collections should split into multiple albums.
+  const MAX_SHARE_FILE_IDS = 1000;
+  if (body.fileIds.length > MAX_SHARE_FILE_IDS) {
+    return c.json(
+      {
+        error: `fileIds must be ≤ ${MAX_SHARE_FILE_IDS} entries (got ${body.fileIds.length})`,
+      },
+      400
+    );
+  }
+  try {
+    const { token, expiresAtMs, jti } = await signShareToken(c.env, {
+      userId,
+      fileIds: body.fileIds as string[],
+      albumName,
+    });
+    return c.json({ token, expiresAtMs, jti });
+  } catch (err) {
+    if (err instanceof VFSConfigError) {
+      return c.json({ error: err.message }, 503);
+    }
+    if (err instanceof Error) {
+      return c.json({ error: err.message }, 400);
+    }
+    throw err;
+  }
 });
 
 /**
