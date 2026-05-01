@@ -576,8 +576,8 @@ export async function openYDoc(
       // flush() runs (each Yjs update is emitted synchronously
       // by `doc.transact`), so the compaction sees them.
       //
-      // Encrypted files: route to `compactYjs` (Phase 52 P3 #8)
-      // because the server can't materialise an encrypted Y.Doc
+      // Encrypted files: route to `compactYjs` because the server
+      // can't materialise an encrypted Y.Doc
       // — the client has to build the checkpoint envelope locally
       // and submit it via the encrypted-compact RPC. We pass
       // `userVisible: true` so versioning-on tenants get a

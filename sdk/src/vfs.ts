@@ -557,10 +557,10 @@ export interface UserDOClient {
    * + the expected `next_seq` for CAS. Server appends the checkpoint
    * atomically and drops oplog rows below it.
    *
-   * Phase 52 P3 #8 — `opts.userVisible: true` emits a user-visible
-   * `file_versions` row when versioning is enabled for the tenant
-   * (mirroring the plain-yjs `vfsFlushYjs` semantics). The optional
-   * label gives the version a ≤128-char human label.
+   * `opts.userVisible: true` emits a user-visible `file_versions`
+   * row when versioning is enabled for the tenant (mirroring the
+   * plain-yjs `vfsFlushYjs` semantics). The optional label gives
+   * the version a ≤128-char human label.
    */
   vfsCompactEncryptedYjs(
     scope: VFSScope,
@@ -2095,8 +2095,8 @@ export class VFS implements VFSClient {
           "yj"
         );
 
-        // Step 5: submit with CAS. Forward Phase 52 P3 #8 opts so a
-        // user-visible flush emits a `file_versions` row on
+        // Step 5: submit with CAS. Forward userVisible/label opts
+        // so a user-visible flush emits a `file_versions` row on
         // versioning-on tenants — mirrors the plain-yjs
         // `vfsFlushYjs` semantics.
         const result = await this.user().vfsCompactEncryptedYjs(
