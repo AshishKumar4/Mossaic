@@ -609,14 +609,30 @@ export async function vfsAppendWriteStream(
 ): Promise<{ bytesWritten: number }> {
   const userId = userIdFor(scope);
   // Verify handle still refers to an uploading row owned by this user.
+  //
+  // Phase 32 Fix 2 — server-authoritative pool size. Pre-fix the
+  // chunk PUT below trusted `handle.poolSize` directly. Handles
+  // are returned to the SDK consumer at `vfsBeginWriteStream` and
+  // round-tripped on every `vfsAppendWriteStream` call; a
+  // malicious or buggy client could supply a tampered value
+  // (e.g. spoofed pool=64 to spread chunks onto un-allocated
+  // shards, or pool=1 to concentrate on a single shard). The tmp
+  // `files` row carries the server's snapshotted `pool_size` from
+  // the begin-time `vfsBeginWriteStream` call \u2014 read it from
+  // the row and use that, not the handle's claim.
   const row = durableObject.sql
     .exec(
-      `SELECT file_size, chunk_count, status FROM files WHERE file_id=? AND user_id=?`,
+      `SELECT file_size, chunk_count, status, pool_size FROM files WHERE file_id=? AND user_id=?`,
       handle.tmpId,
       userId
     )
     .toArray()[0] as
-    | { file_size: number; chunk_count: number; status: string }
+    | {
+        file_size: number;
+        chunk_count: number;
+        status: string;
+        pool_size: number;
+      }
     | undefined;
   if (!row) {
     throw new VFSError("ENOENT", "appendWriteStream: handle not found");
@@ -645,7 +661,8 @@ export async function vfsAppendWriteStream(
   }
 
   const hash = await hashChunk(data);
-  const sIdx = placeChunk(userIdFor(scope), handle.tmpId, chunkIndex, handle.poolSize);
+  // Phase 32 Fix 2 \u2014 use server-recorded pool_size, not handle.
+  const sIdx = placeChunk(userIdFor(scope), handle.tmpId, chunkIndex, row.pool_size);
   const env = durableObject.envPublic;
   const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
   const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, sIdx);
