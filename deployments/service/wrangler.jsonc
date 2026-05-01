@@ -1,5 +1,9 @@
 // Service-mode deployment.
 //
+// Default deploy target: **Seal staging** (account_id below). See
+// docs/deployment.md for the migration history away from the
+// personal account.
+//
 // Deploys ONLY the SDK-essential surface (UserDOCore + ShardDO +
 // the HTTP fallback at /api/vfs and a /api/health route) as a
 // standalone Worker. Pair this with consumer Workers that bind via
@@ -13,9 +17,8 @@
 //
 // Class names: this Worker exports `UserDOCore` (NOT `UserDO`). The
 // service-mode namespace is therefore distinct from the App-mode
-// namespace at mossaic.ashishkumarsingh.com — different
-// `class_name`s ⇒ different runtime DO namespaces ⇒ different
-// SQLite databases. Production photo-app data is untouched.
+// namespace — different `class_name`s ⇒ different runtime DO
+// namespaces ⇒ different SQLite databases.
 //
 // Required secrets (set via `wrangler secret put --config
 // deployments/service/wrangler.jsonc`, NEVER committed):
@@ -24,7 +27,7 @@
 {
   "name": "mossaic-core",
   "main": "../../worker/core/index.ts",
-  "account_id": "f44999d1ddda7012e9a87729eba250f1",
+  "account_id": "f42e5aacc251bd8ca6eadc04fb4ed13c",
   "compatibility_date": "2026-03-01",
   "compatibility_flags": ["nodejs_compat"],
 
