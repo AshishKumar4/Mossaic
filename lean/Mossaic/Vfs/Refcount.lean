@@ -874,4 +874,143 @@ theorem metadata_mutation_preserves_chunk_invariant
   refine ⟨hv, ?_⟩
   rfl
 
+-- ─── Phase 32 Fix C2: restoreChunkRef atomicity ────────────────────────
+--
+-- `restoreChunkRef` (shard-do.ts:301-356) is the rollback path for the
+-- versioning system: when a `commitVersion` swap fails partway, the
+-- recently-decremented chunk_refs need to be re-incremented. The
+-- structural shape is:
+--
+--   1. Verify chunk is alive (deleted_at IS NULL ∧ ref_count ≥ 1).
+--   2. INSERT OR IGNORE INTO chunk_refs (composite key).
+--   3. If changes() = 1 (fresh insert) bump ref_count by 1.
+--
+-- This is byte-equivalent to the hot path of `putChunk` when the
+-- target chunk already exists (the cold-path branch — coldInsert with
+-- size — never fires, because step 1 enforces the chunk is present).
+-- We model this as `restoreChunkRef`, prove it equals
+-- `step (Op.putChunk h size fid idx)` under the precondition, and
+-- inherit `validState` preservation from the master theorem.
+
+/-- The restoreChunkRef operation. Returns the new state plus a status
+flag mirroring the TS return value. -/
+inductive RestoreStatus where
+  | restored
+  | alreadyReferenced
+  deriving DecidableEq, Repr
+
+/-- Pure model of `restoreChunkRef`. Precondition (enforced by the TS
+caller via the `live.length === 0 → throw` gate at shard-do.ts:316):
+the chunk with hash `h` is present in `s.chunks` and has refCount ≥ 1
+and deletedAt = none. -/
+def restoreChunkRef (s : ShardState) (h : Hash) (fid : FileId) (idx : Nat) :
+    ShardState × RestoreStatus :=
+  let r : ChunkRef := ⟨h, fid, idx⟩
+  let refExists := s.refs.any (fun x => x.key = r.key)
+  if refExists then (s, .alreadyReferenced)
+  else (s.appendRef r |>.incrRef h, .restored)
+
+/-- Liveness precondition: a chunk is alive on the shard. Mirrors the
+SQL query at shard-do.ts:316-323. -/
+def chunkAlive (s : ShardState) (h : Hash) : Prop :=
+  ∃ c ∈ s.chunks, c.hash = h ∧ c.refCount ≥ 1 ∧ c.deletedAt = none
+
+/-- Decidable on concrete data. -/
+instance (s : ShardState) (h : Hash) : Decidable (chunkAlive s h) := by
+  unfold chunkAlive; exact inferInstance
+
+/--
+**(R1) restoreChunkRef preserves validState.** Direct: structurally
+restoreChunkRef is the no-op branch (when ref exists) or the same
+state transition as putChunk's hot-path (when ref doesn't exist and
+the chunk is present). We prove this by case analysis on
+`s.findChunk h`. The `none` case requires the liveness precondition
+to be vacuous — under chunkAlive, findChunk returns `some _`.
+-/
+theorem restoreChunkRef_preserves_validState
+    (s : ShardState) (h : Hash) (fid : FileId) (idx : Nat)
+    (h_alive : chunkAlive s h)
+    (hv : validState s) :
+    validState (restoreChunkRef s h fid idx).1 := by
+  -- Show restoreChunkRef = step s (Op.putChunk h 0 fid idx) by
+  -- proving findChunk h = some _.
+  have h_find : ∃ c, s.findChunk h = some c := by
+    obtain ⟨c, hc_mem, hc_hash, _, _⟩ := h_alive
+    unfold ShardState.findChunk
+    -- chunks.find? returns some when at least one element matches.
+    cases hf : s.chunks.find? (fun c => c.hash = h) with
+    | none =>
+      exfalso
+      have hno := List.find?_eq_none.mp hf c hc_mem
+      simp at hno
+      exact hno hc_hash
+    | some c' => exact ⟨c', rfl⟩
+  obtain ⟨c, hc⟩ := h_find
+  -- restoreChunkRef matches step's `.putChunk h 0 fid idx` exactly
+  -- on this branch.
+  have h_eq : (restoreChunkRef s h fid idx).1 = step s (.putChunk h 0 fid idx) := by
+    unfold restoreChunkRef step
+    by_cases h_exists : s.refs.any (fun x => x.key = (⟨h, fid, idx⟩ : ChunkRef).key)
+    · simp [h_exists, hc]
+    · simp [h_exists, hc]
+  rw [h_eq]
+  exact step_preserves_validState s _ hv
+
+/--
+**(R3) restoreChunkRef is atomic — refs and chunks update together.**
+On the `.restored` branch, the new ref is appended atomically with
+the chunk-side bump (no intermediate state where refs grew but
+chunks didn't, or vice versa). On the `.alreadyReferenced` branch,
+the state is bit-identical to `s`. This is the load-bearing claim
+of the @lean-invariant tag at shard-do.ts:295-299: the audit C2
+race (refs/chunks split across awaits) is structurally impossible.
+-/
+theorem restoreChunkRef_atomic
+    (s : ShardState) (h : Hash) (fid : FileId) (idx : Nat) :
+    let (s', status) := restoreChunkRef s h fid idx
+    (status = .alreadyReferenced ∧ s' = s) ∨
+    (status = .restored ∧
+      s'.refs = s.refs ++ [⟨h, fid, idx⟩] ∧
+      s'.chunks = (s.incrRef h).chunks) := by
+  unfold restoreChunkRef
+  by_cases h_exists : s.refs.any (fun x => x.key = (⟨h, fid, idx⟩ : ChunkRef).key)
+  · left
+    simp [h_exists]
+  · right
+    simp [h_exists]
+    refine ⟨?_, ?_⟩
+    · -- Goal: ((s.appendRef r).incrRef h).refs = s.refs ++ [r].
+      rw [incrRef_refs]
+      rfl
+    · -- Goal: ((s.appendRef r).incrRef h).chunks = (s.incrRef h).chunks.
+      -- appendRef preserves chunks, incrRef is a function of chunks
+      -- only.
+      unfold ShardState.incrRef ShardState.appendRef
+      rfl
+
+/--
+**(R4) restoreChunkRef bumps liveRefs by exactly 1 on .restored.**
+The numerical I1 invariant `refCount = liveRefs` is maintained
+because both sides increase by 1 in lockstep: liveRefs grows because
+a new chunk_refs row was inserted (refs ++= [r]); refCount grows
+because incrRef bumps the chunk row. The atomicity of this dual
+update is what (R3) formalises; (R4) extracts the numerical
+consequence.
+-/
+theorem restoreChunkRef_liveRefs_bump
+    (s : ShardState) (h : Hash) (fid : FileId) (idx : Nat) :
+    let (s', status) := restoreChunkRef s h fid idx
+    status = .restored →
+    liveRefs s' h = liveRefs s h + 1 := by
+  unfold restoreChunkRef
+  by_cases h_exists : s.refs.any (fun x => x.key = (⟨h, fid, idx⟩ : ChunkRef).key)
+  · simp [h_exists]
+  · simp [h_exists]
+    -- s' = (s.appendRef r).incrRef h. liveRefs is unaffected by
+    -- incrRef (refs unchanged). So liveRefs s' h = liveRefs (s.appendRef r) h.
+    -- And liveRefs_appendRef gives the +1 (since r.chunkHash = h).
+    rw [liveRefs_incrRef]
+    rw [liveRefs_appendRef]
+    simp
+
 end Mossaic.Vfs.Refcount
