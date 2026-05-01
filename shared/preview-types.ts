@@ -119,3 +119,66 @@ export const STANDARD_VARIANT_DIMS: Record<
   medium: { width: 768, height: 768, fit: "contain" },
   lightbox: { width: 1920, height: 1920, fit: "contain" },
 };
+
+/**
+ * Phase 45 \u2014 result of `vfs.previewInfo(path, opts)` and
+ * `vfs.previewInfoMany(paths, opts)`. Carries the signed URL the
+ * browser can fetch directly + metadata an SPA needs to render
+ * the IMG element (mimeType, width, height) and to perform
+ * conditional revalidation (etag).
+ *
+ *   - `token` HMAC-signed by the server. Browser embeds in URL.
+ *   - `url` full path component starting `/api/vfs/preview-variant/<token>`.
+ *     Caller prepends its origin.
+ *   - `etag` weak ETag wrapping the contentHash. Send via
+ *     `If-None-Match` for 304 revalidation.
+ *   - `mimeType`, `width`, `height` mirror `ReadPreviewResult`.
+ *   - `rendererKind` is the renderer that actually produced the
+ *     bytes (server-side dispatched).
+ *   - `versionId` is the head_version_id at mint time
+ *     (null on legacy / versioning-OFF tenants).
+ *   - `cacheControl` mirrors the route's response header so the
+ *     SPA can pre-set browser cache expectations.
+ *   - `contentHash` SHA-256 hex of the rendered bytes; the cache
+ *     key on the route side.
+ *   - `expiresAtMs` token expiry (ms epoch). The cached bytes
+ *     live for the year-long max-age regardless.
+ */
+export interface PreviewInfo {
+  token: string;
+  url: string;
+  etag: string;
+  mimeType: string;
+  width: number;
+  height: number;
+  rendererKind: string;
+  versionId: string | null;
+  cacheControl: string;
+  contentHash: string;
+  expiresAtMs: number;
+}
+
+/**
+ * Per-path result for `vfs.previewInfoMany`. Mirrors the batched
+ * manifest shape (`{ ok: true, ... } | { ok: false, code, message }`)
+ * so a single missing file in a 256-path batch surfaces as a
+ * per-entry failure rather than 4xx for the whole batch.
+ */
+export type PreviewInfoBatchEntry =
+  | { path: string; ok: true; info: PreviewInfo }
+  | { path: string; ok: false; code: string; message: string };
+
+/**
+ * Phase 45 \u2014 options for `vfs.previewUrl` / `vfs.previewInfo` /
+ * `vfs.previewInfoMany`. Same shape as `ReadPreviewOpts` plus a
+ * `ttlMs` knob for the signed token's lifetime.
+ *
+ * Default token TTL is 24 hours (`PREVIEW_TOKEN_DEFAULT_TTL_MS`
+ * on the server). Operators or callers needing long-lived
+ * embeds can pass up to 30 days; the server clamps to that
+ * maximum.
+ */
+export interface PreviewUrlOpts extends ReadPreviewOpts {
+  /** Token TTL in milliseconds. Server clamps to [60s, 30d]. */
+  ttlMs?: number;
+}
