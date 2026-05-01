@@ -4,7 +4,11 @@ import {
   VFSError,
   type VFSScope,
 } from "../../../../../shared/vfs-types";
-import { INLINE_LIMIT, WRITEFILE_MAX } from "../../../../../shared/inline";
+import {
+  INLINE_LIMIT,
+  INLINE_TIER_CAP,
+  WRITEFILE_MAX,
+} from "../../../../../shared/inline";
 import { hashChunk } from "../../../../../shared/crypto";
 import { computeChunkSpec } from "../../../../../shared/chunking";
 import { generateId, vfsShardDOName } from "../../../lib/utils";
@@ -85,6 +89,32 @@ export async function hardDeleteFileRow(
   scope: VFSScope,
   fileId: string
 ): Promise<void> {
+  // Phase 32 Fix 5 — inline-tier accounting.
+  //
+  // Read `(status, inline_data)` BEFORE the delete cascade so we
+  // can decrement `quota.inline_bytes_used` after the row goes
+  // away. Inline-tier graceful migration depends on this counter
+  // being accurate (the cap fires the moment a tenant crosses
+  // INLINE_TIER_CAP, and not before). Plain `storage_used` /
+  // `file_count` decrement is deferred to Phase 32.5 — pool growth
+  // is monotonic by design (Lean invariant), so the cosmetic
+  // inflation of `storage_used` doesn't impact scaling
+  // correctness. Inline-bytes accounting MUST be balanced because
+  // the inline tier cap is small (1 GiB) and the rounding error
+  // would dominate.
+  //
+  // The `status='uploading'` branch (tmp-row reaper sweeps;
+  // multipart-abort) was never accounted as a positive delta in
+  // `commitInlineTier`, so we do NOT decrement it.
+  const accountingRow = durableObject.sql
+    .exec(
+      "SELECT status, inline_data FROM files WHERE file_id = ?",
+      fileId
+    )
+    .toArray()[0] as
+    | { status: string; inline_data: ArrayBuffer | null }
+    | undefined;
+
   // Group by shard before deleting the chunk_index rows.
   const shardRows = durableObject.sql
     .exec(
@@ -111,6 +141,26 @@ export async function hardDeleteFileRow(
   // path); the versioning path uses dropVersions for its own GC.
   durableObject.sql.exec("DELETE FROM file_tags WHERE path_id = ?", fileId);
   durableObject.sql.exec("DELETE FROM files WHERE file_id = ?", fileId);
+
+  // Phase 32 Fix 5 — decrement inline-tier counter on inline-row
+  // deletes. Plain storage_used / file_count are NOT decremented
+  // here (Phase 32.5 follow-up); they're cosmetic and unrelated
+  // to the inline-tier cap. The `status='complete'` gate prevents
+  // double-counting: tmp/uploading rows were never positive-
+  // counted by `commitInlineTier`.
+  if (
+    accountingRow &&
+    accountingRow.status === "complete" &&
+    accountingRow.inline_data
+  ) {
+    recordWriteUsage(
+      durableObject,
+      userId,
+      0,
+      0,
+      -accountingRow.inline_data.byteLength
+    );
+  }
 
   // Then dispatch one deleteChunks RPC per touched shard.
   const env = durableObject.envPublic;
@@ -270,31 +320,77 @@ async function vfsWriteFileVersioned(
 
   // 2a. Inline tier — no shards, no chunk_refs. Just insert the
   //     file_versions row and flip the head pointer.
+  //
+  // Phase 32 Fix 5 — same graceful-migration cap as the
+  // non-versioned path. Versioned tenants doing many tiny writes
+  // accumulate `file_versions.inline_data` BLOBs on the UserDO
+  // and hit the same SQLite ceiling. The cap also applies here.
   if (data.byteLength <= INLINE_LIMIT) {
-    commitVersion(durableObject, {
-      pathId,
-      versionId,
-      userId,
-      size: data.byteLength,
-      mode,
-      mtimeMs: now,
-      chunkSize: 0,
-      chunkCount: 0,
-      fileHash: "",
-      mimeType,
-      inlineData: data,
-      userVisible: meta.versionUserVisible ?? true,
-      label: meta.versionLabel,
-      metadata: metadataForVersion,
-      encryption: meta.encryption,
-    });
-    if (meta.tags !== undefined) {
-      replaceTags(durableObject, userId, pathId, meta.tags);
-    } else {
-      // Bump tag mtimes so list-by-tag reflects this write's recency.
-      bumpTagMtimes(durableObject, pathId, now);
+    const inlineUsed = (
+      durableObject.sql
+        .exec(
+          "SELECT COALESCE(inline_bytes_used, 0) AS used FROM quota WHERE user_id = ?",
+          userId
+        )
+        .toArray()[0] as { used: number } | undefined
+    )?.used ?? 0;
+    if (inlineUsed + data.byteLength <= INLINE_TIER_CAP) {
+      commitVersion(durableObject, {
+        pathId,
+        versionId,
+        userId,
+        size: data.byteLength,
+        mode,
+        mtimeMs: now,
+        chunkSize: 0,
+        chunkCount: 0,
+        fileHash: "",
+        mimeType,
+        inlineData: data,
+        userVisible: meta.versionUserVisible ?? true,
+        label: meta.versionLabel,
+        metadata: metadataForVersion,
+        encryption: meta.encryption,
+      });
+      // Bump the inline counter for this versioned write — the
+      // standard write-commit path's `commitInlineTier` does the
+      // same via `recordWriteUsage(..., data.byteLength)`. Here
+      // we tick it directly because the versioned commit doesn't
+      // route through `recordWriteUsage` for byte accounting (it
+      // uses `commitVersion` for the row, see Phase 27 design).
+      // Sub-quota cosmetic for this phase; full versioned-bytes
+      // accounting is Phase 32.5.
+      durableObject.sql.exec(
+        `UPDATE quota
+            SET inline_bytes_used = COALESCE(inline_bytes_used, 0) + ?
+          WHERE user_id = ?`,
+        data.byteLength,
+        userId
+      );
+      if (meta.tags !== undefined) {
+        replaceTags(durableObject, userId, pathId, meta.tags);
+      } else {
+        // Bump tag mtimes so list-by-tag reflects this write's recency.
+        bumpTagMtimes(durableObject, pathId, now);
+      }
+      return;
     }
-    return;
+    // Spill to chunked tier; same first-crossing warning shape.
+    if (inlineUsed < INLINE_TIER_CAP) {
+      console.warn(
+        JSON.stringify({
+          event: "inline_tier_cap_first_crossing",
+          tenant: scope.tenant,
+          ns: scope.ns,
+          sub: scope.sub,
+          versioned: true,
+          inlineBytesUsed: inlineUsed,
+          capBytes: INLINE_TIER_CAP,
+          incomingByteLength: data.byteLength,
+        })
+      );
+    }
+    // fall through to chunked-tier branch below
   }
 
   // 2b. Chunked tier — push chunks under the synthetic
@@ -600,7 +696,17 @@ async function commitInlineTier(
   // boundary. Inline tier is always small (≤16 KB) so growth here is
   // accounting-only — but it MUST run because the tenant's first
   // write might be inline + push file_count from 0 → 1.
-  recordWriteUsage(durableObject, plan.userId, data.byteLength, 1);
+  //
+  // Phase 32 Fix 5 — also bump `quota.inline_bytes_used` so the
+  // inline-tier cap can fire on subsequent writes. The chunked
+  // tier passes 0 for this delta (default).
+  recordWriteUsage(
+    durableObject,
+    plan.userId,
+    data.byteLength,
+    1,
+    data.byteLength
+  );
 }
 
 /**
@@ -802,8 +908,43 @@ export async function vfsWriteFile(
   // Tier dispatch. The inline tier embeds bytes in `files.inline_data`
   // (≤ INLINE_LIMIT); the chunked tier fans out to ShardDOs via
   // bounded-concurrency PUTs.
+  //
+  // Phase 32 Fix 5 — graceful migration. A tenant approaching the
+  // INLINE_TIER_CAP (1 GiB cumulative inline bytes) spills NEW
+  // tiny writes to the chunked tier instead of further loading
+  // the UserDO's SQLite. Pre-existing inline rows are read
+  // identically by `vfsReadFile` (it checks `inline_data IS NOT
+  // NULL` first); the cap is a write-side gate, not a read-side
+  // migration. `quota.inline_bytes_used` is maintained by
+  // `recordWriteUsage`'s `deltaInlineBytes` parameter; cold
+  // tenants (`COALESCE(NULL, 0)`) start at 0 and inline freely.
   if (data.byteLength <= INLINE_LIMIT) {
-    return commitInlineTier(durableObject, scope, plan, data);
+    const inlineUsed = (
+      durableObject.sql
+        .exec(
+          "SELECT COALESCE(inline_bytes_used, 0) AS used FROM quota WHERE user_id = ?",
+          plan.userId
+        )
+        .toArray()[0] as { used: number } | undefined
+    )?.used ?? 0;
+    if (inlineUsed + data.byteLength <= INLINE_TIER_CAP) {
+      return commitInlineTier(durableObject, scope, plan, data);
+    }
+    // Spill to chunked tier; the per-write structured warning lets
+    // operators see when a tenant first crosses the cap.
+    if (inlineUsed < INLINE_TIER_CAP) {
+      console.warn(
+        JSON.stringify({
+          event: "inline_tier_cap_first_crossing",
+          tenant: scope.tenant,
+          ns: scope.ns,
+          sub: scope.sub,
+          inlineBytesUsed: inlineUsed,
+          capBytes: INLINE_TIER_CAP,
+          incomingByteLength: data.byteLength,
+        })
+      );
+    }
   }
   return commitChunkedTier(durableObject, scope, plan, data);
 }

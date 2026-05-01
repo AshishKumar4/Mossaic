@@ -388,7 +388,17 @@ export function recordWriteUsage(
   durableObject: UserDO,
   userId: string,
   deltaBytes: number,
-  deltaFiles: number
+  deltaFiles: number,
+  /**
+   * Phase 32 Fix 5 — inline-tier byte accounting. Positive on
+   * inline-tier writes, negative on inline-tier deletes. Defaults
+   * to 0 so legacy callers (every site outside `commitInlineTier`
+   * and `hardDeleteFileRow` for inline rows) keep their existing
+   * behaviour. Used to gate the inline tier at `INLINE_TIER_CAP`
+   * (1 GiB) per tenant — beyond which `vfsWriteFile` falls
+   * through to the chunked tier even for ≤ INLINE_LIMIT inputs.
+   */
+  deltaInlineBytes: number = 0
 ): void {
   // Ensure a quota row exists. The schema is created at ensureInit
   // (`user-do-core.ts:172-179`) but a brand-new tenant's first
@@ -398,10 +408,22 @@ export function recordWriteUsage(
      VALUES (?, 0, 107374182400, 0, 32)`,
     userId
   );
+  // Phase 32 — clamp at zero on negative deltas. Phase 32 Fix 5
+  // accepts negative `deltaInlineBytes` from
+  // `hardDeleteFileRow` for inline-row deletes; full
+  // `storage_used` decrement on every destructive path is
+  // deferred to Phase 32.5 (cosmetic; pool growth is monotonic
+  // by design so the inflation doesn't impact scaling). The
+  // clamp is defensive against any historical drift.
   durableObject.sql.exec(
-    `UPDATE quota SET storage_used = storage_used + ?, file_count = file_count + ? WHERE user_id = ?`,
+    `UPDATE quota
+        SET storage_used = MAX(0, storage_used + ?),
+            file_count = MAX(0, file_count + ?),
+            inline_bytes_used = MAX(0, COALESCE(inline_bytes_used, 0) + ?)
+      WHERE user_id = ?`,
     deltaBytes,
     deltaFiles,
+    deltaInlineBytes,
     userId
   );
   // Recompute pool size from the post-update total. We import lazily
@@ -415,6 +437,10 @@ export function recordWriteUsage(
   if (!row) return;
   // BASE_POOL=32, +1 per 5 GB stored. Inlined to avoid the
   // shared/placement import (the helper is on the hot write path).
+  // Pool size is monotonic — Lean invariant. Negative byte deltas
+  // do NOT shrink it; the `newPool > row.pool_size` guard below
+  // is the load-bearing check. (Shrinking would orphan chunks
+  // pinned to high shard indices via `file_chunks.shard_index`.)
   const BASE_POOL = 32;
   const BYTES_PER_SHARD = 5 * 1024 * 1024 * 1024;
   const newPool = BASE_POOL + Math.floor(Math.max(0, row.storage_used) / BYTES_PER_SHARD);
