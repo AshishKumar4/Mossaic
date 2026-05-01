@@ -34,6 +34,9 @@ import type {
   VFSStatRaw,
 } from "../../shared/vfs-types";
 import type {
+  PreviewInfo,
+  PreviewInfoBatchEntry,
+  PreviewUrlOpts,
   ReadPreviewOpts,
   ReadPreviewResult,
 } from "../../shared/preview-types";
@@ -177,6 +180,50 @@ export interface VFSClient {
     p: string,
     opts?: ReadPreviewOpts
   ): Promise<ReadPreviewResult>;
+
+  /**
+   * Phase 45 \u2014 mint a signed preview-variant URL.
+   *
+   * Returns a string suitable for embedding in an `<img src=...>`
+   * tag (or any other browser-direct fetch). The browser fetches
+   * the bytes WITHOUT going through this Worker's RPC surface;
+   * the URL hits Workers Cache + a CDN edge tier on subsequent
+   * loads.
+   *
+   * For multi-image grids prefer `previewInfoMany` (one RPC
+   * batch) so each grid item doesn't pay a per-mint network
+   * round trip.
+   *
+   * Encrypted files throw `ENOTSUP`. Tombstoned heads throw
+   * `ENOENT`.
+   */
+  previewUrl(p: string, opts?: PreviewUrlOpts): Promise<string>;
+
+  /**
+   * Phase 45 \u2014 mint a signed preview-variant URL + return all
+   * the metadata an SPA needs to render the IMG element
+   * (mimeType, width, height) and revalidate via ETag.
+   *
+   * Same auth + lifecycle as `previewUrl`; the additional metadata
+   * costs nothing (already computed during the mint).
+   */
+  previewInfo(p: string, opts?: PreviewUrlOpts): Promise<PreviewInfo>;
+
+  /**
+   * Phase 45 \u2014 batched preview-info mint. One RPC per N paths
+   * (max 256 per call). Per-path failures land as
+   * `{ ok: false, code, message }` entries; callers can render a
+   * placeholder for those without aborting the whole batch.
+   *
+   * Designed for thumbnail grids: a 50-photo gallery becomes one
+   * RPC + 50 direct browser fetches against the CDN-cached
+   * route, instead of 50 RPCs that each tunnel bytes through the
+   * Worker.
+   */
+  previewInfoMany(
+    paths: readonly string[],
+    opts?: PreviewUrlOpts
+  ): Promise<PreviewInfoBatchEntry[]>;
 
   // file-level versioning (only meaningful when the tenant
   // has versioning enabled; the binding client surfaces these methods
@@ -1486,6 +1533,44 @@ export class VFS implements VFSClient {
       return await this.user().vfsReadPreview(this.scope(), p, opts ?? {});
     } catch (err) {
       throw mapServerError(err, { path: p, syscall: "open" });
+    }
+  }
+
+  async previewUrl(p: string, opts?: PreviewUrlOpts): Promise<string> {
+    const info = await this.previewInfo(p, opts);
+    return info.url;
+  }
+
+  async previewInfo(
+    p: string,
+    opts?: PreviewUrlOpts
+  ): Promise<PreviewInfo> {
+    try {
+      return await this.user().vfsMintPreviewToken(
+        this.scope(),
+        p,
+        opts ?? {}
+      );
+    } catch (err) {
+      throw mapServerError(err, { path: p, syscall: "open" });
+    }
+  }
+
+  async previewInfoMany(
+    paths: readonly string[],
+    opts?: PreviewUrlOpts
+  ): Promise<PreviewInfoBatchEntry[]> {
+    try {
+      return await this.user().vfsPreviewInfoMany(
+        this.scope(),
+        paths as string[],
+        opts ?? {}
+      );
+    } catch (err) {
+      throw mapServerError(err, {
+        path: paths[0] ?? "",
+        syscall: "open",
+      });
     }
   }
 
