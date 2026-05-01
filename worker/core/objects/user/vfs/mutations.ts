@@ -767,17 +767,22 @@ export async function vfsRemoveRecursive(
     const fileIds = fileRows.map((r) => r.file_id);
     const placeholdersFiles = fileIds.map(() => "?").join(",");
 
-    // Per-file accounting (inline-bytes only \u2014 plain storage
-    // decrement is Phase 32.5).
+    // Per-file accounting \u2014 Phase 32.5 quota-desync correction.
+    // Read (status, file_size, inline_data) so a single negative
+    // recordWriteUsage call covers storage_used, file_count, AND
+    // inline_bytes_used. Pre-fix this branch only decremented
+    // inline bytes; storage_used / file_count drifted upward
+    // every rmrf invocation.
     const accountingRows = durableObject.sql
       .exec(
-        `SELECT file_id, status, inline_data FROM files
+        `SELECT file_id, status, file_size, inline_data FROM files
           WHERE file_id IN (${placeholdersFiles})`,
         ...fileIds
       )
       .toArray() as {
       file_id: string;
       status: string;
+      file_size: number;
       inline_data: ArrayBuffer | null;
     }[];
 
@@ -810,18 +815,37 @@ export async function vfsRemoveRecursive(
       ...fileIds
     );
 
-    // Phase 32 Fix 5 \u2014 decrement inline counter for inline-tier
-    // rows in the batch (full storage_used decrement deferred to
-    // 32.5).
+    // Phase 32.5 quota-desync correction \u2014 single negative
+    // recordWriteUsage covering storage_used, file_count, and
+    // inline_bytes_used for the entire batch. Gate is
+    // `status !== 'uploading'` (mirrors hardDeleteFileRow's
+    // BUG #1 fix): tmp / multipart-abort rows were never
+    // positive-counted, so they don't decrement. The rmrf
+    // SELECT at line 685 already filters `status != 'deleted'`,
+    // so accountingRows contains only `complete` and `uploading`
+    // \u2014 the gate effectively keeps complete-only here, but
+    // we use the same predicate as hardDeleteFileRow for
+    // consistency / future-proofing.
+    let bytesDelta = 0;
+    let filesDelta = 0;
     let inlineDelta = 0;
     for (const r of accountingRows) {
-      if (r.status === "complete" && r.inline_data) {
+      if (r.status === "uploading") continue;
+      bytesDelta -= r.file_size;
+      filesDelta -= 1;
+      if (r.inline_data) {
         inlineDelta -= r.inline_data.byteLength;
       }
     }
-    if (inlineDelta !== 0) {
+    if (bytesDelta !== 0 || filesDelta !== 0 || inlineDelta !== 0) {
       const { recordWriteUsage } = await import("./helpers");
-      recordWriteUsage(durableObject, userId, 0, 0, inlineDelta);
+      recordWriteUsage(
+        durableObject,
+        userId,
+        bytesDelta,
+        filesDelta,
+        inlineDelta
+      );
     }
 
     // Fan out: ONE deleteManyChunks per touched shard.

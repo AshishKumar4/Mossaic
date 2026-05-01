@@ -90,32 +90,39 @@ export async function hardDeleteFileRow(
   scope: VFSScope,
   fileId: string
 ): Promise<void> {
-  // Phase 32 Fix 5 — inline-tier accounting.
+  // Phase 32 Fix 5 + Phase 32.5 quota-desync correction \u2014
+  // full byte / file accounting on hard-delete.
   //
-  // Read `(status, inline_data)` BEFORE the delete cascade so we
-  // can decrement `quota.inline_bytes_used` after the row goes
-  // away. Inline-tier graceful migration depends on this counter
-  // being accurate (the cap fires the moment a tenant crosses
-  // INLINE_TIER_CAP, and not before). Plain `storage_used` /
-  // `file_count` decrement is deferred to Phase 32.6 — pool growth
-  // is monotonic by design (Lean invariant), so the cosmetic
-  // inflation of `storage_used` doesn't impact scaling
-  // correctness. Inline-bytes accounting MUST be balanced because
-  // the inline tier cap is small (1 GiB) and the rounding error
-  // would dominate (each overwrite cycle would inflate by file_size).
+  // Read `(status, file_size, inline_data)` BEFORE the delete
+  // cascade so we can issue ONE negative `recordWriteUsage` call
+  // covering all three counters: storage_used, file_count, and
+  // (for inline rows) inline_bytes_used.
+  //
+  // Pre-Phase-32 behaviour: deletes never decremented anything;
+  // `storage_used` / `file_count` monotonically inflated for any
+  // tenant that ever deleted. The Phase 23 Lean invariant
+  // `pool_size_monotonic` is preserved \u2014 negative storage_used
+  // deltas are clamped at 0 by `recordWriteUsage` (helpers.ts:421)
+  // and the pool-recompute is gated on `newPool > row.pool_size`
+  // so shrink is impossible. Cosmetic counters now reflect reality.
   //
   // The `status='uploading'` branch (tmp-row reaper sweeps;
   // multipart-abort) was never accounted as a positive delta in
-  // `commitInlineTier`, so we do NOT decrement it. The
-  // `'complete'` and `'deleted'` (post-supersede) statuses both
-  // decrement \u2014 see Phase 32.5 BUG #1 fix at the gate below.
+  // `commitInlineTier` / `commitChunkedTier` / multipart finalize,
+  // so we do NOT decrement it. The `'complete'` and `'deleted'`
+  // (post-supersede) statuses both decrement \u2014 see Phase 32.5
+  // BUG #1 fix at the gate below.
   const accountingRow = durableObject.sql
     .exec(
-      "SELECT status, inline_data FROM files WHERE file_id = ?",
+      "SELECT status, file_size, inline_data FROM files WHERE file_id = ?",
       fileId
     )
     .toArray()[0] as
-    | { status: string; inline_data: ArrayBuffer | null }
+    | {
+        status: string;
+        file_size: number;
+        inline_data: ArrayBuffer | null;
+      }
     | undefined;
 
   // Group by shard before deleting the chunk_index rows.
@@ -145,51 +152,48 @@ export async function hardDeleteFileRow(
   durableObject.sql.exec("DELETE FROM file_tags WHERE path_id = ?", fileId);
   durableObject.sql.exec("DELETE FROM files WHERE file_id = ?", fileId);
 
-  // Phase 32 Fix 5 — decrement inline-tier counter on inline-row
-  // deletes. Plain storage_used / file_count are NOT decremented
-  // here (Phase 32.6 follow-up); they're cosmetic and unrelated
-  // to the inline-tier cap.
+  // Phase 32.5 quota-desync + BUG #1 \u2014 single decrement call
+  // covering storage_used, file_count, and inline_bytes_used in
+  // one SQL UPDATE. recordWriteUsage clamps all three at zero
+  // (helpers.ts:421-425) so a partial pre-Phase-32.5 deficit
+  // (some tenants accumulated rmrf/unlink inflation before this
+  // landed) doesn't underflow.
   //
-  // Phase 32.5 BUG #1 fix — gate is `status !== 'uploading'`, NOT
-  // `status === 'complete'`. The two callers that drive the
-  // overwrite/rename flow (`commitRename` write-commit.ts:1112,
-  // `vfsRename` mutations.ts:498-499) flip status to `'deleted'`
+  // Phase 32.5 BUG #1 fix \u2014 gate is `status !== 'uploading'`,
+  // NOT `status === 'complete'`. The two callers that drive the
+  // overwrite/rename flow (`commitRename` write-commit.ts:~1145,
+  // `vfsRename` mutations.ts:~530) flip status to `'deleted'`
   // BEFORE invoking hardDeleteFileRow on the displaced row. Under
   // the previous `status === 'complete'` gate the inline-bytes
-  // decrement was skipped on every overwrite — `inline_bytes_used`
+  // decrement was skipped on every overwrite \u2014 `inline_bytes_used`
   // monotonically inflated by `file_size` per overwrite cycle, so
   // INLINE_TIER_CAP fired earlier than 1 GiB.
   //
   // What the gate must exclude is the `'uploading'` status \u2014 tmp
   // rows reaped by the stale-upload sweeper / multipart-abort were
-  // never positive-counted by `commitInlineTier` (chunked writes
-  // always start as `'uploading'` and the inline tier never enters
-  // an `'uploading'` state for the file_id it commits). The
-  // post-supersede `'deleted'` and the post-commit `'complete'`
-  // statuses are both legitimately positive-counted, so both
-  // decrement.
+  // never positive-counted by `commitInlineTier` /
+  // `commitChunkedTier` / `vfsFinalizeMultipart` (each of those
+  // calls `recordWriteUsage(..., +file_size, +1)` AFTER the
+  // status flip to `'complete'`). The post-supersede `'deleted'`
+  // and the post-commit `'complete'` statuses are both
+  // legitimately positive-counted, so both decrement.
   //
   // Symmetry guarantee: every code path that flows positive bytes
-  // into `inline_bytes_used` via `commitInlineTier` (write-commit.ts:704)
-  // OR via the direct UPDATE in `vfsWriteFileVersioned` inline branch
-  // (write-commit.ts:364-370) writes `inline_data IS NOT NULL` AND
-  // commits the row to `'complete'` first. From that point the only
-  // way the row can disappear is through hardDeleteFileRow (this
-  // function) \u2014 either directly (rmrf, unlink) or via a supersede
-  // (commitRename, vfsRename) that flips `'complete' \u2192 'deleted'`
-  // immediately before the call. Both pre-flip statuses now
-  // decrement.
-  if (
-    accountingRow &&
-    accountingRow.status !== "uploading" &&
-    accountingRow.inline_data
-  ) {
+  // into the quota counters writes `'complete'` first; the only
+  // way a row disappears is through hardDeleteFileRow (this
+  // function), `dropVersionRows` (vfs-versions.ts), or rmrf-batch
+  // (mutations.ts non-versioning branch). All three now
+  // decrement symmetrically.
+  if (accountingRow && accountingRow.status !== "uploading") {
+    const inlineDelta = accountingRow.inline_data
+      ? -accountingRow.inline_data.byteLength
+      : 0;
     recordWriteUsage(
       durableObject,
       userId,
-      0,
-      0,
-      -accountingRow.inline_data.byteLength
+      -accountingRow.file_size,
+      -1,
+      inlineDelta
     );
   }
 
