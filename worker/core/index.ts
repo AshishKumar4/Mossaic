@@ -32,6 +32,7 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import type { EnvCore as Env } from "../../shared/types";
+import { requestIdMiddleware } from "./lib/logger";
 import vfsRoutes from "./routes/vfs";
 import vfsPreviewRoutes from "./routes/vfs-preview";
 import yjsWsRoutes from "./routes/vfs-yjs-ws";
@@ -41,6 +42,9 @@ export { UserDOCore } from "./objects/user/index";
 export { ShardDO } from "./objects/shard/index";
 
 const app = new Hono<{ Bindings: Env }>();
+
+// Phase 42 \u2014 assign a request-id before any other middleware runs.
+app.use("/api/*", requestIdMiddleware());
 
 app.use(
   "/api/*",

@@ -4,6 +4,7 @@ import { VFSError, type VFSScope } from "../../../../shared/vfs-types";
 import { generateId, vfsShardDOName } from "../../lib/utils";
 import { placeChunk } from "../../../../shared/placement";
 import { recordWriteUsage, userIdFor } from "./vfs/helpers";
+import { insertAuditLog } from "./vfs/audit-log";
 import { resolvePath } from "./path-walk";
 
 /**
@@ -980,6 +981,16 @@ export async function dropVersions(
     pathId,
     drop
   );
+  insertAuditLog(durableObject, {
+    op: "dropVersions",
+    actor: userId,
+    target: pathId,
+    payload: JSON.stringify({
+      dropped: reaped,
+      kept: all.length - reaped,
+      policy,
+    }),
+  });
   return { dropped: reaped, kept: all.length - reaped };
 }
 
@@ -1032,6 +1043,16 @@ export async function restoreVersion(
       inlineData: new Uint8Array(src.inlineData),
       // restore preserves the source version's encryption mode.
       encryption: src.encryption,
+    });
+    insertAuditLog(durableObject, {
+      op: "restoreVersion",
+      actor: userId,
+      target: pathId,
+      payload: JSON.stringify({
+        sourceVersionId,
+        newVersionId,
+        tier: "inline",
+      }),
     });
     return { versionId: newVersionId };
   }
@@ -1171,6 +1192,16 @@ export async function restoreVersion(
     inlineData: null,
     // restore preserves the source version's encryption mode.
     encryption: src.encryption,
+  });
+  insertAuditLog(durableObject, {
+    op: "restoreVersion",
+    actor: userId,
+    target: pathId,
+    payload: JSON.stringify({
+      sourceVersionId,
+      newVersionId,
+      tier: "chunked",
+    }),
   });
   return { versionId: newVersionId };
 }

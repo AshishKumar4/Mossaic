@@ -16,6 +16,7 @@ import {
   resolveParent,
   userIdFor,
 } from "./helpers";
+import { insertAuditLog } from "./audit-log";
 import { isYjsMode } from "./metadata";
 import { hardDeleteFileRow } from "./write-commit";
 
@@ -96,6 +97,12 @@ export async function vfsUnlink(
       inlineData: null,
       deleted: true,
     });
+    insertAuditLog(durableObject, {
+      op: "unlink",
+      actor: userId,
+      target: r.leafId,
+      payload: JSON.stringify({ path, versioning: true, tombId, kind: r.kind }),
+    });
     return;
   }
 
@@ -111,6 +118,12 @@ export async function vfsUnlink(
   }
 
   await hardDeleteFileRow(durableObject, userId, scope, r.leafId);
+  insertAuditLog(durableObject, {
+    op: "unlink",
+    actor: userId,
+    target: r.leafId,
+    payload: JSON.stringify({ path, versioning: false, kind: r.kind }),
+  });
 }
 
 /**
@@ -194,6 +207,16 @@ export async function vfsPurge(
   // dropVersionRows). hardDeleteFileRow is itself idempotent w.r.t.
   // an already-deleted row.
   await hardDeleteFileRow(durableObject, userId, scope, fileId);
+  insertAuditLog(durableObject, {
+    op: "purge",
+    actor: userId,
+    target: fileId,
+    payload: JSON.stringify({
+      path,
+      versionsReaped: versionRows.length,
+      kind: r.kind,
+    }),
+  });
 }
 
 // ── mkdir / rmdir ──────────────────────────────────────────────────────
@@ -432,6 +455,12 @@ export async function vfsRename(
       srcR.leafId,
       userId
     );
+    insertAuditLog(durableObject, {
+      op: "rename",
+      actor: userId,
+      target: srcR.leafId,
+      payload: JSON.stringify({ src, dst, kind: "dir" }),
+    });
     return;
   }
 
@@ -489,6 +518,18 @@ export async function vfsRename(
         srcR.leafId,
         userId
       );
+      insertAuditLog(durableObject, {
+        op: "rename",
+        actor: userId,
+        target: srcR.leafId,
+        payload: JSON.stringify({
+          src,
+          dst,
+          replacedFileId: dstFile.file_id,
+          replacedTombId: tombId,
+          versioning: true,
+        }),
+      });
       return;
     }
 
@@ -536,6 +577,17 @@ export async function vfsRename(
     }
     // Hard-delete the displaced file's contents.
     await hardDeleteFileRow(durableObject, userId, scope, dstFile.file_id);
+    insertAuditLog(durableObject, {
+      op: "rename",
+      actor: userId,
+      target: srcR.leafId,
+      payload: JSON.stringify({
+        src,
+        dst,
+        replacedFileId: dstFile.file_id,
+        versioning: false,
+      }),
+    });
     return;
   }
   // dst is empty: simple UPDATE.
@@ -548,6 +600,12 @@ export async function vfsRename(
     srcR.leafId,
     userId
   );
+  insertAuditLog(durableObject, {
+    op: "rename",
+    actor: userId,
+    target: srcR.leafId,
+    payload: JSON.stringify({ src, dst }),
+  });
 }
 
 // ── symlink ────────────────────────────────────────────────────────────
@@ -864,6 +922,17 @@ export async function vfsRemoveRecursive(
 
   // If the batch was full, we have more work — caller should loop.
   if (fileRows.length >= BATCH_LIMIT) {
+    insertAuditLog(durableObject, {
+      op: "removeRecursive",
+      actor: userId,
+      target: rootR.leafId,
+      payload: JSON.stringify({
+        path,
+        filesProcessed: fileRows.length,
+        versioning,
+        done: false,
+      }),
+    });
     return { done: false, cursor: "" };
   }
 
@@ -876,5 +945,17 @@ export async function vfsRemoveRecursive(
       userId
     );
   }
+  insertAuditLog(durableObject, {
+    op: "removeRecursive",
+    actor: userId,
+    target: rootR.leafId,
+    payload: JSON.stringify({
+      path,
+      filesProcessed: fileRows.length,
+      foldersReaped: allFolders.length,
+      versioning,
+      done: true,
+    }),
+  });
   return { done: true };
 }

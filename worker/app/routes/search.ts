@@ -3,6 +3,7 @@ import type { EnvApp as Env } from "@shared/types";
 import type { SearchResult, ProviderStatus, VectorSpace } from "@shared/embedding-types";
 import { classifyResultType, isClipIndexable, isImageMime } from "@shared/embedding-types";
 import { authMiddleware } from "@core/lib/auth";
+import { ctxFromHono, logError, logWarn } from "@core/lib/logger";
 import { createVFS } from "@mossaic/sdk";
 import { userStub } from "../lib/user-stub";
 import {
@@ -62,7 +63,12 @@ search.post("/", async (c) => {
         });
       }
     } catch (err) {
-      console.error("CLIP search failed:", err);
+      logError(
+        "CLIP search failed",
+        ctxFromHono(c),
+        err,
+        { event: "search_clip_failed", query }
+      );
       // Continue — text search may still work
     }
   }
@@ -88,7 +94,12 @@ search.post("/", async (c) => {
       });
     }
   } catch (err) {
-    console.error("Text search failed:", err);
+    logError(
+      "Text search failed",
+      ctxFromHono(c),
+      err,
+      { event: "search_text_failed", query }
+    );
   }
 
   // ── Merge and deduplicate ──
@@ -286,7 +297,16 @@ search.post("/reindex", async (c) => {
         );
         clipIndexed++;
       } catch (err) {
-        console.error(`CLIP indexing failed for ${file.file_name}:`, err);
+        logError(
+          "CLIP indexing failed",
+          ctxFromHono(c),
+          err,
+          {
+            event: "search_clip_index_failed",
+            fileName: file.file_name,
+            fileId: file.file_id,
+          }
+        );
       }
     }
   }
@@ -351,7 +371,16 @@ async function fetchFileBytes(
     const vfs = createVFS(env, { tenant: userId });
     return await vfs.readFile(resolved.path);
   } catch (err) {
-    console.error("Failed to fetch file bytes:", err);
+    // No Hono context here \u2014 this helper is called from indexFile
+    // which itself is invoked from a route. We log without
+    // requestId; callers concerned about correlation should log
+    // around the helper.
+    logError(
+      "fetchFileBytes failed",
+      { tenantId: `default::${userId}` },
+      err,
+      { event: "search_fetch_bytes_failed", fileId }
+    );
     return null;
   }
 }
@@ -469,7 +498,12 @@ export async function indexFile(
       "text"
     );
   } catch (err) {
-    console.error("Text indexing failed:", err);
+    logError(
+      "text indexing failed",
+      { tenantId: `default::${userId}` },
+      err,
+      { event: "search_text_index_failed", fileId, fileName }
+    );
   }
 
   // ── CLIP space: index if image and within limits ──
@@ -499,7 +533,12 @@ export async function indexFile(
         }
       }
     } catch (err) {
-      console.error("CLIP indexing failed:", err);
+      logError(
+        "CLIP indexing failed",
+        { tenantId: `default::${userId}` },
+        err,
+        { event: "search_clip_index_failed", fileId, fileName }
+      );
     }
   }
 
@@ -513,7 +552,12 @@ export async function indexFile(
   try {
     await userStub(env, userId).appMarkFileIndexed(fileId);
   } catch (err) {
-    console.error("appMarkFileIndexed failed:", err);
+    logError(
+      "appMarkFileIndexed failed",
+      { tenantId: `default::${userId}` },
+      err,
+      { event: "search_mark_indexed_failed", fileId }
+    );
   }
 }
 
@@ -563,27 +607,41 @@ export async function reconcileUnindexedFiles(
           row.file_id
         );
         if (capJustHit) {
-          console.error(
-            `[mossaic:P1-8] reconcileUnindexedFiles: ${row.file_id} hit attempt cap (${attempts}); excluding from future ticks. Last error: ${
-              err instanceof Error ? err.message : String(err)
-            }`
+          logError(
+            "reconcileUnindexedFiles: file hit attempt cap",
+            { tenantId: `default::${userId}` },
+            err,
+            {
+              event: "search_reconcile_attempts_capped",
+              fileId: row.file_id,
+              attempts,
+              cap: 5,
+            }
           );
         } else {
-          console.warn(
-            `reconcileUnindexedFiles: ${row.file_id} failed (attempt ${attempts}/5): ${
-              err instanceof Error ? err.message : String(err)
-            }`
+          logWarn(
+            "reconcileUnindexedFiles: file failed",
+            { tenantId: `default::${userId}` },
+            {
+              event: "search_reconcile_attempt_failed",
+              fileId: row.file_id,
+              attempts,
+              cap: 5,
+              errMsg: err instanceof Error ? err.message : String(err),
+            }
           );
         }
       } catch (bumpErr) {
-        // Bumping the counter failed — fall back to the original
-        // bounded log so the operator sees the issue.
-        console.warn(
-          `reconcileUnindexedFiles: ${row.file_id} failed: ${
-            err instanceof Error ? err.message : String(err)
-          } (additionally, appBumpIndexAttempts threw: ${
-            bumpErr instanceof Error ? bumpErr.message : String(bumpErr)
-          })`
+        logWarn(
+          "reconcileUnindexedFiles: bumpAttempts threw",
+          { tenantId: `default::${userId}` },
+          {
+            event: "search_reconcile_bump_failed",
+            fileId: row.file_id,
+            errMsg: err instanceof Error ? err.message : String(err),
+            bumpErrMsg:
+              bumpErr instanceof Error ? bumpErr.message : String(bumpErr),
+          }
         );
       }
     }

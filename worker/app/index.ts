@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import type { EnvApp as Env } from "@shared/types";
+import { requestIdMiddleware } from "@core/lib/logger";
 import authRoutes from "./routes/auth";
 import filesRoutes from "./routes/files";
 import indexRoutes from "./routes/index";
@@ -30,6 +31,12 @@ export { ShardDO } from "@core/objects/shard/index";
 export { SearchDO } from "./objects/search/index";
 
 const app = new Hono<{ Bindings: Env }>();
+
+// Phase 42 \u2014 assign a request-id to every incoming request before
+// any other middleware runs. Mirrors `X-Mossaic-Request-Id` onto
+// the response so clients can correlate. Cheap (1 randomUUID per
+// request); see worker/core/lib/logger.ts.
+app.use("/api/*", requestIdMiddleware());
 
 // CORS for development
 app.use(

@@ -12,6 +12,7 @@ import {
 import { hashChunk } from "../../../../../shared/crypto";
 import { computeChunkSpec } from "../../../../../shared/chunking";
 import { generateId, vfsShardDOName } from "../../../lib/utils";
+import { logWarn } from "../../../lib/logger";
 import { placeChunk, POOL_FULL } from "../../../../../shared/placement";
 import { loadFullShards } from "../shard-capacity";
 import {
@@ -402,17 +403,19 @@ async function vfsWriteFileVersioned(
     }
     // Spill to chunked tier; same first-crossing warning shape.
     if (inlineUsed < INLINE_TIER_CAP) {
-      console.warn(
-        JSON.stringify({
+      const tenantId = scope.sub
+        ? `${scope.ns}::${scope.tenant}::${scope.sub}`
+        : `${scope.ns}::${scope.tenant}`;
+      logWarn(
+        "inline tier cap first crossing (versioned)",
+        { tenantId },
+        {
           event: "inline_tier_cap_first_crossing",
-          tenant: scope.tenant,
-          ns: scope.ns,
-          sub: scope.sub,
           versioned: true,
           inlineBytesUsed: inlineUsed,
           capBytes: INLINE_TIER_CAP,
           incomingByteLength: data.byteLength,
-        })
+        }
       );
     }
     // fall through to chunked-tier branch below
@@ -791,15 +794,17 @@ async function commitChunkedTier(
     // Re-read \u2014 the new shard is not in the cache so it's
     // implicitly non-full.
     fullShards = loadFullShards(durableObject);
-    console.warn(
-      JSON.stringify({
+    const tenantId = scope.sub
+      ? `${scope.ns}::${scope.tenant}::${scope.sub}`
+      : `${scope.ns}::${scope.tenant}`;
+    logWarn(
+      "pool growth forced by full shards",
+      { tenantId },
+      {
         event: "pool_growth_forced_by_full_shards",
-        tenant: scope.tenant,
-        ns: scope.ns,
-        sub: scope.sub,
         newPoolSize: poolSize,
         fullShardCount: fullShards.size,
-      })
+      }
     );
   }
 
@@ -1011,16 +1016,18 @@ export async function vfsWriteFile(
     // Spill to chunked tier; the per-write structured warning lets
     // operators see when a tenant first crosses the cap.
     if (inlineUsed < INLINE_TIER_CAP) {
-      console.warn(
-        JSON.stringify({
+      const tenantId = scope.sub
+        ? `${scope.ns}::${scope.tenant}::${scope.sub}`
+        : `${scope.ns}::${scope.tenant}`;
+      logWarn(
+        "inline tier cap first crossing",
+        { tenantId },
+        {
           event: "inline_tier_cap_first_crossing",
-          tenant: scope.tenant,
-          ns: scope.ns,
-          sub: scope.sub,
           inlineBytesUsed: inlineUsed,
           capBytes: INLINE_TIER_CAP,
           incomingByteLength: data.byteLength,
-        })
+        }
       );
     }
   }

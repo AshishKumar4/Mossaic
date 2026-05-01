@@ -1,5 +1,6 @@
 import type { UserDOCore as UserDO } from "../user-do-core";
 import { VFSError, type VFSScope } from "../../../../../shared/vfs-types";
+import { insertAuditLog } from "./audit-log";
 import { resolveOrThrow, userIdFor } from "./helpers";
 
 /**
@@ -120,6 +121,12 @@ export function vfsArchive(
     r.leafId,
     userId
   );
+  insertAuditLog(durableObject, {
+    op: "archive",
+    actor: userId,
+    target: r.leafId,
+    payload: JSON.stringify({ path, kind: r.kind }),
+  });
 }
 
 /**
@@ -150,4 +157,10 @@ export function vfsUnarchive(
     r.leafId,
     userId
   );
+  insertAuditLog(durableObject, {
+    op: "unarchive",
+    actor: userId,
+    target: r.leafId,
+    payload: JSON.stringify({ path, kind: r.kind }),
+  });
 }
