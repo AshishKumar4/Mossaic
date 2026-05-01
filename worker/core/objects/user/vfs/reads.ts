@@ -1,4 +1,5 @@
 import type { UserDOCore as UserDO } from "../user-do-core";
+import type { ShardDO } from "../../shard/shard-do";
 import {
   VFSError,
   type OpenManifestResult,
@@ -358,9 +359,9 @@ async function readFileVersioned(
   const env = durableObject.envPublic;
   const out = new Uint8Array(size);
 
-  // H3: parallel chunk fetches with bounded concurrency (mirrors the
-  // read path). Per-chunk destination offset is precomputed
-  // from chunk_size so order doesn't depend on arrival.
+  // Phase 39 B2/B3 — per-shard batched RPC fan-out (mirrors the
+  // Phase-8 read path above). Group chunk-row indices by shard,
+  // issue ONE `getChunksBatch(...)` RPC per shard in parallel.
   const offsets = new Array<number>(chunkRows.length);
   {
     let acc = 0;
@@ -369,36 +370,36 @@ async function readFileVersioned(
       acc += chunkRows[i].chunk_size;
     }
   }
-  const CONCURRENCY = 8;
-  let next = 0;
-  async function fetchOne(i: number): Promise<void> {
-    const c = chunkRows[i];
-    const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, c.shard_index);
-    const stub = env.MOSSAIC_SHARD.get(env.MOSSAIC_SHARD.idFromName(shardName));
-    const res = await stub.fetch(
-      new Request(`http://internal/chunk/${c.chunk_hash}`)
-    );
-    if (!res.ok) {
-      throw new VFSError(
-        "ENOENT",
-        `readFile: chunk ${c.chunk_index} (${c.chunk_hash}) missing on shard ${c.shard_index}`
-      );
+  const byShard = new Map<number, number[]>();
+  for (let i = 0; i < chunkRows.length; i++) {
+    const sIdx = chunkRows[i].shard_index;
+    let arr = byShard.get(sIdx);
+    if (arr === undefined) {
+      arr = [];
+      byShard.set(sIdx, arr);
     }
-    const buf = new Uint8Array(await res.arrayBuffer());
-    out.set(buf, offsets[i]);
+    arr.push(i);
   }
-  async function lane(): Promise<void> {
-    while (true) {
-      const i = next++;
-      if (i >= chunkRows.length) return;
-      await fetchOne(i);
-    }
-  }
-  const lanes: Promise<void>[] = [];
-  for (let w = 0; w < Math.min(CONCURRENCY, chunkRows.length); w++) {
-    lanes.push(lane());
-  }
-  await Promise.all(lanes);
+  const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
+  await Promise.all(
+    Array.from(byShard, async ([sIdx, indices]) => {
+      const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, sIdx);
+      const stub = shardNs.get(shardNs.idFromName(shardName));
+      const hashes = indices.map((i) => chunkRows[i].chunk_hash);
+      const { bytes } = await stub.getChunksBatch(hashes);
+      for (let k = 0; k < indices.length; k++) {
+        const i = indices[k];
+        const buf = bytes[k];
+        if (buf === null) {
+          throw new VFSError(
+            "ENOENT",
+            `readFile: chunk ${chunkRows[i].chunk_index} (${chunkRows[i].chunk_hash}) missing on shard ${sIdx}`
+          );
+        }
+        out.set(buf, offsets[i]);
+      }
+    })
+  );
 
   const written =
     chunkRows.length > 0
@@ -538,25 +539,24 @@ export async function vfsReadFile(
   const env = durableObject.envPublic;
   const out = new Uint8Array(row.file_size);
 
-  // H3: parallel chunk fetches with bounded concurrency.
+  // Phase 39 B2/B3 — per-shard batched RPC fan-out.
   //
-  // Previously: serial `for (...) await stub.fetch(...)` capped
-  // throughput at 1 chunk per ~10–30 ms intra-DO RPC, i.e. ~33–100 MB/s
-  // for 1 MB chunks. The feasibility study's 200–500 MB/s claim
-  // (study §5.2) needs parallel issuance.
+  // Previous architecture (H3, 8-way concurrent `stub.fetch` per
+  // chunk) issued ONE RPC per chunk. For a 100-chunk file landing
+  // across 32 shards, that was 100 round trips at ~10–30 ms each.
   //
-  // Bound at 8 concurrent in-flight to stay well under the Workers
-  // concurrent-subrequest limit (50 free, 1000 paid). 8 saturates
-  // typical home/cloud bandwidth on read while leaving headroom for
-  // any other RPCs the calling Worker has in flight. Order of `out.set`
-  // is preserved by the destination offset, which is computed from
-  // each chunk's known position in the manifest, not its arrival
-  // order. Throw-on-first-error is preserved by Promise.all semantics.
-  const CONCURRENCY = 8;
-  let next = 0;
-  // Each chunk's destination offset = sum of preceding chunks' sizes,
-  // computed up-front. This decouples the parallel fetches from any
-  // notion of arrival order — a chunk's slot is fixed by its index.
+  // New architecture: group chunks by shard_index, issue ONE
+  // `getChunksBatch(hashesOnThatShard)` typed RPC per shard, all
+  // dispatched in parallel without intermediate awaits (CF Workers
+  // RPC promise pipelining). Round trips drop to O(touched shards),
+  // typically ≤ 32 for a tenant's full pool. For a 100-chunk file
+  // spread evenly: ~32 RPCs vs 100 — a 3× cut. For a 1000-chunk
+  // multipart upload: ~32 RPCs vs 1000 — 30× cut.
+  //
+  // Order is preserved by precomputed per-chunk offsets — a chunk's
+  // destination slot is fixed by its `chunk_index`, not by RPC
+  // arrival order. Throw-on-first-error is preserved by Promise.all
+  // semantics.
   const offsets = new Array<number>(chunkRows.length);
   {
     let acc = 0;
@@ -565,36 +565,45 @@ export async function vfsReadFile(
       acc += chunkRows[i].chunk_size;
     }
   }
-
-  async function fetchOne(i: number): Promise<void> {
-    const c = chunkRows[i];
-    const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, c.shard_index);
-    const stub = env.MOSSAIC_SHARD.get(env.MOSSAIC_SHARD.idFromName(shardName));
-    const res = await stub.fetch(
-      new Request(`http://internal/chunk/${c.chunk_hash}`)
-    );
-    if (!res.ok) {
-      throw new VFSError(
-        "ENOENT",
-        `readFile: chunk ${c.chunk_index} (${c.chunk_hash}) missing on shard ${c.shard_index}`
-      );
+  // Group chunk-row indices by shard so each shard receives ONE
+  // RPC with the subset of hashes it owns.
+  const byShard = new Map<number, number[]>();
+  for (let i = 0; i < chunkRows.length; i++) {
+    const sIdx = chunkRows[i].shard_index;
+    let arr = byShard.get(sIdx);
+    if (arr === undefined) {
+      arr = [];
+      byShard.set(sIdx, arr);
     }
-    const buf = new Uint8Array(await res.arrayBuffer());
-    out.set(buf, offsets[i]);
+    arr.push(i);
   }
-
-  async function worker(): Promise<void> {
-    while (true) {
-      const i = next++;
-      if (i >= chunkRows.length) return;
-      await fetchOne(i);
-    }
-  }
-  const workers: Promise<void>[] = [];
-  for (let w = 0; w < Math.min(CONCURRENCY, chunkRows.length); w++) {
-    workers.push(worker());
-  }
-  await Promise.all(workers);
+  // Cast the un-parameterized binding to the typed namespace so the
+  // typed `.getChunksBatch(...)` RPC method is visible (matches the
+  // existing pattern at hardDeleteFileRow et al.).
+  const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
+  // Issue all per-shard RPCs in parallel. Each `.getChunksBatch(...)`
+  // returns a Promise immediately (RPC pipelining); we only block
+  // when we await the per-shard handler that drains the result into
+  // the output buffer.
+  await Promise.all(
+    Array.from(byShard, async ([sIdx, indices]) => {
+      const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, sIdx);
+      const stub = shardNs.get(shardNs.idFromName(shardName));
+      const hashes = indices.map((i) => chunkRows[i].chunk_hash);
+      const { bytes } = await stub.getChunksBatch(hashes);
+      for (let k = 0; k < indices.length; k++) {
+        const i = indices[k];
+        const buf = bytes[k];
+        if (buf === null) {
+          throw new VFSError(
+            "ENOENT",
+            `readFile: chunk ${chunkRows[i].chunk_index} (${chunkRows[i].chunk_hash}) missing on shard ${sIdx}`
+          );
+        }
+        out.set(buf, offsets[i]);
+      }
+    })
+  );
 
   const written = offsets.length > 0
     ? offsets[offsets.length - 1] + chunkRows[offsets.length - 1].chunk_size
@@ -874,17 +883,18 @@ export async function vfsReadChunk(
       scope.sub,
       verChunkRow.shard_index
     );
-    const stub = env.MOSSAIC_SHARD.get(env.MOSSAIC_SHARD.idFromName(shardName));
-    const res = await stub.fetch(
-      new Request(`http://internal/chunk/${verChunkRow.chunk_hash}`)
-    );
-    if (!res.ok) {
+    // Phase 39 B1 — typed `getChunkBytes` RPC instead of HTTP-style
+    // `stub.fetch`. One IPC hop, no Response/arrayBuffer marshalling.
+    const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
+    const stub = shardNs.get(shardNs.idFromName(shardName));
+    const buf = await stub.getChunkBytes(verChunkRow.chunk_hash);
+    if (buf === null) {
       throw new VFSError(
         "ENOENT",
         `readChunk: chunk data missing on shard ${verChunkRow.shard_index}`
       );
     }
-    return new Uint8Array(await res.arrayBuffer());
+    return buf;
   }
   if (inlineRow.inline_data) {
     if (chunkIndex !== 0) {
@@ -913,15 +923,15 @@ export async function vfsReadChunk(
   }
   const env = durableObject.envPublic;
   const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, chunkRow.shard_index);
-  const stub = env.MOSSAIC_SHARD.get(env.MOSSAIC_SHARD.idFromName(shardName));
-  const res = await stub.fetch(
-    new Request(`http://internal/chunk/${chunkRow.chunk_hash}`)
-  );
-  if (!res.ok) {
+  // Phase 39 B1 — typed `getChunkBytes` RPC.
+  const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
+  const stub = shardNs.get(shardNs.idFromName(shardName));
+  const buf = await stub.getChunkBytes(chunkRow.chunk_hash);
+  if (buf === null) {
     throw new VFSError(
       "ENOENT",
       `readChunk: chunk data missing on shard ${chunkRow.shard_index}`
     );
   }
-  return new Uint8Array(await res.arrayBuffer());
+  return buf;
 }

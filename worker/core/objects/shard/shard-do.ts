@@ -717,6 +717,93 @@ export class ShardDO extends DurableObject<Env> {
   }
 
   /**
+   * Phase 39 B1 — typed single-chunk read RPC.
+   *
+   * The HTTP-style `GET /chunk/:hash` route remains for the legacy
+   * upload/download surface; this RPC is what UserDO's read paths
+   * call for typed in-process invocation. Compared to
+   * `stub.fetch(new Request("http://internal/chunk/<hash>"))`, the
+   * typed RPC:
+   *   - skips Request/Response construction and JSON header parsing
+   *   - uses workerd's RPC arg/return marshalling (one IPC hop) vs
+   *     two awaits on the HTTP path (`fetch` + `arrayBuffer()`)
+   *   - benefits from CF Workers RPC promise pipelining: callers
+   *     that issue multiple `stub.getChunkBytes(...)` calls without
+   *     awaiting each receive Promise stubs back and only pay one
+   *     round trip if their consumption pattern allows.
+   *
+   * Returns `null` when the chunk is missing — caller maps to
+   * VFSError("ENOENT") with their preferred phrasing. Returning
+   * `null` (vs throwing) keeps the typed return shape predictable
+   * for parallel callers; thrown errors abort `Promise.all` and
+   * cancel sibling RPCs which is undesirable for partial-success
+   * patterns.
+   */
+  async getChunkBytes(hash: string): Promise<Uint8Array | null> {
+    this.ensureInit();
+    const rows = this.sql
+      .exec("SELECT data FROM chunks WHERE hash = ?", hash)
+      .toArray() as { data: ArrayBuffer }[];
+    if (rows.length === 0) return null;
+    return new Uint8Array(rows[0].data);
+  }
+
+  /**
+   * Phase 39 B2/B3 — batched chunk read RPC.
+   *
+   * Single round-trip retrieval of N chunks on this shard. Replaces
+   * the previous "loop with `stub.fetch` per chunk" which paid one
+   * intra-DO RPC per chunk; for a 100-chunk file landing across
+   * 32 shards, fan-out drops from 100 round-trips to 32.
+   *
+   * Returns a parallel array `bytes[i]` for `hashes[i]`; missing
+   * chunks come back as `null` so the caller can map exactly which
+   * hash failed (the order is preserved by index, not by SQLite
+   * row order). Order matters: callers fix per-chunk destination
+   * offsets up-front against `chunk_index` and feed those offsets
+   * with the returned bytes.
+   *
+   * Empty input → empty output (`{ bytes: [] }`); zero allocations.
+   *
+   * Memory bound: caller must already enforce READFILE_MAX (server-
+   * side cap, default 100 MB per Phase 1) BEFORE calling — we hold
+   * the response buffer in memory. The list of hashes is also
+   * bounded by the caller (one shard's contribution to a manifest);
+   * typical manifests have dozens of chunks per shard, not
+   * thousands.
+   */
+  async getChunksBatch(
+    hashes: string[]
+  ): Promise<{ bytes: (Uint8Array | null)[] }> {
+    this.ensureInit();
+    if (hashes.length === 0) return { bytes: [] };
+    // Single SQL with `WHERE hash IN (?, ?, ...)` — SQLite parses N
+    // bound parameters in O(N) and the IN scan is one indexed range
+    // per hash. We then re-order the result to match the input
+    // order so the caller's offset map lines up.
+    const placeholders = hashes.map(() => "?").join(",");
+    const rows = this.sql
+      .exec(
+        `SELECT hash, data FROM chunks WHERE hash IN (${placeholders})`,
+        ...hashes
+      )
+      .toArray() as { hash: string; data: ArrayBuffer }[];
+    // Build a hash → bytes map so duplicate hashes in the input
+    // (which can legally happen if a manifest references the same
+    // dedup'd chunk at multiple indices) all resolve to the same
+    // byte array.
+    const map = new Map<string, Uint8Array>();
+    for (const row of rows) {
+      map.set(row.hash, new Uint8Array(row.data));
+    }
+    const out: (Uint8Array | null)[] = new Array(hashes.length);
+    for (let i = 0; i < hashes.length; i++) {
+      out[i] = map.get(hashes[i]) ?? null;
+    }
+    return { bytes: out };
+  }
+
+  /**
    * Telemetry RPC (Phase 23 audit Claim 4).
    *
    * Returns the bytes currently stored on this shard, the count of
