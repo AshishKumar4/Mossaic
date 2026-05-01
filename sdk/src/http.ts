@@ -27,6 +27,9 @@ import { VFSStat } from "./stats";
 import { mapServerError, MossaicUnavailableError, EINVAL } from "./errors";
 import type { OpenManifestResult, VFSStatRaw } from "../../shared/vfs-types";
 import type {
+  PreviewInfo,
+  PreviewInfoBatchEntry,
+  PreviewUrlOpts,
   ReadPreviewOpts,
   ReadPreviewResult,
 } from "../../shared/preview-types";
@@ -538,6 +541,52 @@ export class HttpVFS implements VFSClient {
       rendererKind,
       fromVariantTable: cacheHdr === "hit",
     };
+  }
+
+  async previewUrl(p: string, opts?: PreviewUrlOpts): Promise<string> {
+    const info = await this.previewInfo(p, opts);
+    return info.url;
+  }
+
+  async previewInfo(
+    p: string,
+    opts?: PreviewUrlOpts
+  ): Promise<PreviewInfo> {
+    const res = await this.post(
+      "previewInfo",
+      {
+        path: p,
+        variant: opts?.variant ?? "thumb",
+        format: opts?.format,
+        renderer: opts?.renderer,
+        ttlMs: opts?.ttlMs,
+      },
+      "open",
+      p,
+      "json"
+    );
+    return (await res.json()) as PreviewInfo;
+  }
+
+  async previewInfoMany(
+    paths: readonly string[],
+    opts?: PreviewUrlOpts
+  ): Promise<PreviewInfoBatchEntry[]> {
+    const res = await this.post(
+      "previewInfoMany",
+      {
+        paths: paths as string[],
+        variant: opts?.variant ?? "thumb",
+        format: opts?.format,
+        renderer: opts?.renderer,
+        ttlMs: opts?.ttlMs,
+      },
+      "open",
+      paths[0] ?? "",
+      "json"
+    );
+    const body = (await res.json()) as { results: PreviewInfoBatchEntry[] };
+    return body.results;
   }
 
   async readChunk(p: string, chunkIndex: number): Promise<Uint8Array> {
