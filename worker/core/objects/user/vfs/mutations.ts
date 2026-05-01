@@ -10,6 +10,7 @@ import {
   isVersioningEnabled,
 } from "../vfs-versions";
 import {
+  bumpFolderRevision,
   folderExists,
   poolSizeFor,
   resolveOrThrow,
@@ -58,6 +59,18 @@ export async function vfsUnlink(
     throw new VFSError("EINVAL", `unlink: not a regular file: ${path}`);
   }
 
+  // Phase 46 — capture parent_id BEFORE mutation so we can bump
+  // the parent folder's revision. Read once; the value doesn't
+  // change inside this DO turn.
+  const parentRow = durableObject.sql
+    .exec(
+      "SELECT parent_id FROM files WHERE file_id = ? AND user_id = ?",
+      r.leafId,
+      userId
+    )
+    .toArray()[0] as { parent_id: string | null } | undefined;
+  const parentId: string | null = parentRow?.parent_id ?? null;
+
   // versioning fork.
   if (isVersioningEnabled(durableObject, userId)) {
     // Purge yjs DO state inside the versioning fork too. Without
@@ -103,6 +116,11 @@ export async function vfsUnlink(
       target: r.leafId,
       payload: JSON.stringify({ path, versioning: true, tombId, kind: r.kind }),
     });
+    // Phase 46 — bump parent revision so listChildren consumers see
+    // the path disappear from the directory listing. Versioned
+    // unlink leaves the row alive but tombstones the head; the
+    // directory's user-visible contents change.
+    bumpFolderRevision(durableObject, userId, parentId);
     return;
   }
 
@@ -124,6 +142,8 @@ export async function vfsUnlink(
     target: r.leafId,
     payload: JSON.stringify({ path, versioning: false, kind: r.kind }),
   });
+  // Phase 46 — bump parent revision after non-versioning hard delete.
+  bumpFolderRevision(durableObject, userId, parentId);
 }
 
 /**
@@ -176,6 +196,15 @@ export async function vfsPurge(
   // vfs-versions.ts:626-631) or is dropped by hardDeleteFileRow as
   // a belt-and-suspenders.
   const fileId = r.leafId;
+  // Phase 46 — capture parent_id BEFORE mutation for revision bump.
+  const purgeParentRow = durableObject.sql
+    .exec(
+      "SELECT parent_id FROM files WHERE file_id = ? AND user_id = ?",
+      fileId,
+      userId
+    )
+    .toArray()[0] as { parent_id: string | null } | undefined;
+  const purgeParentId: string | null = purgeParentRow?.parent_id ?? null;
   const versionRows = durableObject.sql
     .exec(
       "SELECT version_id FROM file_versions WHERE path_id = ?",
@@ -216,6 +245,8 @@ export async function vfsPurge(
       kind: r.kind,
     }),
   });
+  // Phase 46 — bump parent revision; purge always removes from listing.
+  bumpFolderRevision(durableObject, userId, purgeParentId);
 }
 
 // ── mkdir / rmdir ──────────────────────────────────────────────────────
@@ -304,6 +335,10 @@ export function vfsMkdir(
       now,
       mode
     );
+    // Phase 46 — bump the PARENT's revision (not the new folder's
+    // own revision; that's 0 by default and only bumps when its own
+    // children change). The parent gained a child.
+    bumpFolderRevision(durableObject, userId, parentId);
     parentId = folderId;
   }
 }
@@ -350,10 +385,21 @@ export function vfsRmdir(
   if (childFile.length > 0) {
     throw new VFSError("ENOTEMPTY", `rmdir: directory not empty: ${path}`);
   }
+  // Phase 46 — capture parent_id BEFORE delete for the revision bump.
+  const rmdirParentRow = durableObject.sql
+    .exec(
+      "SELECT parent_id FROM folders WHERE folder_id = ? AND user_id = ?",
+      r.leafId,
+      userId
+    )
+    .toArray()[0] as { parent_id: string | null } | undefined;
+  const rmdirParentId: string | null = rmdirParentRow?.parent_id ?? null;
   durableObject.sql.exec(
     "DELETE FROM folders WHERE folder_id = ?",
     r.leafId
   );
+  // Phase 46 — parent's children just lost one entry.
+  bumpFolderRevision(durableObject, userId, rmdirParentId);
 }
 
 // ── rename ─────────────────────────────────────────────────────────────
@@ -392,6 +438,11 @@ export async function vfsRename(
     dst
   );
 
+  // Phase 46 — capture src parent BEFORE any mutation so we can
+  // bump both src + dst parents atomically after the rename. Both
+  // bumps fire iff src.parent !== dst.parent (cross-folder move);
+  // for in-folder rename only one bump fires.
+  let srcParent: string | null = null;
   // Check if dst is the same as src (no-op).
   if (srcR.kind === "file" || srcR.kind === "symlink") {
     const srcRow = durableObject.sql
@@ -400,8 +451,9 @@ export async function vfsRename(
         srcR.leafId
       )
       .toArray()[0] as { parent_id: string | null; file_name: string };
+    srcParent = srcRow.parent_id ?? null;
     if (
-      (srcRow.parent_id ?? null) === dstParent &&
+      srcParent === dstParent &&
       srcRow.file_name === dstLeaf
     ) {
       return; // same path
@@ -410,8 +462,9 @@ export async function vfsRename(
     const srcFolder = durableObject.sql
       .exec("SELECT parent_id, name FROM folders WHERE folder_id=?", srcR.leafId)
       .toArray()[0] as { parent_id: string | null; name: string };
+    srcParent = srcFolder.parent_id ?? null;
     if (
-      (srcFolder.parent_id ?? null) === dstParent &&
+      srcParent === dstParent &&
       srcFolder.name === dstLeaf
     ) {
       return;
@@ -460,6 +513,8 @@ export async function vfsRename(
       target: srcR.leafId,
       payload: JSON.stringify({ src, dst, kind: "dir" }),
     });
+    // Phase 46 — bump src + dst parents (de-duplicated when same).
+    bumpRenameParents(durableObject, userId, srcParent, dstParent);
     return;
   }
 
@@ -529,6 +584,8 @@ export async function vfsRename(
           versioning: true,
         }),
       });
+      // Phase 46 — bump src + dst parents (de-dup'd when same).
+      bumpRenameParents(durableObject, userId, srcParent, dstParent);
       return;
     }
 
@@ -587,6 +644,8 @@ export async function vfsRename(
         versioning: false,
       }),
     });
+    // Phase 46 — bump src + dst parents (de-dup'd when same).
+    bumpRenameParents(durableObject, userId, srcParent, dstParent);
     return;
   }
   // dst is empty: simple UPDATE.
@@ -605,6 +664,30 @@ export async function vfsRename(
     target: srcR.leafId,
     payload: JSON.stringify({ src, dst }),
   });
+  // Phase 46 — bump src + dst parents (de-dup'd when same — that's
+  // the in-folder rename case where only one bump is needed).
+  bumpRenameParents(durableObject, userId, srcParent, dstParent);
+}
+
+/**
+ * Phase 46 — bump src + dst parent revisions for a rename, de-
+ * duplicated when src and dst share the same parent (in-folder
+ * rename). Two distinct parents → two strict-monotonic bumps;
+ * same parent → one bump.
+ *
+ * Folder-root → represented as `null`; both-null also de-dups to
+ * one bump on the dedicated `root_folder_revision` row.
+ */
+function bumpRenameParents(
+  durableObject: UserDO,
+  userId: string,
+  srcParent: string | null,
+  dstParent: string | null
+): void {
+  bumpFolderRevision(durableObject, userId, srcParent);
+  if (srcParent !== dstParent) {
+    bumpFolderRevision(durableObject, userId, dstParent);
+  }
 }
 
 // ── symlink ────────────────────────────────────────────────────────────
@@ -659,6 +742,9 @@ export function vfsSymlink(
     now,
     target
   );
+  // Phase 46 — symlink creation adds a new entry to the parent's
+  // child set; bump revision so listChildren observers refresh.
+  bumpFolderRevision(durableObject, userId, parentId);
 }
 
 // ── removeRecursive ────────────────────────────────────────────────────
@@ -721,6 +807,18 @@ export async function vfsRemoveRecursive(
     throw new VFSError("EBUSY", "removeRecursive: cannot remove root");
   }
 
+  // Phase 46 — capture the rmrf root's PARENT folder id so that when
+  // the tree is fully drained we can bump the parent's revision
+  // (the parent loses one child folder).
+  const rmrfRootParentRow = durableObject.sql
+    .exec(
+      "SELECT parent_id FROM folders WHERE folder_id = ? AND user_id = ?",
+      rootR.leafId,
+      userId
+    )
+    .toArray()[0] as { parent_id: string | null } | undefined;
+  const rmrfRootParentId: string | null = rmrfRootParentRow?.parent_id ?? null;
+
   // Drain up to BATCH_LIMIT files within this subtree by gathering all
   // descendant folder ids first, then deleting files row by row.
   // Note: cursor is currently unused — we keep the parameter for
@@ -746,17 +844,26 @@ export async function vfsRemoveRecursive(
   }
 
   // Files in any descendant folder. Process up to BATCH_LIMIT per call.
+  // Phase 46 — also pull `parent_id` so we can bump the revision of
+  // every folder that lost direct file children in this batch.
   const placeholders = allFolders.map(() => "?").join(",");
   const fileRows = durableObject.sql
     .exec(
-      `SELECT file_id FROM files
+      `SELECT file_id, parent_id FROM files
         WHERE user_id=? AND parent_id IN (${placeholders}) AND status!='deleted'
         LIMIT ?`,
       userId,
       ...allFolders,
       BATCH_LIMIT
     )
-    .toArray() as { file_id: string }[];
+    .toArray() as { file_id: string; parent_id: string | null }[];
+
+  // Phase 46 — collect distinct parent folders touched in THIS batch.
+  // After the per-file mutations land below, we bump each one's
+  // revision so rmrf-in-progress observers see the directory shrink
+  // batch by batch.
+  const touchedParents = new Set<string | null>();
+  for (const f of fileRows) touchedParents.add(f.parent_id);
 
   // Under versioning ON, recursive remove must tombstone each
   // file instead of hard-deleting it. `hardDeleteFileRow` on a
@@ -912,6 +1019,13 @@ export async function vfsRemoveRecursive(
     await Promise.all(fanout);
   }
 
+  // Phase 46 — bump revision on every folder that lost direct
+  // children in this batch. Each is a strict-monotonic +1; observers
+  // see the listing shrink incrementally as rmrf progresses.
+  for (const pid of touchedParents) {
+    bumpFolderRevision(durableObject, userId, pid);
+  }
+
   // If the batch was full, we have more work — caller should loop.
   if (fileRows.length >= BATCH_LIMIT) {
     insertAuditLog(durableObject, {
@@ -937,6 +1051,12 @@ export async function vfsRemoveRecursive(
       userId
     );
   }
+  // Phase 46 — final drain: bump the rmrf root's parent revision
+  // because the parent just lost the entire subtree as a child.
+  // Any inner folders that were drained are themselves gone now;
+  // their `revision` rows die with them, which is fine — observers
+  // walking the tree topologically will hit ENOENT on those paths.
+  bumpFolderRevision(durableObject, userId, rmrfRootParentId);
   insertAuditLog(durableObject, {
     op: "removeRecursive",
     actor: userId,

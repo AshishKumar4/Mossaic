@@ -19,6 +19,8 @@ export {
   recordWriteUsage,
   folderExists,
   findLiveFile,
+  bumpFolderRevision,
+  readFolderRevision,
   type ResolvedHit,
 } from "./vfs/helpers";
 

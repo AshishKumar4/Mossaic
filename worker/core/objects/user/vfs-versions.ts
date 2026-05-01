@@ -3,7 +3,11 @@ import type { ShardDO } from "../shard/shard-do";
 import { VFSError, type VFSScope } from "../../../../shared/vfs-types";
 import { generateId, vfsShardDOName } from "../../lib/utils";
 import { placeChunk } from "../../../../shared/placement";
-import { recordWriteUsage, userIdFor } from "./vfs/helpers";
+import {
+  bumpFolderRevision,
+  recordWriteUsage,
+  userIdFor,
+} from "./vfs/helpers";
 import { insertAuditLog } from "./vfs/audit-log";
 import { resolvePath } from "./path-walk";
 
@@ -1030,6 +1034,15 @@ export async function restoreVersion(
   const newVersionId = generateId();
   const now = Date.now();
 
+  // Phase 46 — restore can flip a tombstoned path back to live, or
+  // simply advance head_version_id of an already-live path. Either
+  // case warrants a folder-revision bump so listChildren observers
+  // re-fetch. Read parent_id of the path's stable row.
+  const parentRow = durableObject.sql
+    .exec("SELECT parent_id FROM files WHERE file_id = ?", pathId)
+    .toArray()[0] as { parent_id: string | null } | undefined;
+  const parentId = parentRow ? parentRow.parent_id : null;
+
   if (src.inlineData) {
     // Inline restore: no shard work; just insert + flip head.
     commitVersion(durableObject, {
@@ -1047,6 +1060,7 @@ export async function restoreVersion(
       // restore preserves the source version's encryption mode.
       encryption: src.encryption,
     });
+    bumpFolderRevision(durableObject, userId, parentId);
     insertAuditLog(durableObject, {
       op: "restoreVersion",
       actor: userId,
@@ -1196,6 +1210,7 @@ export async function restoreVersion(
     // restore preserves the source version's encryption mode.
     encryption: src.encryption,
   });
+  bumpFolderRevision(durableObject, userId, parentId);
   insertAuditLog(durableObject, {
     op: "restoreVersion",
     actor: userId,

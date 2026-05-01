@@ -290,6 +290,9 @@ class BatchedLstatFs implements VFSClient {
   listFiles(opts?: Parameters<VFSClient["listFiles"]>[0]) {
     return this.inner.listFiles(opts);
   }
+  listChildren(p: string, opts?: Parameters<VFSClient["listChildren"]>[1]) {
+    return this.inner.listChildren(p, opts);
+  }
   markVersion(
     p: string,
     versionId: string,
