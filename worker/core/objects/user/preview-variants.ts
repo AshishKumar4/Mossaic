@@ -24,6 +24,7 @@ import type { VFSScope } from "../../../../shared/vfs-types";
 import type {
   Variant,
   RenderResult,
+  RenderOpts,
 } from "../../../../shared/preview-types";
 import { hashChunk } from "../../../../shared/crypto";
 import { vfsCreateReadStream } from "./vfs/streams";
@@ -159,6 +160,11 @@ export async function renderAndStoreVariant(
 ): Promise<{ row: VariantRow; bytes: Uint8Array; result: RenderResult }> {
   const registry = defaultRegistry();
   const renderer = registry.dispatchByMime(mimeType);
+  // Phase 39 A3: track which renderer ACTUALLY produced the bytes.
+  // Starts as the primary; flips on EMOSSAIC_UNAVAILABLE fallback so
+  // the persisted `renderer_kind` column matches reality (a future
+  // cache lookup keys on this).
+  let usedRendererKind: string = renderer.kind;
 
   const stream = await vfsCreateReadStream(durableObject, scope, path);
   let result: RenderResult;
@@ -179,13 +185,22 @@ export async function renderAndStoreVariant(
     );
   } catch (err: unknown) {
     // EMOSSAIC_UNAVAILABLE → renderer missing a binding (e.g. no
-    // IMAGES). Fall back to icon-card so previews degrade
-    // gracefully rather than 500ing.
+    // IMAGES). Fall back gracefully:
+    //   - image/* sources → image-passthrough renderer (Phase 39 A3):
+    //     ship the original bytes back. Strictly better UX than a
+    //     generic icon-card stub for an image — the consumer's
+    //     <img> tag scales the original to whatever px it needs.
+    //   - non-image sources → icon-card universal fallback (an MP4
+    //     or PDF returned as a 200 MB "thumbnail" would dwarf the
+    //     Worker response budget and break every gallery client).
     if (err instanceof RenderError && err.code === "EMOSSAIC_UNAVAILABLE") {
-      const fallback = registry.dispatchByKind("icon-card");
+      const fallbackKind = mimeType.startsWith("image/")
+        ? "image-passthrough"
+        : "icon-card";
+      const fallback = registry.dispatchByKind(fallbackKind);
       if (fallback === null) {
-        // The default registry always includes icon-card. If
-        // someone built a custom registry without it AND a
+        // The default registry always includes both fallbacks. If
+        // someone built a custom registry without them AND a
         // primary renderer needed a missing binding, surface the
         // original error rather than masking it.
         throw err;
@@ -195,11 +210,20 @@ export async function renderAndStoreVariant(
         scope,
         path
       );
+      // image-passthrough emits the source MIME unchanged; icon-card
+      // emits SVG. Pass each its expected nominal output format.
+      const fallbackFormat =
+        fallbackKind === "image-passthrough"
+          ? // Format hint is informational for passthrough — the
+            // renderer ignores it and returns the source MIME.
+            (mimeType as RenderOpts["format"])
+          : "image/svg+xml";
       result = await fallback.render(
         { bytes: fallbackStream, mimeType, fileName, fileSize },
         durableObject.envPublic,
-        { variant, format: "image/svg+xml" }
+        { variant, format: fallbackFormat }
       );
+      usedRendererKind = fallback.kind;
     } else {
       throw err;
     }
@@ -234,9 +258,16 @@ export async function renderAndStoreVariant(
   await shardStub.putChunk(variantHash, variantBytes, refId, 0, userId);
 
   // Resolve the actual stored renderer kind (could be the
-  // fallback if the primary failed).
+  // fallback if the primary failed). The pre-Phase-39 logic
+  // stamped "image" when the result was webp; preserve that quirk
+  // for the resize path (existing rows + cache lookups depend on
+  // it). Other paths (icon-card, code, waveform, video-poster,
+  // and Phase 39's image-passthrough) stamp their renderer's
+  // canonical `kind` so cache lookups can find them.
   const rendererKind =
-    result.mimeType === "image/webp" ? "image" : renderer.kind;
+    usedRendererKind === "image-resize" && result.mimeType === "image/webp"
+      ? "image"
+      : usedRendererKind;
 
   // Phase 28 Fix 1 — `INSERT OR REPLACE` (was `OR IGNORE`) so a
   // re-render on a NEW head version supersedes the stale cache row

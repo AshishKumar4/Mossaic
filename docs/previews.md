@@ -132,7 +132,10 @@ const myRenderer: Renderer = {
   kind: "my-pdf-renderer",
   canRender: (mime) => mime === "application/pdf",
   async render(input, env, opts) {
-    // env.BROWSER → page-1 capture → return { bytes, mimeType, width, height }
+    // Implement page-1 capture using whichever rendering primitive
+    // your deployment provides — Cloudflare's BROWSER binding was
+    // removed in Phase 39, so PDF rendering is now BYO. Return
+    // { bytes, mimeType, width, height }.
     // ...
   },
 };

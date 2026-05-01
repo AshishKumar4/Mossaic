@@ -50,11 +50,17 @@
   },
 
   // Universal preview pipeline. Service-mode SDK consumers get the
-  // same renderer surface as App-mode: image resizing via IMAGES;
-  // BROWSER reserved for Phase 20.1 deferred renderers (the
-  // binding is optional — its absence falls through to icon-card).
+  // same renderer surface as App-mode: image resizing via IMAGES.
+  // When IMAGES is unbound and the source is an image MIME, preview
+  // returns the original bytes (Phase 39 A3 fallback). BROWSER was
+  // removed in Phase 39 — never wired to a production code path.
   "images": { "binding": "IMAGES" },
-  "browser": { "binding": "BROWSER" },
+
+  // Phase 39 A1: bump per-invocation subrequest budget for the
+  // service-mode Worker so multipart fan-out / per-chunk encryption
+  // / parallel decode aren't capped at 1000. See app wrangler for
+  // rationale.
+  "limits": { "subrequests": 100000 },
 
   "migrations": [
     {

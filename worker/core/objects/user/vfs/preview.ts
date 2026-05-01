@@ -162,10 +162,12 @@ export async function vfsReadPreview(
   // hit legacy NULL-version rows.
   const headVersionForCache = fileRow.head_version_id;
 
-  // Try primary renderer kind first; fall back to icon-card row
-  // (the universal fallback the writer would have stored under
-  // EMOSSAIC_UNAVAILABLE conditions). Track which kind we hit so a
-  // stale-chunk recovery can target the correct row.
+  // Try primary renderer kind first; fall back through the
+  // EMOSSAIC_UNAVAILABLE-fallback chain the writer might have used:
+  //   image/* sources → image-passthrough then icon-card
+  //   non-image      → icon-card only
+  // (Phase 39 A3.) Track which kind we hit so a stale-chunk
+  // recovery can target the correct row.
   let row = findVariantRow(
     durableObject,
     fileId,
@@ -175,16 +177,22 @@ export async function vfsReadPreview(
   );
   let rowRendererKind = primaryRenderer.kind;
   if (row === null) {
-    const fallback = findVariantRow(
-      durableObject,
-      fileId,
-      variantKey,
-      "icon-card",
-      headVersionForCache
-    );
-    if (fallback !== null) {
-      row = fallback;
-      rowRendererKind = "icon-card";
+    const fallbackKinds = mimeType.startsWith("image/")
+      ? ["image-passthrough", "icon-card"]
+      : ["icon-card"];
+    for (const k of fallbackKinds) {
+      const fallback = findVariantRow(
+        durableObject,
+        fileId,
+        variantKey,
+        k,
+        headVersionForCache
+      );
+      if (fallback !== null) {
+        row = fallback;
+        rowRendererKind = k;
+        break;
+      }
     }
   }
 
@@ -233,9 +241,10 @@ export async function vfsReadPreview(
     variantKind,
     headVersionForCache
   );
-  // Resolve the renderer_kind that was actually persisted (could
-  // be the icon-card fallback if the primary hit
-  // EMOSSAIC_UNAVAILABLE inside renderAndStoreVariant).
+  // Resolve the renderer_kind that was actually persisted. The
+  // EMOSSAIC_UNAVAILABLE branch in renderAndStoreVariant could have
+  // chosen image-passthrough (image/* sources) or icon-card (others)
+  // — Phase 39 A3.
   const persistedRow = findVariantRow(
     durableObject,
     fileId,
@@ -243,8 +252,28 @@ export async function vfsReadPreview(
     primaryRenderer.kind,
     headVersionForCache
   );
-  const persistedKind =
-    persistedRow !== null ? primaryRenderer.kind : "icon-card";
+  let persistedKind: string;
+  if (persistedRow !== null) {
+    persistedKind = primaryRenderer.kind;
+  } else {
+    const fallbackKinds = mimeType.startsWith("image/")
+      ? ["image-passthrough", "icon-card"]
+      : ["icon-card"];
+    persistedKind = "icon-card";
+    for (const k of fallbackKinds) {
+      const r = findVariantRow(
+        durableObject,
+        fileId,
+        variantKey,
+        k,
+        headVersionForCache
+      );
+      if (r !== null) {
+        persistedKind = k;
+        break;
+      }
+    }
+  }
 
   return {
     bytes: out.bytes,
