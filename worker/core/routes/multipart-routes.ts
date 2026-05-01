@@ -35,6 +35,12 @@ import {
   signVFSDownloadToken,
   VFSConfigError,
 } from "../lib/auth";
+// Phase 41 Fix 1: re-use the canonical errToResponse from ./vfs so
+// EAGAIN → 429 (rate-limit), EBADF / ENOTSUP, and any future codes
+// stay in lockstep across both route surfaces. The previous local
+// re-implementation here had drifted (audit 40A P1) and collapsed
+// EAGAIN to 500.
+import { errToResponse } from "./vfs";
 import {
   MULTIPART_MAX_CHUNK_BYTES,
   type MultipartBeginRequest,
@@ -104,53 +110,11 @@ function shardStub(
   return ns.get(ns.idFromName(name));
 }
 
-/** Map a server-thrown error to a JSON response. Mirrors vfs.ts:errToResponse. */
-function errToResponse(err: unknown): {
-  status: number;
-  body: { code: string; message: string };
-} {
-  if (err instanceof VFSConfigError) {
-    return {
-      status: 503,
-      body: { code: "EMOSSAIC_UNAVAILABLE", message: err.message },
-    };
-  }
-  const e = err as { code?: unknown; message?: unknown };
-  const rawMsg = typeof e?.message === "string" ? e.message : String(err);
-  const KNOWN: Record<string, number> = {
-    ENOENT: 404,
-    EEXIST: 409,
-    EISDIR: 409,
-    ENOTDIR: 409,
-    EBUSY: 409,
-    ENOTEMPTY: 409,
-    EFBIG: 413,
-    ELOOP: 508,
-    EACCES: 403,
-    EROFS: 403,
-    EINVAL: 400,
-    EBADF: 409,
-    ENOTSUP: 501,
-    EMOSSAIC_UNAVAILABLE: 503,
-  };
-  const explicit = typeof e?.code === "string" ? (e.code as string) : undefined;
-  let code: string | undefined =
-    explicit && explicit in KNOWN ? explicit : undefined;
-  if (!code) {
-    const tokens = rawMsg.match(/[A-Z_]{3,}/g) ?? [];
-    for (const tok of tokens) {
-      if (tok in KNOWN) {
-        code = tok;
-        break;
-      }
-    }
-  }
-  const status = code ? KNOWN[code] : 500;
-  return {
-    status,
-    body: { code: code ?? "EINTERNAL", message: rawMsg },
-  };
-}
+// Phase 41 Fix 1: errToResponse is imported from ./vfs. The previous
+// local re-implementation drifted (40A P1) — it lacked EAGAIN → 429,
+// so a per-tenant rate-limit hit returned 500 instead of "retry-with-
+// backoff". The canonical version in vfs.ts is the single source of
+// truth for HTTP status mapping; both routers must share it.
 
 // ── Multipart router ───────────────────────────────────────────────────
 
@@ -660,6 +624,13 @@ chunkDownload.get("/chunk/:fileId/:idx", async (c) => {
         "Content-Type": "application/octet-stream",
         "Content-Length": String(buf.byteLength),
         "Cache-Control": "public, max-age=31536000, immutable",
+        // Phase 41 Fix 2 (audit 40B P1): Vary on Authorization. The
+        // download token sits in the Authorization header; without
+        // Vary an intermediary CDN could replay the bytes to a
+        // request bearing a different (or no) token. The cache key
+        // already includes the token's tenant namespace; Vary is
+        // the wire assertion that downstream caches honour it.
+        Vary: "Authorization",
         ETag: `"${hashHint}"`,
         "X-Mossaic-Hash": hashHint,
       },
