@@ -14,6 +14,7 @@
  */
 
 import type { UserDOCore as UserDO } from "../user-do-core";
+import type { ShardDO } from "../../shard/shard-do";
 import {
   VFSError,
   type VFSScope,
@@ -199,14 +200,11 @@ export async function vfsReadPreview(
   if (row !== null) {
     const env = durableObject.envPublic;
     const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, row.shardIndex);
-    const stub = env.MOSSAIC_SHARD.get(
-      env.MOSSAIC_SHARD.idFromName(shardName)
-    );
-    const res = await stub.fetch(
-      new Request(`http://internal/chunk/${row.chunkHash}`)
-    );
-    if (res.ok) {
-      const bytes = new Uint8Array(await res.arrayBuffer());
+    // Phase 39 B1 — typed `getChunkBytes` RPC for the variant blob.
+    const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
+    const stub = shardNs.get(shardNs.idFromName(shardName));
+    const bytes = await stub.getChunkBytes(row.chunkHash);
+    if (bytes !== null) {
       return {
         bytes,
         mimeType: row.mimeType,

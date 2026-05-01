@@ -352,17 +352,17 @@ export async function vfsPullReadStream(
   }
   const env = durableObject.envPublic;
   const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, chunkRow.shard_index);
-  const stub = env.MOSSAIC_SHARD.get(env.MOSSAIC_SHARD.idFromName(shardName));
-  const res = await stub.fetch(
-    new Request(`http://internal/chunk/${chunkRow.chunk_hash}`)
-  );
-  if (!res.ok) {
+  // Phase 39 B1 — typed `getChunkBytes` RPC. One IPC hop instead of
+  // the two-await `stub.fetch(...).arrayBuffer()` pair.
+  const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
+  const stub = shardNs.get(shardNs.idFromName(shardName));
+  const buf = await stub.getChunkBytes(chunkRow.chunk_hash);
+  if (buf === null) {
     throw new VFSError(
       "ENOENT",
       `pullReadStream: chunk data missing on shard ${chunkRow.shard_index}`
     );
   }
-  const buf = new Uint8Array(await res.arrayBuffer());
   return range ? sliceWithRange(buf, range) : buf;
 }
 
