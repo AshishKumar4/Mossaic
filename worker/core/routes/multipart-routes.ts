@@ -35,11 +35,10 @@ import {
   signVFSDownloadToken,
   VFSConfigError,
 } from "../lib/auth";
-// Phase 41 Fix 1: re-use the canonical errToResponse from ./vfs so
-// EAGAIN → 429 (rate-limit), EBADF / ENOTSUP, and any future codes
-// stay in lockstep across both route surfaces. The previous local
-// re-implementation here had drifted (audit 40A P1) and collapsed
-// EAGAIN to 500.
+// Re-use the canonical errToResponse from ./vfs so EAGAIN → 429
+// (rate-limit), EBADF / ENOTSUP, and any future codes stay in
+// lockstep across both route surfaces. A local re-implementation
+// here would drift and collapse EAGAIN to 500.
 import { errToResponse } from "./vfs";
 import {
   MULTIPART_MAX_CHUNK_BYTES,
@@ -110,11 +109,11 @@ function shardStub(
   return ns.get(ns.idFromName(name));
 }
 
-// Phase 41 Fix 1: errToResponse is imported from ./vfs. The previous
-// local re-implementation drifted (40A P1) — it lacked EAGAIN → 429,
-// so a per-tenant rate-limit hit returned 500 instead of "retry-with-
-// backoff". The canonical version in vfs.ts is the single source of
-// truth for HTTP status mapping; both routers must share it.
+// errToResponse is imported from ./vfs (canonical). A local
+// re-implementation would drift — e.g. lack EAGAIN → 429, so a
+// per-tenant rate-limit hit would return 500 instead of "retry-
+// with-backoff". The vfs.ts version is the single source of truth
+// for HTTP status mapping; both routers must share it.
 
 // ── Multipart router ───────────────────────────────────────────────────
 
@@ -375,19 +374,18 @@ mp.put("/:uploadId/chunk/:idx", async (c) => {
 
     const hash = await hashChunk(bytes);
     const userId = userIdFor(c.var.scope);
-    // Phase 32 Fix 4 + Phase 32.5 Fix 4 \u2014 multipart placement is
-    // intentionally pure-rendezvous (no `fullShards` skip-set).
-    // The per-chunk PUT here and `vfsFinalizeMultipart`'s touched-
-    // shard fan-out (multipart-upload.ts:573-587) MUST use the
-    // SAME placement decision; the `fullShards` set at finalize
-    // time may differ from the set at upload time, and the
-    // server has no reliable way to replay the upload-time
-    // snapshot. The signed `payload.poolSize` is server-
-    // authoritative (HMAC at begin) so adversarial clients
-    // can't tamper. Multipart cap-awareness is deferred until we
-    // persist a per-session full-shards snapshot \u2014 a Phase 32.x
-    // follow-up. Reads work either way; only the write
-    // \"prefer less-full shards\" optimization is missing here.
+    // Multipart placement is intentionally pure-rendezvous (no
+    // `fullShards` skip-set). The per-chunk PUT here and
+    // `vfsFinalizeMultipart`'s touched-shard fan-out
+    // (multipart-upload.ts:573-587) MUST use the SAME placement
+    // decision; the `fullShards` set at finalize time may differ
+    // from the set at upload time, and the server has no reliable
+    // way to replay the upload-time snapshot. The signed
+    // `payload.poolSize` is server-authoritative (HMAC at begin) so
+    // adversarial clients can't tamper. Multipart cap-awareness is
+    // deferred until we persist a per-session full-shards snapshot.
+    // Reads work either way; only the write "prefer less-full
+    // shards" optimization is missing here.
     const sIdx = placeChunk(userId, uploadId, idx, payload.poolSize);
     const stub = shardStub(c.env, c.var.scope, sIdx);
     let putResult;
@@ -484,11 +482,9 @@ export default mp;
 // resolves the chunk's hash + shard via caller-supplied hints, then
 // streams the chunk bytes.
 //
-// Phase 36b \u2014 migrated to the shared `edgeCache*` helpers.
-// Pre-Phase-36b this endpoint had its own inline cache pattern at
-// `chunks.mossaic.local/${fileId}/${idx}`. Now uses the same helper
-// as readPreview / readChunk / openManifest with surfaceTag="chunk"
-// for a single source-of-truth cache convention. Cache key shape:
+// Uses the shared `edgeCache*` helpers (same as readPreview /
+// readChunk / openManifest) with surfaceTag="chunk" for a single
+// source-of-truth cache convention. Cache key shape:
 //   https://chunk.mossaic.local/<userId>/<fileId>/0/d/<chunkHash>/i<idx>
 //
 // `updatedAt = 0` because the (fileId, hash, idx) triple is
@@ -589,9 +585,9 @@ chunkDownload.get("/chunk/:fileId/:idx", async (c) => {
       );
     }
 
-    // Phase 36b \u2014 unified cache key. Per-tenant namespace; chunk
-    // hash + idx as bust-keyed extras. The (fileId, hash, idx)
-    // triple is immutable for a download-token-scoped fileId.
+    // Unified cache key. Per-tenant namespace; chunk hash + idx as
+    // bust-keyed extras. The (fileId, hash, idx) triple is
+    // immutable for a download-token-scoped fileId.
     const namespace = payload.sub
       ? `${payload.tn}::${payload.sub}`
       : payload.tn;
@@ -624,12 +620,12 @@ chunkDownload.get("/chunk/:fileId/:idx", async (c) => {
         "Content-Type": "application/octet-stream",
         "Content-Length": String(buf.byteLength),
         "Cache-Control": "public, max-age=31536000, immutable",
-        // Phase 41 Fix 2 (audit 40B P1): Vary on Authorization. The
-        // download token sits in the Authorization header; without
-        // Vary an intermediary CDN could replay the bytes to a
-        // request bearing a different (or no) token. The cache key
-        // already includes the token's tenant namespace; Vary is
-        // the wire assertion that downstream caches honour it.
+        // Vary on Authorization. The download token sits in the
+        // Authorization header; without Vary an intermediary CDN
+        // could replay the bytes to a request bearing a different
+        // (or no) token. The cache key already includes the
+        // token's tenant namespace; Vary is the wire assertion
+        // that downstream caches honour it.
         Vary: "Authorization",
         ETag: `"${hashHint}"`,
         "X-Mossaic-Hash": hashHint,

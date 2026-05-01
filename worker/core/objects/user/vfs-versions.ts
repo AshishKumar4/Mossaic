@@ -120,14 +120,15 @@ export interface VersionRow {
   /**
    * true iff this version was created by an explicit
    * user-facing op (writeFile, restoreVersion, flush()). False for
-   * Yjs opportunistic compactions and pre-Phase-12 rows.
+   * Yjs opportunistic compactions and legacy rows that pre-date
+   * the column.
    */
   userVisible?: boolean;
   /** snapshot of metadata at this version (when requested). */
   metadata?: Record<string, unknown> | null;
   /**
    * per-version encryption stamp. Undefined for plaintext
-   * (default for pre-Phase-15 rows and explicit plaintext writes).
+   * (default for legacy rows and explicit plaintext writes).
    */
   encryption?: { mode: "convergent" | "random"; keyId?: string };
 }
@@ -217,7 +218,8 @@ export function commitVersion(
     deleted?: boolean;
     /**
      * per-version flags. All optional; defaults preserve
-     * Phase-9 behavior (NULL label, user_visible=0, NULL metadata).
+     * the legacy default behaviour (NULL label, user_visible=0,
+     * NULL metadata).
      *
      * - `userVisible`: when truthy, sets `file_versions.user_visible = 1`.
      *   Used by writeFile (default true), restoreVersion (true), and
@@ -238,9 +240,9 @@ export function commitVersion(
      */
     encryption?: { mode: "convergent" | "random"; keyId?: string };
     /**
-     * Phase 27 — multipart × versioning. ShardDO chunk_refs file_id
-     * actually used when chunks were written. Default `null`; the
-     * standard versioned write path uses the synthetic form
+     * Multipart × versioning. ShardDO chunk_refs file_id actually
+     * used when chunks were written. Default `null`; the canonical
+     * versioned write path uses the synthetic form
      * `${pathId}#${versionId}` (computed by `dropVersionRows` on
      * fan-out) and leaves this NULL. Multipart-finalize-under-
      * versioning sets it to `uploadId` because that's the refId
@@ -250,13 +252,13 @@ export function commitVersion(
     shardRefId?: string;
   }
 ): void {
-  // Phase 36 \u2014 single chokepoint for versioned accounting.
+  // Single chokepoint for versioned accounting.
   //
   // Read the prior head's state BEFORE the INSERT so we can
   // compute (deltaBytes, deltaFiles, deltaInline) for one
   // recordWriteUsage call at the end. This consolidates the
   // accounting that previously had to live (or be missing) at
-  // every commitVersion caller \u2014 13 call sites across 6 files.
+  // every commitVersion caller — 13 call sites across 6 files.
   //
   // Semantics (versioning-on file-count + storage):
   //   - file_count counts LIVE PATHS (paths with a non-tombstone
@@ -291,12 +293,12 @@ export function commitVersion(
     headRowForAccounting.prev_deleted === 0;
   const nowIsLive = !args.deleted;
 
-  // Phase 28 Fix 3 — preserve encryption stamp on tombstones.
+  // Preserve encryption stamp on tombstones.
   //
-  // Pre-fix: when `vfsUnlink` (and `vfsRename` overwrite +
-  // `vfsRemoveRecursive`) called `commitVersion` with
-  // `deleted: true` and no `args.encryption`, both the new
-  // tombstone row AND `files.encryption_mode/key_id` were stamped
+  // Without this, `vfsUnlink` (and `vfsRename` overwrite +
+  // `vfsRemoveRecursive`) calling `commitVersion` with
+  // `deleted: true` and no `args.encryption` would stamp both
+  // the new tombstone row AND `files.encryption_mode/key_id`
   // NULL. If the user then `restoreVersion`'d a prior live
   // (encrypted) version, the restored head would carry the
   // tombstone's NULL stamp on `files` — readers would treat the
@@ -380,17 +382,17 @@ export function commitVersion(
     args.pathId
   );
 
-  // Phase 36 \u2014 single recordWriteUsage call covering all three
-  // counters. Negative deltas are clamped at zero by the
-  // helper's MAX(0, ...) clamp; pool growth is monotonic via
+  // Single recordWriteUsage call covering all three counters.
+  // Negative deltas are clamped at zero by the helper's
+  // MAX(0, ...) clamp; pool growth is monotonic via
   // newPool > row.pool_size guard. See helpers.ts:421-453.
   //
   // deltaFiles transitions:
-  //   prev=live  + now=live      \u2192 0 (path stayed live)
-  //   prev=live  + now=tombstone \u2192 -1 (path exited live)
-  //   prev=dead  + now=live      \u2192 +1 (path entered live)
-  //   prev=dead  + now=tombstone \u2192 0 (still no live path)
-  // (\"dead\" = no head OR tombstoned head OR no row.)
+  //   prev=live  + now=live      → 0 (path stayed live)
+  //   prev=live  + now=tombstone → -1 (path exited live)
+  //   prev=dead  + now=live      → +1 (path entered live)
+  //   prev=dead  + now=tombstone → 0 (still no live path)
+  // ("dead" = no head OR tombstoned head OR no row.)
   //
   // deltaBytes / deltaInline are zero on tombstone inserts \u2014 the
   // older versions still occupy bytes; dropVersionRows is the
@@ -433,7 +435,7 @@ export interface VersionContent {
   mimeType: string;
   /**
    * per-version encryption stamp. NULL for plaintext (default
-   * for pre-Phase-15 rows and for plaintext writes). When set, the SDK
+   * for legacy rows and for plaintext writes). When set, the SDK
    * decrypts the bytes (envelope-stream stored in `inline_data` or
    * across `version_chunks`) before returning them to the consumer.
    */
@@ -675,13 +677,13 @@ export async function dropVersionRows(
   const env = durableObject.envPublic;
   const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
 
-  // Phase 36 \u2014 dropVersionRows owns ALL three counters'
-  // negative deltas for versioning-on tenants. Pre-fix, only
-  // inline_bytes_used was decremented (Phase 32.5 BUG #2);
-  // storage_used and file_count drifted upward forever. The
-  // versioning-on write path increments via commitVersion (Phase 36
-  // change); dropVersionRows is the symmetric decrement. Bytes
-  // are accumulated across non-tombstone versions; the file_count
+  // dropVersionRows owns ALL three counters' negative deltas for
+  // versioning-on tenants. Without symmetric decrements,
+  // storage_used and file_count would drift upward forever (only
+  // inline_bytes_used was decremented historically). The
+  // versioning-on write path increments via commitVersion;
+  // dropVersionRows is the symmetric decrement. Bytes are
+  // accumulated across non-tombstone versions; the file_count
   // delta fires when the `files` row gets dropped at the end
   // (path goes ENOENT) AND the path was previously live.
   let bytesReaped = 0;
@@ -727,16 +729,16 @@ export async function dropVersionRows(
       )
       .toArray() as { shard_index: number }[];
 
-    // Phase 27 \u2014 read the per-version `shard_ref_id` BEFORE the
-    // delete so multipart-finalized versions can fan out to the
-    // correct chunk_refs key (uploadId, not the synthetic
+    // Read the per-version `shard_ref_id` BEFORE the delete so
+    // multipart-finalized versions can fan out to the correct
+    // chunk_refs key (uploadId, not the synthetic
     // `${pathId}#${versionId}`). Falls back to the synthetic form
-    // when the column is NULL \u2014 matches every legacy and standard
+    // when the column is NULL — matches every legacy and canonical
     // versioned-write row.
     //
-    // Phase 32.5 BUG #2 + Phase 36 \u2014 also read size, inline_data,
-    // and deleted so we can accumulate the byte deltas for the
-    // post-loop recordWriteUsage call. Tombstones (`deleted=1`)
+    // Also read size, inline_data, and deleted so we can
+    // accumulate the byte deltas for the post-loop
+    // recordWriteUsage call. Tombstones (`deleted=1`)
     // contribute 0 (their bytes were never positive-counted by
     // commitVersion). Live (`deleted=0`) versions contribute
     // `+size` for storage_used and (if inline) `+inline_data.byteLength`
@@ -798,9 +800,9 @@ export async function dropVersionRows(
     }
 
     // Dispatch deleteChunks RPC per touched shard. Use the explicit
-    // `shard_ref_id` stamped at write time when set (Phase 27
-    // multipart path); else fall back to the synthetic form used by
-    // the standard versioned-write path.
+    // `shard_ref_id` stamped at write time when set (multipart
+    // path); else fall back to the synthetic form used by the
+    // canonical versioned-write path.
     const shardFileId = explicitRefId ?? shardRefId(pathId, versionId);
     for (const { shard_index } of shardRows) {
       const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, shard_index);
@@ -810,11 +812,11 @@ export async function dropVersionRows(
     reaped++;
   }
 
-  // Phase 36 \u2014 single recordWriteUsage call covering all three
-  // counters for the whole batch. Pre-Phase-36 only inline_bytes_used
-  // was decremented (Phase 32.5 BUG #2); storage_used + file_count
-  // drifted forever for versioning tenants. Now symmetric with
-  // commitVersion.
+  // Single recordWriteUsage call covering all three counters for
+  // the whole batch. Without symmetric decrements,
+  // storage_used + file_count would drift forever for versioning
+  // tenants (only inline_bytes_used was decremented historically).
+  // Symmetric with commitVersion.
   //
   // file_count delta: -1 IFF the path was LIVE at the start of
   // the drop AND the `files` row gets dropped below (liveCount === 0
@@ -860,16 +862,17 @@ export async function dropVersionRows(
     // Reset the head pointer to the (still extant) newest LIVE
     // version.
     //
-    // Phase 25 — tombstone-consistency. Pre-fix the query was
-    // `ORDER BY mtime_ms DESC LIMIT 1` with no `WHERE deleted = 0`
-    // filter. If retention dropped every live version while a
-    // tombstone survived (e.g. operator dropped older live versions
-    // newer than a retention cutoff that also captured a tombstone
-    // in between), the head would be repointed at a tombstone —
-    // making subsequent stat() throw the systemic "head version is
-    // a tombstone" error.
+    // Tombstone-consistency. The query MUST filter on
+    // `WHERE deleted = 0` (not just
+    // `ORDER BY mtime_ms DESC LIMIT 1`). If retention dropped every
+    // live version while a tombstone survived (e.g. operator
+    // dropped older live versions newer than a retention cutoff
+    // that also captured a tombstone in between), without the
+    // filter the head would be repointed at a tombstone — making
+    // subsequent stat() throw the systemic "head version is a
+    // tombstone" error.
     //
-    // Now we prefer the newest non-tombstoned version. Two outcomes:
+    // We prefer the newest non-tombstoned version. Two outcomes:
     //   A. A live version exists → head moves to it; stat() works.
     //   B. Only tombstones survive → head goes to NULL; stat() falls
     //      through helpers.ts:225 to the non-versioned branch using

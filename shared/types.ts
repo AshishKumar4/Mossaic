@@ -138,11 +138,11 @@ export interface EnvCore {
   JWT_SECRET_PREVIOUS?: string;
   /** Cloudflare Images binding; optional — renderers fall through. */
   IMAGES?: ImagesBinding;
-  // BROWSER (Browser Run) binding was removed in Phase 39. The
-  // deferred renderers (PDF page-1, video poster, Office) never
-  // had a production code path wired and the binding kept the
-  // Worker on a billing tier it didn't need. If/when those
-  // renderers ship, re-add the binding under a new name.
+  // No BROWSER (Browser Run) binding: the deferred renderers (PDF
+  // page-1, video poster, Office) never had a production code path
+  // wired and the binding kept the Worker on a billing tier it
+  // didn't need. If/when those renderers ship, re-add the binding
+  // under a new name.
 }
 
 /**

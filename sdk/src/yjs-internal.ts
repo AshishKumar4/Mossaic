@@ -1,7 +1,6 @@
 /**
- * Phase 38 — internal helpers shared between `sdk/src/vfs.ts`
- * (which provides `commitYjsSnapshot`) and `sdk/src/yjs.ts` (the
- * `openYDoc` runtime).
+ * Internal helpers shared between `sdk/src/vfs.ts` (which provides
+ * `commitYjsSnapshot`) and `sdk/src/yjs.ts` (the `openYDoc` runtime).
  *
  * Lives in its own file so `vfs.ts` (which is imported by every
  * SDK consumer) doesn't pay for any of the yjs-specific code path
@@ -37,8 +36,8 @@ export const YJS_SNAPSHOT_MAGIC: Uint8Array = new Uint8Array([
 ]);
 
 /**
- * Phase 38 — wrap raw `Y.encodeStateAsUpdate(doc)` bytes with the
- * snapshot magic prefix. The result is the byte payload to pass
+ * Wrap raw `Y.encodeStateAsUpdate(doc)` bytes with the snapshot
+ * magic prefix. The result is the byte payload to pass
  * to `vfs.writeFile(yjsPath, payload)` so the server applies it
  * via `Y.applyUpdate` instead of stuffing the bytes into
  * `Y.Text("content")`.
@@ -53,7 +52,7 @@ export function wrapYjsSnapshot(updateBytes: Uint8Array): Uint8Array {
 }
 
 /**
- * Phase 38 — true iff `bytes` starts with `YJS_SNAPSHOT_MAGIC`.
+ * True iff `bytes` starts with `YJS_SNAPSHOT_MAGIC`.
  * Cheap (4-byte prefix check); safe on short inputs (returns
  * false for `bytes.byteLength < 4`).
  *

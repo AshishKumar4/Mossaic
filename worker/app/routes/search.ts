@@ -542,8 +542,8 @@ export async function indexFile(
     }
   }
 
-  // Phase 23 Blindspot fix: stamp indexed_at so the reconciler
-  // doesn't re-queue this file. We mark on a best-effort basis: if
+  // Stamp indexed_at so the reconciler doesn't re-queue this file.
+  // We mark on a best-effort basis: if
   // the text-space upsert succeeded the file is searchable, even
   // when CLIP failed. The reconciler errs on the side of NOT
   // re-running for already-marked files (it filters
@@ -562,7 +562,7 @@ export async function indexFile(
 }
 
 /**
- * Search-index reconciler (Phase 23 Blindspot fix).
+ * Search-index reconciler.
  *
  * Sweeps the per-tenant `indexed_at IS NULL` set and re-fires
  * `indexFile` for each. Bounded `limit` (default 25) keeps a single

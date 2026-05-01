@@ -72,7 +72,7 @@ shared.get("/:token/photos", async (c) => {
  * Public image bytes for shared albums via canonical `vfs.readFile()`.
  * Same HMAC verification as the manifest endpoint.
  *
- * Phase 36 — Workers Cache wrap. Cache key is
+ * Workers Cache wrap. Cache key is
  * `simg/<userId>/<fileId>/<updated_at>`. The HMAC verify + the
  * token-includes-fileId check run BEFORE the cache lookup so a
  * cached response can never serve an unauthorized request — the

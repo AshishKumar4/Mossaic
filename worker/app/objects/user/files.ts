@@ -4,13 +4,13 @@ import type { UserFile } from "@shared/types";
 /**
  * List files in a folder.
  *
- * Phase 25 — tombstone-consistency: rows whose `head_version_id`
- * points at a `deleted=1` `file_versions` row are EXCLUDED. This
- * matches the canonical `vfsListFiles` default. The user-visible
- * App listing surface (`/api/files`) must not surface unlinked-
- * under-versioning paths because every consumer would then call
- * `vfsStat` on them and hit the "head version is a tombstone" throw
- * at `helpers.ts:245`.
+ * Tombstone-consistency: rows whose `head_version_id` points at a
+ * `deleted=1` `file_versions` row are EXCLUDED. This matches the
+ * canonical `vfsListFiles` default. The user-visible App listing
+ * surface (`/api/files`) must not surface unlinked-under-versioning
+ * paths because every consumer would then call `vfsStat` on them
+ * and hit the "head version is a tombstone" throw at
+ * `helpers.ts:245`.
  */
 export function listFiles(
   durableObject: UserDO,
@@ -84,12 +84,12 @@ export function deleteFile(durableObject: UserDO, fileId: string): boolean {
 /**
  * Get file record by ID.
  *
- * Phase 25 — tombstone-consistency: returns `null` when the head
- * version is tombstoned, so all downstream consumers
- * (`appGetFile`, public-share routes, gallery image fetch) return
- * a clean 404 instead of throwing the "head version is a tombstone"
- * error from a downstream byte read. Admin/recovery surfaces that
- * need to see tombstones can read `files` directly via SQL.
+ * Tombstone-consistency: returns `null` when the head version is
+ * tombstoned, so all downstream consumers (`appGetFile`,
+ * public-share routes, gallery image fetch) return a clean 404
+ * instead of throwing the "head version is a tombstone" error from
+ * a downstream byte read. Admin/recovery surfaces that need to see
+ * tombstones can read `files` directly via SQL.
  */
 export function getFile(
   durableObject: UserDO,

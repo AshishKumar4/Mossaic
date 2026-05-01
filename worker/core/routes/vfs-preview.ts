@@ -92,7 +92,7 @@ preview.post("/readPreview", async (c) => {
     const variant =
       body.variant === undefined ? "thumb" : expectVariant(body.variant);
 
-    // Phase 36b \u2014 Workers Cache for variant bytes.
+    // Workers Cache for variant bytes.
     //
     // Pre-flight `vfsResolveCacheKey` returns the cache-bust
     // state in one cheap SQL JOIN: (fileId, headVersionId,
@@ -106,7 +106,7 @@ preview.post("/readPreview", async (c) => {
     // response never serves an unauthenticated request.
     //
     // Encrypted files surface ENOTSUP from the underlying RPC
-    // (preview.ts:124) \u2014 we don't pre-cache them. The cache key
+    // (preview.ts:124) — we don't pre-cache them. The cache key
     // includes the encryption fingerprint so a tenant who
     // toggles encryption between writes lands on a different key.
     const stub = userStub(c);
@@ -154,10 +154,10 @@ preview.post("/readPreview", async (c) => {
           headers: {
             ETag: cachedEtag,
             "Cache-Control": "public, max-age=31536000, immutable",
-            // Phase 41 Fix 2 (audit 40B P1): even the warm-cache-hit
-            // 304 must carry Vary so a downstream CDN cannot replay
-            // this 304 to a request bearing a different Authorization
-            // token. See the 200 path below for rationale.
+            // Even the warm-cache-hit 304 must carry Vary so a
+            // downstream CDN cannot replay this 304 to a request
+            // bearing a different Authorization token. See the 200
+            // path below for rationale.
             Vary: "Authorization",
           },
         });
@@ -189,10 +189,10 @@ preview.post("/readPreview", async (c) => {
         headers: {
           ETag: etag,
           "Cache-Control": "public, max-age=31536000, immutable",
-          // Phase 41 Fix 2 (audit 40B P1): see the 200 path below
-          // for rationale. The 304 also flows through intermediary
-          // caches; without Vary, a CDN could replay this response
-          // to a request bearing a different Authorization token.
+          // See the 200 path below for rationale. The 304 also
+          // flows through intermediary caches; without Vary, a CDN
+          // could replay this response to a request bearing a
+          // different Authorization token.
           Vary: "Authorization",
         },
       });
@@ -204,16 +204,16 @@ preview.post("/readPreview", async (c) => {
         "Content-Type": result.mimeType,
         "Content-Length": String(result.bytes.byteLength),
         ETag: etag,
-        // Variants are content-addressed \u2014 the bytes for a given
+        // Variants are content-addressed — the bytes for a given
         // ETag never change. Year-long immutable cache is safe;
         // on re-render the chunk_hash changes and the ETag
         // changes with it, busting any intermediary cache.
         "Cache-Control": "public, max-age=31536000, immutable",
-        // Phase 41 Fix 2 (audit 40B P1): Vary on Authorization so
-        // any intermediary CDN keys cached entries by Bearer token
-        // and never serves a tenant-A preview to a tenant-B request
-        // whose URL collides. The Workers Cache key already includes
-        // a per-user namespace; Vary is the wire assertion that
+        // Vary on Authorization so any intermediary CDN keys
+        // cached entries by Bearer token and never serves a
+        // tenant-A preview to a tenant-B request whose URL
+        // collides. The Workers Cache key already includes a
+        // per-user namespace; Vary is the wire assertion that
         // downstream caches honour the same axis.
         Vary: "Authorization",
         "X-Mossaic-Renderer": result.rendererKind,
@@ -233,7 +233,7 @@ preview.post("/readPreview", async (c) => {
   }
 });
 
-// ── previewInfo / previewInfoMany (Phase 45) ─────────────────────────
+// ── previewInfo / previewInfoMany ─────────────────────────────────────
 //
 // HTTP fallback for the SDK's `previewUrl` / `previewInfo` /
 // `previewInfoMany` methods. Both endpoints invoke the auth-gated
@@ -382,7 +382,7 @@ preview.post("/manifests", async (c) => {
   }
 });
 
-// ── public preview-variant route (Phase 45) ───────────────────────────
+// ── public preview-variant route ─────────────────────────────────────
 //
 // `GET /api/vfs/preview-variant/:token` is a SEPARATE Hono app
 // because the auth model differs from the rest of `vfs-preview`:
@@ -439,8 +439,8 @@ previewVariant.get("/preview-variant/:token", async (c) => {
       );
     }
 
-    // Phase 45 \u2014 cache key is the contentHash itself. Workers
-    // Cache key shape preserves the helper's
+    // Cache key is the contentHash itself. Workers Cache key
+    // shape preserves the helper's
     // `https://<surfaceTag>.mossaic.local/<namespace>/<fileId>/<updatedAt>/<extras>`
     // convention; for content-addressed keys we set updatedAt=0
     // and namespace="cas" (content-addressed storage) so

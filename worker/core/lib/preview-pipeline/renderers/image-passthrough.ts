@@ -1,5 +1,5 @@
 /**
- * Image-passthrough renderer — Phase 39 A3.
+ * Image-passthrough renderer.
  *
  * Returns the source bytes verbatim with their original MIME type
  * and the variant's nominal display dimensions. Used as the
@@ -70,7 +70,7 @@ export const imagePassthroughRenderer: Renderer = {
     // Drain the source stream into one buffer. Passthrough doesn't
     // transform — we're just collecting bytes that travel back as
     // the variant's body. Memory bound: bounded by READFILE_MAX
-    // (server-side cap, default 100 MB per Phase 39 H7) because
+    // (server-side cap, default 100 MB) because
     // this path is only reachable from preview RPCs that route
     // through the same chunked read pipeline.
     const reader = input.bytes.getReader();

@@ -98,7 +98,7 @@ export const YJS_UPDATE = 2;
 export const YJS_AWARENESS = 3;
 
 /**
- * Phase 38 — magic-prefix that distinguishes a snapshot payload
+ * Magic-prefix that distinguishes a snapshot payload
  * (`Y.encodeStateAsUpdate(doc)` bytes wrapped for `writeFile`)
  * from legacy plaintext-via-`Y.Text("content")` payloads.
  *
@@ -120,7 +120,7 @@ export const YJS_SNAPSHOT_MAGIC: Uint8Array = new Uint8Array([
 ]);
 
 /**
- * Phase 38 — true iff `bytes` starts with `YJS_SNAPSHOT_MAGIC`.
+ * True iff `bytes` starts with `YJS_SNAPSHOT_MAGIC`.
  * Cheap (4-byte prefix check); safe on short inputs (returns
  * false for `bytes.byteLength < 4`).
  */
@@ -133,8 +133,8 @@ export function hasYjsSnapshotMagic(bytes: Uint8Array): boolean {
 }
 
 /**
- * Phase 38 — wrap raw `Y.encodeStateAsUpdate(doc)` bytes with the
- * snapshot magic prefix. The result is the byte payload to pass
+ * Wrap raw `Y.encodeStateAsUpdate(doc)` bytes with the snapshot
+ * magic prefix. The result is the byte payload to pass
  * to `vfs.writeFile(yjsPath, payload)` so the server applies it
  * via `Y.applyUpdate` instead of stuffing the bytes into
  * `Y.Text("content")`.
@@ -776,16 +776,16 @@ export class YjsRuntime {
         "./vfs-versions"
       );
       if (isVersioningEnabled(this.durableObject, userId)) {
-        // Phase 38 — snapshot the FULL Y.Doc state as
+        // Snapshot the FULL Y.Doc state as
         // `Y.encodeStateAsUpdate(doc)` bytes wrapped with
         // `YJS_SNAPSHOT_MAGIC`. This preserves arbitrary named
-        // shared types (Y.XmlFragment for Tiptap/ProseMirror,
-        // Y.Map for Notion-style block editors, Y.Array, multiple
-        // Y.Texts). Pre-Phase-38 this stored only the flattened
+        // shared types (Y.XmlFragment for Tiptap/ProseMirror, Y.Map
+        // for Notion-style block editors, Y.Array, multiple Y.Texts).
+        // The legacy form stored only the flattened
         // `Y.Text("content")` UTF-8 bytes, which threw away every
         // other shared type. Existing Y.Text("content") files
-        // continue to work because the encoded state still
-        // contains that type as a top-level entry.
+        // continue to work because the encoded state still contains
+        // that type as a top-level entry.
         //
         // Stored magic-wrapped so a subsequent restoreVersion on
         // a yjs-mode path can be detected and routed through
@@ -927,7 +927,7 @@ export class YjsRuntime {
    * the readFile surface flattens to the conventional "content"
    * named Y.Text for backwards compatibility.
    *
-   * Phase 38: callers that want the FULL Y.Doc state (so they can
+   * Callers that want the FULL Y.Doc state (so they can
    * register `Y.XmlFragment`, `Y.Map`, `Y.Array`, or any other
    * named shared types — Tiptap/ProseMirror/Notion-style block
    * editors) should call `readSnapshot()` which returns
@@ -944,7 +944,7 @@ export class YjsRuntime {
   }
 
   /**
-   * Phase 38 — return full `Y.encodeStateAsUpdate(doc)` bytes so
+   * Return full `Y.encodeStateAsUpdate(doc)` bytes so
    * clients can decode arbitrary named shared types
    * (`Y.XmlFragment`, `Y.Map`, `Y.Array`, `Y.Text`, …). The bytes
    * are directly applicable via `Y.applyUpdate(localDoc, bytes)`
@@ -966,7 +966,7 @@ export class YjsRuntime {
    * Apply a Uint8Array via a Yjs transaction. Two payload shapes
    * are supported:
    *
-   * 1. **Snapshot update (Phase 38)** — bytes prefixed with the
+   * 1. **Snapshot update** — bytes prefixed with the
    *    `YJS_SNAPSHOT_MAGIC` 4-byte sequence (`0x59 0x4A 0x53 0x31`,
    *    "YJS1") followed by `Y.encodeStateAsUpdate(doc)` output.
    *    Applied as a CRDT state update (`Y.applyUpdate`) so the
@@ -980,7 +980,7 @@ export class YjsRuntime {
    *    Existing `vfs.writeFile(yjsPath, "text")` consumers keep
    *    working byte-for-byte; this is the contract every test in
    *    `tests/integration/yjs.test.ts` (and `encryption-yjs.test.ts`)
-   *    pinned before Phase 38.
+   *    pin.
    *
    * Capture-and-broadcast semantics are identical for both paths:
    * the emitted update is appended to `yjs_oplog`, broadcast to
@@ -995,8 +995,8 @@ export class YjsRuntime {
   ): Promise<void> {
     const isSnapshot = hasYjsSnapshotMagic(bytes);
 
-    // Phase 38 sub-agent (c) finding — reject snapshot writes on
-    // encrypted yjs files. The server cannot materialise an
+    // Reject snapshot writes on encrypted yjs files. The server
+    // cannot materialise an
     // encrypted Y.Doc (no key); applying a plaintext snapshot
     // update would either:
     //   (a) silently inject plaintext bytes into an op-log that
@@ -1011,8 +1011,8 @@ export class YjsRuntime {
     // outbound update individually).
     //
     // Legacy `Y.Text("content")` writes (`isSnapshot === false`)
-    // pre-date Phase 38 — they continue to work via the standard
-    // encrypted-yjs path, which intercepts each emitted update
+    // continue to work via the standard encrypted-yjs path, which
+    // intercepts each emitted update
     // and encrypts it client-side before it reaches the server.
     // For the SERVER this is moot: writeYjsBytes is only ever
     // called for plaintext yjs files (the encrypted client-side
@@ -1038,8 +1038,8 @@ export class YjsRuntime {
     doc.on("update", onUpdate);
     try {
       if (isSnapshot) {
-        // Phase 38 — apply the post-magic bytes as a Yjs state
-        // update inside a transaction so the resulting MERGED
+        // Apply the post-magic bytes as a Yjs state update inside
+        // a transaction so the resulting MERGED
         // update (which incorporates only the new info, not the
         // entire prior state) is what we persist + broadcast.
         // Yjs guarantees that applying the merged update on any
@@ -1302,8 +1302,8 @@ export async function readYjsAsBytes(
 }
 
 /**
- * Phase 38 — return `Y.encodeStateAsUpdate(doc)` bytes for a
- * yjs-mode file so SDK consumers can decode the FULL Y.Doc and
+ * Return `Y.encodeStateAsUpdate(doc)` bytes for a yjs-mode file
+ * so SDK consumers can decode the FULL Y.Doc and
  * use arbitrary named shared types (`Y.XmlFragment`, `Y.Map`,
  * `Y.Array`, multiple `Y.Text` instances under arbitrary names —
  * everything Tiptap/ProseMirror or a Notion-style block editor

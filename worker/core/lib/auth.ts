@@ -347,10 +347,10 @@ export async function verifyVFSMultipartToken(
   env: Env,
   token: string
 ): Promise<MultipartSessionTokenPayload | null> {
-  // Multi-secret aware (Phase 23 Fix 2). Tokens minted under the OLD
-  // JWT_SECRET stay valid through a rotation window so in-flight
-  // multipart sessions don't get killed when an operator rotates the
-  // signing key — see `docs/operations.md` §6.10.
+  // Multi-secret aware. Tokens minted under the OLD JWT_SECRET
+  // stay valid through a rotation window so in-flight multipart
+  // sessions don't get killed when an operator rotates the signing
+  // key — see `docs/operations.md` §6.10.
   const result = await verifyAgainstSecrets(env, token);
   if (result === null) return null;
   try {
@@ -439,10 +439,9 @@ export async function signVFSDownloadToken(
 /**
  * Verify a download token.
  *
- * Multi-secret aware (Phase 23 Fix 2). Pre-minted download URLs
- * (e.g. shareable thumbnail links handed to a CDN) stay valid
- * through a JWT_SECRET rotation window — see `docs/operations.md`
- * §6.10.
+ * Multi-secret aware. Pre-minted download URLs (e.g. shareable
+ * thumbnail links handed to a CDN) stay valid through a
+ * JWT_SECRET rotation window — see `docs/operations.md` §6.10.
  */
 export async function verifyVFSDownloadToken(
   env: Env,

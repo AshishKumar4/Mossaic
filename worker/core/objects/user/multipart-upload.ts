@@ -573,18 +573,18 @@ export async function vfsFinalizeMultipart(
 
   // 3. Compute touched shards.
   //
-  // Phase 32 Fix 4 NOTE: multipart placement intentionally does
-  // NOT pass `fullShards` to `placeChunk`. The route layer
-  // (`multipart-routes.ts`) places each chunk PUT via the same
+  // Multipart placement intentionally does NOT pass `fullShards`
+  // to `placeChunk`. The route layer (`multipart-routes.ts`)
+  // places each chunk PUT via the same
   // `placeChunk(uploadId, idx, payload.poolSize)` call without a
   // skip-set; the `fullShards` set at finalize time may differ
   // from the set at upload time, and we have no reliable way to
   // replay the upload-time snapshot here. The deterministic
   // pure-rendezvous form keeps finalize verification consistent
   // with placement. Multipart cap-awareness is deferred until we
-  // persist the per-session full-shards snapshot \u2014 a Phase 32.x
-  // follow-up. Reads work either way; only the write \"prefer
-  // less-full shards\" optimization is missing for multipart.
+  // persist the per-session full-shards snapshot. Reads work
+  // either way; only the write "prefer less-full shards"
+  // optimization is missing for multipart.
   const touched = new Set<number>();
   const idxToShard = new Array<number>(session.total_chunks);
   for (let i = 0; i < session.total_chunks; i++) {
@@ -650,21 +650,19 @@ export async function vfsFinalizeMultipart(
     new TextEncoder().encode(chunkHashList.join(""))
   );
 
-  // Phase 27 — multipart × versioning. When versioning is enabled
-  // for this tenant, finalize must:
+  // Multipart × versioning. When versioning is enabled for this
+  // tenant, finalize must:
   //   (a) write `version_chunks` (NOT `file_chunks`) keyed by a fresh
   //       version id, recording shard_ref_id = uploadId so a future
   //       `dropVersionRows` fan-out keys ShardDO `deleteChunks` with
   //       the same refId the chunk PUTs used at upload time;
   //   (b) call `commitVersion` to insert the file_versions row and
   //       move `files.head_version_id` ATOMICALLY — the prior
-  //       version's row + chunks survive (the heart of the
-  //       Phase 27 fix);
-  //   (c) NOT call `commitRename` (whose hard-delete branch is what
-  //       silently destroyed prior history pre-Phase-27).
-  // The non-versioned branch is byte-equivalent to pre-Phase-27 —
-  // commitRename's hard-delete supersede is correct semantics for
-  // versioning-off tenants.
+  //       version's row + chunks survive;
+  //   (c) NOT call `commitRename` (whose hard-delete branch would
+  //       silently destroy prior history under versioning).
+  // The non-versioned branch keeps `commitRename`'s hard-delete
+  // supersede — correct semantics for versioning-off tenants.
   const versioning = isVersioningEnabled(durableObject, userId);
   const now = Date.now();
 
@@ -790,9 +788,9 @@ export async function vfsFinalizeMultipart(
     //  and the file_chunks / metadata / tags it carried are intact;
     //  the row IS the path's identity so we keep it.)
   } else {
-    // Non-versioned tenant — pre-Phase-27 behaviour preserved
-    // verbatim. commitRename hard-deletes any prior live row, which
-    // is correct semantics for versioning-off (no history to keep).
+    // Non-versioned tenant — commitRename hard-deletes any prior
+    // live row, which is correct semantics for versioning-off (no
+    // history to keep).
 
     // 7. Batch-insert file_chunks rows. SQLite supports multi-row
     //    VALUES; we go per-row in a tight loop because the DO's bound-
@@ -856,10 +854,10 @@ export async function vfsFinalizeMultipart(
   //     the row) but BEFORE marking the session finalized so a
   //     post-finalize crash doesn't double-count on retry.
   //
-  // Phase 36 \u2014 only fires for the non-versioning branch.
-  // commitVersion (the versioning branch above) now self-accounts
-  // via recordWriteUsage. Calling here too would double-count
-  // bytes + file_count on every versioning multipart finalize.
+  // Only fires for the non-versioning branch. commitVersion (the
+  // versioning branch above) self-accounts via recordWriteUsage;
+  // calling here too would double-count bytes + file_count on
+  // every versioning multipart finalize.
   if (!versioning) {
     recordWriteUsage(durableObject, userId, totalSize, 1);
   }

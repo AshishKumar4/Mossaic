@@ -32,12 +32,12 @@
   // ShardDO holds content-addressed chunk blobs. The binding names
   // are CANONICAL: the SDK reads `env.MOSSAIC_USER` directly, and the
   // bundled UserDO code reads `env.MOSSAIC_SHARD` from inside its own
-  // env. Both bindings are required (Phase 13).
+  // env. Both bindings are required.
   //
-  // Phase 11.1: SearchDO is no longer part of the SDK surface. The
-  // CLIP/BGE vector search backed the photo-library's /api/search
-  // route specifically; SDK consumers who need semantic search
-  // should run their own Vectorize index or a separate DO.
+  // SearchDO is NOT part of the SDK surface. The CLIP/BGE vector
+  // search backed the photo-library's /api/search route specifically;
+  // SDK consumers who need semantic search should run their own
+  // Vectorize index or a separate DO.
   "durable_objects": {
     "bindings": [
       { "name": "MOSSAIC_USER", "class_name": "UserDO" },

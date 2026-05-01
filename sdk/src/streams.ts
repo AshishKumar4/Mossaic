@@ -99,18 +99,18 @@ export interface ReadHandle {
   chunkSize: number;
   inlined: boolean;
   /**
-   * Phase 25 — when set, the worker resolves chunks via
-   * `version_chunks` keyed by this versionId. Captured at open-time
-   * so a concurrent write doesn't move the head out from under an
-   * in-flight stream. Undefined for non-versioned tenants.
+   * When set, the worker resolves chunks via `version_chunks`
+   * keyed by this versionId. Captured at open-time so a concurrent
+   * write doesn't move the head out from under an in-flight stream.
+   * Undefined for non-versioned tenants.
    */
   versionId?: string;
   /**
-   * Phase 27.5 — pre-materialized bytes for yjs-mode files. Yjs
-   * content lives in the op-log + checkpoint pair, NOT in
-   * file/version chunks; the worker materializes the live `Y.Doc`
-   * once at open-time and stashes the bytes here. When present,
-   * `inlined === true` and `chunkCount === 0`.
+   * Pre-materialized bytes for yjs-mode files. Yjs content lives
+   * in the op-log + checkpoint pair, NOT in file/version chunks;
+   * the worker materializes the live `Y.Doc` once at open-time and
+   * stashes the bytes here. When present, `inlined === true` and
+   * `chunkCount === 0`.
    */
   inlineBytes?: Uint8Array;
 }

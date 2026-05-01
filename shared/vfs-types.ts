@@ -34,7 +34,7 @@ export interface VFSStatRaw {
   ino: number;
   /**
    * per-file encryption stamp. Undefined for plaintext
-   * (default for pre-Phase-15 rows and explicit plaintext writes).
+   * (default for legacy rows and explicit plaintext writes).
    * The SDK consults this on readFile to decide whether to attempt
    * decryption. NULL/undefined → return server bytes verbatim.
    */

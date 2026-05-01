@@ -761,7 +761,7 @@ export class HttpVFS implements VFSClient {
   }
 
   /**
-   * Phase 38 — Yjs snapshot read over HTTP fallback.
+   * Yjs snapshot read over HTTP fallback.
    *
    * Returns `Y.encodeStateAsUpdate(doc)` bytes for a yjs-mode
    * file. The HTTP route mirrors the binding-mode RPC: POST to
@@ -781,7 +781,7 @@ export class HttpVFS implements VFSClient {
   }
 
   /**
-   * Phase 38 — Yjs snapshot commit over HTTP fallback.
+   * Yjs snapshot commit over HTTP fallback.
    *
    * Encodes via `Y.encodeStateAsUpdate(doc)`, wraps with the
    * snapshot magic prefix, and writes via the existing

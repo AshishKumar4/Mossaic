@@ -43,7 +43,7 @@ export { ShardDO } from "./objects/shard/index";
 
 const app = new Hono<{ Bindings: Env }>();
 
-// Phase 42 \u2014 assign a request-id before any other middleware runs.
+// Assign a request-id before any other middleware runs.
 app.use("/api/*", requestIdMiddleware());
 
 app.use(
@@ -73,7 +73,7 @@ app.route("/api/vfs/multipart", multipartRoutes);
 // scope-bound). Cache-Control: immutable for hash-addressed bytes.
 app.route("/api/vfs", chunkDownload);
 
-// Phase 45 \u2014 signed preview-variant route. Lives at
+// Signed preview-variant route. Lives at
 // /api/vfs/preview-variant/:token. NO Bearer auth; the HMAC
 // token IS the auth. Bytes are content-addressed (immutable
 // cache by contentHash). Mounted BEFORE the auth-gated
