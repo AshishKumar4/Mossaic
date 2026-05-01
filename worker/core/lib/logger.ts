@@ -1,13 +1,13 @@
 /**
- * Structured logger for Mossaic Worker code (Phase 42).
+ * Structured logger for Mossaic Worker code.
  *
  * Three concerns this module addresses:
  *
- *   1. **Operator visibility.** Pre-Phase-42 logging was free-form
- *      `console.{warn,error}(`message: ${err}`)` which Logpush
- *      ingests as opaque text. Operators couldn't grep for
- *      "every error from tenant X" or "every error from request
- *      Y". The structured shape `{ts, level, msg, ...fields}` is
+ *   1. **Operator visibility.** Free-form
+ *      `console.{warn,error}(`message: ${err}`)` is ingested by
+ *      Logpush as opaque text — operators can't grep for "every
+ *      error from tenant X" or "every error from request Y". The
+ *      structured shape `{ts, level, msg, ...fields}` is
  *      machine-parseable — Logpush + Workers Logs both surface
  *      structured JSON natively.
  *
@@ -15,11 +15,11 @@
  *      may fan out to multiple DOs (UserDO + N ShardDOs); each
  *      logs from its own isolate. Without a shared request-id,
  *      correlating "which user's PUT triggered this ShardDO
- *      error?" requires log timestamp triangulation. Phase 42
- *      assigns a request-id at the Worker edge via
- *      `requestIdMiddleware` and threads it through (a) Hono
- *      context for route-layer logs, and (b) the
- *      `X-Mossaic-Request-Id` header for cross-DO calls.
+ *      error?" requires log timestamp triangulation. A request-id
+ *      is assigned at the Worker edge via `requestIdMiddleware`
+ *      and threaded through (a) Hono context for route-layer
+ *      logs, and (b) the `X-Mossaic-Request-Id` header for
+ *      cross-DO calls.
  *
  *   3. **Alarm-handler error visibility.** Three bare `catch {}`
  *      sites in `user-do-core.ts:alarm()` swallowed every error,

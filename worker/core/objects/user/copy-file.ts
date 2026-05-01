@@ -334,8 +334,8 @@ async function copyInline(
   );
   await durableObject.scheduleStaleUploadSweep();
 
-  // Phase 27 Fix 7 — under versioning ON, copy must NOT hard-delete
-  // the destination's prior history. The non-versioned source carries
+  // Under versioning ON, copy must NOT hard-delete the
+  // destination's prior history. The non-versioned source carries
   // no `head_version_id`, but the destination tenant may have
   // versioning enabled and the dest path may already be a versioned
   // file. Route through commitVersion when versioning is ON; the
@@ -399,7 +399,7 @@ async function copyInline(
     return;
   }
 
-  // Versioning OFF \u2014 pre-Phase-27 behaviour preserved.
+  // Versioning OFF — commitRename hard-deletes any prior live row.
   await opsMod.commitRename(
     durableObject,
     userId,
@@ -409,9 +409,9 @@ async function copyInline(
     leaf
   );
   await applyCopySideEffects(durableObject, userId, tmpId, opts, now, srcRow.file_id);
-  // Phase 36 \u2014 record bytes against quota for the non-versioning
-  // copy path. Pre-fix copyFile silently understated storage_used /
-  // file_count for non-versioning tenants. Inline tier so also
+  // Record bytes against quota for the non-versioning copy path.
+  // Without this, copyFile would silently understate storage_used
+  // / file_count for non-versioning tenants. Inline tier so also
   // bump inline_bytes_used.
   const { recordWriteUsage } = await import("./vfs/helpers");
   recordWriteUsage(
@@ -534,10 +534,10 @@ async function copyChunked(
     leaf
   );
   await applyCopySideEffects(durableObject, userId, tmpId, opts, now, srcRow.file_id);
-  // Phase 36 \u2014 record bytes against quota for the non-versioning
-  // chunked copy. Pre-fix copyFile silently understated
+  // Record bytes against quota for the non-versioning chunked
+  // copy. Without this, copyFile would silently understate
   // storage_used / file_count for non-versioning chunked copies,
-  // so multi-GB tenants saw their pool stay at 32 forever.
+  // so multi-GB tenants would see their pool stay at 32 forever.
   const { recordWriteUsage } = await import("./vfs/helpers");
   recordWriteUsage(durableObject, userId, srcRow.file_size, 1);
 }
@@ -606,9 +606,9 @@ async function copyVersioned(
 
   const newVersionId = generateId();
 
-  // Phase 27 Fix 7 — when destination already has a versioned live
-  // row, attach the new version to its `pathId` instead of `tmpId`
-  // so prior history survives the copy.
+  // When destination already has a versioned live row, attach the
+  // new version to its `pathId` instead of `tmpId` so prior
+  // history survives the copy.
   const liveDst = findLiveFile(durableObject, userId, parentId, leaf);
   let pathId: string;
   if (liveDst) {
@@ -725,8 +725,8 @@ async function copyVersioned(
     throw err;
   }
 
-  // Phase 27 Fix 7 — chunked copy commits the new version onto the
-  // destination's stable pathId (resolved above). chunk_refs were
+  // Chunked copy commits the new version onto the destination's
+  // stable pathId (resolved above). chunk_refs were
   // filed under `newRefId = shardRefId(tmpId, newVersionId)`; we
   // stamp that as `shard_ref_id` so a future `dropVersionRows`
   // fan-out keys ShardDO `deleteChunks` correctly when the version

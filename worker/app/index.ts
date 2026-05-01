@@ -32,10 +32,10 @@ export { SearchDO } from "./objects/search/index";
 
 const app = new Hono<{ Bindings: Env }>();
 
-// Phase 42 \u2014 assign a request-id to every incoming request before
-// any other middleware runs. Mirrors `X-Mossaic-Request-Id` onto
-// the response so clients can correlate. Cheap (1 randomUUID per
-// request); see worker/core/lib/logger.ts.
+// Assign a request-id to every incoming request before any other
+// middleware runs. Mirrors `X-Mossaic-Request-Id` onto the response
+// so clients can correlate. Cheap (1 randomUUID per request); see
+// worker/core/lib/logger.ts.
 app.use("/api/*", requestIdMiddleware());
 
 // CORS for development
@@ -79,7 +79,7 @@ app.route("/api/vfs/multipart", multipartRoutes);
 // cacheable per-chunk download endpoint at
 // /api/vfs/chunk/:fileId/:idx — token-auth, immutable cache.
 app.route("/api/vfs", chunkDownload);
-// Phase 45 \u2014 signed preview-variant route at
+// Signed preview-variant route at
 // /api/vfs/preview-variant/:token. HMAC token IS the auth;
 // bytes are content-addressed (CDN-cacheable across all clients).
 app.route("/api/vfs", previewVariant);

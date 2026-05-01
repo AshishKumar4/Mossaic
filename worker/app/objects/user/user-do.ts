@@ -70,10 +70,10 @@ export class UserDO extends UserDOCore {
 
   /**
    * Override Core's alarm to chain through the App-side search-index
-   * reconciler (Phase 23 Blindspot fix). Core's alarm sweeps tmp
-   * upload rows + expired multipart sessions; the App layer adds a
-   * sweep of `indexed_at IS NULL` files to catch cases where the
-   * SPA crashed between `multipart/finalize` and the index POST.
+   * reconciler. Core's alarm sweeps tmp upload rows + expired
+   * multipart sessions; the App layer adds a sweep of
+   * `indexed_at IS NULL` files to catch cases where the SPA crashed
+   * between `multipart/finalize` and the index POST.
    *
    * The reconciler is best-effort: any error is logged and swallowed
    * so it never blocks Core's alarm reschedule logic.
@@ -237,11 +237,11 @@ export class UserDO extends UserDOCore {
       parentId = folderRow.folder_id;
     }
 
-    // Phase 25 — tombstone-consistency. The index callback resolves
-    // a path → fileId then re-fires `indexFile`, which reads bytes.
-    // If the head version is tombstoned the read would throw; just
-    // return null here so the index POST 404s instead of triggering
-    // a downstream byte-read that explodes.
+    // Tombstone-consistency. The index callback resolves a path →
+    // fileId then re-fires `indexFile`, which reads bytes. If the
+    // head version is tombstoned the read would throw; just return
+    // null here so the index POST 404s instead of triggering a
+    // downstream byte-read that explodes.
     const fileRow = this.sql
       .exec(
         `SELECT f.*
@@ -293,9 +293,9 @@ export class UserDO extends UserDOCore {
     path: string;
     mimeType: string;
     /**
-     * Phase 36 \u2014 cache-key bust token. Returned so HTTP-cache layers
-     * (gallery thumbnail / shared image / preview) can include this
-     * in the cache-key path component. Every write that mutates
+     * Cache-key bust token. Returned so HTTP-cache layers (gallery
+     * thumbnail / shared image / preview) can include this in the
+     * cache-key path component. Every write that mutates
      * bytes-or-metadata bumps `files.updated_at` (via the various
      * UPDATE files SET ... updated_at = ? sites in vfs/* and
      * vfs-versions.ts), so a stale cached response is never served
@@ -313,11 +313,11 @@ export class UserDO extends UserDOCore {
     // path).
     this.ensureInit();
     appGateFromPersistedScope(this);
-    // Phase 25 — tombstone-consistency. Gallery/shared-album routes
-    // call this then immediately read bytes via canonical VFS. A
-    // tombstoned head would 404 with the wrong error class
-    // (downstream "head version is a tombstone" instead of "no such
-    // file"); returning null here gives the route a clean 404 path.
+    // Tombstone-consistency. Gallery/shared-album routes call this
+    // then immediately read bytes via canonical VFS. A tombstoned
+    // head would 404 with the wrong error class (downstream "head
+    // version is a tombstone" instead of "no such file"); returning
+    // null here gives the route a clean 404 path.
     const fileRow = this.sql
       .exec(
         `SELECT f.parent_id, f.file_name, f.mime_type, f.updated_at
@@ -423,10 +423,10 @@ export class UserDO extends UserDOCore {
    * reindex pipeline. `status='deleted'` rows are excluded; the
    * caller filters further on `status === 'complete'` if needed.
    *
-   * Phase 25 — tombstone-consistency: rows whose `head_version_id`
-   * points at a `deleted=1` `file_versions` row are EXCLUDED so
-   * downstream consumers (e.g. `indexFile`) don't try to read bytes
-   * for an unlinked path. Mirrors the canonical `vfsListFiles`
+   * Tombstone-consistency: rows whose `head_version_id` points at a
+   * `deleted=1` `file_versions` row are EXCLUDED so downstream
+   * consumers (e.g. `indexFile`) don't try to read bytes for an
+   * unlinked path. Mirrors the canonical `vfsListFiles`
    * default (`includeTombstones=false`).
    */
   async appListAllFiles(userId: string): Promise<UserFile[]> {
@@ -461,7 +461,7 @@ export class UserDO extends UserDOCore {
   /**
    * All complete image files across all folders, newest first.
    *
-   * Phase 25 — tombstone-consistency: same filter as `appListAllFiles`.
+   * Tombstone-consistency: same filter as `appListAllFiles`.
    * The gallery surface absolutely cannot show unlinked-under-versioning
    * photos: those photos' chunks are still referenced (versioning
    * preserves history) but the user has expressed intent to hide them.
@@ -507,7 +507,7 @@ export class UserDO extends UserDOCore {
     return getQuota(this, userId);
   }
 
-  // ── Search-index reconciler (Phase 23 Blindspot fix) ──────────────
+  // ── Search-index reconciler ───────────────────────────────────────
   //
   // The SPA's POST /api/index/file is fire-and-forget on
   // `executionCtx.waitUntil`. If the SPA crashes between
@@ -601,13 +601,13 @@ export class UserDO extends UserDOCore {
     }>
   > {
     appGate(this, appScopeFor(userId));
-    // Phase 25 — tombstone-consistency. Skip files whose head version
-    // is tombstoned: re-firing `indexFile` on them would attempt a
-    // byte read that throws "head version is a tombstone" downstream.
-    // The file's previously-indexed embeddings remain in the vector
-    // store keyed by file_id (acceptable: an unlinked file
-    // shouldn't surface in search anyway, and the next live write
-    // would re-fire indexing under a fresh fileId).
+    // Tombstone-consistency. Skip files whose head version is
+    // tombstoned: re-firing `indexFile` on them would attempt a
+    // byte read that throws "head version is a tombstone"
+    // downstream. The file's previously-indexed embeddings remain
+    // in the vector store keyed by file_id (acceptable: an unlinked
+    // file shouldn't surface in search anyway, and the next live
+    // write would re-fire indexing under a fresh fileId).
     // P1-8 — exclude rows that have hit the retry cap. The `index_attempts`
     // column is bumped in the reconciler's catch path; once it
     // crosses INDEX_MAX_ATTEMPTS (5) the row is dormant. An
@@ -797,7 +797,7 @@ export class UserDO extends UserDOCore {
   }
 
   /**
-   * Phase 42 \u2014 audit-log a share-link mint. Public surface so
+   * Audit-log a share-link mint. Public surface so
    * `worker/app/routes/auth.ts` can record the mint after
    * `signShareToken` succeeds. The token itself never touches the
    * DO (HMAC-only); this RPC exists purely so operators can query
@@ -827,12 +827,12 @@ export class UserDO extends UserDOCore {
   }
 
   /**
-   * Phase 42 \u2014 audit-log an account-delete attempt + outcome.
-   * Public surface so `worker/app/routes/auth.ts` can record the
-   * destructive operation; the appWipeAccountData / appWipeAuthRow
-   * pair has its own audit emissions for the data + auth wipes
-   * but the user-facing "I asked to delete my account" event
-   * deserves its own trail entry.
+   * Audit-log an account-delete attempt + outcome. Public surface
+   * so `worker/app/routes/auth.ts` can record the destructive
+   * operation; the appWipeAccountData / appWipeAuthRow pair has its
+   * own audit emissions for the data + auth wipes but the
+   * user-facing "I asked to delete my account" event deserves its
+   * own trail entry.
    */
   async appAuditAccountDelete(
     userId: string,

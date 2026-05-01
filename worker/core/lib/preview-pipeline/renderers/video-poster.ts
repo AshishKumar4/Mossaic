@@ -37,12 +37,12 @@ export const videoPosterRenderer: Renderer = {
     env,
     opts: RenderOpts
   ): Promise<RenderResult> {
-    // Delegate to icon-card. The BROWSER (Browser Run) binding
-    // was removed in Phase 39 — when a real video-poster pipeline
-    // is wired (likely via a different binding name), this body
-    // will run a headless snapshot and return the resulting
-    // PNG/WebP bytes. Until then, video MIMEs render as the
-    // generic icon-card stub.
+    // Delegate to icon-card. There is no BROWSER (Browser Run)
+    // binding wired today — when a real video-poster pipeline is
+    // wired (likely via a different binding name), this body will
+    // run a headless snapshot and return the resulting PNG/WebP
+    // bytes. Until then, video MIMEs render as the generic
+    // icon-card stub.
     void env;
     return iconCardRenderer.render(input, env, opts);
   },

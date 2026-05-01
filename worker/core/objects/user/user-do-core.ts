@@ -351,7 +351,7 @@ export class UserDOCore extends DurableObject<Env> {
       // column already exists
     }
 
-    // Phase 32 Fix 5 — inline-tier graceful migration.
+    // Inline-tier graceful migration.
     //
     // Tracks per-tenant cumulative bytes stored in the inline tier
     // (`files.inline_data` BLOBs). `vfsWriteFile` consults this on
@@ -367,7 +367,7 @@ export class UserDOCore extends DurableObject<Env> {
     //
     // Defaults to 0; legacy rows behave as if no inline bytes are
     // accounted, so the cap is effectively only enforced for
-    // POST-Phase-32 writes. That is correct behaviour: a tenant
+    // forward-going writes. That is correct behaviour: a tenant
     // already over the cap on legacy data continues to use inline
     // for the rows that already exist; new writes spill to chunked.
     try {
@@ -549,21 +549,21 @@ export class UserDOCore extends DurableObject<Env> {
       )
     `);
 
-    // Phase 32 Fix 4 \u2014 skip-full-shard placement.
+    // Skip-full-shard placement cache.
     //
     // Persistent per-shard byte-count cache. Refreshed every
     // ~30 min by `monitorShardCapacity` from the alarm path.
-    // \`placeChunk\` reads this table to construct a `fullShards`
+    // `placeChunk` reads this table to construct a `fullShards`
     // skip-set: rendezvous winners that are at-or-over the soft
     // cap fall over to the next-best score so writes never land
     // on a near-capacity shard. Backward-compat: empty cache
-    // (no rows) \u2192 `placeChunk` is byte-equivalent to the
-    // pre-Phase-32 deterministic top-1 winner; the test pool +
+    // (no rows) → `placeChunk` is byte-equivalent to the
+    // pure-rendezvous deterministic top-1 winner; the test pool +
     // brand-new tenants exhibit identical placement until the
     // first capacity poll runs.
     //
     // Cold-cache scenarios (no entry for a particular shard)
-    // are treated as \"not full\" \u2014 better to write to an
+    // are treated as "not full" — better to write to an
     // un-measured shard than to refuse the write under-spec'd.
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS shard_storage_cache (
@@ -658,18 +658,18 @@ export class UserDOCore extends DurableObject<Env> {
       // column already exists
     }
 
-    // Phase 27 — multipart × versioning consistency.
+    // Multipart × versioning consistency.
     //
     // Records the actual ShardDO chunk_refs file_id used at write
-    // time for this version's chunks. The legacy versioned write
-    // path (vfsWriteFileVersioned, restoreVersion, copy-file) uses
-    // the synthetic `${pathId}#${versionId}` form
+    // time for this version's chunks. The canonical versioned
+    // write path (vfsWriteFileVersioned, restoreVersion, copy-file)
+    // uses the synthetic `${pathId}#${versionId}` form
     // (`shardRefId(pathId, versionId)` in vfs-versions.ts:179) and
     // so the column is NULL for those rows — `dropVersionRows`
     // falls back to the synthetic form.
     //
-    // Multipart-finalize-under-versioning (Phase 27) writes chunks
-    // to ShardDOs at upload time keyed by `refId = uploadId`. The
+    // Multipart-finalize-under-versioning writes chunks to ShardDOs
+    // at upload time keyed by `refId = uploadId`. The
     // `file_versions` row created at finalize stamps
     // `shard_ref_id = uploadId` so a future `dropVersionRows` calls
     // ShardDO `deleteChunks(uploadId)` and finds the right
@@ -697,13 +697,13 @@ export class UserDOCore extends DurableObject<Env> {
       // column already exists
     }
 
-    // Phase 23 Blindspot fix: indexed_at marks files that have been
-    // search-indexed (text+CLIP via `indexFile` in worker/app/routes/
-    // search.ts). NULL = not yet indexed. The reconciler alarm
+    // indexed_at marks files that have been search-indexed
+    // (text+CLIP via `indexFile` in worker/app/routes/search.ts).
+    // NULL = not yet indexed. The reconciler alarm
     // (`runIndexReconcile`) sweeps NULL rows on a periodic cadence
-    // and re-queues them. Pre-fix, if the SPA crashed between
+    // and re-queues them. Without it, if the SPA crashed between
     // `multipart/finalize` and `POST /api/index/file` the file
-    // landed in canonical VFS but was never indexed → silent search
+    // would land in canonical VFS but never indexed → silent search
     // miss for the lifetime of the file.
     try {
       this.sql.exec("ALTER TABLE files ADD COLUMN indexed_at INTEGER");
@@ -739,7 +739,7 @@ export class UserDOCore extends DurableObject<Env> {
         WHERE indexed_at IS NULL AND status = 'complete'
     `);
 
-    // ── Phase 29 — archive bit (three-tier delete API) ────────────
+    // ── Archive bit (three-tier delete API) ───────────────────────
     //
     // `archived = 1` hides a path from the default `listFiles` /
     // `fileInfo` results without destroying or tombstoning data.
@@ -748,7 +748,7 @@ export class UserDOCore extends DurableObject<Env> {
     // are UNCHANGED — an archived file is fully readable by anyone
     // who knows its path. Only the listing-side filters apply.
     //
-    // Three-tier delete model after Phase 29:
+    // Three-tier delete model:
     //   - `archive(path)` — cosmetic; reversible via `unarchive`;
     //                       does NOT touch versions or chunks.
     //   - `unlink(path)`  — POSIX-style; versioning-on writes a
@@ -914,25 +914,27 @@ export class UserDOCore extends DurableObject<Env> {
         ON file_variants(file_id)
     `);
 
-    // Phase 28 Fix 1 — version-aware variant cache.
+    // Version-aware variant cache.
     //
-    // Pre-fix, the cache key was `(file_id, variant_kind, renderer_kind)`.
-    // After v2 supersedes v1 on a versioning-on tenant, the cache row
-    // for v1 still matches a thumbnail lookup and the gallery serves
-    // STALE bytes for the file's HEAD until the row is manually
-    // invalidated. The bug surfaces as "I edited the photo but the
-    // thumbnail shows the old image."
+    // The cache key would otherwise be
+    // `(file_id, variant_kind, renderer_kind)` — but after v2
+    // supersedes v1 on a versioning-on tenant, the cache row for
+    // v1 still matches a thumbnail lookup and the gallery would
+    // serve STALE bytes for the file's HEAD until the row is
+    // manually invalidated. The bug surfaces as "I edited the
+    // photo but the thumbnail shows the old image."
     //
-    // Post-fix: store the head_version_id at render time on the
-    // variant row. The reader (`findVariantRow` in
-    // `worker/core/objects/user/preview-variants.ts`) gates on a match
-    // with the file's CURRENT head_version_id; mismatch → cache miss
-    // → re-render against the new head. Existing (legacy) rows have
-    // version_id IS NULL — they remain valid for the
-    // versioning-OFF / no-head-version case (where head_version_id
-    // is NULL on `files` too). The legacy passthrough is a load-
-    // bearing equivalence: NULL == NULL is the SQL convention we
-    // adopt explicitly (`IS NULL` predicate, not `=`).
+    // Fix: store the head_version_id at render time on the variant
+    // row. The reader (`findVariantRow` in
+    // `worker/core/objects/user/preview-variants.ts`) gates on a
+    // match with the file's CURRENT head_version_id; mismatch →
+    // cache miss → re-render against the new head. Existing
+    // (legacy) rows have version_id IS NULL — they remain valid
+    // for the versioning-OFF / no-head-version case (where
+    // head_version_id is NULL on `files` too). The legacy
+    // passthrough is a load-bearing equivalence: NULL == NULL is
+    // the SQL convention we adopt explicitly (`IS NULL` predicate,
+    // not `=`).
     try {
       this.sql.exec(
         "ALTER TABLE file_variants ADD COLUMN version_id TEXT"
@@ -941,11 +943,11 @@ export class UserDOCore extends DurableObject<Env> {
       // column already exists
     }
 
-    // ── Phase 42: audit_log table ────────────────────────────────────────
+    // ── audit_log table ──────────────────────────────────────────
     //
     // Per-tenant append-only audit trail of every destructive
     // operation. See `worker/core/objects/user/vfs/audit-log.ts`
-    // for the helper API + retention policy. Idempotent CREATE \u2014
+    // for the helper API + retention policy. Idempotent CREATE —
     // existing tenants pick up the table on next ensureInit.
     //
     // Index on (op, ts DESC) supports the "last N entries of op X"
@@ -1281,14 +1283,14 @@ export class UserDOCore extends DurableObject<Env> {
       try {
         await hardDeleteFileRow(this, userId, scope, file_id);
       } catch (err) {
-        // Phase 42 \u2014 surface alarm-handler errors via structured
-        // log + counter. Pre-Phase-42 the bare `catch {}` ate
-        // every error including permanent failures (corrupted tmp
-        // row, ShardDO outage). Now: log via `logError`, bump the
-        // `alarm_failures` counter in `vfs_meta`, and CONTINUE \u2014
-        // alarms have at-least-once retry; throwing would just
-        // get the alarm replayed without progress on the
-        // remaining batch.
+        // Surface alarm-handler errors via structured log +
+        // counter. A bare `catch {}` would eat every error
+        // including permanent failures (corrupted tmp row, ShardDO
+        // outage). Instead: log via `logError`, bump the
+        // `alarm_failures` counter in `vfs_meta`, and CONTINUE —
+        // alarms have at-least-once retry; throwing would just get
+        // the alarm replayed without progress on the remaining
+        // batch.
         this.recordAlarmFailure(
           "stale_tmp_sweep",
           file_id,
@@ -1310,17 +1312,16 @@ export class UserDOCore extends DurableObject<Env> {
       const r = await sweepExpiredMultipartSessions(this, () => scope);
       multipartHasMore = r.remaining;
     } catch (err) {
-      // Phase 42 \u2014 visible failure (was bare swallow).
+      // Visible failure (instead of a bare swallow).
       this.recordAlarmFailure("multipart_sweep", "", err);
     }
 
-    // Phase 28 Fix 4 — shard capacity warning poll. Throttled to
-    // once per hour by the helper itself; reads `quota.pool_size`
-    // and fans out a `getStorageBytes` RPC per shard. Logs a
-    // structured warning for each shard that's >softCap (9 GB).
-    // Best-effort: a transient shard failure or missing quota row
-    // is swallowed so capacity monitoring never blocks the
-    // primary alarm work.
+    // Shard capacity warning poll. Throttled (once per cadence) by
+    // the helper itself; reads `quota.pool_size` and fans out a
+    // `getStorageBytes` RPC per shard. Logs a structured warning
+    // for each shard that's >softCap (9 GB). Best-effort: a
+    // transient shard failure or missing quota row is swallowed so
+    // capacity monitoring never blocks the primary alarm work.
     try {
       const poolRow = this.sql
         .exec(
@@ -1335,14 +1336,14 @@ export class UserDOCore extends DurableObject<Env> {
         await monitorShardCapacity(this, scope, poolRow.pool_size);
       }
     } catch (err) {
-      // Phase 42 \u2014 visible failure (was bare swallow).
+      // Visible failure (instead of a bare swallow).
       this.recordAlarmFailure("shard_capacity_poll", "", err);
     }
 
-    // Phase 42 \u2014 audit-log retention sweep. Trim oldest rows when
-    // count exceeds the configured cap. Cheap (one COUNT + one
-    // bounded DELETE); fires inline so retention pressure
-    // amortizes across alarm ticks.
+    // Audit-log retention sweep. Trim oldest rows when count
+    // exceeds the configured cap. Cheap (one COUNT + one bounded
+    // DELETE); fires inline so retention pressure amortizes
+    // across alarm ticks.
     try {
       const max = loadAuditLogMaxRows(this);
       const reaped = reapAuditLog(this, max);
@@ -1369,13 +1370,13 @@ export class UserDOCore extends DurableObject<Env> {
   }
 
   /**
-   * Phase 42 \u2014 record an alarm-handler failure visibly. Logs the
-   * error via `logError` (so Logpush surfaces it) AND bumps the
-   * persistent `alarm_failures` counter in `vfs_meta`. Operators
-   * who notice the counter rising can grep Logpush by
+   * Record an alarm-handler failure visibly. Logs the error via
+   * `logError` (so Logpush surfaces it) AND bumps the persistent
+   * `alarm_failures` counter in `vfs_meta`. Operators who notice
+   * the counter rising can grep Logpush by
    * `event: "alarm_handler_failed"` for the specific stack.
    *
-   * Never throws \u2014 alarm handlers swallow their own observability
+   * Never throws — alarm handlers swallow their own observability
    * failures so a failed log/counter doesn't compound into a
    * failed alarm.
    */
@@ -1499,8 +1500,8 @@ export class UserDOCore extends DurableObject<Env> {
   }
 
   /**
-   * Phase 36b \u2014 cheap pre-flight for cache-key construction.
-   * Returns the bust state (fileId, headVersionId, updatedAt,
+   * Cheap pre-flight for cache-key construction. Returns the
+   * bust state (fileId, headVersionId, updatedAt,
    * encryption stamp) for `path` in one SQL JOIN. Routes that
    * wrap reads in `caches.default` call this BEFORE the heavy
    * RPC so they can build a deterministic cache key.
@@ -1517,7 +1518,7 @@ export class UserDOCore extends DurableObject<Env> {
   }
 
   /**
-   * Phase 45 \u2014 mint a signed preview-variant URL.
+   * Mint a signed preview-variant URL.
    *
    * Resolves `path` to a fileId + headVersionId, ensures the
    * variant cache row exists (rendering on demand if needed),
@@ -1555,7 +1556,7 @@ export class UserDOCore extends DurableObject<Env> {
   }
 
   /**
-   * Phase 45 \u2014 read variant bytes by content hash, gated on the
+   * Read variant bytes by content hash, gated on the
    * variant cache row matching `(fileId, variantKind, rendererKind,
    * headVersionId, contentHash)`. Used by the preview-variant
    * route after `verifyPreviewToken` succeeds: the token claims
@@ -1622,7 +1623,7 @@ export class UserDOCore extends DurableObject<Env> {
   }
 
   /**
-   * Phase 45 \u2014 batched preview-info mint. Mirrors the
+   * Batched preview-info mint. Mirrors the
    * `/manifests` batched shape: one RPC per N paths instead of N
    * RPCs. Per-path failures are returned alongside successes so
    * a single missing file doesn't surface 4xx for the whole
@@ -1673,7 +1674,7 @@ export class UserDOCore extends DurableObject<Env> {
   }
 
   /**
-   * Phase 45 \u2014 internal mint helper. Resolves the path, ensures
+   * Internal mint helper. Resolves the path, ensures
    * the variant cache row exists, signs the token. Used by both
    * `vfsMintPreviewToken` and `vfsPreviewInfoMany`.
    *
@@ -1943,7 +1944,7 @@ export class UserDOCore extends DurableObject<Env> {
   }
 
   /**
-   * purge() — Phase 25 destructive cleanup.
+   * purge() — destructive cleanup.
    *
    * Drops every version row + the `files` row + decrements ShardDO
    * chunk refs for all versions' chunks. Independent of versioning
@@ -1955,7 +1956,7 @@ export class UserDOCore extends DurableObject<Env> {
   }
 
   /**
-   * Phase 29 — `archive(path)` / `unarchive(path)`.
+   * `archive(path)` / `unarchive(path)`.
    *
    * Hide a path from default `listFiles` / `fileInfo` results
    * without destroying or tombstoning data. Read surfaces (`stat`,
@@ -2604,7 +2605,7 @@ export class UserDOCore extends DurableObject<Env> {
   }
 
   /**
-   * Phase 25 — recovery primitive for tombstoned-head rows.
+   * Recovery primitive for tombstoned-head rows.
    *
    * Scans `files` rows whose `head_version_id` points at a
    * `deleted=1` `file_versions` row and either drops them
@@ -2675,9 +2676,9 @@ export class UserDOCore extends DurableObject<Env> {
       fileSize: number;
       isEncrypted: boolean;
       /**
-       * Phase 28 Fix 1 — head_version_id at finalize time. Optional
-       * for backward compat with route callers that haven't been
-       * updated; resolved from the `files` row when omitted.
+       * head_version_id at finalize time. Optional for backward
+       * compat with route callers that haven't been updated;
+       * resolved from the `files` row when omitted.
        */
       headVersionId?: string | null;
     }
@@ -2685,8 +2686,7 @@ export class UserDOCore extends DurableObject<Env> {
     this.gateVfs(scope);
     // Resolve head_version_id from `files` when the caller didn't
     // pass it. Pre-generated variants stamp this value so a
-    // subsequent write that flips the head invalidates them
-    // (Phase 28 Fix 1).
+    // subsequent write that flips the head invalidates them.
     let headVersionId: string | null = args.headVersionId ?? null;
     if (args.headVersionId === undefined) {
       const row = this.sql
@@ -2820,8 +2820,8 @@ export class UserDOCore extends DurableObject<Env> {
   }
 
   /**
-   * Phase 38 — return the full `Y.encodeStateAsUpdate(doc)` bytes
-   * for a yjs-mode file so SDK consumers can decode arbitrary
+   * Return the full `Y.encodeStateAsUpdate(doc)` bytes for a
+   * yjs-mode file so SDK consumers can decode arbitrary
    * named shared types (`Y.XmlFragment`, `Y.Map`, `Y.Array`,
    * multiple `Y.Text`s — Tiptap/ProseMirror, Notion-style block
    * editors).
@@ -2847,11 +2847,11 @@ export class UserDOCore extends DurableObject<Env> {
         ? `${scope.tenant}::${scope.sub}`
         : scope.tenant;
     const r = resolvePathFollow(this, userId, path);
-    // Phase 38 sub-agent (a) finding — distinguish ENOENT /
-    // ENOTDIR / ELOOP / EISDIR / EINVAL on path resolution. Pre-fix
-    // every non-"file" kind collapsed to EINVAL with the misleading
-    // message "not a regular file", breaking the standard fs-style
-    // error contract a Tiptap consumer expects.
+    // Distinguish ENOENT / ENOTDIR / ELOOP / EISDIR / EINVAL on
+    // path resolution. Without this branching, every non-"file"
+    // kind would collapse to EINVAL with the misleading message
+    // "not a regular file", breaking the standard fs-style error
+    // contract a Tiptap consumer expects.
     if (r.kind === "ENOENT") {
       throw new VFSError(
         "ENOENT",
@@ -2947,12 +2947,12 @@ export class UserDOCore extends DurableObject<Env> {
         `openYjsSocket: file is not in yjs mode: ${path}`
       );
     }
-    // Phase 25 Fix 12 — refuse the WS upgrade for a tombstoned-head
-    // file. Pre-fix, a yjs-mode path that had been `unlink`ed under
-    // versioning-on still accepted incoming WS connections; clients
-    // could read AND WRITE into a path the SDK reported as
-    // gone. Now an explicit head-tombstone shortcuts to ENOENT,
-    // matching `vfsStat` / `vfsReadFile`.
+    // Refuse the WS upgrade for a tombstoned-head file. Without
+    // this gate, a yjs-mode path that had been `unlink`ed under
+    // versioning-on would still accept incoming WS connections;
+    // clients could read AND WRITE into a path the SDK reported as
+    // gone. The explicit head-tombstone shortcut to ENOENT matches
+    // `vfsStat` / `vfsReadFile`.
     const yjsHead = this.sql
       .exec(
         `SELECT f.head_version_id, fv.deleted AS head_deleted

@@ -1,19 +1,18 @@
 /**
- * Phase 36b \u2014 cheap path \u2192 cache-key bust-token resolver.
+ * Cheap path → cache-key bust-token resolver.
  *
  * Routes that wrap a heavy read in `caches.default` (readPreview,
  * readChunk, openManifest) need a cache-key derived from the
  * tenant + the file's current state. The state must include
  * EVERY signal that would invalidate the cache:
  *
- *   - `fileId` (immutable) \u2014 picks out the right file row.
- *   - `headVersionId` \u2014 bumps on every commitVersion (versioning
+ *   - `fileId` (immutable) — picks out the right file row.
+ *   - `headVersionId` — bumps on every commitVersion (versioning
  *     ON) or stays NULL (versioning OFF). Version-keyed cache.
- *   - `updatedAt` \u2014 covers metadata-only mutations that don't
- *     bump head_version (rename, mode change, archive flip,
- *     metadata edit). Phase 36's gallery cache keys on this; we
- *     reuse for symmetry.
- *   - `encryptionMode` + `encryptionKeyId` \u2014 a key-rotation
+ *   - `updatedAt` — covers metadata-only mutations that don't bump
+ *     head_version (rename, mode change, archive flip, metadata
+ *     edit). The gallery cache keys on this; we reuse for symmetry.
+ *   - `encryptionMode` + `encryptionKeyId` — a key-rotation
  *     between writes invalidates rendered variants (re-encrypted
  *     bytes look different to readers).
  *
@@ -21,7 +20,7 @@
  * cost at ~1ms inside the UserDO. The route then builds the cache
  * key locally and proceeds.
  *
- * @lean-invariant Mossaic.Vfs.Cache.bust_token_completeness \u2014
+ * @lean-invariant Mossaic.Vfs.Cache.bust_token_completeness —
  * the cache key includes every column that any write path might
  * mutate AND that affects the response bytes. See
  * `local/cache-staleness-audit.md` for the per-surface proof.

@@ -645,17 +645,17 @@ export class ShardDO extends DurableObject<Env> {
   }
 
   /**
-   * Phase 32 Fix 3 \u2014 batched chunk-ref drop.
+   * Batched chunk-ref drop.
    *
-   * Reviewer Q3 flagged the rmrf subrequest blast: with
-   * BATCH_LIMIT=200 and poolSize=32, the per-file
-   * \`vfsRemoveRecursive\` loop fanned out up to 200 \xd7 32 = 6400
-   * subrequests \u2014 over the Workers paid cap of 1000.
+   * Without batching, with BATCH_LIMIT=200 and poolSize=32, the
+   * per-file `vfsRemoveRecursive` loop would fan out up to
+   * 200 × 32 = 6400 subrequests — over the Workers paid cap of
+   * 1000.
    *
    * This RPC accepts an array of file_ids and processes them in
    * a single DO turn (one SQL transaction). The caller groups
    * file_ids by shard_index FIRST, then issues ONE RPC per shard
-   * with the full list \u2014 worst case poolSize subrequests
+   * with the full list — worst case poolSize subrequests
    * regardless of BATCH_LIMIT.
    *
    * Idempotent per fileId: \`removeFileRefs\` does nothing on a
@@ -717,7 +717,7 @@ export class ShardDO extends DurableObject<Env> {
   }
 
   /**
-   * Phase 39 B1 — typed single-chunk read RPC.
+   * Typed single-chunk read RPC.
    *
    * The HTTP-style `GET /chunk/:hash` route remains for the legacy
    * upload/download surface; this RPC is what UserDO's read paths
@@ -749,7 +749,7 @@ export class ShardDO extends DurableObject<Env> {
   }
 
   /**
-   * Phase 39 B2/B3 — batched chunk read RPC.
+   * Batched chunk read RPC.
    *
    * Single round-trip retrieval of N chunks on this shard. Replaces
    * the previous "loop with `stub.fetch` per chunk" which paid one
@@ -766,7 +766,7 @@ export class ShardDO extends DurableObject<Env> {
    * Empty input → empty output (`{ bytes: [] }`); zero allocations.
    *
    * Memory bound: caller must already enforce READFILE_MAX (server-
-   * side cap, default 100 MB per Phase 1) BEFORE calling — we hold
+   * side cap, default 100 MB) BEFORE calling — we hold
    * the response buffer in memory. The list of hashes is also
    * bounded by the caller (one shard's contribution to a manifest);
    * typical manifests have dozens of chunks per shard, not
@@ -804,7 +804,7 @@ export class ShardDO extends DurableObject<Env> {
   }
 
   /**
-   * Telemetry RPC (Phase 23 audit Claim 4).
+   * Telemetry RPC.
    *
    * Returns the bytes currently stored on this shard, the count of
    * unique chunks (post-dedup), and a soft-cap value for monitoring.

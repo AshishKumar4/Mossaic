@@ -4,16 +4,15 @@ import { insertAuditLog } from "./audit-log";
 import { resolveOrThrow, userIdFor } from "./helpers";
 
 /**
- * Phase 29 sub-agent (c) "$1000 bet" finding — refuse to mutate
- * the archive bit on a tombstoned-head row. Without this guard,
- * `archive(path)` on a versioning-on tenant where `unlink(path)`
- * has tombstoned the head version would silently flip
- * `files.archived = 1` (the `files` row is still alive — only the
- * head version is `deleted=1`). Two consequences:
+ * Refuse to mutate the archive bit on a tombstoned-head row.
+ * Without this guard, `archive(path)` on a versioning-on tenant
+ * where `unlink(path)` has tombstoned the head version would
+ * silently flip `files.archived = 1` (the `files` row is still
+ * alive — only the head version is `deleted=1`). Two consequences:
  *
  *   - the `listFiles({ includeArchived: true })` "Trash UI"
- *     surface excludes tombstoned heads (Phase 25), so the row
- *     becomes invisible to every listing, archived or not.
+ *     surface excludes tombstoned heads, so the row becomes
+ *     invisible to every listing, archived or not.
  *   - if a later `restoreVersion` / `writeFile` revives the path,
  *     the stale archive bit resurfaces — the resurrected file
  *     appears archived from day one with no user action.
@@ -56,7 +55,7 @@ function ensureNotTombstoned(
 }
 
 /**
- * Phase 29 — `vfs.archive(path)` / `vfs.unarchive(path)`.
+ * `vfs.archive(path)` / `vfs.unarchive(path)`.
  *
  * The third tier of the delete API surface. Archive is a purely
  * cosmetic flag: it hides a path from the default `listFiles` /

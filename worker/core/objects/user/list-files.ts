@@ -59,7 +59,7 @@ interface ListFilesOpts {
   includeStat?: boolean;
   includeMetadata?: boolean;
   /**
-   * Phase 25 — tombstone-consistency.
+   * Tombstone-consistency.
    *
    * Default `false`: rows whose `files.head_version_id` points at a
    * `file_versions` row with `deleted=1` are EXCLUDED from results.
@@ -75,7 +75,7 @@ interface ListFilesOpts {
    */
   includeTombstones?: boolean;
   /**
-   * Phase 29 — archive bit.
+   * Archive bit.
    *
    * Default `false`: rows where `files.archived = 1` are EXCLUDED
    * from results. Archive is the third tier of the delete API
@@ -93,14 +93,14 @@ export interface FileInfoOpts {
   includeStat?: boolean;
   includeMetadata?: boolean;
   /**
-   * Phase 25 — same semantics as `ListFilesOpts.includeTombstones`.
+   * Same semantics as `ListFilesOpts.includeTombstones`.
    * Default `false`: a path resolving to a row whose head version
    * is tombstoned throws ENOENT, matching `vfsStat`. Set to `true`
    * for admin/recovery surfaces.
    */
   includeTombstones?: boolean;
   /**
-   * Phase 29 — archive filter.
+   * Archive filter.
    *
    * Default `false`: a path resolving to a row with `archived = 1`
    * throws ENOENT (matches the `listFiles` exclusion). Set to
@@ -259,8 +259,8 @@ export async function vfsFileInfo(
     // head IS ENOENT, matching `vfsStat`/`vfsReadFile`. Admin /
     // recovery callers can opt in via `includeTombstones: true`.
     opts.includeTombstones === true,
-    // Phase 29 — archive default is also strict: archived files are
-    // ENOENT to fileInfo unless the caller opts in. Note this is
+    // Archive default is also strict: archived files are ENOENT
+    // to fileInfo unless the caller opts in. Note this is
     // STRICTER than `stat` / `readFile` (which never gate on
     // archived) — fileInfo is the listing-shape surface, and a UI
     // building a "Trash" view must opt in explicitly.
@@ -343,9 +343,9 @@ function listByFiles(
     where.push("IFNULL(f.parent_id,'') = IFNULL(?,'')");
     args.push(parentId ?? "");
   }
-  // Phase 25 — tombstone-consistency. LEFT JOIN to file_versions on
-  // the head pointer; require either no head (non-versioned tenants
-  // have head_version_id IS NULL) or a non-tombstoned head. The
+  // Tombstone-consistency. LEFT JOIN to file_versions on the head
+  // pointer; require either no head (non-versioned tenants have
+  // head_version_id IS NULL) or a non-tombstoned head. The
   // partial-NULL match is preserved by the LEFT JOIN — when
   // head_version_id IS NULL the join returns NULL columns and the
   // `fv.deleted IS NULL` predicate accepts it.
@@ -354,8 +354,8 @@ function listByFiles(
       "(f.head_version_id IS NULL OR fv.deleted IS NULL OR fv.deleted = 0)"
     );
   }
-  // Phase 29 — archive bit. Default-on filter so a tenant's
-  // "Hidden" / "Trash" UI must explicitly opt in to see them.
+  // Archive bit. Default-on filter so a tenant's "Hidden" /
+  // "Trash" UI must explicitly opt in to see them.
   if (!includeArchived) {
     where.push("f.archived = 0");
   }
@@ -507,7 +507,7 @@ function listSingleTag(
       );
       args.push(parentId ?? "");
     }
-    // Phase 25 — tombstone filter on the path_id's head version.
+    // Tombstone filter on the path_id's head version.
     if (!includeTombstones) {
       where.push(
         `NOT EXISTS (
@@ -520,7 +520,7 @@ function listSingleTag(
          )`
       );
     }
-    // Phase 29 — archive filter on the path_id's files row.
+    // Archive filter on the path_id's files row.
     if (!includeArchived) {
       where.push(
         `EXISTS (
@@ -560,7 +560,7 @@ function listSingleTag(
       "(f.head_version_id IS NULL OR fv.deleted IS NULL OR fv.deleted = 0)"
     );
   }
-  // Phase 29 — archive filter (non-mtime ordering branch).
+  // Archive filter (non-mtime ordering branch).
   if (!includeArchived) {
     where.push("f.archived = 0");
   }
@@ -706,13 +706,13 @@ function hydrateItem(
       }
     | undefined;
   if (!f) return null;
-  // Phase 29 — archive filter at the hydration boundary. Default
-  // listings exclude archived rows. fileInfo (with default
+  // Archive filter at the hydration boundary. Default listings
+  // exclude archived rows. fileInfo (with default
   // `includeArchived: false`) returns null → caller raises ENOENT.
   if (!includeArchived && f.archived === 1) return null;
 
-  // Phase 25 — tombstone-consistency. When the file row carries a
-  // versioned head pointer, follow it; if the head is tombstoned we
+  // Tombstone-consistency. When the file row carries a versioned
+  // head pointer, follow it; if the head is tombstoned we
   // skip this row (default) so the result is stat-able, mirroring
   // `statForResolved` (helpers.ts:244). We also use the head
   // version's `size` and `mtime_ms` so the surfaced stat matches

@@ -101,11 +101,11 @@ export type {
 // implementations live in the worker (server-side rendering). SDK
 // consumers call `vfs.readPreview()` and receive `ReadPreviewResult`.
 //
-// Phase 45 \u2014 also export the signed-URL types (`previewUrl` /
-// `previewInfo` / `previewInfoMany`). The new methods return URLs
-// the browser can fetch directly via the
-// `/api/vfs/preview-variant/<token>` route, hitting Workers Cache +
-// CDN edge instead of tunneling bytes through the SDK's RPC.
+// Also export the signed-URL types (`previewUrl` / `previewInfo`
+// / `previewInfoMany`). These methods return URLs the browser can
+// fetch directly via the `/api/vfs/preview-variant/<token>`
+// route, hitting Workers Cache + CDN edge instead of tunneling
+// bytes through the SDK's RPC.
 export type {
   Variant,
   StandardVariant,

@@ -101,15 +101,15 @@ export interface VFSReadHandle {
    * server-authoritative chunkSize (bytes per chunk except possibly the
    * last). Pinned at open-time so `vfsCreateReadStream`'s range math
    * never has to re-query a stale `files.chunk_size` (which is 0 on
-   * versioned tenants — the cause of the readPreview NaN bug fixed in
-   * Phase 27.5). For inlined / yjs / empty files this is 0; the
+   * versioned tenants — readPreview would otherwise hit a NaN
+   * div-by-zero). For inlined / yjs / empty files this is 0; the
    * stream layer above must guard div-by-zero before using it.
    */
   chunkSize: number;
   /** true iff content lives in inline_data; chunkCount == 0 in that case */
   inlined: boolean;
   /**
-   * Phase 25 — when set, `vfsPullReadStream` resolves chunks via
+   * When set, `vfsPullReadStream` resolves chunks via
    * `version_chunks` keyed by this versionId (and inline bytes from
    * the head version row). Captured at open-time so a concurrent
    * write doesn't move the head out from under an in-flight stream.
@@ -118,8 +118,8 @@ export interface VFSReadHandle {
    */
   versionId?: string;
   /**
-   * Phase 27.5 — pre-materialized bytes for yjs-mode files. Yjs
-   * content lives in `yjs_oplog` + `yjs_checkpoints`, NOT in
+   * Pre-materialized bytes for yjs-mode files. Yjs content lives
+   * in `yjs_oplog` + `yjs_checkpoints`, NOT in
    * `file_chunks` / `version_chunks`. The stream surface materializes
    * the live `Y.Doc` once at open-time and stashes the bytes here so
    * `vfsPullReadStream` can serve them as if they were inlined. When
@@ -147,21 +147,21 @@ export async function vfsOpenReadStream(
       `openReadStream: not a regular file: ${path}`
     );
   }
-  // Phase 25 Fix 11 — tombstone gate + versioned-byte-source.
-  // Without this, any caller of `vfsCreateReadStream` (HTTP fallback
-  // download, SDK `createReadStream`) on a tombstoned-head path
-  // streams legacy `file_chunks` bytes for an "unlinked" file. For
+  // Tombstone gate + versioned-byte-source. Without this, any
+  // caller of `vfsCreateReadStream` (HTTP fallback download, SDK
+  // `createReadStream`) on a tombstoned-head path would stream
+  // legacy `file_chunks` bytes for an "unlinked" file. For
   // non-tombstoned versioned tenants the handle's chunkCount/size
-  // come from the head version row (which `vfsPullReadStream` then
-  // resolves via `version_chunks`), matching `readFileVersioned`.
+  // come from the head version row (which `vfsPullReadStream`
+  // then resolves via `version_chunks`), matching
+  // `readFileVersioned`.
   //
-  // Phase 27.5 — also pull `mode_yjs`, `chunk_size` (legacy), and the
-  // head version's `chunk_size` so the handle carries an
-  // authoritative chunkSize. The download/preview/stream paths
-  // previously called `getChunkSizeForHandle` which queried
-  // `files.chunk_size` — STALE (0) for versioned tenants — producing
-  // `Math.floor(0/0) === NaN` in `vfsCreateReadStream`. Pinning
-  // chunkSize at open-time eliminates that race.
+  // Also pull `mode_yjs`, `chunk_size` (legacy), and the head
+  // version's `chunk_size` so the handle carries an authoritative
+  // chunkSize. A naive `getChunkSizeForHandle` querying
+  // `files.chunk_size` would be STALE (0) for versioned tenants —
+  // producing `Math.floor(0/0) === NaN` in `vfsCreateReadStream`.
+  // Pinning chunkSize at open-time eliminates that race.
   const row = durableObject.sql
     .exec(
       `SELECT f.file_id, f.file_size, f.chunk_size, f.chunk_count,
@@ -201,9 +201,9 @@ export async function vfsOpenReadStream(
     );
   }
 
-  // Phase 27.5 — yjs-mode short-circuit. Yjs files persist as an
-  // op-log + checkpoint pair (`yjs_oplog` / `yjs_checkpoints`), NOT
-  // as `file_chunks` / `version_chunks`. Materialize the live Y.Doc
+  // Yjs-mode short-circuit. Yjs files persist as an op-log +
+  // checkpoint pair (`yjs_oplog` / `yjs_checkpoints`), NOT as
+  // `file_chunks` / `version_chunks`. Materialize the live Y.Doc
   // once at open-time and serve it as a single inlined buffer. This
   // matches `vfsReadFile`'s yjs short-circuit at reads.ts:468 and
   // means `createReadStream` / `openManifest` / `readChunk` /
@@ -270,16 +270,16 @@ export async function vfsPullReadStream(
         `pullReadStream: inlined file has no chunk index ${chunkIndex}`
       );
     }
-    // Phase 27.5 — yjs-mode handle carries pre-materialized bytes
-    // captured at open-time. Serve directly without touching SQL.
+    // Yjs-mode handle carries pre-materialized bytes captured at
+    // open-time. Serve directly without touching SQL.
     if (handle.inlineBytes !== undefined) {
       return range
         ? sliceWithRange(handle.inlineBytes, range)
         : handle.inlineBytes;
     }
-    // Phase 25 Fix 11 — read inline bytes from the head version row
-    // when the handle was opened for a versioned tenant; falls back
-    // to legacy `files.inline_data` for non-versioned.
+    // Read inline bytes from the head version row when the
+    // handle was opened for a versioned tenant; falls back to
+    // legacy `files.inline_data` for non-versioned.
     if (handle.versionId !== undefined) {
       const vrow = durableObject.sql
         .exec(
@@ -352,8 +352,8 @@ export async function vfsPullReadStream(
   }
   const env = durableObject.envPublic;
   const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, chunkRow.shard_index);
-  // Phase 39 B1 — typed `getChunkBytes` RPC. One IPC hop instead of
-  // the two-await `stub.fetch(...).arrayBuffer()` pair.
+  // Typed `getChunkBytes` RPC. One IPC hop instead of the
+  // two-await `stub.fetch(...).arrayBuffer()` pair.
   const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
   const stub = shardNs.get(shardNs.idFromName(shardName));
   const buf = await stub.getChunkBytes(chunkRow.chunk_hash);
@@ -406,7 +406,7 @@ export async function vfsCreateReadStream(
     throw new VFSError("EINVAL", `range end < start: [${start}, ${end})`);
   }
 
-  // Phase 27.5 — empty-file fast path. A 0-byte file (legal: empty
+  // Empty-file fast path. A 0-byte file (legal: empty
   // writeFile, or the post-resurrection placeholder) MUST emit zero
   // chunks and close cleanly. Without this guard the chunked branch
   // below computes `Math.floor(start / 0) === NaN` and the stream
@@ -431,10 +431,10 @@ export async function vfsCreateReadStream(
     });
   }
 
-  // Phase 27.5 — chunkSize is now pinned on the handle at open-time
-  // (was: re-queried via `getChunkSizeForHandle` from `files` row,
-  // which is STALE for versioned tenants — root cause of the
-  // production readPreview NaN bug). For non-empty chunked files
+  // chunkSize is pinned on the handle at open-time (NOT re-queried
+  // via `getChunkSizeForHandle` from the `files` row, which is
+  // STALE for versioned tenants — root cause of a production
+  // readPreview NaN bug). For non-empty chunked files
   // chunkSize MUST be >0; defend in depth so a corrupt schema row
   // surfaces as EINVAL rather than NaN-propagation.
   const chunkSize = handle.chunkSize;
@@ -480,14 +480,15 @@ function clampOffset(n: number, max: number): number {
   return Math.min(n, max);
 }
 
-// Phase 27.5 — `getChunkSizeForHandle` was REMOVED. It re-queried
-// `files.chunk_size` per createReadStream call, which is stale (0)
-// on versioned tenants — `Math.floor(0/0) === NaN` was the
-// production readPreview crash. The replacement is `handle.chunkSize`,
-// pinned at `vfsOpenReadStream` time from `version_chunks.chunk_size`
-// (versioned) or `files.chunk_size` (legacy). Yjs / inlined / empty
-// files carry chunkSize=0 and are routed away from chunk math
-// entirely by the empty-file fast path above.
+// `getChunkSizeForHandle` is intentionally absent. A naive
+// re-query of `files.chunk_size` per createReadStream call is
+// stale (0) on versioned tenants — `Math.floor(0/0) === NaN` was
+// the production readPreview crash. Use `handle.chunkSize`,
+// pinned at `vfsOpenReadStream` time from
+// `version_chunks.chunk_size` (versioned) or `files.chunk_size`
+// (legacy). Yjs / inlined / empty files carry chunkSize=0 and are
+// routed away from chunk math entirely by the empty-file fast
+// path above.
 
 // ── Write stream (handle-based + WritableStream wrapper) ───────────────
 
@@ -611,16 +612,16 @@ export async function vfsAppendWriteStream(
   const userId = userIdFor(scope);
   // Verify handle still refers to an uploading row owned by this user.
   //
-  // Phase 32 Fix 2 — server-authoritative pool size. Pre-fix the
-  // chunk PUT below trusted `handle.poolSize` directly. Handles
-  // are returned to the SDK consumer at `vfsBeginWriteStream` and
-  // round-tripped on every `vfsAppendWriteStream` call; a
-  // malicious or buggy client could supply a tampered value
-  // (e.g. spoofed pool=64 to spread chunks onto un-allocated
-  // shards, or pool=1 to concentrate on a single shard). The tmp
-  // `files` row carries the server's snapshotted `pool_size` from
-  // the begin-time `vfsBeginWriteStream` call \u2014 read it from
-  // the row and use that, not the handle's claim.
+  // Server-authoritative pool size. The chunk PUT below MUST NOT
+  // trust `handle.poolSize` directly. Handles are returned to the
+  // SDK consumer at `vfsBeginWriteStream` and round-tripped on
+  // every `vfsAppendWriteStream` call; a malicious or buggy
+  // client could supply a tampered value (e.g. spoofed pool=64 to
+  // spread chunks onto un-allocated shards, or pool=1 to
+  // concentrate on a single shard). The tmp `files` row carries
+  // the server's snapshotted `pool_size` from the begin-time
+  // `vfsBeginWriteStream` call — read it from the row and use
+  // that, not the handle's claim.
   const row = durableObject.sql
     .exec(
       `SELECT file_size, chunk_count, status, pool_size FROM files WHERE file_id=? AND user_id=?`,
@@ -662,12 +663,12 @@ export async function vfsAppendWriteStream(
   }
 
   const hash = await hashChunk(data);
-  // Phase 32 Fix 2 \u2014 use server-recorded pool_size, not handle.
-  // Phase 32 Fix 4 \u2014 honor the skip-full-shard cache so a
-  // streaming append never sends bytes to a near-cap shard. Pool
-  // growth on all-full is handled in `vfsWriteFile`'s chunked
-  // tier; for the streaming path, hitting POOL_FULL surfaces as
-  // an EBUSY (the SDK's append loop will retry the chunk after
+  // Use server-recorded pool_size (not handle's claim). Honour
+  // the skip-full-shard cache so a streaming append never sends
+  // bytes to a near-cap shard. Pool growth on all-full is handled
+  // in `vfsWriteFile`'s chunked tier; for the streaming path,
+  // hitting POOL_FULL surfaces as an EBUSY (the SDK's append loop
+  // will retry the chunk after
   // the next alarm refreshes the cache, by which point pool
   // growth in another write may have added headroom).
   const fullShards = loadFullShards(durableObject);
@@ -784,15 +785,15 @@ export async function vfsCommitWriteStream(
     }
   }
 
-  // Phase 27 Fix 6 — commit-write-stream × versioning.
-  // Pre-fix this called `commitRename` unconditionally, which under
-  // versioning ON hard-deleted any prior live row at the target —
-  // destroying its history (same bug class as multipart finalize).
-  // Post-fix: under versioning ON, route through `commitVersion`
-  // analogously to multipart-versioned-finalize. The chunks already
-  // live on ShardDOs under refId=tmpId; we mirror them into
-  // version_chunks and stamp shard_ref_id=tmpId so the future
-  // dropVersionRows fan-out finds them.
+  // Commit-write-stream × versioning. A naive call to
+  // `commitRename` here would, under versioning ON, hard-delete
+  // any prior live row at the target — destroying its history
+  // (same bug class as multipart finalize). Instead, under
+  // versioning ON, route through `commitVersion` analogously to
+  // multipart-versioned-finalize. The chunks already live on
+  // ShardDOs under refId=tmpId; we mirror them into version_chunks
+  // and stamp shard_ref_id=tmpId so the future dropVersionRows
+  // fan-out finds them.
   const versioning = isVersioningEnabled(durableObject, userId);
 
   if (versioning) {
@@ -906,15 +907,12 @@ export async function vfsCommitWriteStream(
     return;
   }
 
-  // Versioning OFF \u2014 pre-Phase-27 behaviour preserved.
-  //
-  // Phase 36 \u2014 record bytes against quota AFTER commitRename
-  // succeeds. Pre-fix this path NEVER called recordWriteUsage,
-  // so any tenant who ever used createWriteStream had their
-  // storage_used and file_count silently understated. The
-  // versioning branch above goes through commitVersion which
-  // self-accounts (Phase 36); this is the symmetric increment
-  // for the non-versioning branch.
+  // Versioning OFF — record bytes against quota AFTER
+  // commitRename succeeds. Without this, any tenant who ever
+  // used createWriteStream would have their storage_used and
+  // file_count silently understated. The versioning branch above
+  // goes through commitVersion which self-accounts; this is the
+  // symmetric increment for the non-versioning branch.
   //
   // Read file_size from the now-promoted row. commitRename
   // either inserted a fresh path or superseded a prior live one;

@@ -85,15 +85,16 @@ export class WRONG_KEY extends VFSFsError {
 /**
  * Encrypt a plaintext payload as a single envelope.
  *
- * The current Phase-15 SDK encrypts the WHOLE file as one envelope
- * (one AES-GCM call). The server stores the envelope as opaque chunk
+ * The current SDK encrypts the WHOLE file as one envelope (one
+ * AES-GCM call). The server stores the envelope as opaque chunk
  * bytes; on read, the SDK fetches the envelope and decrypts in one
- * call. This avoids any chunk-boundary coordination between SDK and
- * server during the v1 rollout.
+ * call. This avoids any chunk-boundary coordination between SDK
+ * and server.
  *
- * Multi-chunk envelope-stream encryption (which would unlock per-chunk
- * dedup at the chunked tier) is a v15.1 enhancement and uses the same
- * `encryptChunk` primitive over `computeChunkSpec` boundaries.
+ * Multi-chunk envelope-stream encryption (which would unlock
+ * per-chunk dedup at the chunked tier) is a future enhancement and
+ * uses the same `encryptChunk` primitive over `computeChunkSpec`
+ * boundaries.
  *
  * @param plaintext bytes to encrypt
  * @param config the VFS instance's encryption config

@@ -64,7 +64,7 @@ export type VariantRow = {
 
 /**
  * Look up an existing variant row by its composite key, gated by
- * the current head_version_id (Phase 28 Fix 1).
+ * the current head_version_id.
  *
  * Returns `null` when:
  *  - no row exists for the (file_id, variant_kind, renderer_kind) triple, OR
@@ -141,11 +141,11 @@ export function findVariantRow(
  * @param fileName Display name (icon-card label, code filename).
  * @param fileSize Original byte size (icon-card label, headers).
  * @param variant  Standard or custom variant request.
- * @param headVersionId  Phase 28 Fix 1 — current head_version_id of
- *   the file at render time. Stamped on the persisted variant row
- *   so a future read on a NEW head version cache-misses (forces
- *   re-render against the new bytes). Pass `null` for legacy /
- *   versioning-OFF tenants.
+ * @param headVersionId  Current head_version_id of the file at
+ *   render time. Stamped on the persisted variant row so a future
+ *   read on a NEW head version cache-misses (forces re-render
+ *   against the new bytes). Pass `null` for legacy / versioning-
+ *   OFF tenants.
  */
 export async function renderAndStoreVariant(
   durableObject: UserDOCore,
@@ -160,9 +160,9 @@ export async function renderAndStoreVariant(
 ): Promise<{ row: VariantRow; bytes: Uint8Array; result: RenderResult }> {
   const registry = defaultRegistry();
   const renderer = registry.dispatchByMime(mimeType);
-  // Phase 39 A3: track which renderer ACTUALLY produced the bytes.
-  // Starts as the primary; flips on EMOSSAIC_UNAVAILABLE fallback so
-  // the persisted `renderer_kind` column matches reality (a future
+  // Track which renderer ACTUALLY produced the bytes. Starts as
+  // the primary; flips on EMOSSAIC_UNAVAILABLE fallback so the
+  // persisted `renderer_kind` column matches reality (a future
   // cache lookup keys on this).
   let usedRendererKind: string = renderer.kind;
 
@@ -186,8 +186,8 @@ export async function renderAndStoreVariant(
   } catch (err: unknown) {
     // EMOSSAIC_UNAVAILABLE → renderer missing a binding (e.g. no
     // IMAGES). Fall back gracefully:
-    //   - image/* sources → image-passthrough renderer (Phase 39 A3):
-    //     ship the original bytes back. Strictly better UX than a
+    //   - image/* sources → image-passthrough renderer: ship the
+    //     original bytes back. Strictly better UX than a
     //     generic icon-card stub for an image — the consumer's
     //     <img> tag scales the original to whatever px it needs.
     //   - non-image sources → icon-card universal fallback (an MP4
@@ -258,23 +258,22 @@ export async function renderAndStoreVariant(
   await shardStub.putChunk(variantHash, variantBytes, refId, 0, userId);
 
   // Resolve the actual stored renderer kind (could be the
-  // fallback if the primary failed). The pre-Phase-39 logic
-  // stamped "image" when the result was webp; preserve that quirk
-  // for the resize path (existing rows + cache lookups depend on
-  // it). Other paths (icon-card, code, waveform, video-poster,
-  // and Phase 39's image-passthrough) stamp their renderer's
-  // canonical `kind` so cache lookups can find them.
+  // fallback if the primary failed). Legacy quirk: the resize
+  // path stamps "image" when the result is webp — existing rows
+  // and cache lookups depend on it. Other paths (icon-card, code,
+  // waveform, video-poster, image-passthrough) stamp their
+  // renderer's canonical `kind` so cache lookups can find them.
   const rendererKind =
     usedRendererKind === "image-resize" && result.mimeType === "image/webp"
       ? "image"
       : usedRendererKind;
 
-  // Phase 28 Fix 1 — `INSERT OR REPLACE` (was `OR IGNORE`) so a
-  // re-render on a NEW head version supersedes the stale cache row
-  // by composite PK. The `version_id` column stamps the head
-  // version this variant was rendered FROM — readers in
-  // `findVariantRow` gate on a match. Without OR REPLACE the
-  // version_id update would be a no-op when an old row existed.
+  // `INSERT OR REPLACE` (NOT `OR IGNORE`) so a re-render on a NEW
+  // head version supersedes the stale cache row by composite PK.
+  // The `version_id` column stamps the head version this variant
+  // was rendered FROM — readers in `findVariantRow` gate on a
+  // match. With `OR IGNORE` the version_id update would be a no-op
+  // when an old row existed.
   durableObject.sql.exec(
     `INSERT OR REPLACE INTO file_variants
        (file_id, variant_kind, renderer_kind, chunk_hash, shard_index,
@@ -343,9 +342,9 @@ export async function preGenerateStandardVariants(
     fileSize: number;
     isEncrypted: boolean;
     /**
-     * Phase 28 Fix 1 — head_version_id at finalize time. Stamped on
-     * each pre-generated variant row so a future write that flips
-     * the head invalidates these variants automatically. NULL for
+     * head_version_id at finalize time. Stamped on each
+     * pre-generated variant row so a future write that flips the
+     * head invalidates these variants automatically. NULL for
      * non-versioning tenants.
      */
     headVersionId: string | null;
@@ -359,12 +358,11 @@ export async function preGenerateStandardVariants(
       // SHA-256 of rendered bytes. Re-running produces no observable
       // change beyond a wasted render — acceptable on the rare
       // double-finalize path; on the hot path each variant is fresh.
-      // Post-Phase-28 the cache row is keyed by version, so a
-      // concurrent rerender against the same head is still
-      // idempotent.
+      // The cache row is keyed by version, so a concurrent
+      // rerender against the same head is still idempotent.
       //
-      // Phase 23 audit Claim 7: gate through `withRenderSlot` so
-      // concurrent finalize bursts don't fan out >MAX_CONCURRENT_RENDERS
+      // Gate through `withRenderSlot` so concurrent finalize
+      // bursts don't fan out >MAX_CONCURRENT_RENDERS
       // simultaneous Cloudflare Images binding calls — that path will
       // 429 under sustained load and the silent-drop in this catch
       // would manifest as user-visible "no preview" on first gallery
@@ -395,7 +393,7 @@ export async function preGenerateStandardVariants(
 
 /**
  * Concurrency bound for in-flight preview renders within a single
- * worker isolate (Phase 23 audit Claim 7).
+ * worker isolate.
  *
  * Cloudflare Images binding (and the JS-only renderer code paths) all
  * compete for the same per-isolate CPU + bound-binding budget. Without
@@ -407,7 +405,7 @@ export async function preGenerateStandardVariants(
  * lands on a gallery with a sea of broken thumbnails and the only
  * remediation is on-demand re-render (cold-path latency +800ms each).
  *
- * 6 was picked from the audit recommendation (4-8): an isolate
+ * 6 sits in the 4-8 sweet spot: an isolate
  * comfortably handles 6 concurrent IMAGES binding calls, which
  * corresponds to roughly 2 fully-rendering files at a time (3 variants
  * each). For very small files / fast renders the bound just gates the

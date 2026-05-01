@@ -49,7 +49,7 @@ export class VFSStat {
 
   /**
    * per-file encryption stamp. Undefined for plaintext
-   * files (default for pre-Phase-15 rows and explicit plaintext
+   * files (default for legacy rows and explicit plaintext
    * writes). Consumers wanting to detect encrypted files can call
    * `stat(p)` and inspect this field.
    */

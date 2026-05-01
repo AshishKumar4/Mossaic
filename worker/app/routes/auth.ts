@@ -226,10 +226,10 @@ auth.post("/share-token", authMiddleware(), async (c) => {
       fileIds: body.fileIds as string[],
       albumName,
     });
-    // Phase 42 \u2014 audit-log the mint. Persist on the owner's UserDO
-    // so an operator querying "who minted share tokens?" gets the
-    // full trail per-tenant. Best-effort: a failure here doesn't
-    // block the mint (the token is already signed).
+    // Audit-log the mint. Persist on the owner's UserDO so an
+    // operator querying "who minted share tokens?" gets the full
+    // trail per-tenant. Best-effort: a failure here doesn't block
+    // the mint (the token is already signed).
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       await (userStub(c.env, userId) as any).appAuditShareLinkMint(userId, {
@@ -341,11 +341,10 @@ auth.delete("/account", authMiddleware(), async (c) => {
     );
   }
 
-  // Phase 42 \u2014 audit-log the account-delete on the tenant's
-  // UserDO. Best-effort: failure here doesn't change the response.
-  // The DataDO audit row is the user-facing event; the per-table
-  // audits (adminWipeAccountData) provide a granular byte/file
-  // count.
+  // Audit-log the account-delete on the tenant's UserDO.
+  // Best-effort: failure here doesn't change the response. The
+  // DataDO audit row is the user-facing event; the per-table audits
+  // (adminWipeAccountData) provide a granular byte/file count.
   try {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (userStub(c.env, userId) as any).appAuditAccountDelete(userId, {

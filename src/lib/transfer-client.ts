@@ -38,9 +38,9 @@ let client: HttpVFS | null = null;
  */
 export function getTransferClient(): HttpVFS {
   if (!client) {
-    // Phase 29 — read `window.location.origin` via `globalThis` so
-    // the tsconfig.test.json (lib=ES2022, no DOM) typechecks this
-    // file when it's pulled in by the unit-test that exercises the
+    // Read `window.location.origin` via `globalThis` so the
+    // tsconfig.test.json (lib=ES2022, no DOM) typechecks this file
+    // when it's pulled in by the unit-test that exercises the
     // transfer-client surface. At runtime `globalThis.window` is
     // always present in browsers (SPA path) and the unit tests
     // shim it via `globalThis.window` directly.
