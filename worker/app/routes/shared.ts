@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import type { EnvApp as Env } from "@shared/types";
 import { createVFS } from "@mossaic/sdk";
 import { userStub } from "../lib/user-stub";
-import { edgeCacheServe } from "../lib/edge-cache";
+import { edgeCacheServe } from "@core/lib/edge-cache";
 
 const shared = new Hono<{ Bindings: Env }>();
 
