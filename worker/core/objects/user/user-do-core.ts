@@ -2380,9 +2380,20 @@ export class UserDOCore extends DurableObject<Env> {
     scope: VFSScope,
     path: string,
     checkpointEnvelope: Uint8Array,
-    expectedNextSeq: number
-  ): Promise<{ checkpointSeq: number; opsReaped: number }> {
+    expectedNextSeq: number,
+    opts?: { userVisible?: boolean; label?: string }
+  ): Promise<{
+    checkpointSeq: number;
+    opsReaped: number;
+    versionId?: string;
+  }> {
     this.gateVfsWrite(scope);
+    if (opts?.label !== undefined) {
+      const { validateLabel } = await import(
+        "../../../../shared/metadata-validate"
+      );
+      validateLabel(opts.label);
+    }
     const userId = scope.sub
       ? `${scope.tenant}::${scope.sub}`
       : scope.tenant;
@@ -2413,7 +2424,8 @@ export class UserDOCore extends DurableObject<Env> {
       r.leafId,
       poolSize,
       checkpointEnvelope,
-      expectedNextSeq
+      expectedNextSeq,
+      opts
     );
   }
 
