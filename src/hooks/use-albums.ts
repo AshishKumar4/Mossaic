@@ -1,5 +1,6 @@
 import { useState, useCallback, useEffect } from "react";
 import { useAuth } from "@/lib/auth";
+import { api } from "@/lib/api";
 import type { Album, SharedAlbum } from "@app/types";
 
 const ALBUMS_KEY = "mossaic_albums";
@@ -116,30 +117,42 @@ export function useAlbums() {
     []
   );
 
+  /**
+   * Mint an HMAC-signed share token for an album. The server is the
+   * single signer (P0-1 fix): client-side `btoa(JSON.stringify(...))`
+   * was forgeable. We POST to `/api/auth/share-token` with the
+   * authenticated session JWT; the server stamps the userId from
+   * the verified token, signs with `JWT_SECRET`, and returns a JWT.
+   *
+   * Returns null if the user is not authenticated. Throws if the
+   * mint endpoint rejects (e.g. JWT_SECRET missing on the deploy →
+   * 503; the SPA surfaces the error via the api client).
+   */
   const shareAlbum = useCallback(
-    (albumId: string): string => {
+    async (albumId: string): Promise<string | null> => {
       const album = albums.find((a) => a.id === albumId);
-      if (!album || !userId) return "";
+      if (!album || !userId) return null;
 
-      // Check if already shared
+      // Reuse a non-expired existing share rather than minting a new
+      // token on every "Share" click. localStorage holds the token
+      // alongside its mint timestamp; we re-mint if the cached token
+      // looks like the pre-fix unsigned shape (lacks the JWT three-
+      // segment dot pattern) so post-fix-deploy SPAs auto-rotate.
       const existing = shares.find((s) => s.albumId === albumId);
-      if (existing) return existing.token;
+      if (existing && existing.token.split(".").length === 3) {
+        return existing.token;
+      }
 
-      // Create share token: base64 encoded JSON with userId + fileIds
-      const tokenData = JSON.stringify({
-        userId,
-        fileIds: album.photoIds,
-        albumName: album.name,
-      });
-      const token = btoa(tokenData);
-
+      const { token } = await api.mintShareToken(album.photoIds, album.name);
       const share: SharedAlbum = {
         token,
         albumId,
         createdAt: Date.now(),
       };
-
-      setShares((prev) => [...prev, share]);
+      setShares((prev) => {
+        const filtered = prev.filter((s) => s.albumId !== albumId);
+        return [...filtered, share];
+      });
       return token;
     },
     [albums, shares, userId]

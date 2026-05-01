@@ -995,6 +995,18 @@ export async function vfsGetMultipartStatus(
 }
 
 /**
+ * Cap on how many times the alarm sweeper retries
+ * `vfsAbortMultipart` on a single session before giving up. After
+ * the cap, the row flips to status='poisoned' so future sweeps
+ * skip it and the operator can investigate via Logpush.
+ *
+ * 5 attempts × ~10 minute alarm cadence = ~50 minutes of retries
+ * before declaring the session unrecoverable. Generous given that
+ * the typical failure mode is a transient ShardDO error.
+ */
+export const MULTIPART_MAX_ABORT_ATTEMPTS = 5;
+
+/**
  * Alarm-driven sweep of expired open sessions. Called from
  * UserDOCore's alarm() handler at scheduled intervals. Idempotent and
  * batch-bounded (LIMIT 32 per call) to keep DO turns short.
@@ -1002,6 +1014,16 @@ export async function vfsGetMultipartStatus(
  * For each expired session, performs the equivalent of
  * `vfsAbortMultipart` — flips status, fans out cleanup, hard-deletes
  * the tmp files row.
+ *
+ * P1-5 fix — failure handling. Pre-fix, a `vfsAbortMultipart`
+ * throw flipped status to 'aborted' immediately and the row was
+ * invisible to subsequent sweeps. Chunks staged on the shards
+ * stayed refcounted forever — permanent shard storage leak per
+ * transient error. Now the catch path BUMPS the `attempts`
+ * counter and leaves status='open' so the next sweep retries.
+ * Only after MULTIPART_MAX_ABORT_ATTEMPTS does the row flip to
+ * 'poisoned' (a NEW status, distinct from 'aborted'/'finalized')
+ * so an operator can find it via Logpush + manually reconcile.
  */
 export async function sweepExpiredMultipartSessions(
   durableObject: UserDO,
@@ -1010,26 +1032,55 @@ export async function sweepExpiredMultipartSessions(
   const now = Date.now();
   const stale = durableObject.sql
     .exec(
-      `SELECT upload_id, user_id FROM upload_sessions
+      `SELECT upload_id, user_id, attempts FROM upload_sessions
         WHERE status = 'open' AND expires_at < ?
         ORDER BY expires_at ASC
         LIMIT 32`,
       now
     )
-    .toArray() as { upload_id: string; user_id: string }[];
+    .toArray() as {
+      upload_id: string;
+      user_id: string;
+      attempts: number;
+    }[];
 
   for (const row of stale) {
     try {
       const scope = scopeForUser(row.user_id);
       await vfsAbortMultipart(durableObject, scope, row.upload_id);
-    } catch {
-      // Best-effort; flip status to 'aborted' as a fallback so we
-      // don't loop forever on a poison row. Cleanup happens on next
-      // sweep or on resurrection.
-      durableObject.sql.exec(
-        "UPDATE upload_sessions SET status = 'aborted' WHERE upload_id = ?",
-        row.upload_id
-      );
+    } catch (err) {
+      const nextAttempts = (row.attempts ?? 0) + 1;
+      if (nextAttempts >= MULTIPART_MAX_ABORT_ATTEMPTS) {
+        // Give up — flip to the distinct 'poisoned' status so an
+        // operator can find these via Logpush + manually
+        // reconcile (the staged chunks on shards still hold
+        // chunk_refs under the upload_id; an admin script can
+        // call deleteChunks(upload_id) per shard to free them).
+        durableObject.sql.exec(
+          `UPDATE upload_sessions
+              SET status = 'poisoned', attempts = ?
+            WHERE upload_id = ?`,
+          nextAttempts,
+          row.upload_id
+        );
+        // eslint-disable-next-line no-console
+        console.error(
+          `[mossaic:P1-5] multipart session ${row.upload_id} poisoned after ${nextAttempts} abort attempts: ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
+      } else {
+        // Bump the attempt counter; leave status='open' so the
+        // next sweep retries. The next sweep query at the top of
+        // this function still finds this row (status='open' AND
+        // expires_at<now), so retries continue on the alarm
+        // cadence until MULTIPART_MAX_ABORT_ATTEMPTS.
+        durableObject.sql.exec(
+          "UPDATE upload_sessions SET attempts = ? WHERE upload_id = ?",
+          nextAttempts,
+          row.upload_id
+        );
+      }
     }
   }
 

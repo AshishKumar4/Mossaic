@@ -551,12 +551,41 @@ export async function reconcileUnindexedFiles(
         row.file_size
       );
     } catch (err) {
-      // Bounded log; the alarm will retry on the next tick.
-      console.warn(
-        `reconcileUnindexedFiles: ${row.file_id} failed: ${
-          err instanceof Error ? err.message : String(err)
-        }`
-      );
+      // P1-8 — bump the per-file attempt counter. After 5 failures
+      // `appListUnindexedFiles` excludes this row from future
+      // reconciler ticks. `appBumpIndexAttempts` returns
+      // `capJustHit: true` exactly once on the transition; we log
+      // a single `console.error` then so operators see poison
+      // files in Logpush without log-spam from the per-tick
+      // `console.warn` below.
+      try {
+        const { capJustHit, attempts } = await stub.appBumpIndexAttempts(
+          row.file_id
+        );
+        if (capJustHit) {
+          console.error(
+            `[mossaic:P1-8] reconcileUnindexedFiles: ${row.file_id} hit attempt cap (${attempts}); excluding from future ticks. Last error: ${
+              err instanceof Error ? err.message : String(err)
+            }`
+          );
+        } else {
+          console.warn(
+            `reconcileUnindexedFiles: ${row.file_id} failed (attempt ${attempts}/5): ${
+              err instanceof Error ? err.message : String(err)
+            }`
+          );
+        }
+      } catch (bumpErr) {
+        // Bumping the counter failed — fall back to the original
+        // bounded log so the operator sees the issue.
+        console.warn(
+          `reconcileUnindexedFiles: ${row.file_id} failed: ${
+            err instanceof Error ? err.message : String(err)
+          } (additionally, appBumpIndexAttempts threw: ${
+            bumpErr instanceof Error ? bumpErr.message : String(bumpErr)
+          })`
+        );
+      }
     }
   }
   return { reconciled: rows.length };

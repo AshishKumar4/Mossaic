@@ -3,39 +3,50 @@ import type { EnvApp as Env } from "@shared/types";
 import { createVFS } from "@mossaic/sdk";
 import { userStub } from "../lib/user-stub";
 import { edgeCacheServe } from "../lib/edge-cache";
+import { verifyShareToken, VFSConfigError } from "@core/lib/auth";
 
 const shared = new Hono<{ Bindings: Env }>();
 
 /**
  * GET /api/shared/:token/photos
- * Public endpoint — no auth required.
+ * Public endpoint — no session auth. The HMAC-signed share token
+ * IS the auth; `verifyShareToken` rejects forgeries.
  *
- * The token encodes userId + fileIds. Albums are stored client-side in
- * V1, so the share link includes the userId in the token to enable
- * image fetching.
+ * Pre-fix (P0-1): the token was an unsigned `base64(JSON({...}))`
+ * payload. Anyone who knew or guessed any userId could forge a
+ * token and read that user's files. The fix replaces the wire
+ * format with an HMAC-signed JWT (`scope: "vfs-share"`) keyed off
+ * the same `JWT_SECRET` as the rest of the auth surface, signed
+ * via `signShareToken` at the auth-gated mint route
+ * (`POST /api/auth/share-token`).
  *
- * Token format: base64(JSON({ userId, fileIds, albumName }))
+ * Existing pre-fix tokens fail verification (they aren't JWTs and
+ * lack the `vfs-share` scope claim) and surface as 403. The SPA
+ * re-shares to obtain new tokens. Acceptable: pre-fix tokens
+ * convey access freely already and were never security-meaningful.
  */
 shared.get("/:token/photos", async (c) => {
   const token = c.req.param("token");
 
-  let decoded: { userId: string; fileIds: string[]; albumName: string };
+  let payload;
   try {
-    decoded = JSON.parse(atob(token));
-  } catch {
-    return c.json({ error: "Invalid share token" }, 400);
+    payload = await verifyShareToken(c.env, token);
+  } catch (err) {
+    if (err instanceof VFSConfigError) {
+      // JWT_SECRET missing → service mis-configured.
+      return c.json({ error: err.message }, 503);
+    }
+    throw err;
+  }
+  if (!payload) {
+    return c.json({ error: "Invalid or expired share token" }, 403);
   }
 
-  const { userId, fileIds, albumName } = decoded;
-  if (!userId || !fileIds?.length) {
-    return c.json({ error: "Invalid share token" }, 400);
-  }
-
-  const stub = userStub(c.env, userId);
+  const stub = userStub(c.env, payload.userId);
 
   // Fetch file metadata for each file in parallel.
   const fileResults = await Promise.all(
-    fileIds.map((fileId) => stub.appGetFile(fileId))
+    payload.fileIds.map((fileId) => stub.appGetFile(fileId))
   );
 
   const photos = [];
@@ -53,18 +64,19 @@ shared.get("/:token/photos", async (c) => {
     });
   }
 
-  return c.json({ albumName, photos });
+  return c.json({ albumName: payload.albumName, photos });
 });
 
 /**
  * GET /api/shared/:token/image/:fileId
  * Public image bytes for shared albums via canonical `vfs.readFile()`.
+ * Same HMAC verification as the manifest endpoint.
  *
- * Phase 36 \u2014 Workers Cache wrap. Cache key is
- * `simg/<userId>/<fileId>/<updated_at>`. Auth check
- * (token-includes-fileId) runs BEFORE the cache lookup so a
- * cached response can never serve an unauthorized request \u2014
- * the cache key is per-user but the auth gate is the bouncer.
+ * Phase 36 — Workers Cache wrap. Cache key is
+ * `simg/<userId>/<fileId>/<updated_at>`. The HMAC verify + the
+ * token-includes-fileId check run BEFORE the cache lookup so a
+ * cached response can never serve an unauthorized request — the
+ * cache key is per-user but the auth gate is the bouncer.
  * `updated_at` busts the cache on any write to the fileId.
  *
  * Public sharing implies high hit rates (viral links). The
@@ -75,23 +87,32 @@ shared.get("/:token/image/:fileId", async (c) => {
   const token = c.req.param("token");
   const fileId = c.req.param("fileId");
 
-  let decoded: { userId: string; fileIds: string[] };
+  let payload;
   try {
-    decoded = JSON.parse(atob(token));
-  } catch {
-    return c.json({ error: "Invalid share token" }, 400);
+    payload = await verifyShareToken(c.env, token);
+  } catch (err) {
+    if (err instanceof VFSConfigError) {
+      return c.json({ error: err.message }, 503);
+    }
+    throw err;
   }
-
-  const { userId, fileIds } = decoded;
-  if (!userId || !fileIds?.includes(fileId)) {
+  if (!payload) {
+    return c.json({ error: "Invalid or expired share token" }, 403);
+  }
+  // The token's fileIds bind exactly which files the share grants.
+  // Requesting any other fileId → 403.
+  if (!payload.fileIds.includes(fileId)) {
     return c.json({ error: "Unauthorized" }, 403);
   }
 
-  const resolved = await userStub(c.env, userId).appGetFilePath(fileId);
+  const resolved = await userStub(c.env, payload.userId).appGetFilePath(
+    fileId
+  );
   if (!resolved) {
     return c.json({ error: "File not found" }, 404);
   }
   const { path, mimeType, updatedAt } = resolved;
+  const userId = payload.userId;
 
   return edgeCacheServe(
     {

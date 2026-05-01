@@ -331,9 +331,19 @@ function AlbumDetail({
     [addPhotosToAlbum, album.id]
   );
 
-  const handleShare = useCallback(() => {
+  const handleShare = useCallback(async () => {
     if (!shareToken) {
-      shareAlbum(album.id);
+      try {
+        await shareAlbum(album.id);
+      } catch (err) {
+        // Mint failed (e.g. JWT_SECRET missing on the deploy → 503,
+        // or session expired → 401). Surface in the share dialog
+        // rather than silently failing — the dialog reads the share
+        // token via getShareToken, so the absence renders a clear
+        // "no token yet" state.
+        // eslint-disable-next-line no-console
+        console.error("shareAlbum: mint failed", err);
+      }
     }
     setShowShare(true);
   }, [shareToken, shareAlbum, album.id]);

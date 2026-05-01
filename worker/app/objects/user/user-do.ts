@@ -543,6 +543,45 @@ export class UserDO extends UserDOCore {
   }
 
   /**
+   * P1-8 — bump `index_attempts` after a failed `indexFile` run.
+   * The reconciler at `reconcileUnindexedFiles` calls this in its
+   * catch path so permanently-failing files stop being re-fired
+   * after `INDEX_MAX_ATTEMPTS` alarm ticks.
+   *
+   * Returns the new attempt count + whether the cap was just hit
+   * (so the caller can `console.error` once when crossing).
+   */
+  async appBumpIndexAttempts(
+    fileId: string
+  ): Promise<{ attempts: number; capJustHit: boolean }> {
+    this.ensureInit();
+    appGateFromPersistedScope(this);
+    // Read-then-write inside one DO turn — synchronous SQL means
+    // no concurrent caller can race the bump.
+    const row = this.sql
+      .exec(
+        "SELECT index_attempts FROM files WHERE file_id = ?",
+        fileId
+      )
+      .toArray()[0] as { index_attempts: number | null } | undefined;
+    if (!row) return { attempts: 0, capJustHit: false };
+    const prior = row.index_attempts ?? 0;
+    const next = prior + 1;
+    this.sql.exec(
+      "UPDATE files SET index_attempts = ? WHERE file_id = ?",
+      next,
+      fileId
+    );
+    return {
+      attempts: next,
+      // INDEX_MAX_ATTEMPTS = 5 (in sync with appListUnindexedFiles
+      // filter). The "just hit" signal lets the caller fire the
+      // operator-visible log exactly once on the transition.
+      capJustHit: prior < 5 && next >= 5,
+    };
+  }
+
+  /**
    * Return up to `limit` files that are committed (status='complete')
    * but have not yet been search-indexed. Ordered oldest-first to
    * give freshly-uploaded files some grace before the reconciler
@@ -568,6 +607,12 @@ export class UserDO extends UserDOCore {
     // store keyed by file_id (acceptable: an unlinked file
     // shouldn't surface in search anyway, and the next live write
     // would re-fire indexing under a fresh fileId).
+    // P1-8 — exclude rows that have hit the retry cap. The `index_attempts`
+    // column is bumped in the reconciler's catch path; once it
+    // crosses INDEX_MAX_ATTEMPTS (5) the row is dormant. An
+    // operator who fixes the underlying issue (re-uploads the
+    // file, etc.) can manually reset `index_attempts = 0` to
+    // re-queue the file for the reconciler.
     const rows = this.sql
       .exec(
         `SELECT f.file_id, f.file_name, f.mime_type, f.file_size
@@ -577,6 +622,7 @@ export class UserDO extends UserDOCore {
           WHERE f.user_id = ?
             AND f.status = 'complete'
             AND f.indexed_at IS NULL
+            AND COALESCE(f.index_attempts, 0) < 5
             AND (f.head_version_id IS NULL OR fv.deleted IS NULL OR fv.deleted = 0)
           ORDER BY f.created_at ASC
           LIMIT ?`,
