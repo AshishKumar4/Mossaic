@@ -34,7 +34,7 @@ import { cors } from "hono/cors";
 import type { EnvCore as Env } from "../../shared/types";
 import { requestIdMiddleware } from "./lib/logger";
 import vfsRoutes from "./routes/vfs";
-import vfsPreviewRoutes from "./routes/vfs-preview";
+import vfsPreviewRoutes, { previewVariant } from "./routes/vfs-preview";
 import yjsWsRoutes from "./routes/vfs-yjs-ws";
 import multipartRoutes, { chunkDownload } from "./routes/multipart-routes";
 
@@ -72,6 +72,13 @@ app.route("/api/vfs/multipart", multipartRoutes);
 // Bearer required if the token is presented; download tokens are
 // scope-bound). Cache-Control: immutable for hash-addressed bytes.
 app.route("/api/vfs", chunkDownload);
+
+// Phase 45 \u2014 signed preview-variant route. Lives at
+// /api/vfs/preview-variant/:token. NO Bearer auth; the HMAC
+// token IS the auth. Bytes are content-addressed (immutable
+// cache by contentHash). Mounted BEFORE the auth-gated
+// vfs-preview routes so the more-specific path wins.
+app.route("/api/vfs", previewVariant);
 
 // preview pipeline + batched manifests. Specific paths under
 // /api/vfs (`/readPreview`, `/manifests`); mounted BEFORE the
