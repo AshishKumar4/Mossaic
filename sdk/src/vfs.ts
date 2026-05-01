@@ -124,6 +124,17 @@ export interface VFSClient {
   copyFile(src: string, dest: string, opts?: CopyFileOpts): Promise<void>;
   /** indexed listFiles with HMAC-signed cursor pagination. */
   listFiles(opts?: ListFilesOpts): Promise<ListFilesPage>;
+  /**
+   * Phase 46 — batched directory listing. Returns folder revision
+   * counter + a single page of merged folder/file/symlink entries
+   * with stat / metadata / tags / contentHash hydrated in one
+   * round-trip. Replaces the pre-Phase-46 `readdir + lstat × N`
+   * loop with O(1) RPCs per page.
+   *
+   * `revision` is a monotonic per-folder counter; cache it client-
+   * side and re-fetch only when it changes (or use it as an ETag).
+   */
+  listChildren(p: string, opts?: ListChildrenOpts): Promise<ListChildrenPage>;
 
   // Streams (HTTP fallback throws EINVAL for these in v1)
   createReadStream(
@@ -375,6 +386,7 @@ export interface UserDOClient {
       stat?: VFSStatRaw;
       metadata?: Record<string, unknown> | null;
       tags: string[];
+      contentHash?: string;
     }>;
     cursor?: string;
   }>;
@@ -388,6 +400,42 @@ export interface UserDOClient {
     stat?: VFSStatRaw;
     metadata?: Record<string, unknown> | null;
     tags: string[];
+    contentHash?: string;
+  }>;
+  /** Phase 46 — batched directory listing (folder revision + entries). */
+  vfsListChildren(
+    scope: VFSScope,
+    opts: ListChildrenOpts & { path: string }
+  ): Promise<{
+    revision: number;
+    entries: Array<
+      | {
+          kind: "folder";
+          path: string;
+          pathId: string;
+          name: string;
+          stat?: VFSStatRaw;
+        }
+      | {
+          kind: "file";
+          path: string;
+          pathId: string;
+          name: string;
+          stat?: VFSStatRaw;
+          metadata?: Record<string, unknown> | null;
+          tags: string[];
+          contentHash?: string;
+        }
+      | {
+          kind: "symlink";
+          path: string;
+          pathId: string;
+          name: string;
+          target: string;
+          stat?: VFSStatRaw;
+        }
+    >;
+    cursor?: string;
   }>;
   /** flip the per-file Yjs-mode bit. */
   vfsSetYjsMode(
@@ -800,6 +848,12 @@ export interface ListFilesOpts {
    * surfaces apply the filter.
    */
   includeArchived?: boolean;
+  /**
+   * Phase 46 — opt-in: include each file row's `contentHash`
+   * (hex SHA-256). Default false to keep wire payloads compact
+   * for typical UIs that don't need the hash.
+   */
+  includeContentHash?: boolean;
 }
 
 export interface FileInfoOpts {
@@ -822,6 +876,8 @@ export interface FileInfoOpts {
    * exclusion by default.
    */
   includeArchived?: boolean;
+  /** Phase 46 — opt-in: include `contentHash` (hex SHA-256). */
+  includeContentHash?: boolean;
 }
 
 /** a single row returned by listFiles. */
@@ -836,10 +892,98 @@ export interface ListFilesItem {
   metadata?: Record<string, unknown> | null;
   /** Always present — the file's tag set, sorted alphabetically. */
   tags: string[];
+  /**
+   * Phase 46 — present iff `includeContentHash: true` was passed.
+   * Hex SHA-256 of the file's contents.
+   */
+  contentHash?: string;
 }
 
 export interface ListFilesPage {
   items: ListFilesItem[];
+  /** Present iff there's another page. */
+  cursor?: string;
+}
+
+/**
+ * Phase 46 — options for `listChildren`.
+ *
+ * Like `ListFilesOpts` but tied to a specific folder (no `prefix` /
+ * `tags` / `metadata` filter). The result merges folders + files +
+ * symlinks under that folder in a single round-trip with full stat
+ * / metadata / tags / contentHash hydration.
+ */
+export interface ListChildrenOpts {
+  /** Default 'mtime'. */
+  orderBy?: "mtime" | "name" | "size";
+  /** Default 'desc' for mtime/size, 'asc' for name. */
+  direction?: "asc" | "desc";
+  /** 1..1000, default 50. */
+  limit?: number;
+  /** Opaque cursor returned from a prior call. */
+  cursor?: string;
+  /** Default true. */
+  includeStat?: boolean;
+  /** Default false. */
+  includeMetadata?: boolean;
+  /** Default false. Hex SHA-256 on each file entry. */
+  includeContentHash?: boolean;
+  /** Default false. Reserved for admin/recovery surfaces. */
+  includeTombstones?: boolean;
+  /** Default false. */
+  includeArchived?: boolean;
+}
+
+/**
+ * Phase 46 — discriminated-union entry returned by `listChildren`.
+ *
+ * - `kind: 'folder'` — `name`, `pathId`, optional `stat` (`type: 'dir'`).
+ * - `kind: 'file'` — `name`, `pathId`, optional `stat` (`type: 'file'`),
+ *   `tags`, optional `metadata`, optional `contentHash`.
+ * - `kind: 'symlink'` — `name`, `pathId`, `target` (the symlink's
+ *   destination string), optional `stat` (`type: 'symlink'`).
+ *
+ * `name` is the leaf segment without leading slash; `path` is the
+ * absolute path with leading slash. Both pre-computed by the server.
+ */
+export type VFSChild =
+  | {
+      kind: "folder";
+      path: string;
+      pathId: string;
+      name: string;
+      stat?: VFSStat;
+    }
+  | {
+      kind: "file";
+      path: string;
+      pathId: string;
+      name: string;
+      stat?: VFSStat;
+      metadata?: Record<string, unknown> | null;
+      tags: string[];
+      contentHash?: string;
+    }
+  | {
+      kind: "symlink";
+      path: string;
+      pathId: string;
+      name: string;
+      target: string;
+      stat?: VFSStat;
+    };
+
+/**
+ * Phase 46 — `listChildren` page.
+ *
+ * `revision` is the per-folder mutation counter — strictly monotonic
+ * within a single tenant DO. Use it as a client-side ETag: when
+ * `revision` is unchanged across two reads, the directory contents
+ * are guaranteed identical (no need to diff `entries`).
+ */
+export interface ListChildrenPage {
+  revision: number;
+  entries: VFSChild[];
   /** Present iff there's another page. */
   cursor?: string;
 }
@@ -1366,6 +1510,7 @@ export class VFS implements VFSClient {
         stat?: VFSStatRaw;
         metadata?: Record<string, unknown> | null;
         tags: string[];
+        contentHash?: string;
       }>;
       cursor?: string;
     };
@@ -1383,6 +1528,7 @@ export class VFS implements VFSClient {
       stat: r.stat ? new VFSStat(r.stat) : undefined,
       metadata: r.metadata,
       tags: r.tags,
+      ...(r.contentHash !== undefined ? { contentHash: r.contentHash } : {}),
     }));
     return { items, cursor: raw.cursor };
   }
@@ -1396,10 +1542,106 @@ export class VFS implements VFSClient {
         stat: raw.stat ? new VFSStat(raw.stat) : undefined,
         metadata: raw.metadata,
         tags: raw.tags,
+        ...(raw.contentHash !== undefined
+          ? { contentHash: raw.contentHash }
+          : {}),
       };
     } catch (err) {
       throw mapServerError(err, { path: p, syscall: "stat" });
     }
+  }
+
+  /**
+   * Phase 46 — batched directory listing. Single round-trip returns
+   * folder revision + a sorted page of merged folder/file/symlink
+   * entries with stat / metadata / tags / contentHash hydrated.
+   *
+   * Use the returned `revision` as a client-side ETag — when it's
+   * unchanged across two reads the directory contents are guaranteed
+   * identical (no need to re-render).
+   *
+   * Performance: O(1) RPCs per page (vs O(N) for the legacy
+   * `readdir + lstat × N` loop). Default `limit` is 50; max 1000.
+   * `orderBy` defaults to `mtime` (descending).
+   */
+  async listChildren(
+    p: string,
+    opts: ListChildrenOpts = {}
+  ): Promise<ListChildrenPage> {
+    let raw: {
+      revision: number;
+      entries: Array<
+        | {
+            kind: "folder";
+            path: string;
+            pathId: string;
+            name: string;
+            stat?: VFSStatRaw;
+          }
+        | {
+            kind: "file";
+            path: string;
+            pathId: string;
+            name: string;
+            stat?: VFSStatRaw;
+            metadata?: Record<string, unknown> | null;
+            tags: string[];
+            contentHash?: string;
+          }
+        | {
+            kind: "symlink";
+            path: string;
+            pathId: string;
+            name: string;
+            target: string;
+            stat?: VFSStatRaw;
+          }
+      >;
+      cursor?: string;
+    };
+    try {
+      raw = await this.user().vfsListChildren(this.scope(), {
+        path: p,
+        ...opts,
+      });
+    } catch (err) {
+      throw mapServerError(err, { path: p, syscall: "scandir" });
+    }
+    const entries: VFSChild[] = raw.entries.map((e) => {
+      if (e.kind === "folder") {
+        const out: VFSChild = {
+          kind: "folder",
+          path: e.path,
+          pathId: e.pathId,
+          name: e.name,
+        };
+        if (e.stat) out.stat = new VFSStat(e.stat);
+        return out;
+      }
+      if (e.kind === "symlink") {
+        const out: VFSChild = {
+          kind: "symlink",
+          path: e.path,
+          pathId: e.pathId,
+          name: e.name,
+          target: e.target,
+        };
+        if (e.stat) out.stat = new VFSStat(e.stat);
+        return out;
+      }
+      const out: VFSChild = {
+        kind: "file",
+        path: e.path,
+        pathId: e.pathId,
+        name: e.name,
+        tags: e.tags,
+      };
+      if (e.stat) out.stat = new VFSStat(e.stat);
+      if (e.metadata !== undefined) out.metadata = e.metadata;
+      if (e.contentHash !== undefined) out.contentHash = e.contentHash;
+      return out;
+    });
+    return { revision: raw.revision, entries, cursor: raw.cursor };
   }
 
   /**

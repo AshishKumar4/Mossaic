@@ -1011,6 +1011,8 @@ const listFilesHandler = async (
       includeStat?: boolean;
       includeMetadata?: boolean;
       includeTombstones?: boolean;
+      includeArchived?: boolean;
+      includeContentHash?: boolean;
     }>();
     const r = await userStub(c).vfsListFiles(c.var.scope, body);
     return c.json(r);
@@ -1029,12 +1031,16 @@ vfs.post("/fileInfo", async (c) => {
       includeStat?: boolean;
       includeMetadata?: boolean;
       includeTombstones?: boolean;
+      includeArchived?: boolean;
+      includeContentHash?: boolean;
     }>();
     const path = expectPath(body);
     const item = await userStub(c).vfsFileInfo(c.var.scope, path, {
       includeStat: body.includeStat,
       includeMetadata: body.includeMetadata,
       includeTombstones: body.includeTombstones,
+      includeArchived: body.includeArchived,
+      includeContentHash: body.includeContentHash,
     });
     return c.json({ item });
   } catch (err) {
@@ -1042,6 +1048,45 @@ vfs.post("/fileInfo", async (c) => {
     return c.json(r.body, r.status as 400);
   }
 });
+
+// Phase 46 — batched directory listing. Body shape mirrors
+// `ListChildrenOpts`. Returns `{ revision, entries, cursor? }`.
+const listChildrenHandler = async (
+  c: import("hono").Context<{ Bindings: Env; Variables: { scope: VFSScope } }>
+) => {
+  try {
+    const body = await c.req.json<{
+      path: string;
+      orderBy?: "mtime" | "name" | "size";
+      direction?: "asc" | "desc";
+      limit?: number;
+      cursor?: string;
+      includeStat?: boolean;
+      includeMetadata?: boolean;
+      includeContentHash?: boolean;
+      includeTombstones?: boolean;
+      includeArchived?: boolean;
+    }>();
+    const path = expectPath(body);
+    const r = await userStub(c).vfsListChildren(c.var.scope, {
+      path,
+      orderBy: body.orderBy,
+      direction: body.direction,
+      limit: body.limit,
+      cursor: body.cursor,
+      includeStat: body.includeStat,
+      includeMetadata: body.includeMetadata,
+      includeContentHash: body.includeContentHash,
+      includeTombstones: body.includeTombstones,
+      includeArchived: body.includeArchived,
+    });
+    return c.json(r);
+  } catch (err) {
+    const r = errToResponse(err);
+    return c.json(r.body, r.status as 400);
+  }
+};
+vfs.post("/listChildren", listChildrenHandler);
 
 const markVersionHandler = async (
   c: import("hono").Context<{ Bindings: Env; Variables: { scope: VFSScope } }>

@@ -40,6 +40,19 @@ export interface CursorPayload {
   d: Direction;
   ov: number | string;
   pid: string;
+  /**
+   * Phase 46 — `listChildren` merge-pagination boundary. Distinguishes
+   * folder vs file boundary rows when folders + files are interleaved
+   * in a single sorted page. Optional so existing `listFiles` cursors
+   * (which only ever boundary on files) continue to round-trip
+   * through encode/decode without touching this field.
+   *
+   * Value `'folder'` means the prior page ended on a folder row;
+   * `'file'` (or absent) means it ended on a file row. Used only by
+   * `vfsListChildren` to seek both the folders and files SQL queries
+   * past the boundary correctly.
+   */
+  k?: "folder" | "file" | "symlink";
 }
 
 const CURSOR_SIG_LEN = 22; // ~128 bits of base64-url
@@ -101,7 +114,16 @@ export async function decodeCursor(
     ov: number | string;
     pid: string;
     sig: string;
+    k?: "folder" | "file" | "symlink";
   };
+  if (
+    p.k !== undefined &&
+    p.k !== "folder" &&
+    p.k !== "file" &&
+    p.k !== "symlink"
+  ) {
+    throw new VFSError("EINVAL", "listFiles: malformed cursor (k)");
+  }
   if (p.ob !== expectedOb) {
     throw new VFSError(
       "EINVAL",
@@ -121,6 +143,7 @@ export async function decodeCursor(
     d: p.d,
     ov: p.ov,
     pid: p.pid,
+    ...(p.k !== undefined ? { k: p.k } : {}),
   };
   const expectedSig = (await hmacSha256B64Url(canonical(stripped), secret)).slice(
     0,
@@ -134,6 +157,21 @@ export async function decodeCursor(
 
 /** Canonical JSON for HMAC input. Property order is fixed. */
 function canonical(p: CursorPayload): string {
+  // Phase 46 — `k` is included in the HMAC input ONLY when present
+  // so existing `listFiles` cursors (k absent) continue to verify
+  // with the legacy canonical form. Adding `k: undefined`
+  // unconditionally would break every cursor minted before this
+  // change.
+  if (p.k !== undefined) {
+    return JSON.stringify({
+      v: p.v,
+      ob: p.ob,
+      d: p.d,
+      ov: p.ov,
+      pid: p.pid,
+      k: p.k,
+    });
+  }
   return JSON.stringify({
     v: p.v,
     ob: p.ob,

@@ -702,6 +702,7 @@ export class HttpVFS implements VFSClient {
         stat?: import("../../shared/vfs-types").VFSStatRaw;
         metadata?: Record<string, unknown> | null;
         tags: string[];
+        contentHash?: string;
       }>;
       cursor?: string;
     };
@@ -712,6 +713,7 @@ export class HttpVFS implements VFSClient {
         stat: r.stat ? new VFSStat(r.stat) : undefined,
         metadata: r.metadata,
         tags: r.tags,
+        ...(r.contentHash !== undefined ? { contentHash: r.contentHash } : {}),
       })),
       cursor: raw.cursor,
     };
@@ -735,6 +737,7 @@ export class HttpVFS implements VFSClient {
         stat?: import("../../shared/vfs-types").VFSStatRaw;
         metadata?: Record<string, unknown> | null;
         tags: string[];
+        contentHash?: string;
       };
     };
     return {
@@ -743,7 +746,89 @@ export class HttpVFS implements VFSClient {
       stat: raw.item.stat ? new VFSStat(raw.item.stat) : undefined,
       metadata: raw.item.metadata,
       tags: raw.item.tags,
+      ...(raw.item.contentHash !== undefined
+        ? { contentHash: raw.item.contentHash }
+        : {}),
     };
+  }
+
+  async listChildren(
+    p: string,
+    opts: import("./vfs").ListChildrenOpts = {}
+  ): Promise<import("./vfs").ListChildrenPage> {
+    const res = await this.post(
+      "listChildren",
+      { path: p, ...opts },
+      "scandir",
+      p,
+      "json"
+    );
+    const raw = (await res.json()) as {
+      revision: number;
+      entries: Array<
+        | {
+            kind: "folder";
+            path: string;
+            pathId: string;
+            name: string;
+            stat?: import("../../shared/vfs-types").VFSStatRaw;
+          }
+        | {
+            kind: "file";
+            path: string;
+            pathId: string;
+            name: string;
+            stat?: import("../../shared/vfs-types").VFSStatRaw;
+            metadata?: Record<string, unknown> | null;
+            tags: string[];
+            contentHash?: string;
+          }
+        | {
+            kind: "symlink";
+            path: string;
+            pathId: string;
+            name: string;
+            target: string;
+            stat?: import("../../shared/vfs-types").VFSStatRaw;
+          }
+      >;
+      cursor?: string;
+    };
+    const entries: import("./vfs").VFSChild[] = raw.entries.map((e) => {
+      if (e.kind === "folder") {
+        const out: import("./vfs").VFSChild = {
+          kind: "folder",
+          path: e.path,
+          pathId: e.pathId,
+          name: e.name,
+        };
+        if (e.stat) out.stat = new VFSStat(e.stat);
+        return out;
+      }
+      if (e.kind === "symlink") {
+        const out: import("./vfs").VFSChild = {
+          kind: "symlink",
+          path: e.path,
+          pathId: e.pathId,
+          name: e.name,
+          target: e.target,
+        };
+        if (e.stat) out.stat = new VFSStat(e.stat);
+        return out;
+      }
+      const out: import("./vfs").VFSChild = {
+        kind: "file",
+        path: e.path,
+        pathId: e.pathId,
+        name: e.name,
+        tags: e.tags,
+      };
+      if (e.stat) out.stat = new VFSStat(e.stat);
+      if (e.metadata !== undefined) out.metadata = e.metadata;
+      if (e.contentHash !== undefined) out.contentHash = e.contentHash;
+      return out;
+    });
+    return { revision: raw.revision, entries, cursor: raw.cursor };
   }
 
   async markVersion(

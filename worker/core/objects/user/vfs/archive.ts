@@ -1,7 +1,7 @@
 import type { UserDOCore as UserDO } from "../user-do-core";
 import { VFSError, type VFSScope } from "../../../../../shared/vfs-types";
 import { insertAuditLog } from "./audit-log";
-import { resolveOrThrow, userIdFor } from "./helpers";
+import { bumpFolderRevision, resolveOrThrow, userIdFor } from "./helpers";
 
 /**
  * Refuse to mutate the archive bit on a tombstoned-head row.
@@ -126,6 +126,10 @@ export function vfsArchive(
     target: r.leafId,
     payload: JSON.stringify({ path, kind: r.kind }),
   });
+  // Phase 46 — bump parent revision: default-listing visibility
+  // flipped from "shown" to "hidden" so any listChildren consumer
+  // re-fetches.
+  bumpParentRevisionForFile(durableObject, userId, r.leafId);
 }
 
 /**
@@ -162,4 +166,28 @@ export function vfsUnarchive(
     target: r.leafId,
     payload: JSON.stringify({ path, kind: r.kind }),
   });
+  // Phase 46 — bump parent revision: visibility flipped from
+  // "hidden" back to "shown".
+  bumpParentRevisionForFile(durableObject, userId, r.leafId);
+}
+
+/**
+ * Phase 46 — read the file's parent_id and bump its folder revision.
+ * Co-located with archive/unarchive so we don't pull mutations.ts
+ * into archive.ts for one helper. The same SQL pattern is used by
+ * vfsUnlink/vfsRename which read parent_id directly.
+ */
+function bumpParentRevisionForFile(
+  durableObject: UserDO,
+  userId: string,
+  fileId: string
+): void {
+  const row = durableObject.sql
+    .exec(
+      "SELECT parent_id FROM files WHERE file_id = ? AND user_id = ?",
+      fileId,
+      userId
+    )
+    .toArray()[0] as { parent_id: string | null } | undefined;
+  bumpFolderRevision(durableObject, userId, row?.parent_id ?? null);
 }
