@@ -2,7 +2,7 @@
 
 Mathlib4-backed formal verification of Mossaic VFS invariants in Lean 4.
 
-**Status (Phase 43 honest accounting):** **226 theorems**, zero `sorry`, zero project axioms. The only axioms used are Lean's three kernel axioms: `propext`, `Classical.choice`, `Quot.sound`, plus Mathlib's transitive use of them.
+**Status (Phase 51 honest accounting):** **224 theorems**, zero `sorry`, zero project axioms. The only axioms used are Lean's three kernel axioms: `propext`, `Classical.choice`, `Quot.sound`, plus Mathlib's transitive use of them. Phase 51 audited every theorem for vacuous patterns and removed 7 vacuous statements (function congruences, `T → T := id`, excluded-middle); see `local/lean-vacuousness-audit.md`. Added `PreviewToken.lean` (5 theorems) to back the previously-orphaned `@lean-invariant` tag at `worker/core/lib/preview-token.ts:48`.
 
 ```bash
 cd lean && lake build
@@ -177,7 +177,30 @@ EXTENDED modules (3):
     window) and `restoreChunkRef_liveRefs_bump` (numerical
     consequence: liveRefs grows by 1 in lockstep with refCount).
 
-## Theorem totals (Phase 43 post-additions)
+## Phase 51 vacuousness audit
+
+Phase 51 audited all 226 pre-existing theorems against 9 vacuous-pattern
+detectors (function congruence `f x = f x`, tautology `T → T := id`,
+excluded middle `P ∨ ¬P`, hypothesis-equals-conclusion, etc.). Seven
+theorems were caught and disposed:
+
+  - `Cache.cache_key_extensional` — function congruence (Phase 43 def-fold). Deleted; witnesses cover the real claim.
+  - `Cache.versioned_variant_chunk_hash_determines_bytes` — `T → T := id`. Deleted; SHA-256 collision-resistance is a cryptographic assumption, not a Lean theorem.
+  - `Quota.witness_no_client_hint_in_placement` — function congruence (Phase 43 def-fold). Deleted; type-level argument captures the claim.
+  - `Quota.placement_immutability_under_resize` — `cp.x = cp.x`; dead args. Deleted; `stored_shard_within_resized_pool` is the substantive corollary.
+  - `RPC.single_rpc_per_shard_def` — definitional unfolding (Phase 43). Deleted; `witness_rpc_count_*` theorems cover batching.
+  - `StreamRouting.read_surfaces_agree_on_byte_source` — `f(x) = f(x)` under three let-bound aliases. Deleted; per-surface routing theorems are the real claims.
+  - `AtomicWrite.readFile_changes_only_at_state_change` — `P ∨ ¬P` (excluded middle). Deleted; `readFile_unchanged_under_beginWrite` plus witnesses are the real claims.
+
+One theorem was strengthened rather than deleted:
+
+  - `Refcount.metadata_mutation_preserves_chunk_invariant` — first conjunct was `validState s` from hypothesis (id-shaped), second was rfl from def. Strengthened by adding an `op : Op` parameter so the first conjunct now invokes `step_preserves_validState` — a real claim.
+
+The previously-orphaned `@lean-invariant Mossaic.Vfs.PreviewToken.scope_binding` xref at `worker/core/lib/preview-token.ts:48` (Phase 47) is fixed by adding `lean/Mossaic/Vfs/PreviewToken.lean` (5 theorems, opaque-HMAC style matching `ShareToken.lean`).
+
+Full report: `local/lean-vacuousness-audit.md`.
+
+## Theorem totals (Phase 51 post-audit)
 
 | Module | Theorems | Notes |
 |---|--:|---|
@@ -185,23 +208,24 @@ EXTENDED modules (3):
 | `Tenant.lean` | 14 | I3 tenant isolation. |
 | `Refcount.lean` | 39 | I1 + Phase 12 copyFile + Phase 32 restoreChunkRef atomicity. |
 | `Gc.lean` | 9 | I5 GC safety. |
-| `AtomicWrite.lean` | 11 | I2 linearizability. |
+| `AtomicWrite.lean` | 10 | I2 linearizability (Phase 51: −1 vacuous). |
 | `Versioning.lean` | 19 | I4 sortedness + Phase 12 user_visible + Phase 36 commitVersion. |
 | `Encryption.lean` | 1 | refcount-blindness only. |
 | `Multipart.lean` | 10 | Phase 24 base + Phase 30 versioning split (§4). |
-| `Quota.lean` | 22 | Pool-growth + Phase 32 skip-full + Phase 25 inline-tier + server-auth. |
+| `Quota.lean` | 20 | Pool-growth + Phase 32 skip-full + Phase 25 inline-tier (Phase 51: −2 vacuous). |
 | `Preview.lean` | 13 | file_variants invariants. |
 | `Tombstone.lean` | 11 | Phase 25 tombstone consistency. |
 | `HistoryPreservation.lean` | 14 | Phase 27 Fix 5/6/7. |
-| `StreamRouting.lean` | 12 | Phase 27.5 read-stream routing. |
-| `Cache.lean` | 11 | NEW (Phase 43) — Phase 36/36b cache-key + bust-token completeness. |
-| `Yjs.lean` | 15 | NEW (Phase 43) — Phase 38 Yjs magic-prefix wire format. |
-| `ShareToken.lean` | 6 | NEW (Phase 43) — Phase 32.5 HMAC share-token verify. |
-| `RPC.lean` | 12 | NEW (Phase 43) — Phase 39b batch RPC ordering + atomicity. |
+| `StreamRouting.lean` | 11 | Phase 27.5 read-stream routing (Phase 51: −1 vacuous). |
+| `Cache.lean` | 9 | Phase 36/36b cache-key + bust-token completeness (Phase 51: −2 vacuous). |
+| `Yjs.lean` | 15 | Phase 38 Yjs magic-prefix wire format. |
+| `ShareToken.lean` | 6 | Phase 32.5 HMAC share-token verify. |
+| `RPC.lean` | 11 | Phase 39b batch RPC ordering + atomicity (Phase 51: −1 vacuous). |
+| `PreviewToken.lean` | 5 | NEW (Phase 51) — Phase 47 preview-variant token scope binding. |
 | `Generated/Placement.lean` | 0 | Documentation. |
 | `Generated/ShardDO.lean` | 3 | Re-exports. |
 | `Generated/UserDO.lean` | 3 | Re-exports. |
-| **Total** | **226** | (+44 NEW in Phase 43; +10 EXTENDED) |
+| **Total** | **224** | (Phase 51: −7 vacuous, +5 PreviewToken; net −2) |
 
 Plus **0 project axioms** (unchanged from Phase 24) and **0 sorrys**.
 
@@ -219,7 +243,7 @@ lean/
 ├── lakefile.lean                   (Mathlib v4.29.0 dependency)
 ├── lean-toolchain                  (leanprover/lean4:v4.29.0)
 ├── lake-manifest.json              (auto-generated; pinned)
-├── Mossaic.lean                    (root, re-exports all 18 modules)
+├── Mossaic.lean                    (root, re-exports all 19 modules)
 ├── Mossaic/
 │   ├── Vfs/
 │   │   ├── Common.lean             (Hash/PathId/TimeMs aliases, UniqueBy)
@@ -235,10 +259,11 @@ lean/
 │   │   ├── Tombstone.lean          (Phase 25 tombstone consistency)
 │   │   ├── HistoryPreservation.lean (Phase 27 Fix 5/6/7)
 │   │   ├── StreamRouting.lean      (Phase 27.5 read-stream routing)
-│   │   ├── Cache.lean              (Phase 43 NEW: Phase 36/36b cache-key + bust-token)
-│   │   ├── Yjs.lean                (Phase 43 NEW: Phase 38 magic-prefix wire format)
-│   │   ├── ShareToken.lean         (Phase 43 NEW: Phase 32.5 HMAC verify)
-│   │   └── RPC.lean                (Phase 43 NEW: Phase 39b batch RPC ordering)
+│   │   ├── Cache.lean              (Phase 36/36b cache-key + bust-token)
+│   │   ├── Yjs.lean                (Phase 38 magic-prefix wire format)
+│   │   ├── ShareToken.lean         (Phase 32.5 HMAC verify)
+│   │   ├── RPC.lean                (Phase 39b batch RPC ordering)
+│   │   └── PreviewToken.lean       (Phase 51 NEW: Phase 47 preview-variant token)
 │   └── Generated/
 │       ├── ShardDO.lean            (re-exports for shard-do.ts)
 │       ├── UserDO.lean             (re-exports for user-do.ts)

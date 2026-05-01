@@ -24,7 +24,7 @@ cd "$(dirname "$0")/.."
 output=$(lake build 2>&1 || true)
 
 # Filter for files we care about (everything under Mossaic/).
-must_have_pattern='Mossaic/Vfs/(Common|Tenant|Refcount|Gc|AtomicWrite|Versioning|Encryption|Multipart|Quota|Preview|Tombstone|HistoryPreservation|StreamRouting|Cache|Yjs|ShareToken|RPC)\.lean|Mossaic/Generated/(ShardDO|UserDO|Placement)\.lean'
+must_have_pattern='Mossaic/Vfs/(Common|Tenant|Refcount|Gc|AtomicWrite|Versioning|Encryption|Multipart|Quota|Preview|Tombstone|HistoryPreservation|StreamRouting|Cache|Yjs|ShareToken|RPC|PreviewToken)\.lean|Mossaic/Generated/(ShardDO|UserDO|Placement)\.lean'
 
 sorry_warnings=$(echo "$output" | grep -E "declaration uses .sorry." | grep -E "$must_have_pattern" || true)
 

@@ -192,17 +192,11 @@ def uniqueShardCount (refs : List ChunkRef) : Nat :=
 shard count. We package the structural identity. -/
 def rpcCount (refs : List ChunkRef) : Nat := uniqueShardCount refs
 
-/--
-**(P3) single_rpc_per_shard_def.**
-The RPC count IS the unique-shard count by construction; this is a
-definitional unfolding, not a deep theorem. The non-vacuous content
-lives in the witness theorems below, which exhibit a concrete
-manifest (5 refs across 2 shards) and pin `rpcCount = 2` via
-`decide`. That witness establishes that batching is real (5 → 2
-rather than 5 → 5).
--/
-theorem single_rpc_per_shard_def (refs : List ChunkRef) :
-    rpcCount refs = uniqueShardCount refs := rfl
+-- Note: `rpcCount` is defined as `uniqueShardCount`, so a theorem
+-- stating their equality (`single_rpc_per_shard_def`) was vacuous
+-- and removed in Phase 51. The non-vacuous P3 content — that
+-- batching reduces N refs across K shards to K RPCs — lives in
+-- the witness theorems below.
 
 /-- Concrete witness for (P3): 5 chunks across 2 shards → 2 RPCs. -/
 theorem witness_rpc_count_2_shards :

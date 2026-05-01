@@ -17,6 +17,7 @@ import Mossaic.Vfs.Cache
 import Mossaic.Vfs.Yjs
 import Mossaic.Vfs.ShareToken
 import Mossaic.Vfs.RPC
+import Mossaic.Vfs.PreviewToken
 import Mossaic.Generated.ShardDO
 import Mossaic.Generated.UserDO
 import Mossaic.Generated.Placement
