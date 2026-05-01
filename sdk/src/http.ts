@@ -711,6 +711,45 @@ export class HttpVFS implements VFSClient {
     );
   }
 
+  /**
+   * Phase 38 — Yjs snapshot read over HTTP fallback.
+   *
+   * Returns `Y.encodeStateAsUpdate(doc)` bytes for a yjs-mode
+   * file. The HTTP route mirrors the binding-mode RPC: POST to
+   * `/api/vfs/readYjsSnapshot` with the path in the JSON body;
+   * response body is the raw bytes (Content-Type
+   * `application/octet-stream`).
+   */
+  async readYjsSnapshot(p: string): Promise<Uint8Array> {
+    const res = await this.post(
+      "readYjsSnapshot",
+      { path: p },
+      "read",
+      p,
+      "octet-stream"
+    );
+    return new Uint8Array(await res.arrayBuffer());
+  }
+
+  /**
+   * Phase 38 — Yjs snapshot commit over HTTP fallback.
+   *
+   * Encodes via `Y.encodeStateAsUpdate(doc)`, wraps with the
+   * snapshot magic prefix, and writes via the existing
+   * `writeFile` POST. The server detects the magic and routes
+   * through `Y.applyUpdate`.
+   */
+  async commitYjsSnapshot(
+    p: string,
+    doc: import("yjs").Doc
+  ): Promise<void> {
+    const Y = await import("yjs");
+    const { wrapYjsSnapshot } = await import("./yjs-internal");
+    const updateBytes = Y.encodeStateAsUpdate(doc);
+    const wrapped = wrapYjsSnapshot(updateBytes);
+    await this.writeFile(p, wrapped);
+  }
+
   // ── multipart parallel transfer ───────────────────────────
   //
   // Thin wire helpers used by `sdk/src/transfer.ts`. They speak the

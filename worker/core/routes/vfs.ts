@@ -634,6 +634,32 @@ vfs.post("/setYjsMode", async (c) => {
   }
 });
 
+// Phase 38 — Yjs snapshot read.
+//
+// Returns `Y.encodeStateAsUpdate(doc)` bytes as `application/octet-stream`
+// so SDK consumers can decode the FULL Y.Doc and use any named shared
+// types (Y.XmlFragment, Y.Map, Y.Array — Tiptap/ProseMirror,
+// Notion-style block editors). Pairs with the SDK's
+// `vfs.readYjsSnapshot(path)` and the Worker RPC `vfsReadYjsSnapshot`.
+//
+// EINVAL for non-yjs paths, EACCES for encrypted yjs files (server
+// cannot materialise — clients must use `openYDoc` and decrypt op log
+// locally for those tenants).
+vfs.post("/readYjsSnapshot", async (c) => {
+  try {
+    const body = await c.req.json<{ path: string }>();
+    const path = expectPath(body);
+    const bytes = await userStub(c).vfsReadYjsSnapshot(c.var.scope, path);
+    return new Response(bytes, {
+      status: 200,
+      headers: { "Content-Type": "application/octet-stream" },
+    });
+  } catch (err) {
+    const r = errToResponse(err);
+    return c.json(r.body, r.status as 400);
+  }
+});
+
 // admin: enable/disable per-tenant versioning. Operator-
 // class RPC; Bearer-gated like the rest of /api/vfs/*. The userId
 // argument is derived from the verified scope (tenant + optional sub),
