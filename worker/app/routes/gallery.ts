@@ -5,6 +5,7 @@ import { authMiddleware } from "@core/lib/auth";
 import { createVFS } from "@mossaic/sdk";
 import { userStub } from "../lib/user-stub";
 import { edgeCacheServe } from "@core/lib/edge-cache";
+import { serveBytesWithRange } from "@core/lib/http-range";
 
 const gallery = new Hono<{
   Bindings: Env;
@@ -80,6 +81,38 @@ async function serveImage(
   }
   const { path, mimeType, updatedAt } = resolved;
 
+  // Range requests bypass the Workers Cache wrapper: the cached
+  // entry is a 200 with full bytes, and Workers Cache does NOT
+  // slice it to 206 on hit. Serving from origin is correct (the
+  // ShardDO read is bounded; <video>/<audio> seek issues
+  // bytes=START- followed by sequential GETs that the browser
+  // assembles). The full-body 200 path keeps Workers Cache happy.
+  const rangeHeader = c.req.header("Range") ?? null;
+
+  if (rangeHeader !== null) {
+    const vfs = createVFS(env, { tenant: userId });
+    try {
+      if (opts.variant === "thumb") {
+        const result = await vfs.readPreview(path, { variant: "thumb" });
+        return serveBytesWithRange(result.bytes, rangeHeader, {
+          "Content-Type": result.mimeType,
+          "Cache-Control": `private, max-age=${opts.cacheSeconds}`,
+        });
+      }
+      const bytes = await vfs.readFile(path);
+      return serveBytesWithRange(bytes, rangeHeader, {
+        "Content-Type": mimeType,
+        "Cache-Control": `private, max-age=${opts.cacheSeconds}`,
+      });
+    } catch (err) {
+      const code = (err as { code?: string }).code;
+      if (code === "ENOENT") {
+        return Response.json({ error: "File not found" }, { status: 404 });
+      }
+      throw err;
+    }
+  }
+
   return edgeCacheServe(
     {
       surfaceTag: opts.surfaceTag,
@@ -98,6 +131,10 @@ async function serveImage(
             headers: {
               "Content-Type": result.mimeType,
               "Cache-Control": `private, max-age=${opts.cacheSeconds}`,
+              // Advertise Range support so the client's first
+              // (full-body) GET tells the browser it can seek on
+              // subsequent requests.
+              "Accept-Ranges": "bytes",
             },
           });
         }
@@ -107,6 +144,7 @@ async function serveImage(
             "Content-Type": mimeType,
             "Content-Length": String(bytes.byteLength),
             "Cache-Control": `private, max-age=${opts.cacheSeconds}`,
+            "Accept-Ranges": "bytes",
           },
         });
       } catch (err) {

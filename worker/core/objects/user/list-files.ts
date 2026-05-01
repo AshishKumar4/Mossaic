@@ -43,11 +43,11 @@ export interface ListFilesItemRaw {
   metadata?: Record<string, unknown> | null;
   tags: string[];
   /**
-   * Phase 46 — opt-in via `includeContentHash: true`. Hex SHA-256 of
-   * the file's contents, persisted in `files.file_hash`. Always
-   * defined for completed file rows; absent when the caller did not
-   * request it (kept off-by-default to keep listFiles wire payloads
-   * compact for typical list-and-render UIs).
+   * Opt-in via `includeContentHash: true`. Hex SHA-256 of the
+   * file's contents, persisted in `files.file_hash`. Always defined
+   * for completed file rows; absent when the caller did not request
+   * it (kept off-by-default to keep listFiles wire payloads compact
+   * for typical list-and-render UIs).
    */
   contentHash?: string;
 }
@@ -58,7 +58,7 @@ export interface ListFilesResult {
 }
 
 /**
- * Phase 46 — discriminated-union entry returned by `vfsListChildren`.
+ * Discriminated-union entry returned by `vfsListChildren`.
  *
  * - `kind: "file"` carries everything `ListFilesItemRaw` does
  *   (path, pathId, optional stat / metadata / contentHash, tags).
@@ -121,7 +121,7 @@ export interface ListChildrenOpts {
   cursor?: string;
   includeStat?: boolean;
   includeMetadata?: boolean;
-  /** Phase 46 — opt-in `contentHash` on file entries. */
+  /** Opt-in `contentHash` on file entries. */
   includeContentHash?: boolean;
   /** See `ListFilesOpts.includeTombstones`. Default false. */
   includeTombstones?: boolean;
@@ -169,9 +169,9 @@ interface ListFilesOpts {
    */
   includeArchived?: boolean;
   /**
-   * Phase 46 — opt-in inclusion of `contentHash` (hex SHA-256) on
-   * each file row. Default false to keep wire payloads compact;
-   * passive listings (typical UIs) don't need it.
+   * Opt-in inclusion of `contentHash` (hex SHA-256) on each file
+   * row. Default false to keep wire payloads compact; passive
+   * listings (typical UIs) don't need it.
    */
   includeContentHash?: boolean;
 }
@@ -179,7 +179,7 @@ interface ListFilesOpts {
 export interface FileInfoOpts {
   includeStat?: boolean;
   includeMetadata?: boolean;
-  /** Phase 46 — see `ListFilesOpts.includeContentHash`. */
+  /** See `ListFilesOpts.includeContentHash`. */
   includeContentHash?: boolean;
   /**
    * Same semantics as `ListFilesOpts.includeTombstones`.
@@ -308,22 +308,25 @@ export async function vfsListFiles(
     if (item) items.push(item);
   }
 
-  // Phase 46 — pagination correctness fix.
+  // Pagination correctness: emit cursor on SQL boundary, not items
+  // survivor.
   //
-  // Pre-fix: cursor was emitted only when `items.length === limit`.
-  // When `metadata` post-filter (or tag intersect, or archive/tombstone
-  // hydration filter) shrank the page below `limit`, no cursor was
-  // emitted EVEN THOUGH the underlying SQL had returned a full
-  // `sqlLimit` rows — meaning more matches lived past the boundary.
-  // Callers iterating to enumerate the dataset stopped early.
+  // A naive `if (items.length === limit)` cursor emission would
+  // miss pages: when `metadata` post-filter (or tag intersect, or
+  // archive/tombstone hydration filter) shrinks the page below
+  // `limit`, no cursor would be emitted EVEN THOUGH the underlying
+  // SQL returned a full `sqlLimit` rows — meaning more matches
+  // lived past the boundary. Callers iterating to enumerate the
+  // dataset would stop early.
   //
-  // Post-fix: emit cursor whenever the SQL fetched a full page,
-  // anchored at the LAST row that came back from SQL (`sqlBoundary`),
-  // not the last surviving item. Strict-monotonic boundary on
-  // (orderValue, file_id) means the next page resumes past every row
-  // SQL has already considered, so no row is unreachable. When the
-  // SQL page was short (everything that exists has been seen), no
-  // cursor is emitted and the caller knows enumeration is complete.
+  // Correct: emit cursor whenever the SQL fetched a full page,
+  // anchored at the LAST row that came back from SQL
+  // (`sqlBoundary`), not the last surviving item. Strict-monotonic
+  // boundary on (orderValue, file_id) means the next page resumes
+  // past every row SQL has already considered, so no row is
+  // unreachable. When the SQL page was short (everything that
+  // exists has been seen), no cursor is emitted and the caller
+  // knows enumeration is complete.
   let nextCursor: string | undefined;
   if (sqlPageWasFull && sqlBoundary) {
     nextCursor = await encodeCursor(
@@ -401,18 +404,18 @@ export async function vfsFileInfo(
 }
 
 /**
- * Phase 46 — batched directory listing with hydrated stat / metadata
- * / tags / contentHash for every direct child (folders, files,
- * symlinks). Single round-trip replaces the SDK's pre-Phase-46
- * `readdir + lstat × N` loop, which incurred N+1 RPCs and could not
- * surface metadata or contentHash in the same call.
+ * Batched directory listing with hydrated stat / metadata / tags /
+ * contentHash for every direct child (folders, files, symlinks).
+ * Single round-trip replaces a naive `readdir + lstat × N` loop,
+ * which incurs N+1 RPCs and cannot surface metadata or contentHash
+ * in the same call.
  *
  * Wire shape: `{ revision, entries: VFSChildRaw[], cursor? }`.
- *   - `revision`: monotonically-increasing per-folder counter
- *     (Phase 46 schema). Bumped by every mutation that affects this
- *     folder's direct children. Equality across two reads ⇒ contents
- *     identical (modulo concurrent in-flight mutations resolved by
- *     the DO's single-thread invariant).
+ *   - `revision`: monotonically-increasing per-folder counter.
+ *     Bumped by every mutation that affects this folder's direct
+ *     children. Equality across two reads ⇒ contents identical
+ *     (modulo concurrent in-flight mutations resolved by the DO's
+ *     single-thread invariant).
  *   - `entries`: discriminated by `kind: "folder" | "file" | "symlink"`.
  *     Order: caller-supplied `orderBy` (default `mtime`) + `direction`
  *     (default `desc` for mtime/size, `asc` for name). Tie-break:
@@ -427,10 +430,10 @@ export async function vfsFileInfo(
  * at the schema level — they're hard-deleted by `vfsRmdir` — so
  * `includeTombstones` only affects file/symlink entries.
  *
- * No metadata / tag filter on this surface (Phase 46 deliberately
- * narrow). Use `vfsListFiles` with `prefix` for filtered queries; the
- * pagination-correctness fix elsewhere in this file ensures those
- * cursors enumerate completely.
+ * No metadata / tag filter on this surface (deliberately narrow).
+ * Use `vfsListFiles` with `prefix` for filtered queries; the
+ * pagination-correctness logic elsewhere in this file ensures
+ * those cursors enumerate completely.
  */
 export async function vfsListChildren(
   durableObject: UserDO,
@@ -1571,11 +1574,11 @@ function hydrateItem(
   }
 
   if (includeContentHash) {
-    // Phase 46 — surface persisted SHA-256 hex. The column is NOT
-    // NULL but pre-Phase-46 inline-tier writes set it to '' (no
-    // hash computed). For backward compatibility we surface only
-    // non-empty values; consumers who need an inline hash should
-    // compute it client-side from the bytes.
+    // Surface persisted SHA-256 hex. The column is NOT NULL but
+    // legacy inline-tier writes set it to '' (no hash computed).
+    // For backward compatibility we surface only non-empty values;
+    // consumers who need an inline hash should compute it
+    // client-side from the bytes.
     if (f.file_hash !== "") {
       out.contentHash = f.file_hash;
     }

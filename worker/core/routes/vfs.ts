@@ -1049,8 +1049,8 @@ vfs.post("/fileInfo", async (c) => {
   }
 });
 
-// Phase 46 — batched directory listing. Body shape mirrors
-// `ListChildrenOpts`. Returns `{ revision, entries, cursor? }`.
+// Batched directory listing. Body shape mirrors `ListChildrenOpts`.
+// Returns `{ revision, entries, cursor? }`.
 const listChildrenHandler = async (
   c: import("hono").Context<{ Bindings: Env; Variables: { scope: VFSScope } }>
 ) => {

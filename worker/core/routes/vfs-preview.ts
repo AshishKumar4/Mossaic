@@ -31,6 +31,7 @@ import {
   edgeCacheLookup,
   edgeCachePut,
 } from "../lib/edge-cache";
+import { parseRange, rangeResponse, rangeNotSatisfiableResponse } from "../lib/http-range";
 import { userIdFor } from "../objects/user/vfs/helpers";
 import { verifyPreviewToken } from "../lib/preview-token";
 import { VFSConfigError } from "../lib/auth";
@@ -483,10 +484,41 @@ previewVariant.get("/preview-variant/:token", async (c) => {
       });
     }
 
-    const cached = await edgeCacheLookup(cacheOpts);
-    if (cached) return cached;
+    // Read the Range header once; it controls both the cache-hit
+    // and cache-miss paths below so the seek behaviour is
+    // symmetric across cold/warm caches.
+    const rangeHeader = c.req.header("Range") ?? null;
 
-    // Cache miss \u2014 derive scope from the token's tenantId, look
+    const cached = await edgeCacheLookup(cacheOpts);
+    if (cached) {
+      if (rangeHeader === null) return cached;
+      // Slice the cached full-200 body into a 206 — same pattern
+      // as the chunk-download route. Avoids a UserDO RPC + a
+      // ShardDO RPC on every seek frame for warm cache entries.
+      const cachedBuf = new Uint8Array(await cached.arrayBuffer());
+      const total = cachedBuf.byteLength;
+      const parsed = parseRange(rangeHeader, total);
+      if (parsed === "unsatisfiable") {
+        return rangeNotSatisfiableResponse(
+          total,
+          cached.headers.get("Content-Type") ?? undefined
+        );
+      }
+      if (parsed !== null) {
+        return rangeResponse(cachedBuf, parsed, total, {
+          "Content-Type":
+            cached.headers.get("Content-Type") ?? "application/octet-stream",
+          ETag: cached.headers.get("ETag") ?? expectedEtag,
+          "Cache-Control":
+            cached.headers.get("Cache-Control") ??
+            "public, max-age=31536000, immutable",
+        });
+      }
+      // Unparseable Range — fall through to the cached 200.
+      return cached;
+    }
+
+    // Cache miss — derive scope from the token's tenantId, look
     // up the variant row in the user's DO, fetch bytes from the
     // appropriate ShardDO. The DO RPC re-verifies the variant row
     // matches the token's contentHash; mismatch returns null and
@@ -532,24 +564,50 @@ previewVariant.get("/preview-variant/:token", async (c) => {
       );
     }
 
+    // Honour Range when present. Preview bytes are usually small
+    // images (Range is mostly irrelevant) but spec-compliant 206
+    // makes the route safe for any future renderer that emits
+    // larger media (e.g. a video-poster pipeline that returns a
+    // full-frame snapshot). The cache entry stored via
+    // edgeCachePut below is always the FULL 200 — Range responses
+    // are served from origin and not cached (they're a sliced
+    // view of the same underlying content). `rangeHeader` was
+    // captured at the top of the handler (cache-hit path uses it
+    // too); reuse the same value here.
+    const baseHeaders: Record<string, string> = {
+      "Content-Type": result.mimeType,
+      ETag: expectedEtag,
+      // Year-long immutable cache. Bytes are content-addressed
+      // by contentHash; re-renders produce a different hash
+      // (different URL).
+      "Cache-Control": "public, max-age=31536000, immutable",
+      // NO Vary: Authorization. The token IS in the URL path,
+      // not a header; the URL itself is the cache key. Adding
+      // Vary would force CDN re-fetch on every Authorization
+      // value variation — the opposite of what we want.
+      "X-Mossaic-Renderer": payload.rendererKind,
+      "X-Mossaic-Variant": payload.variantKind,
+      "X-Mossaic-Width": String(result.width),
+      "X-Mossaic-Height": String(result.height),
+    };
+    if (rangeHeader !== null) {
+      const total = result.bytes.byteLength;
+      const parsed = parseRange(rangeHeader, total);
+      if (parsed === "unsatisfiable") {
+        return rangeNotSatisfiableResponse(total, result.mimeType);
+      }
+      if (parsed !== null) {
+        return rangeResponse(result.bytes, parsed, total, baseHeaders);
+      }
+      // Fall through to 200 on unparseable range.
+    }
+
     const fresh = new Response(result.bytes, {
       status: 200,
       headers: {
-        "Content-Type": result.mimeType,
+        ...baseHeaders,
         "Content-Length": String(result.bytes.byteLength),
-        ETag: expectedEtag,
-        // Year-long immutable cache. Bytes are content-addressed
-        // by contentHash; re-renders produce a different hash
-        // (different URL).
-        "Cache-Control": "public, max-age=31536000, immutable",
-        // NO Vary: Authorization. The token IS in the URL path,
-        // not a header; the URL itself is the cache key. Adding
-        // Vary would force CDN re-fetch on every Authorization
-        // value variation \u2014 the opposite of what we want.
-        "X-Mossaic-Renderer": payload.rendererKind,
-        "X-Mossaic-Variant": payload.variantKind,
-        "X-Mossaic-Width": String(result.width),
-        "X-Mossaic-Height": String(result.height),
+        "Accept-Ranges": "bytes",
       },
     });
     edgeCachePut(cacheOpts, fresh);

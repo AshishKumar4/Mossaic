@@ -494,7 +494,7 @@ export function folderExists(
 }
 
 /**
- * Phase 46 — bump the per-folder revision counter.
+ * Bump the per-folder revision counter.
  *
  * Used by `vfsListChildren` consumers (Seal etc.) as a cheap ETag
  * for directory contents: when the returned revision is unchanged
@@ -505,7 +505,7 @@ export function folderExists(
  * `null` represents the synthetic root folder; we bump the
  * "user_root" sentinel row stored as a `folders` row with
  * folder_id='__root__' for that case (created lazily here so
- * tenants pre-dating Phase 46 don't need a one-shot migration).
+ * legacy tenants don't need a one-shot migration).
  *
  * Mutations that bump (caller's responsibility — bumpFolderRevision
  * does NOT discover the parent itself):
@@ -559,7 +559,7 @@ export function bumpFolderRevision(
 }
 
 /**
- * Phase 46 — read the current revision counter for a folder.
+ * Read the current revision counter for a folder.
  * Returns 0 for the root sentinel before its first bump (the row
  * may not yet exist) and for any folder_id that doesn't resolve.
  *
