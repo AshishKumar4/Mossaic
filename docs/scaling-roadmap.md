@@ -32,7 +32,42 @@ hits the SQLite limit (depending on file count + version churn).
 To scale a single tenant past this, the metadata layer needs to
 shard horizontally too \u2014 see Phase 32b.
 
-## Phase 32.5 \u2014 Quota desync correction (deferred from Phase 32)
+## Phase 32.5 \u2014 Quota desync correction (LANDED)
+## Phase 36 \u2014 Versioned accounting consolidation (LANDED)
+
+Phase 36 closed the deferred work below. The summary lives here
+so future operators can read this single doc and understand the
+post-Phase-36 invariants:
+
+- `commitVersion` (vfs-versions.ts) is the single accounting
+  chokepoint for all versioned writes. 13 callers across 6
+  files all positive- or negative-count via the
+  (prevWasLive, nowIsLive) tuple inside commitVersion.
+- `dropVersionRows` is the symmetric decrement: accumulates
+  bytes / inline-bytes per dropped non-tombstone version +
+  tracks file_count delta when path goes ENOENT.
+- Non-versioning paths that previously didn't account
+  (vfsCommitWriteStream non-versioning, copyInline / copyChunked
+  non-versioning) gained explicit `recordWriteUsage` calls.
+- multipart finalize stops double-counting under versioning ON.
+- VER-ON TENANTS NOW GET POOL GROWTH (THE bug that motivated
+  Phase 36): a 5 GB versioned upload moves pool_size 32\u219233.
+  Pre-Phase-36 it stayed at 32 forever.
+
+Tests: 9 new cases at tests/integration/versioning-accounting.test.ts
+pin every transition (VA1\u2013VA9). 5 cases in edge-cache.test.ts
+pin Phase 36 Theme B's cache-key shape (EC1\u2013EC5). All
+existing 743 tests continue to pass.
+
+Lean invariant `Mossaic.Vfs.Quota.pool_size_monotonic` is
+preserved by `recordWriteUsage`'s `MAX(0, col + ?)` clamp +
+the `newPool > row.pool_size` guard at helpers.ts:447.
+Negative deltas can never shrink pool_size, regardless of
+sign or magnitude.
+
+---
+
+## Phase 32.5 \u2014 Quota desync correction (LANDED in Phase 32.5; superseded by Phase 36)
 
 **Blocker (cosmetic, not scaling):** `recordWriteUsage` is
 called only on positive deltas from

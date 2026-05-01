@@ -399,7 +399,7 @@ async function copyInline(
     return;
   }
 
-  // Versioning OFF — pre-Phase-27 behaviour preserved.
+  // Versioning OFF \u2014 pre-Phase-27 behaviour preserved.
   await opsMod.commitRename(
     durableObject,
     userId,
@@ -409,6 +409,18 @@ async function copyInline(
     leaf
   );
   await applyCopySideEffects(durableObject, userId, tmpId, opts, now, srcRow.file_id);
+  // Phase 36 \u2014 record bytes against quota for the non-versioning
+  // copy path. Pre-fix copyFile silently understated storage_used /
+  // file_count for non-versioning tenants. Inline tier so also
+  // bump inline_bytes_used.
+  const { recordWriteUsage } = await import("./vfs/helpers");
+  recordWriteUsage(
+    durableObject,
+    userId,
+    srcRow.file_size,
+    1,
+    srcRow.file_size
+  );
 }
 
 async function copyChunked(
@@ -522,6 +534,12 @@ async function copyChunked(
     leaf
   );
   await applyCopySideEffects(durableObject, userId, tmpId, opts, now, srcRow.file_id);
+  // Phase 36 \u2014 record bytes against quota for the non-versioning
+  // chunked copy. Pre-fix copyFile silently understated
+  // storage_used / file_count for non-versioning chunked copies,
+  // so multi-GB tenants saw their pool stay at 32 forever.
+  const { recordWriteUsage } = await import("./vfs/helpers");
+  recordWriteUsage(durableObject, userId, srcRow.file_size, 1);
 }
 
 async function copyVersioned(

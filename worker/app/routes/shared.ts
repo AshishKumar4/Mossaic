@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import type { EnvApp as Env } from "@shared/types";
 import { createVFS } from "@mossaic/sdk";
 import { userStub } from "../lib/user-stub";
+import { edgeCacheServe } from "../lib/edge-cache";
 
 const shared = new Hono<{ Bindings: Env }>();
 
@@ -58,6 +59,17 @@ shared.get("/:token/photos", async (c) => {
 /**
  * GET /api/shared/:token/image/:fileId
  * Public image bytes for shared albums via canonical `vfs.readFile()`.
+ *
+ * Phase 36 \u2014 Workers Cache wrap. Cache key is
+ * `simg/<userId>/<fileId>/<updated_at>`. Auth check
+ * (token-includes-fileId) runs BEFORE the cache lookup so a
+ * cached response can never serve an unauthorized request \u2014
+ * the cache key is per-user but the auth gate is the bouncer.
+ * `updated_at` busts the cache on any write to the fileId.
+ *
+ * Public sharing implies high hit rates (viral links). The
+ * `public, max-age=86400` Cache-Control on the response also
+ * lets the CDN edge tier cache, double-stacking the win.
  */
 shared.get("/:token/image/:fileId", async (c) => {
   const token = c.req.param("token");
@@ -79,25 +91,37 @@ shared.get("/:token/image/:fileId", async (c) => {
   if (!resolved) {
     return c.json({ error: "File not found" }, 404);
   }
-  const { path, mimeType } = resolved;
+  const { path, mimeType, updatedAt } = resolved;
 
-  const vfs = createVFS(c.env, { tenant: userId });
-  try {
-    const bytes = await vfs.readFile(path);
-    return new Response(bytes, {
-      headers: {
-        "Content-Type": mimeType,
-        "Content-Length": String(bytes.byteLength),
-        "Cache-Control": "public, max-age=86400",
-      },
-    });
-  } catch (err) {
-    const code = (err as { code?: string }).code;
-    if (code === "ENOENT") {
-      return c.json({ error: "File not found" }, 404);
+  return edgeCacheServe(
+    {
+      surfaceTag: "simg",
+      namespace: userId,
+      fileId,
+      updatedAt,
+      cacheControl: "public, max-age=86400",
+      waitUntil: (p) => c.executionCtx.waitUntil(p),
+    },
+    async () => {
+      const vfs = createVFS(c.env, { tenant: userId });
+      try {
+        const bytes = await vfs.readFile(path);
+        return new Response(bytes, {
+          headers: {
+            "Content-Type": mimeType,
+            "Content-Length": String(bytes.byteLength),
+            "Cache-Control": "public, max-age=86400",
+          },
+        });
+      } catch (err) {
+        const code = (err as { code?: string }).code;
+        if (code === "ENOENT") {
+          return c.json({ error: "File not found" }, 404);
+        }
+        throw err;
+      }
     }
-    throw err;
-  }
+  );
 });
 
 export default shared;

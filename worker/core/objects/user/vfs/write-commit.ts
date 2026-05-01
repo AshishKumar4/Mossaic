@@ -370,6 +370,11 @@ async function vfsWriteFileVersioned(
         .toArray()[0] as { used: number } | undefined
     )?.used ?? 0;
     if (inlineUsed + data.byteLength <= INLINE_TIER_CAP) {
+      // Phase 36 \u2014 commitVersion now does its own accounting
+      // via recordWriteUsage (storage_used + file_count +
+      // inline_bytes_used). The duplicate UPDATE that used to
+      // live here is gone; commitVersion is the single
+      // chokepoint.
       commitVersion(durableObject, {
         pathId,
         versionId,
@@ -387,29 +392,6 @@ async function vfsWriteFileVersioned(
         metadata: metadataForVersion,
         encryption: meta.encryption,
       });
-      // Bump the inline counter for this versioned write — the
-      // standard write-commit path's `commitInlineTier` does the
-      // same via `recordWriteUsage(..., data.byteLength)`. Here
-      // we tick it directly because the versioned commit doesn't
-      // route through `recordWriteUsage` for byte accounting (it
-      // uses `commitVersion` for the row, see Phase 27 design).
-      //
-      // Phase 32.5 BUG #2 \u2014 the symmetric DECREMENT lives in
-      // `dropVersionRows` (vfs-versions.ts:~620 + ~720), which now
-      // accumulates `inline_data.byteLength` per dropped version
-      // and issues one negative `recordWriteUsage` for the batch.
-      // Pre-fix this counter only ever incremented in the
-      // versioning-on path \u2014 versioning tenants saw cap fire
-      // earlier than 1 GiB after enough drop-version churn.
-      // Plain storage_used / file_count decrement on dropped
-      // versions is Phase 32.6.
-      durableObject.sql.exec(
-        `UPDATE quota
-            SET inline_bytes_used = COALESCE(inline_bytes_used, 0) + ?
-          WHERE user_id = ?`,
-        data.byteLength,
-        userId
-      );
       if (meta.tags !== undefined) {
         replaceTags(durableObject, userId, pathId, meta.tags);
       } else {

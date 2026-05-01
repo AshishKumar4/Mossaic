@@ -288,7 +288,21 @@ export class UserDO extends UserDOCore {
    */
   async appGetFilePath(
     fileId: string
-  ): Promise<{ path: string; mimeType: string } | null> {
+  ): Promise<{
+    path: string;
+    mimeType: string;
+    /**
+     * Phase 36 \u2014 cache-key bust token. Returned so HTTP-cache layers
+     * (gallery thumbnail / shared image / preview) can include this
+     * in the cache-key path component. Every write that mutates
+     * bytes-or-metadata bumps `files.updated_at` (via the various
+     * UPDATE files SET ... updated_at = ? sites in vfs/* and
+     * vfs-versions.ts), so a stale cached response is never served
+     * after a write. Non-versioned and versioned paths both update
+     * this column.
+     */
+    updatedAt: number;
+  } | null> {
     // Pre-gate ensureInit so the persisted-scope lookup below sees
     // the schema. We can't pass userId in without breaking the route
     // caller signature; recover it from `vfs_meta.scope` (set by any
@@ -305,7 +319,7 @@ export class UserDO extends UserDOCore {
     // file"); returning null here gives the route a clean 404 path.
     const fileRow = this.sql
       .exec(
-        `SELECT f.parent_id, f.file_name, f.mime_type
+        `SELECT f.parent_id, f.file_name, f.mime_type, f.updated_at
            FROM files f
            LEFT JOIN file_versions fv
              ON fv.path_id = f.file_id AND fv.version_id = f.head_version_id
@@ -315,7 +329,12 @@ export class UserDO extends UserDOCore {
         fileId
       )
       .toArray()[0] as
-      | { parent_id: string | null; file_name: string; mime_type: string }
+      | {
+          parent_id: string | null;
+          file_name: string;
+          mime_type: string;
+          updated_at: number;
+        }
       | undefined;
     if (!fileRow) return null;
 
@@ -337,6 +356,7 @@ export class UserDO extends UserDOCore {
     return {
       path: "/" + segments.join("/"),
       mimeType: fileRow.mime_type ?? "application/octet-stream",
+      updatedAt: fileRow.updated_at,
     };
   }
 
