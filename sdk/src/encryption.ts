@@ -72,11 +72,11 @@ export class ENCRYPTION_REQUIRED extends VFSFsError {
  * corrupt". Preserves `cause` so consumers who care about the
  * underlying Error can drill in.
  *
- * Phase 52 P3 #3: this class is now narrowly scoped. Envelope
+ * This class is narrowly scoped to auth-tag mismatches. Envelope
  * structural errors (truncation, unsupported version, AAD-tag
  * cross-purpose mismatch) surface as {@link CORRUPT_ENVELOPE} —
- * those are NOT key-rotation problems and operators
- * debugging "WRONG_KEY storms" need to know the difference.
+ * those are NOT key-rotation problems and operators debugging
+ * "WRONG_KEY storms" need to know the difference.
  */
 export class WRONG_KEY extends VFSFsError {
   readonly cause?: unknown;
@@ -96,12 +96,13 @@ export class WRONG_KEY extends VFSFsError {
  * as a valid Mossaic envelope (truncated, unsupported version, AAD
  * cross-purpose mismatch, malformed tail).
  *
- * Phase 52 P3 #3: pre-Phase-52 these surfaced as `WRONG_KEY` which
- * sent operators chasing key-rotation hypotheses for what was
- * actually a storage-corruption / replay / version-mismatch event.
- * Disambiguation lets dashboards alert separately on
- * "auth-tag mismatches" (key-rotation pressure) vs "envelope
- * corruption" (storage durability / replay-attack pressure).
+ * Without this discrimination, structural errors would surface as
+ * `WRONG_KEY`, sending operators chasing key-rotation hypotheses
+ * for what is actually a storage-corruption / replay /
+ * version-mismatch event. Disambiguation lets dashboards alert
+ * separately on "auth-tag mismatches" (key-rotation pressure) vs
+ * "envelope corruption" (storage durability / replay-attack
+ * pressure).
  *
  * Inherits from {@link WRONG_KEY} so existing `instanceof WRONG_KEY`
  * call-sites keep working — corruption is a strict subset of "the
@@ -170,11 +171,11 @@ export async function encryptPayload(
 /**
  * Decrypt a single envelope payload back to plaintext.
  *
- * Phase 52 P3 #3 — error discrimination. Pre-Phase-52, every failure
- * was re-mapped to {@link WRONG_KEY}, which made operator dashboards
- * conflate auth-tag mismatches (= key rotation / re-keying pressure)
- * with envelope corruption (= storage durability / replay-attack /
- * version-mismatch pressure). They have different remediations.
+ * Error discrimination: a naive single-bucket `WRONG_KEY` mapping
+ * would make operator dashboards conflate auth-tag mismatches
+ * (= key rotation / re-keying pressure) with envelope corruption
+ * (= storage durability / replay-attack / version-mismatch
+ * pressure). They have different remediations.
  *
  * Now:
  *  - WebCrypto AES-GCM auth-tag mismatch → {@link WRONG_KEY}.

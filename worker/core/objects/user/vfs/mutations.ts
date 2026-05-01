@@ -529,25 +529,25 @@ export async function vfsRename(
     );
   }
   if (dstFile) {
-    // Phase 52 P1-2 fix — rename overwrite under versioning ON
-    // PRESERVES the destination path's history.
+    // Rename overwrite under versioning ON PRESERVES the
+    // destination path's history.
     //
-    // Pre-Phase-52 behaviour (audit Phase 35 P1-2): the displaced
-    // file_id was tombstoned via commitVersion(deleted=true) AND
-    // renamed to `<file_id>.tombstoned-<ts>` to free the unique
-    // index slot, then the src row was moved into that slot. The
-    // path A's history (rows under file_id `fA`) became orphaned:
-    //   - listVersions(A) resolved to the NEW occupant (formerly
+    // The naive approach would tombstone the displaced file_id via
+    // commitVersion(deleted=true) AND rename to
+    // `<file_id>.tombstoned-<ts>` to free the unique index slot,
+    // then move the src row into that slot. But path A's history
+    // (rows under file_id `fA`) would become orphaned:
+    //   - listVersions(A) resolves to the NEW occupant (formerly
     //     `fB`), returning its history not A's.
-    //   - The synthetic name `<fA>.tombstoned-<ts>` was filtered
+    //   - The synthetic name `<fA>.tombstoned-<ts>` is filtered
     //     from listFiles by the tombstone-head guard.
-    //   - No public API took a file_id, so fA's a1/a2/etc.
-    //     versions were unreachable except via the
+    //   - No public API takes a file_id, so fA's a1/a2/etc.
+    //     versions become unreachable except via the
     //     `adminReapTombstonedHeads({mode:"walkBack"})` recovery
     //     primitive — operator-only.
     //
-    // Phase 52 fix: instead of moving the src row INTO A's slot,
-    // we IMPORT src's content as a NEW VERSION on A's history.
+    // Correct approach: instead of moving the src row INTO A's
+    // slot, IMPORT src's content as a NEW VERSION on A's history.
     // After this:
     //   - A's path_id (= fA) stays put. Path A still resolves to
     //     fA, preserving the row's archival/tag/encryption stamps.
@@ -698,8 +698,8 @@ function bumpRenameParents(
 // ── rename overwrite under versioning ON ───────────────────────────────
 
 /**
- * Phase 52 P1-2 fix: rename(srcPath → dstPath) overwriting an
- * existing destination on a versioning-ON tenant.
+ * rename(srcPath → dstPath) overwriting an existing destination on
+ * a versioning-ON tenant.
  *
  * Migrates the source row's HEAD content as a new version on the
  * destination's existing path_id, so dst's history is preserved:
@@ -1016,7 +1016,7 @@ async function renameOverwriteVersioned(
     // putChunk refbumps that succeeded leak chunk_refs under
     // newRefId — they'll be reclaimed by the shard's alarm sweep
     // when the user re-attempts and the failed shard recovers,
-    // OR by adminReapOrphanRefs (Phase 47) on the next sweep.
+    // OR by adminReapOrphanRefs on the next sweep.
     durableObject.sql.exec(
       "DELETE FROM version_chunks WHERE version_id = ?",
       newVersionId
