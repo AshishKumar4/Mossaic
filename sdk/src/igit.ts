@@ -238,6 +238,18 @@ class BatchedLstatFs implements VFSClient {
   readPreview(p: string, opts?: Parameters<VFSClient["readPreview"]>[1]) {
     return this.inner.readPreview(p, opts);
   }
+  previewUrl(p: string, opts?: Parameters<VFSClient["previewUrl"]>[1]) {
+    return this.inner.previewUrl(p, opts);
+  }
+  previewInfo(p: string, opts?: Parameters<VFSClient["previewInfo"]>[1]) {
+    return this.inner.previewInfo(p, opts);
+  }
+  previewInfoMany(
+    paths: Parameters<VFSClient["previewInfoMany"]>[0],
+    opts?: Parameters<VFSClient["previewInfoMany"]>[1]
+  ) {
+    return this.inner.previewInfoMany(paths, opts);
+  }
   readChunk(p: string, idx: number) {
     return this.inner.readChunk(p, idx);
   }

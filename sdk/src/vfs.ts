@@ -423,6 +423,18 @@ export interface UserDOClient {
     path: string,
     opts?: ReadPreviewOpts
   ): Promise<ReadPreviewResult>;
+  /** Phase 45 \u2014 mint a signed preview-variant URL. */
+  vfsMintPreviewToken(
+    scope: VFSScope,
+    path: string,
+    opts?: PreviewUrlOpts
+  ): Promise<PreviewInfo>;
+  /** Phase 45 \u2014 batched mint (max 256 paths). */
+  vfsPreviewInfoMany(
+    scope: VFSScope,
+    paths: string[],
+    opts?: PreviewUrlOpts
+  ): Promise<PreviewInfoBatchEntry[]>;
   vfsReadChunk(
     scope: VFSScope,
     path: string,
