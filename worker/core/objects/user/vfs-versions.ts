@@ -1034,9 +1034,9 @@ export async function restoreVersion(
   const newVersionId = generateId();
   const now = Date.now();
 
-  // Phase 46 — restore can flip a tombstoned path back to live, or
-  // simply advance head_version_id of an already-live path. Either
-  // case warrants a folder-revision bump so listChildren observers
+  // Restore can flip a tombstoned path back to live, or simply
+  // advance head_version_id of an already-live path. Either case
+  // warrants a folder-revision bump so listChildren observers
   // re-fetch. Read parent_id of the path's stable row.
   const parentRow = durableObject.sql
     .exec("SELECT parent_id FROM files WHERE file_id = ?", pathId)

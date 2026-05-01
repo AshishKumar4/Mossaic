@@ -25,17 +25,18 @@ export default defineConfig({
     "src/igit.ts",
     "src/yjs.ts",
     "src/http-only.ts",
-    // Phase 15: lazy-load encryption helpers via /encryption subpath.
-    // The main entry's writeFile/readFile use `await import("./encryption")`
-    // — splitting:true keeps that out of the main bundle.
+    // Lazy-load encryption helpers via /encryption subpath. The
+    // main entry's writeFile/readFile use
+    // `await import("./encryption")` — splitting:true keeps that
+    // out of the main bundle.
     "src/encryption.ts",
   ],
   format: ["esm"],
   dts: true,
   sourcemap: true,
   clean: true,
-  // Phase 14: code-splitting on so the dynamic
-  // `await import("./yjs")` inside `user-do-core.ts:getYjsRuntime()`
+  // Code-splitting on so the dynamic `await import("./yjs")`
+  // inside `user-do-core.ts:getYjsRuntime()`
   // becomes a real lazy chunk. Without splitting, esbuild inlines
   // the dynamic import into index.js and `import { Awareness, ... }
   // from "y-protocols/awareness"` at the top of the file forces

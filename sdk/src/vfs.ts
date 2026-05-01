@@ -125,11 +125,11 @@ export interface VFSClient {
   /** indexed listFiles with HMAC-signed cursor pagination. */
   listFiles(opts?: ListFilesOpts): Promise<ListFilesPage>;
   /**
-   * Phase 46 — batched directory listing. Returns folder revision
-   * counter + a single page of merged folder/file/symlink entries
-   * with stat / metadata / tags / contentHash hydrated in one
-   * round-trip. Replaces the pre-Phase-46 `readdir + lstat × N`
-   * loop with O(1) RPCs per page.
+   * Batched directory listing. Returns folder revision counter +
+   * a single page of merged folder/file/symlink entries with stat
+   * / metadata / tags / contentHash hydrated in one round-trip.
+   * Replaces a naive `readdir + lstat × N` loop with O(1) RPCs
+   * per page.
    *
    * `revision` is a monotonic per-folder counter; cache it client-
    * side and re-fetch only when it changes (or use it as an ETag).
@@ -402,7 +402,7 @@ export interface UserDOClient {
     tags: string[];
     contentHash?: string;
   }>;
-  /** Phase 46 — batched directory listing (folder revision + entries). */
+  /** Batched directory listing (folder revision + entries). */
   vfsListChildren(
     scope: VFSScope,
     opts: ListChildrenOpts & { path: string }
@@ -849,9 +849,9 @@ export interface ListFilesOpts {
    */
   includeArchived?: boolean;
   /**
-   * Phase 46 — opt-in: include each file row's `contentHash`
-   * (hex SHA-256). Default false to keep wire payloads compact
-   * for typical UIs that don't need the hash.
+   * Opt-in: include each file row's `contentHash` (hex SHA-256).
+   * Default false to keep wire payloads compact for typical UIs
+   * that don't need the hash.
    */
   includeContentHash?: boolean;
 }
@@ -876,7 +876,7 @@ export interface FileInfoOpts {
    * exclusion by default.
    */
   includeArchived?: boolean;
-  /** Phase 46 — opt-in: include `contentHash` (hex SHA-256). */
+  /** Opt-in: include `contentHash` (hex SHA-256). */
   includeContentHash?: boolean;
 }
 
@@ -893,8 +893,8 @@ export interface ListFilesItem {
   /** Always present — the file's tag set, sorted alphabetically. */
   tags: string[];
   /**
-   * Phase 46 — present iff `includeContentHash: true` was passed.
-   * Hex SHA-256 of the file's contents.
+   * Present iff `includeContentHash: true` was passed. Hex
+   * SHA-256 of the file's contents.
    */
   contentHash?: string;
 }
@@ -906,7 +906,7 @@ export interface ListFilesPage {
 }
 
 /**
- * Phase 46 — options for `listChildren`.
+ * Options for `listChildren`.
  *
  * Like `ListFilesOpts` but tied to a specific folder (no `prefix` /
  * `tags` / `metadata` filter). The result merges folders + files +
@@ -935,7 +935,7 @@ export interface ListChildrenOpts {
 }
 
 /**
- * Phase 46 — discriminated-union entry returned by `listChildren`.
+ * Discriminated-union entry returned by `listChildren`.
  *
  * - `kind: 'folder'` — `name`, `pathId`, optional `stat` (`type: 'dir'`).
  * - `kind: 'file'` — `name`, `pathId`, optional `stat` (`type: 'file'`),
@@ -974,7 +974,7 @@ export type VFSChild =
     };
 
 /**
- * Phase 46 — `listChildren` page.
+ * `listChildren` page.
  *
  * `revision` is the per-folder mutation counter — strictly monotonic
  * within a single tenant DO. Use it as a client-side ETag: when
@@ -1552,9 +1552,9 @@ export class VFS implements VFSClient {
   }
 
   /**
-   * Phase 46 — batched directory listing. Single round-trip returns
-   * folder revision + a sorted page of merged folder/file/symlink
-   * entries with stat / metadata / tags / contentHash hydrated.
+   * Batched directory listing. Single round-trip returns folder
+   * revision + a sorted page of merged folder/file/symlink entries
+   * with stat / metadata / tags / contentHash hydrated.
    *
    * Use the returned `revision` as a client-side ETag — when it's
    * unchanged across two reads the directory contents are guaranteed

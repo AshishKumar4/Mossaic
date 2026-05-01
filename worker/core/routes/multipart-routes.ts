@@ -40,6 +40,7 @@ import {
 // lockstep across both route surfaces. A local re-implementation
 // here would drift and collapse EAGAIN to 500.
 import { errToResponse } from "./vfs";
+import { parseRange, rangeResponse, rangeNotSatisfiableResponse } from "../lib/http-range";
 import {
   MULTIPART_MAX_CHUNK_BYTES,
   type MultipartBeginRequest,
@@ -600,8 +601,36 @@ chunkDownload.get("/chunk/:fileId/:idx", async (c) => {
       cacheControl: "public, max-age=31536000, immutable",
       waitUntil: c.executionCtx.waitUntil.bind(c.executionCtx),
     };
+    // Honour Range when present. Per-chunk Range support lets
+    // browsers do byte-precise scrubbing within a chunk. The
+    // cache stores the FULL 200; Range responses are served from
+    // origin (or from the cached buffer below) and never cached
+    // themselves.
+    const rangeHeader = c.req.header("Range") ?? null;
+
     const cached = await edgeCacheLookup(cacheOpts);
-    if (cached) return cached;
+    if (cached) {
+      if (rangeHeader === null) return cached;
+      // Slice the cached body to the requested range. Avoids a
+      // ShardDO round-trip on Range hits over an already-cached
+      // chunk (the common case for video playback).
+      const cachedBuf = new Uint8Array(await cached.arrayBuffer());
+      const total = cachedBuf.byteLength;
+      const parsed = parseRange(rangeHeader, total);
+      if (parsed === "unsatisfiable") {
+        return rangeNotSatisfiableResponse(total, "application/octet-stream");
+      }
+      if (parsed !== null) {
+        return rangeResponse(cachedBuf, parsed, total, {
+          "Content-Type": "application/octet-stream",
+          "Cache-Control": "public, max-age=31536000, immutable",
+          Vary: "Authorization",
+          ETag: `"${hashHint}"`,
+          "X-Mossaic-Hash": hashHint,
+        });
+      }
+      return cached;
+    }
 
     const ssub = shardStub(c.env, scope, sIdx);
     const res = await ssub.fetch(
@@ -614,7 +643,11 @@ chunkDownload.get("/chunk/:fileId/:idx", async (c) => {
       );
     }
     const buf = await res.arrayBuffer();
-    const response = new Response(buf, {
+
+    // Always build + cache the full 200; emit 206 for Range
+    // requests separately. The cache entry must be the full body
+    // so a future Range hit can slice it without a ShardDO RPC.
+    const fullResponse = new Response(buf, {
       status: 200,
       headers: {
         "Content-Type": "application/octet-stream",
@@ -629,10 +662,28 @@ chunkDownload.get("/chunk/:fileId/:idx", async (c) => {
         Vary: "Authorization",
         ETag: `"${hashHint}"`,
         "X-Mossaic-Hash": hashHint,
+        "Accept-Ranges": "bytes",
       },
     });
-    edgeCachePut(cacheOpts, response);
-    return response;
+    edgeCachePut(cacheOpts, fullResponse);
+
+    if (rangeHeader !== null) {
+      const total = buf.byteLength;
+      const parsed = parseRange(rangeHeader, total);
+      if (parsed === "unsatisfiable") {
+        return rangeNotSatisfiableResponse(total, "application/octet-stream");
+      }
+      if (parsed !== null) {
+        return rangeResponse(new Uint8Array(buf), parsed, total, {
+          "Content-Type": "application/octet-stream",
+          "Cache-Control": "public, max-age=31536000, immutable",
+          Vary: "Authorization",
+          ETag: `"${hashHint}"`,
+          "X-Mossaic-Hash": hashHint,
+        });
+      }
+    }
+    return fullResponse;
   } catch (err) {
     const r = errToResponse(err);
     return c.json(r.body, r.status as 400);

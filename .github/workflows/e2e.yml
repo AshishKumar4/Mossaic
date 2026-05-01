@@ -29,6 +29,8 @@ jobs:
           node-version: 20
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - name: Lint — no Phase NN tags in runtime code
+        run: pnpm lint:no-phase-tags
       - name: Build SDK
         run: pnpm -F @mossaic/sdk build
       - name: Build CLI
@@ -60,6 +62,8 @@ jobs:
           node-version: 20
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - name: Lint — no Phase NN tags in runtime code
+        run: pnpm lint:no-phase-tags
       - name: Build SDK
         run: pnpm -F @mossaic/sdk build
       - name: Workspace typecheck

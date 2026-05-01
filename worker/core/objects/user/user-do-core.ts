@@ -270,8 +270,8 @@ export class UserDOCore extends DurableObject<Env> {
     } catch {
       // column already exists
     }
-    // Phase 46 — folders.revision: monotonically-increasing per-folder
-    // counter bumped by every mutation that changes that folder's
+    // folders.revision: monotonically-increasing per-folder counter
+    // bumped by every mutation that changes that folder's
     // direct children (or the folder's own name/parent slot for
     // rename of the folder itself). Returned by `vfsListChildren`
     // so consumers (Seal etc.) can use it as an ETag — when revision
@@ -289,7 +289,7 @@ export class UserDOCore extends DurableObject<Env> {
     } catch {
       // column already exists
     }
-    // Phase 46 — root-folder revision counter.
+    // Root-folder revision counter.
     //
     // The root has no `folders` row (it's implicit: parent_id=NULL is
     // the root). To track its mutation revision we use a dedicated
@@ -2842,11 +2842,12 @@ export class UserDOCore extends DurableObject<Env> {
   }
 
   /**
-   * Phase 46 — batched directory listing. Returns folder revision +
-   * a single page of merged folder/file/symlink entries with stat /
-   * metadata / contentHash hydrated in one round-trip. Replaces the
-   * SDK's pre-Phase-46 readdir + lstat × N loop. See
-   * `list-files.ts:vfsListChildren` for the merge / cursor semantics.
+   * Batched directory listing. Returns folder revision + a single
+   * page of merged folder/file/symlink entries with stat /
+   * metadata / contentHash hydrated in one round-trip. Replaces a
+   * naive `readdir + lstat × N` loop. See
+   * `list-files.ts:vfsListChildren` for the merge / cursor
+   * semantics.
    */
   async vfsListChildren(
     scope: VFSScope,

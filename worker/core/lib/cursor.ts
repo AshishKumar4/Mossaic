@@ -41,11 +41,11 @@ export interface CursorPayload {
   ov: number | string;
   pid: string;
   /**
-   * Phase 46 — `listChildren` merge-pagination boundary. Distinguishes
-   * folder vs file boundary rows when folders + files are interleaved
-   * in a single sorted page. Optional so existing `listFiles` cursors
-   * (which only ever boundary on files) continue to round-trip
-   * through encode/decode without touching this field.
+   * `listChildren` merge-pagination boundary. Distinguishes folder
+   * vs file boundary rows when folders + files are interleaved in
+   * a single sorted page. Optional so `listFiles` cursors (which
+   * only ever boundary on files) continue to round-trip through
+   * encode/decode without touching this field.
    *
    * Value `'folder'` means the prior page ended on a folder row;
    * `'file'` (or absent) means it ended on a file row. Used only by
@@ -157,11 +157,10 @@ export async function decodeCursor(
 
 /** Canonical JSON for HMAC input. Property order is fixed. */
 function canonical(p: CursorPayload): string {
-  // Phase 46 — `k` is included in the HMAC input ONLY when present
-  // so existing `listFiles` cursors (k absent) continue to verify
-  // with the legacy canonical form. Adding `k: undefined`
-  // unconditionally would break every cursor minted before this
-  // change.
+  // `k` is included in the HMAC input ONLY when present so
+  // `listFiles` cursors (k absent) continue to verify with the
+  // legacy canonical form. Adding `k: undefined` unconditionally
+  // would break every legacy cursor.
   if (p.k !== undefined) {
     return JSON.stringify({
       v: p.v,

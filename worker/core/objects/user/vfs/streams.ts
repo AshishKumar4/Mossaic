@@ -905,11 +905,11 @@ export async function vfsCommitWriteStream(
         handle.tmpId
       );
     }
-    // Phase 46 — versioned stream-commit either added a fresh path
-    // (commitRename branch above bumped via the new commitRename
-    // hook) OR advanced the head version of an existing path. The
-    // latter case is invisible to commitRename's bump because it
-    // didn't fire — explicit bump here covers it.
+    // Versioned stream-commit either added a fresh path
+    // (commitRename branch above bumped via the commitRename hook)
+    // OR advanced the head version of an existing path. The latter
+    // case is invisible to commitRename's bump because it didn't
+    // fire — explicit bump here covers it.
     if (liveRow) {
       bumpFolderRevision(durableObject, userId, handle.parentId);
     }
