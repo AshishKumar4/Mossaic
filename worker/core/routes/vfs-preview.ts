@@ -150,6 +150,11 @@ preview.post("/readPreview", async (c) => {
           headers: {
             ETag: cachedEtag,
             "Cache-Control": "public, max-age=31536000, immutable",
+            // Phase 41 Fix 2 (audit 40B P1): even the warm-cache-hit
+            // 304 must carry Vary so a downstream CDN cannot replay
+            // this 304 to a request bearing a different Authorization
+            // token. See the 200 path below for rationale.
+            Vary: "Authorization",
           },
         });
       }
@@ -180,6 +185,11 @@ preview.post("/readPreview", async (c) => {
         headers: {
           ETag: etag,
           "Cache-Control": "public, max-age=31536000, immutable",
+          // Phase 41 Fix 2 (audit 40B P1): see the 200 path below
+          // for rationale. The 304 also flows through intermediary
+          // caches; without Vary, a CDN could replay this response
+          // to a request bearing a different Authorization token.
+          Vary: "Authorization",
         },
       });
     }
@@ -195,6 +205,13 @@ preview.post("/readPreview", async (c) => {
         // on re-render the chunk_hash changes and the ETag
         // changes with it, busting any intermediary cache.
         "Cache-Control": "public, max-age=31536000, immutable",
+        // Phase 41 Fix 2 (audit 40B P1): Vary on Authorization so
+        // any intermediary CDN keys cached entries by Bearer token
+        // and never serves a tenant-A preview to a tenant-B request
+        // whose URL collides. The Workers Cache key already includes
+        // a per-user namespace; Vary is the wire assertion that
+        // downstream caches honour the same axis.
+        Vary: "Authorization",
         "X-Mossaic-Renderer": result.rendererKind,
         "X-Mossaic-Variant-Cache": result.fromVariantTable
           ? "hit"

@@ -831,8 +831,15 @@ vfs.post("/readChunk", async (c) => {
       headers: {
         "Content-Type": "application/octet-stream",
         // Per-version per-chunk-index immutable. Overwrites
-        // create a new headVersionId \u2192 different cache key.
+        // create a new headVersionId → different cache key.
         "Cache-Control": "public, max-age=31536000, immutable",
+        // Phase 41 Fix 2 (audit 40B P1): Vary on Authorization so
+        // any intermediary CDN keys cached entries by Bearer token
+        // and never serves a tenant-A response to a tenant-B
+        // request whose URL happens to collide. The cache key
+        // already includes a per-user namespace; Vary is the wire
+        // assertion that downstream caches honour the same axis.
+        Vary: "Authorization",
       },
     });
     edgeCachePut(cacheOpts, fresh);

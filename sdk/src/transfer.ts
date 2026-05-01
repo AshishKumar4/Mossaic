@@ -538,6 +538,14 @@ async function runAdaptiveDownloadEngine(
       ) {
         state.endgameActive = true;
         const extra = Math.min(pending.size, endgameMaxFanout);
+        // Phase 41 Fix 4 (audit 40C top-1): bump `state.active` so the
+        // observable concurrency metric (currentParallelism in the
+        // onProgress callback, and any consumer assertion against a
+        // claimed concurrency cap) reflects the real fanout. The
+        // previous code set `state.active` once at lane spawn and
+        // left it stale, so a `respects concurrency.max bound` test
+        // saw 8 while real concurrency was 4 + 8 = 12.
+        state.active += extra;
         for (let i = 0; i < extra; i++) lanes.push(lane());
         return;
       }
@@ -844,6 +852,10 @@ export async function parallelUpload(
         // Spawn one extra lane per still-pending chunk (capped at
         // endgameMaxFanout).
         const extra = Math.min(pending.size, endgameMaxFanout);
+        // Phase 41 Fix 4 (audit 40C top-1): bump `state.active` so
+        // the observable concurrency metric reflects the real
+        // fanout. See the download-side site for the full rationale.
+        state.active += extra;
         for (let i = 0; i < extra; i++) {
           extras.push(lane());
         }
