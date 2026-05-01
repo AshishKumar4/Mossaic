@@ -625,26 +625,42 @@ export async function vfsRemoveRecursive(
   path: string,
   cursor?: string
 ): Promise<{ done: boolean; cursor?: string }> {
-  // Phase 32 Fix 3 — subrequest budget.
+  // Phase 32 Fix 3 + Phase 32.5 Fix 3 — subrequest budget,
+  // branched.
   //
-  // Pre-fix BATCH_LIMIT was 200; per-file `hardDeleteFileRow`
-  // fans out up to `poolSize` subrequests via `deleteChunks` (one
-  // RPC per touched shard), giving a worst case of 200 × 32 =
-  // 6400 subrequests per call — well over the Workers paid cap
-  // of 1000.
+  // Pre-Phase-32: unconditional BATCH_LIMIT = 200; per-file
+  // `hardDeleteFileRow` fanned out up to `poolSize` subrequests
+  // via `deleteChunks` (one RPC per touched shard). Worst case
+  // 200 \xd7 32 = 6400 subrequests per call \u2014 over the Workers
+  // paid cap of 1000.
   //
-  // Post-fix two changes:
-  //   1. BATCH_LIMIT lowered to 30 (30 × 32 = 960 < 1000) — the
-  //      versioned tombstone branch and any per-file fallback are
-  //      safe within budget on their own.
-  //   2. Non-versioning hard-delete branch BATCHES THE SHARD
-  //      FAN-OUT: collect every (file_id, shard_index) pair first,
-  //      group by shard_index, and issue ONE
-  //      `deleteManyChunks` RPC per shard with the full file_ids
-  //      list. Worst case: poolSize subrequests = 32, regardless
-  //      of BATCH_LIMIT.
-  const BATCH_LIMIT = 30;
+  // Phase 32: BATCH_LIMIT lowered to 30 globally + non-versioning
+  // path BATCHES THE SHARD FAN-OUT into one `deleteManyChunks`
+  // RPC per touched shard. Worst case: poolSize subrequests = 32
+  // for the non-versioning path.
+  //
+  // Phase 32.5 Fix 3: branch BATCH_LIMIT by versioning state.
+  // The versioning branch tombstones in-place \u2014 NO ShardDO
+  // fan-out, so subrequest cost is 0 per file. Capping at 30 was
+  // a 6.6x slowdown on the path that doesn't need the lower cap
+  // (a versioning-on rmrf of 150k files needed 5000 invocations
+  // at 30; needs 750 at 200).
+  //
+  // Bound on versioning side: BATCH_LIMIT_VERSIONING = 200 keeps
+  // SQL work (UPDATE files SET file_name=..., commitVersion()
+  // tombstone insert) on a single DO turn \u2014 still well below
+  // the 30s wall-clock bound. The non-versioning side stays at
+  // 30 because `deleteManyChunks` over poolSize shards is the
+  // dominant cost; raising would push toward the subrequest cap
+  // even with batched fan-out (30 \xd7 32 = 960 < 1000).
   const userId = userIdFor(scope);
+  const versioning = isVersioningEnabled(durableObject, userId);
+  // Phase 32.5 Fix 3 \u2014 branched limits.
+  const BATCH_LIMIT_VERSIONING = 200;
+  const BATCH_LIMIT_NON_VERSIONING = 30;
+  const BATCH_LIMIT = versioning
+    ? BATCH_LIMIT_VERSIONING
+    : BATCH_LIMIT_NON_VERSIONING;
   const rootR = resolveOrThrow(durableObject, userId, path, /*follow*/ false);
   if (rootR.kind !== "dir") {
     throw new VFSError("ENOTDIR", `removeRecursive: not a directory: ${path}`);
@@ -702,11 +718,14 @@ export async function vfsRemoveRecursive(
   // accessible via `listVersions` + `restoreVersion`. Operators
   // who want full destruction should use `vfsPurge(path)` or
   // `adminReapTombstonedHeads`.
-  const versioning = isVersioningEnabled(durableObject, userId);
+  //
+  // `versioning` already computed above for BATCH_LIMIT branching.
   if (versioning) {
     // Versioning branch — tombstone each file. No ShardDO fan-out:
-    // chunks survive in version_chunks for restore. Bounded by
-    // BATCH_LIMIT (30) per call to keep SQL work cheap.
+    // chunks survive in version_chunks for restore. Phase 32.5 Fix 3
+    // raises BATCH_LIMIT to 200 here \u2014 SQL-only work, fan-out is
+    // zero, cost is dominated by the per-file commitVersion +
+    // file_name UPDATE (single-DO-turn).
     for (const f of fileRows) {
       const tombId = generateId();
       const now = Date.now();
