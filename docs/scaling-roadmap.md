@@ -1,230 +1,314 @@
 # Mossaic scaling roadmap
 
-This document tracks the architectural work that takes Mossaic from
-"horizontally scalable per ShardDO" (Phase 23 pool growth + Phase 32
-skip-full placement) toward "horizontally scalable per UserDO" and
-beyond. Each entry is a phase boundary with a concrete blocker, an
-approach, and the Mossaic invariants the change must preserve.
+This is the only document that cites phase numbers. Every other
+document describes shipped behaviour. Phase entries here trace
+historical decisions that operators may need to reconstruct from
+`git log`; the alternative is letting that trail fade into commit
+archaeology and discovering load-bearing context months later.
 
-## Status as of Phase 32 (HEAD `<post-merge>`)
+## Architectural status (as of HEAD)
 
-Per-tenant scaling is **bounded by UserDO SQLite size** (~10 GiB
-practical ceiling at workerd's per-DO storage limit). Inside that
-ceiling, ShardDOs scale horizontally:
+Per-tenant scaling is bounded by UserDO SQLite size (~10 GiB
+practical ceiling at workerd's per-DO storage limit). Inside
+that ceiling, ShardDOs scale horizontally:
 
-- **Pool growth** (Phase 23): `quota.pool_size` grows by 1 ShardDO per
-  5 GiB of stored bytes. Monotonic by design; never shrinks.
+- **Pool growth.** `quota.pool_size` grows by 1 ShardDO per 5 GiB
+  of stored bytes. Monotonic by design; never shrinks.
   `recordWriteUsage` is the load-bearing function.
-- **Cap-aware placement** (Phase 32 Fix 4): `placeChunk` skips
-  shards over the soft cap (9 GiB) via the `shard_storage_cache`
-  table; falls through to next-best rendezvous score; on all-full,
+- **Cap-aware placement.** `placeChunk` skips shards over the
+  soft cap (9 GiB) via the `shard_storage_cache` table; falls
+  through to the next-best rendezvous score. On all-full,
   returns a `POOL_FULL` sentinel and the caller force-bumps
   `pool_size` to acquire fresh capacity.
-- **Inline-tier graceful migration** (Phase 32 Fix 5): per-tenant
-  cumulative inline bytes (`quota.inline_bytes_used`) capped at
-  1 GiB. Writes past the cap spill to the chunked tier and live on
+- **Inline-tier graceful migration.** Per-tenant cumulative
+  inline bytes (`quota.inline_bytes_used`) capped at 1 GiB.
+  Writes past the cap spill to the chunked tier and live on
   ShardDOs.
+- **Versioned accounting consolidation.** `commitVersion` is the
+  single accounting chokepoint for all versioned writes \u2014
+  storage_used, file_count, and inline_bytes_used update through
+  one path. Versioning-on tenants get pool growth (the bug that
+  motivated the consolidation: pre-fix, ver-on writes never
+  bumped `storage_used`, so pool_size stayed at 32 forever).
 
-The SCALABILITY CEILING after Phase 32: a single tenant's
-`files`/`file_versions`/`file_chunks` metadata fits inside one
-UserDO. Empirically that's ~100 GiB of user data before metadata
-hits the SQLite limit (depending on file count + version churn).
-To scale a single tenant past this, the metadata layer needs to
-shard horizontally too \u2014 see Phase 32b.
+The scalability ceiling beyond ~100 GiB user data per tenant is
+the metadata layer (`files` / `file_versions` / `file_chunks`
+all live on the UserDO). Lifting that ceiling is intentionally
+deferred \u2014 see Phase 32b below.
 
-## Phase 32.5 \u2014 Quota desync correction (LANDED)
-## Phase 36 \u2014 Versioned accounting consolidation (LANDED)
-## Phase 36b \u2014 Cacheable surfaces complete + staleness audit (LANDED)
+---
 
-Phase 36b extended Phase 36's edge-cache helper to the three
-deferred surfaces (readPreview, readChunk, openManifest) and
-migrated the legacy chunk-download endpoint to share the same
-helper. Now SEVEN surfaces use one cache convention:
+## Phase ledger (newest first)
 
-  - GET /api/gallery/thumbnail/:fileId   (Phase 36)
-  - GET /api/gallery/image/:fileId       (Phase 36)
-  - GET /api/shared/:token/image/:fileId (Phase 36)
-  - POST /api/vfs/readPreview            (Phase 36b NEW)
-  - POST /api/vfs/readChunk              (Phase 36b NEW)
-  - POST /api/vfs/openManifest           (Phase 36b NEW)
-  - GET /api/vfs/chunk/:fileId/:idx      (Phase 36b MIGRATED)
+### Phase 47 \u2014 HTTP Range support + pagination audit + CI gate hardening (LANDED)
 
-Cache-key shape across all seven:
-  https://<surfaceTag>.mossaic.local/<namespace>/<fileId>/<updatedAt>[/<...extras>]
+- HTTP Range support for `gallery/image/:fileId` and
+  `shared/:token/image/:fileId`. `serveBytesWithRange()`
+  helper at `worker/core/lib/http-range.ts` parses
+  `Range: bytes=N-M`, returns 206 with `Content-Range` +
+  `Accept-Ranges: bytes`, 416 on out-of-bounds. Range
+  requests bypass the Workers Cache wrapper since the cached
+  full response is the upstream of any range slice.
+- Pagination audit pass over `listFiles` / `listChildren`
+  cursor encoding; covered by deterministic-ordering tests.
+- CI gate hardening. New `ci:check` script chains
+  `typecheck` \u2192 `build:sdk` \u2192 `lint:no-phase-tags` so a
+  missing-tag-leak or DTS-strict-mode mismatch fails the
+  build, not the deploy.
 
-  - surfaceTag distinguishes endpoints (gthumb / gimg / simg /
-    preview / chunk / manifest).
-  - namespace is `<userId>` for private; `<payload.tn>` for
-    download-token endpoints.
-  - updatedAt comes from files.updated_at, advances on every
-    write that mutates response state.
-  - extras encode version part (headVersionId or t<updatedAt>),
-    variant kind/format/renderer, encryption fingerprint
-    (fnv1a folded), chunk index, chunk hash \u2014 whichever apply
-    to the surface.
+### Phase 46 \u2014 listChildren batched listing + folder revision counter + listFiles pagination fix (LANDED)
 
-Pre-flight RPC: vfsResolveCacheKey returns
-(fileId, headVersionId, updatedAt, encryption stamp) in one
-SQL JOIN; routes call it before the heavy operation to build
-deterministic keys.
+- `vfs.listChildren(path, opts?)` returns a single-RPC
+  enumeration of one folder's direct children. Replaces
+  `readdir + lstat\xd7N` for SPA file-tree views; one DO
+  invocation regardless of child count. Discriminated-union
+  entries (`{kind: "file"|"dir"|"symlink", path, stat, ...}`),
+  optional metadata + tags + contentHash via opts.
+- Folder revision counter: each folder row carries a
+  monotonic `revision` column; `bumpFolderRevision` fires on
+  every direct-child mutation. Routes that emit ETag for
+  directory listings derive the etag from
+  `(folder_id, revision)` so the SPA can `If-None-Match` a
+  whole subtree without re-downloading children.
+- listFiles pagination fix: a tie-break bug at the
+  `(orderbyValue, file_id)` boundary occasionally repeated or
+  skipped a row at page boundaries; fixed by tightening the
+  cursor predicate to strict `<`/`>` instead of `<=`/`>=`.
+  Pinned by `tests/integration/list-files-pagination.test.ts`.
 
-Staleness audit at local/cache-staleness-audit.md walks every
-surface and every mutation type. Verdict: HOLDS for all seven.
-Cache-key-versioning beats active invalidation \u2014 races produce
-orphaned cache entries that expire per their TTL, never
-serve stale responses.
+### Phase 45 \u2014 signed preview-variant URLs (LANDED)
 
-Tests: 18 new cases at tests/integration/edge-cache.test.ts
-pin the additional bust signals + the vfsResolveCacheKey RPC
-contract. 23 cases total.
+- `vfs.previewUrl(path, opts?)` mints an HMAC-signed URL the
+  browser fetches directly: `GET /api/vfs/preview-variant/<token>`.
+  Bytes are content-addressed by the `contentHash` claim in
+  the token, so the response carries
+  `Cache-Control: public, max-age=31536000, immutable` without
+  `Vary: Authorization`. CDN edge tier caches across all
+  clients; subsequent loads bypass the Worker entirely.
+- `vfs.previewInfo(path, opts?)` returns the same URL plus
+  the metadata bundle (mimeType, width, height, etag,
+  rendererKind, versionId, cacheControl, contentHash,
+  expiresAtMs). One mint RPC, all the data the SPA needs.
+- `vfs.previewInfoMany(paths, opts?)` batched mint (cap 256
+  paths). Per-path failures land as `{ok: false, code, message}`
+  entries; one ENOENT in a 50-photo grid doesn't 4xx the
+  whole batch.
+- HMAC token at `worker/core/lib/preview-token.ts`. HS256 JWT
+  with `scope: "vfs-pv"` (RFC 8725 \xa72.8 scope-binding rejects
+  cross-purpose replay). Multi-secret rotation aware. Default
+  TTL 24h; clamped to [60s, 30d].
+- Backward compat: `vfs.readPreview` and `POST /readPreview`
+  preserved verbatim. SDK consumers migrate at their own pace.
 
-Phase 36 closed the deferred work below. The summary lives here
-so future operators can read this single doc and understand the
-post-Phase-36 invariants:
+### Phase 44 \u2014 Phase NN tag purge (LANDED)
 
-- `commitVersion` (vfs-versions.ts) is the single accounting
-  chokepoint for all versioned writes. 13 callers across 6
-  files all positive- or negative-count via the
-  (prevWasLive, nowIsLive) tuple inside commitVersion.
+- Phase NN narration drift in production code reverted. The
+  Phase 24 hygiene sweep had cleaned 307 markers to 0; Phase
+  46-era growth reintroduced 60+. Phase 44 stripped the new
+  narration, then Phase 47 added the `lint:no-phase-tags`
+  CI gate so future phases can't regress silently.
+- This roadmap is the SOLE document where `Phase NN` appears.
+  Tests use `Phase NN` as stable test IDs (excluded from the
+  gate). Scope: production code only.
+
+### Phase 43 \u2014 Lean catch-up (LANDED)
+
+- Theorem count 172 \u2192 226. Coverage extensions for Cache
+  (preview-variant cache-key bust completeness),
+  ShareToken (HMAC scope-binding), RPC (typed-RPC
+  null-safety), Yjs (compaction monotonicity). Zero
+  `axiom`, zero `sorry`.
+
+### Phase 42 \u2014 observability infrastructure (LANDED, closes Phase 34 carryover)
+
+- `audit_log` table emits one row per destructive operation:
+  `unlink`, `purge`, `archive`, `unarchive`, `rename`,
+  `removeRecursive`, `restoreVersion`, `dropVersions`, the
+  4 `admin*` RPCs, `appWipeAccountData`, `accountDelete`,
+  `shareLinkMint`. Per-tenant retention (cap 10K rows, trim
+  to 9.8K floor) via the existing UserDO alarm.
+- Structured logger at `worker/core/lib/logger.ts`:
+  `logInfo` / `logWarn` / `logError` emit JSON-stringified
+  single-line `console.*` output. Workers Logs + Logpush
+  parse this as structured fields without further config.
+- `requestIdMiddleware` mints `crypto.randomUUID()` per
+  `/api/*` request, mirrors onto `X-Mossaic-Request-Id`
+  response header. Honors caller-supplied valid id (regex-
+  gated) so a wrapping proxy can thread its own correlation
+  id.
+- Alarm-handler bare `catch {}` sites visible: every
+  alarm-handler exception goes through `recordAlarmFailure`
+  \u2014 `logError(event=alarm_handler_failed)` plus a persistent
+  `vfs_meta.alarm_failures` counter. Alarms continue (at-
+  least-once retry); throwing would replay without progress.
+
+### Phase 41 \u2014 four targeted Phase 40 audit bug fixes (LANDED)
+
+- `errToResponse` `EAGAIN` mapping now consistent across
+  all routes (was missing from a multipart-routes
+  re-implementation). 429 returns 429 instead of collapsing
+  to 500.
+- `Vary: Authorization` on cached responses (preview /
+  manifest / chunk routes) so an intermediary CDN keys
+  cached entries by Bearer token \u2014 no cross-tenant replay
+  through a coincidental URL collision.
+- Encrypted Yjs files refuse `flush()` with `ENOTSUP` (the
+  server can't materialize the doc to snapshot it).
+- Transfer concurrency cap fixed for `parallelDownload`
+  (was bypassing the AIMD controller in one branch).
+
+### Phase 39 \u2014 RPC efficiency + binding cleanup + image-passthrough fallback (LANDED)
+
+- `getChunksBatch` typed RPC: per-shard batched chunk reads
+  in one DO turn. Replaces the legacy `fetch(http://internal/chunk/<hash>)`
+  shape across the four straggler call sites.
+- Image-passthrough renderer: `image/*` MIMEs serve verbatim
+  bytes when the Cloudflare Images binding is unavailable,
+  preserving variant cache shape (kind = `"image-passthrough"`).
+  Bridge for environments without IMAGES (local dev,
+  service-mode without binding).
+- Subrequest budget bumped to 100,000; image binding fallback
+  no longer multiplies subrequests.
+
+### Phase 38 \u2014 Yjs arbitrary named shared types (LANDED)
+
+- The Yjs runtime now broadcasts the entire `Y.Doc` (every
+  named `Y.XmlFragment`, `Y.Map`, `Y.Array`, `Y.Text`,
+  `Y.XmlElement`) rather than just `Y.Text("content")`.
+  Tiptap / ProseMirror / Notion-style apps work end-to-end.
+- New `vfs.readYjsSnapshot(path)` returns
+  `Y.encodeStateAsUpdate(doc)` bytes for SDK consumers
+  bootstrapping a doc without an open WebSocket.
+- Encrypted-Yjs refuses snapshot reads (ENOTSUP) \u2014
+  server can't materialize ciphertext.
+
+### Phase 37 \u2014 P0/P1 audit fixes (LANDED)
+
+- Share-token HMAC: tokens are now HS256-signed (was
+  unsigned `base64(JSON({...}))`). Pre-fix tokens fail
+  verification; users re-share to mint new tokens.
+- Atomic `restoreVersion` via `restoreChunkRef` shard RPC
+  (was a `chunksAlive` preflight + per-chunk `putChunk`
+  loop with a TOCTOU window where concurrent
+  `dropVersions` could reap a chunk between preflight and
+  re-ref).
+- Admin gates: every `admin*` RPC routes through the
+  per-tenant rate-limit bucket so replay attempts are
+  bounded.
+- Hard cap on concurrent Yjs WebSocket clients per pathId
+  (100; warn at 80) so the synchronous broadcast loop
+  doesn't burn DO event-loop time.
+- Multipart session abort-attempts cap (5) so a poisoned
+  session can't block alarm progress forever.
+- Indexer attempts cap (5) so a poison file in the
+  search-index reconciler can't burn AI binding budget on
+  every alarm tick.
+
+### Phase 36b \u2014 cacheable surfaces complete + staleness audit (LANDED)
+
+Workers Cache extended to every read-heavy surface, all
+sharing one helper at `worker/core/lib/edge-cache.ts`:
+
+- `GET /api/gallery/thumbnail/:fileId`
+- `GET /api/gallery/image/:fileId`
+- `GET /api/shared/:token/image/:fileId`
+- `POST /api/vfs/readPreview`
+- `POST /api/vfs/readChunk`
+- `POST /api/vfs/openManifest`
+- `GET /api/vfs/chunk/:fileId/:idx`
+
+Cache-key shape: `https://<surfaceTag>.mossaic.local/<namespace>/<fileId>/<updatedAt>[/<...extras>]`.
+Pre-flight `vfsResolveCacheKey` returns
+`(fileId, headVersionId, updatedAt, encryption stamp)` in
+one SQL JOIN; routes call it before the heavy operation to
+build deterministic keys. Cache-key-versioning beats active
+invalidation \u2014 races produce orphaned cache entries that
+expire per their TTL, never serve stale responses.
+
+### Phase 36 \u2014 versioned accounting consolidation (LANDED)
+
+- `commitVersion` is the single accounting chokepoint for
+  versioned writes. 13 callers across 6 files all update
+  `(storage_used, file_count, inline_bytes_used)` via the
+  `(prevWasLive, nowIsLive)` tuple inside `commitVersion`.
 - `dropVersionRows` is the symmetric decrement: accumulates
   bytes / inline-bytes per dropped non-tombstone version +
   tracks file_count delta when path goes ENOENT.
 - Non-versioning paths that previously didn't account
-  (vfsCommitWriteStream non-versioning, copyInline / copyChunked
-  non-versioning) gained explicit `recordWriteUsage` calls.
-- multipart finalize stops double-counting under versioning ON.
-- VER-ON TENANTS NOW GET POOL GROWTH (THE bug that motivated
-  Phase 36): a 5 GB versioned upload moves pool_size 32\u219233.
-  Pre-Phase-36 it stayed at 32 forever.
+  (`vfsCommitWriteStream` non-versioning,
+  `copyInline` / `copyChunked` non-versioning) gained
+  explicit `recordWriteUsage` calls.
+- Multipart finalize stops double-counting under
+  versioning ON.
+- VER-ON TENANTS NOW GET POOL GROWTH (THE bug that
+  motivated this consolidation): a 5 GB versioned upload
+  moves `pool_size` 32\u219233. Pre-fix it stayed at 32 forever.
 
-Tests: 9 new cases at tests/integration/versioning-accounting.test.ts
-pin every transition (VA1\u2013VA9). 5 cases in edge-cache.test.ts
-pin Phase 36 Theme B's cache-key shape (EC1\u2013EC5). All
-existing 743 tests continue to pass.
-
-Lean invariant `Mossaic.Vfs.Quota.pool_size_monotonic` is
+Lean invariant `Mossaic.Vfs.Quota.pool_size_monotonic`
 preserved by `recordWriteUsage`'s `MAX(0, col + ?)` clamp +
-the `newPool > row.pool_size` guard at helpers.ts:447.
-Negative deltas can never shrink pool_size, regardless of
-sign or magnitude.
+the `newPool > row.pool_size` guard. Negative deltas can
+never shrink `pool_size` regardless of sign or magnitude.
+
+### Phase 32.5 \u2014 quota desync correction (LANDED, superseded by Phase 36)
+
+`recordWriteUsage` was called only on positive deltas;
+zero call sites decremented on
+`unlink` / `remove-recursive` / `rename-supersede` /
+`multipart-abort` / `dropVersionRows`. `quota.storage_used`
+grew monotonically forever; gallery / analytics surfaces
+reported wildly inflated bytes for any tenant that had ever
+deleted anything.
+
+Phase 32.5 threaded negative-delta calls through every
+destructive path. Superseded by Phase 36, which made
+`commitVersion` the single chokepoint and removed the
+caller-by-caller delta plumbing.
+
+### Phase 32 \u2014 capacity story (LANDED)
+
+The original capacity work that the architectural status
+(top of doc) summarises:
+
+- **Fix 4**: cap-aware placement. `placeChunk(...)` skips
+  shards over the 9 GiB soft cap; falls through to next-best
+  score. On all-full, returns `POOL_FULL` and the caller
+  force-bumps `pool_size`. `shard_storage_cache` table
+  records per-shard byte counts; `monitorShardCapacity`
+  refreshes every 30 minutes.
+- **Fix 5**: inline-tier graceful migration. Per-tenant
+  `quota.inline_bytes_used` capped at 1 GiB. Writes past the
+  cap spill to chunked tier even when below `INLINE_LIMIT`
+  (16 KiB) so a tenant with millions of tiny files doesn't
+  monopolize the UserDO's SQLite quota.
 
 ---
 
-## Phase 32.5 \u2014 Quota desync correction (LANDED in Phase 32.5; superseded by Phase 36)
+## Intentionally deferred
 
-**Blocker (cosmetic, not scaling):** `recordWriteUsage` is
-called only on positive deltas from
-`commitInlineTier` / `commitChunkedTier` /
-`vfsFinalizeMultipart`. Zero call sites decrement on
-unlink / remove-recursive / rename-supersede / multipart-abort /
-dropVersionRows. `quota.storage_used` grows monotonically forever;
-the App's gallery / analytics surfaces report wildly inflated bytes
-for any tenant that has ever deleted anything.
+### Phase 32b \u2014 MetaShardDO (single-tenant metadata sharding)
 
-**Why deferred:** Pool growth is monotonic by design (Lean
-invariant `Mossaic.Vfs.Quota.pool_size_monotonic`), so
-`storage_used` inflation does NOT impact placement / scaling. The
-inflation is purely a UX accuracy concern (gallery shows 100 GiB
-when actual is 10 GiB).
+Out of scope per user direction. UserDO holds a tenant's
+entire metadata layer (`files` / `file_versions` /
+`file_chunks` / `file_tags` / `version_chunks` /
+`upload_sessions` / `folders`); at the workerd ~10 GiB
+SQLite limit this caps a single tenant at ~100 GiB user
+data (pool growth scales BYTES horizontally; the metadata
+still concentrates on the UserDO).
 
-**Approach:** Phase 32 already makes `recordWriteUsage` accept
-negative deltas and clamp at zero (`MAX(0, col + ?)`). Phase 32.5
-threads the negative-delta calls through every destructive path:
+The ceiling lift is a multi-day phase on its own \u2014 new
+DO class, new wrangler binding, schema migration, fan-out
+reads/writes, listFiles parallel-merge with cursor encoding.
+Tracked here so the deferral is owned in writing; will be
+revisited when a real tenant approaches the ~100 GiB
+ceiling.
 
-- `hardDeleteFileRow` reads `(file_size, status)` BEFORE the delete
-  cascade; if `status='complete'`, decrements
-  `(-file_size, -1)` AFTER the cascade succeeds. (The
-  `status='uploading'` branch was never positive-counted in the
-  first place \u2014 do not decrement.)
-- `dropVersionRows` reads each version's `size` BEFORE delete;
-  accumulates `bytesReaped` across LIVE versions; decrements once at
-  the end. Tombstones contribute 0.
+The chunked-bytes side already scales horizontally via
+ShardDO pool growth + cap-aware placement, so the
+architectural story holds for the workloads that matter
+today.
 
-Inline-bytes accounting (Phase 32 Fix 5) is already balanced \u2014
-inline-tier deletes correctly subtract from `inline_bytes_used` so
-the cap stays accurate.
+### Phase 33 \u2014 Workers Cache integration (CLOSED via Phase 36b)
 
-## Phase 32b \u2014 MetaShardDO (single-tenant metadata sharding)
-
-**Blocker:** UserDO holds ALL of a tenant's metadata: `files`,
-`file_versions`, `file_chunks`, `file_tags`, `version_chunks`,
-`upload_sessions`, `folders`. At the workerd ~10 GiB SQLite limit
-this caps a single tenant at empirically ~100 GiB of user data
-(the exact ratio depends on chunk size + version churn). Pool
-growth scales the BYTES horizontally across ShardDOs, but the
-METADATA still concentrates on the UserDO.
-
-**Approach:**
-
-- UserDO retains: auth, quota, folders, user-level metadata
-  (versioning_enabled, rate_limit, indexed_at), the canonical
-  `vfs_meta` table, `shard_storage_cache`.
-- New `MetaShardDO` durable object class holds the per-file
-  tables:
-  `files` / `file_versions` / `file_chunks` / `version_chunks` /
-  `file_tags`.
-- Sharding key: `floor(murmur3(file_id) % metaShardCount)`,
-  starting `metaShardCount = 4`. Pool grows like ShardDO: +1
-  MetaShard per 5 GiB of metadata (track via a new
-  `quota.metadata_bytes` column).
-- Address: `vfs:default:${userId}:m${idx}`. ShardDO addressing
-  unchanged.
-- **Critical invariant:** every operation on a single file is
-  fully owned by ONE MetaShard \u2014 no cross-MetaShard
-  transactions. `commitVersion`, `commitRename`,
-  `hardDeleteFileRow`, `dropVersionRows` all operate within a
-  single MetaShard.
-- `vfsListFiles` fans out to all MetaShards in parallel, merges,
-  paginates via cursor that encodes `(shardIdx,
-  in-shard-cursor)`. List / search becomes O(metaShardCount)
-  rather than O(1) but stays within the Workers subrequest
-  budget for any sane `metaShardCount`.
-
-**Migration (pick simpler):**
-
-- **Option A** \u2014 Existing UserDO-resident tables stay for
-  backward compat; new tenants \u2192 MetaShardDOs. Two parallel
-  schemas.
-- **Option B (preferred)** \u2014 Treat UserDO as MetaShard #0; new
-  chunks sharded normally including #0=UserDO. Trivially
-  backward compat: legacy `file_id` values that hash to 0 stay
-  exactly where they are; values hashing to 1..N migrate
-  lazily on next write (sharding key has changed; the file
-  needs to live on a different MetaShard now).
-
-Going with **Option B** because Option A doubles the schema
-surface and complicates `listFiles`'s fan-out logic.
-
-**Tests:**
-
-- meta-shard-routing.test.ts (~6 cases):
-  - hash deterministic;
-  - listFiles fan-out merges;
-  - write to correct MetaShard;
-  - pool grows on metadata-bytes boundary;
-  - cross-MetaShard reads;
-  - MetaShard #0 backward compat with legacy UserDO-resident
-    rows.
-
-**Why deferred from Phase 32:** This is a multi-day phase on its
-own. Adding a new DO class, new wrangler binding, schema
-migration, fan-out reads/writes, listFiles parallel-merge with
-cursor encoding \u2014 too invasive to land on the same branch as 4
-surgical fixes (Fix 2/3/4/5). Phase 32 ships the immediate
-wins; Phase 32b ships the architectural ceiling lift.
-
-**Lean follow-up:**
-- `meta_shard_routing_determinism`
-- `meta_shard_pool_growth`
-- `list_completeness_across_metashards`
-- `single_metashard_owns_file_invariant`
-
-## Phase 33 \u2014 Workers Cache integration (in-progress, plan-only)
-
-A separate audit-fixes-2 session is producing a plan for caching
-read-heavy paths (variant previews, listFiles results, public
-shares) via the Workers Cache API. This is orthogonal to
-metadata sharding (Phase 32b): caching reduces UserDO load on
-the read path without changing the per-DO storage ceiling.
-
-Scope to be defined by that session. No Phase 32 dependencies.
+Phase 33 was a research-only plan. Implementation landed
+across Phase 36, Phase 36b, Phase 41, and Phase 45 (signed
+URLs); the plan's deferred surfaces are all shipped.

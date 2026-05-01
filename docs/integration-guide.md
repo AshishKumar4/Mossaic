@@ -353,30 +353,167 @@ The CLI ships with `≥58` live E2E test cases (categories A–I) plus `≥10` f
 
 ## 6. Previews
 
-The full preview surface lives in [`docs/previews.md`](./previews.md). Quick reference:
+The full preview surface lives in [`docs/previews.md`](./previews.md). The SDK exposes two complementary shapes:
+
+### 6.1 Signed-URL caching (browser-direct, CDN-cached)
+
+The right shape when the consumer is going to ship the bytes to a browser (gallery thumbnails, embedded images, public-share endpoints). Mint a signed URL via the auth-gated RPC; the browser fetches it directly:
+
+```ts
+const url = await vfs.previewUrl("/photos/sunset.jpg", { variant: "thumb" });
+// "/api/vfs/preview-variant/eyJhbGciOi..."
+
+// Or get the URL plus the metadata bundle in one mint:
+const info = await vfs.previewInfo("/photos/sunset.jpg", { variant: "thumb" });
+// {
+//   token, url,
+//   etag: "W/\"<contentHash>\"",
+//   mimeType: "image/webp", width, height,
+//   rendererKind: "image",
+//   versionId,
+//   cacheControl: "public, max-age=31536000, immutable",
+//   contentHash,
+//   expiresAtMs,
+// }
+
+// For galleries, batch the mint (cap 256 paths per call):
+const results = await vfs.previewInfoMany(["/a.jpg", "/b.jpg", "/c.jpg"]);
+// [{ ok: true, info } | { ok: false, code, message }, ...]
+```
+
+Bytes are content-addressed by `contentHash`; the response carries `Cache-Control: public, max-age=31536000, immutable` (no `Vary: Authorization`) so a CDN edge tier caches across all clients. After the first warmup, subsequent loads bypass the Worker entirely.
+
+Token security:
+
+- HMAC-signed (HS256) with the same `JWT_SECRET` as the rest of the auth surface; multi-secret rotation aware.
+- Scope-bound (`scope: "vfs-pv"`): VFS / multipart / download / share tokens replayed at the preview-variant route are rejected.
+- Default TTL 24h; clamped to `[60s, 30d]` via `opts.ttlMs`.
+- Stale-after-write impossible: a write changes `headVersionId`, which mints a fresh `contentHash`, which is a different URL.
+
+If the variant referenced by a token has been re-rendered since mint (its `chunk_hash` no longer matches the token's `contentHash`), the route returns 410 Gone &mdash; SPA recovery is to re-mint the token via `previewInfo` and retry.
+
+### 6.2 Inline reads (bytes-through-RPC)
+
+The right shape when the consumer processes bytes server-side (image manipulation, hashing, re-encoding):
 
 ```ts
 const preview = await vfs.readPreview("/photos/sunset.jpg", { variant: "thumb" });
 // preview.bytes is image/webp (or image/svg+xml for non-image MIMEs).
 
-// Batched manifests for galleries — one round-trip for N paths:
+// Batched manifests for galleries &mdash; one round-trip for N paths:
 const manifests = await vfs.openManifests(["/a.jpg", "/b.jpg", "/c.jpg"]);
 ```
 
-Five built-in renderers dispatch by MIME (`image`, `code-svg`, `waveform-svg`, `video-poster`, `icon-card`). Variant bytes are content-addressed and shared across users via the existing `chunks` refcount table; cache header is `public, max-age=31536000, immutable`. The encryption boundary returns `ENOTSUP` for encrypted files — server-side rendering would require plaintext that the worker doesn't hold.
+Five built-in renderers dispatch by MIME (`image`, `code-svg`, `waveform-svg`, `video-poster`, `icon-card`). Variant bytes are content-addressed and shared across users via the existing `chunks` refcount table; cache header is `public, max-age=31536000, immutable`. The encryption boundary returns `ENOTSUP` for encrypted files &mdash; server-side rendering would require plaintext that the worker doesn't hold.
 
 CLI: `mossaic preview <path> [--variant=thumb|medium|lightbox] [--width=<px>] [--out=<local>]`.
 
 ---
 
-## 7. Operations checklist for a deploy
+## 7. HTTP Range support for media
 
-1. `npx tsc -b` — exit 0.
-2. `pnpm test` — all green (461 worker tests + 44 cli unit + 92 cli e2e).
-3. `npx wrangler deploy --dry-run` (App mode) — bindings list shows `MOSSAIC_USER`, `MOSSAIC_SHARD`, `SEARCH_DO`.
-4. `npx wrangler deploy --dry-run -c deployments/service/wrangler.jsonc` (Service mode) — bindings show `MOSSAIC_USER`, `MOSSAIC_SHARD` only.
-5. App-mode contract suite green: `pnpm test tests/integration/app-smoke.test.ts tests/integration/multipart-routes.test.ts` — these pin the legacy photo-app HTTP wire shape that the SPA still consumes via `stub.appXxx(...)` typed RPCs.
-6. `pnpm lean:build` — proofs green; no new `sorry`s, no new project-level axioms.
-7. Final grep for the legacy binding-name tokens (whole-word match) returns zero hits outside `local/` (plans), `lean/` (proofs), and audit/history files such as `OPERATIONS.md` and this guide's migration-safety callout.
+The gallery and shared-album image endpoints honor HTTP Range requests so the browser's native `<video>` / `<audio>` element can scrub without re-downloading. Two routes in scope:
+
+```
+GET /api/gallery/image/:fileId
+GET /api/shared/:token/image/:fileId
+```
+
+Both honor `Range: bytes=N-M` with:
+
+- **206 Partial Content** + `Content-Range: bytes N-M/total` + `Accept-Ranges: bytes` for valid ranges.
+- **416 Range Not Satisfiable** + `Content-Range: bytes */total` for out-of-bounds.
+- **200** with `Accept-Ranges: bytes` (advertising support) when no `Range` header is sent.
+
+Range requests bypass the Workers Cache wrapper because the cached full response is the upstream of any range slice; the Worker streams the requested byte slice from the cached or freshly-fetched bytes.
+
+The SDK-level `vfs.createReadStream(path, { start, end })` is a separate primitive &mdash; it slices across one or more 1 MB chunks to produce a memory-bounded `ReadableStream` and is suitable for in-Worker byte processing. The HTTP Range support above is for **browser-direct** seeking on the App routes; SDK consumers should use `createReadStream` for in-Worker workflows.
+
+---
+
+## 8. Folder revision counter (directory ETags)
+
+Each folder row carries a monotonic `revision` column that bumps on every direct-child mutation (`writeFile`, `unlink`, `rename`, `mkdir`, `rmdir` in that folder). Nested-tree changes do **not** bump the parent &mdash; the counter is direct-children-only.
+
+Two surfaces expose the counter:
+
+### 8.1 `vfs.listChildren` returns it
+
+```ts
+const page = await vfs.listChildren("/photos/2026", { limit: 50 });
+page.revision;     // monotonic per-folder counter
+page.entries;      // VFSChild[] (discriminated union by `kind`)
+page.cursor;       // optional next-page cursor
+```
+
+When `revision` is unchanged across two reads, the directory contents are guaranteed identical &mdash; you can skip diffing `entries` entirely. This is the SDK-side equivalent of an HTTP ETag for directory listings.
+
+### 8.2 SPA-side ETags for tree views
+
+A consumer Worker that surfaces a directory listing as an HTTP response can derive an ETag from `(folder_id, revision)` and serve `If-None-Match` with 304:
+
+```ts
+const page = await vfs.listChildren(folderPath);
+const etag = `W/"folder-${page.revision}"`;
+const ifNoneMatch = req.headers.get("If-None-Match");
+if (ifNoneMatch === etag) return new Response(null, { status: 304, headers: { ETag: etag } });
+return new Response(JSON.stringify(page), {
+  headers: { ETag: etag, "Cache-Control": "private, max-age=60" },
+});
+```
+
+The counter is monotonic within a single tenant DO; cross-tenant counters are independent (different DO instances).
+
+---
+
+## 9. `listChildren` &mdash; one-RPC enumeration of a folder's direct children
+
+`readdir(path)` returns names only. `listFiles({prefix})` is for indexed queries across the entire tenant. `listChildren` answers the SPA-shaped question "what's directly inside this folder right now?" in a single DO RPC with optional `stat` / `metadata` / `tags` / `contentHash` hydration.
+
+```ts
+const page = await vfs.listChildren("/photos/2026", {
+  orderBy: "mtime",            // 'mtime' (default) | 'name' | 'size'
+  direction: "desc",           // 'desc' default for mtime/size, 'asc' for name
+  limit: 50,                   // default 50, max 1000
+  includeStat: true,           // default true
+  includeMetadata: false,      // default false
+  includeContentHash: false,   // default false; adds SHA-256 to file entries
+  includeTombstones: false,    // default false; admin/recovery surfaces
+  includeArchived: false,      // default false
+});
+```
+
+Result entries are a discriminated union by `kind`:
+
+```ts
+type VFSChild =
+  | { kind: "folder"; path: string; pathId: string; name: string; stat?: VFSStat }
+  | {
+      kind: "file";
+      path: string; pathId: string; name: string;
+      stat?: VFSStat;
+      metadata?: Record<string, unknown> | null;
+      tags: string[];
+      contentHash?: string;
+    }
+  | { kind: "symlink"; path: string; pathId: string; name: string; target: string; stat?: VFSStat };
+```
+
+`name` is the leaf segment without leading slash; `path` is the absolute path with leading slash. Both pre-computed by the server.
+
+The same `includeContentHash: true` knob exists on `listFiles` since both surfaces share the underlying hydration path.
+
+---
+
+## 10. Operations checklist for a deploy
+
+1. `pnpm typecheck` &mdash; exit 0.
+2. `pnpm ci:check` &mdash; chained typecheck + DTS-strict SDK build + no-Phase-tag lint gate; exit 0.
+3. `pnpm test` &mdash; full suite green (~929 cases across unit, integration, CLI, browser e2e).
+4. `npx wrangler deploy --dry-run` (App mode) &mdash; bindings list shows `MOSSAIC_USER`, `MOSSAIC_SHARD`, `SEARCH_DO`.
+5. `npx wrangler deploy --dry-run -c deployments/service/wrangler.jsonc` (Service mode) &mdash; bindings show `MOSSAIC_USER`, `MOSSAIC_SHARD` only.
+6. App-mode contract suite green: `pnpm test tests/integration/app-smoke.test.ts tests/integration/multipart-routes.test.ts` &mdash; these pin the legacy photo-app HTTP wire shape that the SPA still consumes via `stub.appXxx(...)` typed RPCs.
+7. `pnpm verify:proofs` &mdash; Lean proofs green; 226 theorems, 0 axioms, 0 sorrys; no xref drift.
+8. Final grep for the legacy binding-name tokens (whole-word match) returns zero hits outside `local/` (plans), `lean/` (proofs), and audit/history files such as `OPERATIONS.md` and this guide's migration-safety callout.
 
 That is the full contract.
