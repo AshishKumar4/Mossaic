@@ -26,6 +26,33 @@
 export const INLINE_LIMIT = 16 * 1024;
 
 /**
+ * Phase 32 Fix 5 — inline-tier graceful migration cap.
+ *
+ * Per-tenant ceiling on cumulative bytes stored in the inline tier
+ * (`files.inline_data` BLOBs). Tracked via
+ * `quota.inline_bytes_used`. When a write ≤ INLINE_LIMIT would push
+ * the tenant past this cap, the dispatch in `vfsWriteFile` falls
+ * through to the chunked tier even for tiny payloads — keeping the
+ * UserDO's ~10 GiB SQLite quota from being monopolized by a tenant
+ * with millions of tiny files.
+ *
+ * 1 GiB chosen because:
+ *  - It accommodates ~65 thousand tiny files at INLINE_LIMIT each,
+ *    which is the upper bound of practical \"all-tiny\" workloads
+ *    (isomorphic-git loose-object trees, config blobs, JSON
+ *    fragments).
+ *  - It leaves ≥ 9 GiB headroom on the UserDO for everything else
+ *    (folders, file_versions metadata, tags, multipart staging).
+ *  - It's well below the workerd ~10 GiB SQLite ceiling so
+ *    accounting drift can't catastrophically over-shoot.
+ *
+ * Existing inline rows past the cap are unchanged — readers find
+ * them via `files.inline_data` regardless of `inline_bytes_used`.
+ * The cap only gates NEW inline placements.
+ */
+export const INLINE_TIER_CAP = 1024 * 1024 * 1024;
+
+/**
  * Max bytes returned from a single `readFile` RPC. Above → EFBIG, use
  * streaming. 100 MB matches plan §11 and stays well below the 128 MB
  * Worker soft-memory ceiling so allocation never OOMs.

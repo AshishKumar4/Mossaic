@@ -3,7 +3,7 @@ import {
   VFSError,
   type VFSScope,
 } from "../../../../../shared/vfs-types";
-import { generateId } from "../../../lib/utils";
+import { generateId, vfsShardDOName } from "../../../lib/utils";
 import { normalizePath, VFSPathError } from "../../../../../shared/vfs-paths";
 import {
   commitVersion,
@@ -625,7 +625,25 @@ export async function vfsRemoveRecursive(
   path: string,
   cursor?: string
 ): Promise<{ done: boolean; cursor?: string }> {
-  const BATCH_LIMIT = 200;
+  // Phase 32 Fix 3 — subrequest budget.
+  //
+  // Pre-fix BATCH_LIMIT was 200; per-file `hardDeleteFileRow`
+  // fans out up to `poolSize` subrequests via `deleteChunks` (one
+  // RPC per touched shard), giving a worst case of 200 × 32 =
+  // 6400 subrequests per call — well over the Workers paid cap
+  // of 1000.
+  //
+  // Post-fix two changes:
+  //   1. BATCH_LIMIT lowered to 30 (30 × 32 = 960 < 1000) — the
+  //      versioned tombstone branch and any per-file fallback are
+  //      safe within budget on their own.
+  //   2. Non-versioning hard-delete branch BATCHES THE SHARD
+  //      FAN-OUT: collect every (file_id, shard_index) pair first,
+  //      group by shard_index, and issue ONE
+  //      `deleteManyChunks` RPC per shard with the full file_ids
+  //      list. Worst case: poolSize subrequests = 32, regardless
+  //      of BATCH_LIMIT.
+  const BATCH_LIMIT = 30;
   const userId = userIdFor(scope);
   const rootR = resolveOrThrow(durableObject, userId, path, /*follow*/ false);
   if (rootR.kind !== "dir") {
@@ -685,8 +703,11 @@ export async function vfsRemoveRecursive(
   // who want full destruction should use `vfsPurge(path)` or
   // `adminReapTombstonedHeads`.
   const versioning = isVersioningEnabled(durableObject, userId);
-  for (const f of fileRows) {
-    if (versioning) {
+  if (versioning) {
+    // Versioning branch — tombstone each file. No ShardDO fan-out:
+    // chunks survive in version_chunks for restore. Bounded by
+    // BATCH_LIMIT (30) per call to keep SQL work cheap.
+    for (const f of fileRows) {
       const tombId = generateId();
       const now = Date.now();
       commitVersion(durableObject, {
@@ -703,7 +724,7 @@ export async function vfsRemoveRecursive(
         inlineData: null,
         deleted: true,
       });
-      // Free the unique-index slot — same shape as `vfsRename`'s
+      // Free the unique-index slot \u2014 same shape as `vfsRename`'s
       // versioning-overwrite branch. The path resolution surface
       // (Phase 25) filters tombstoned-head rows out of listings.
       durableObject.sql.exec(
@@ -712,9 +733,90 @@ export async function vfsRemoveRecursive(
         now,
         f.file_id
       );
-    } else {
-      await hardDeleteFileRow(durableObject, userId, scope, f.file_id);
     }
+  } else if (fileRows.length > 0) {
+    // Phase 32 Fix 3 \u2014 batch the shard fan-out.
+    //
+    // 1. Read each file's accounting tuple BEFORE delete (only
+    //    needed for inline-bytes decrement \u2014 see Fix 5).
+    // 2. Collect (file_id, shard_index) pairs across all files in
+    //    the batch.
+    // 3. Drop UserDO-side metadata (file_chunks / file_tags /
+    //    files) for ALL files at once via SQL IN (...) clauses.
+    // 4. Group file_ids by shard_index; ONE deleteManyChunks RPC
+    //    per shard. Worst case poolSize subrequests = 32.
+    const fileIds = fileRows.map((r) => r.file_id);
+    const placeholdersFiles = fileIds.map(() => "?").join(",");
+
+    // Per-file accounting (inline-bytes only \u2014 plain storage
+    // decrement is Phase 32.5).
+    const accountingRows = durableObject.sql
+      .exec(
+        `SELECT file_id, status, inline_data FROM files
+          WHERE file_id IN (${placeholdersFiles})`,
+        ...fileIds
+      )
+      .toArray() as {
+      file_id: string;
+      status: string;
+      inline_data: ArrayBuffer | null;
+    }[];
+
+    // Group (file_id, shard_index) pairs.
+    const shardRows = durableObject.sql
+      .exec(
+        `SELECT DISTINCT shard_index, file_id FROM file_chunks
+          WHERE file_id IN (${placeholdersFiles})`,
+        ...fileIds
+      )
+      .toArray() as { shard_index: number; file_id: string }[];
+    const byShard = new Map<number, string[]>();
+    for (const r of shardRows) {
+      const arr = byShard.get(r.shard_index) ?? [];
+      arr.push(r.file_id);
+      byShard.set(r.shard_index, arr);
+    }
+
+    // Drop metadata for ALL files in the batch in one transaction.
+    durableObject.sql.exec(
+      `DELETE FROM file_chunks WHERE file_id IN (${placeholdersFiles})`,
+      ...fileIds
+    );
+    durableObject.sql.exec(
+      `DELETE FROM file_tags WHERE path_id IN (${placeholdersFiles})`,
+      ...fileIds
+    );
+    durableObject.sql.exec(
+      `DELETE FROM files WHERE file_id IN (${placeholdersFiles})`,
+      ...fileIds
+    );
+
+    // Phase 32 Fix 5 \u2014 decrement inline counter for inline-tier
+    // rows in the batch (full storage_used decrement deferred to
+    // 32.5).
+    let inlineDelta = 0;
+    for (const r of accountingRows) {
+      if (r.status === "complete" && r.inline_data) {
+        inlineDelta -= r.inline_data.byteLength;
+      }
+    }
+    if (inlineDelta !== 0) {
+      const { recordWriteUsage } = await import("./helpers");
+      recordWriteUsage(durableObject, userId, 0, 0, inlineDelta);
+    }
+
+    // Fan out: ONE deleteManyChunks per touched shard.
+    const env = durableObject.envPublic;
+    const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<
+      import("../../shard/shard-do").ShardDO
+    >;
+    const fanout: Promise<unknown>[] = [];
+    for (const [sIdx, ids] of byShard) {
+      const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, sIdx);
+      const stub = shardNs.get(shardNs.idFromName(shardName));
+      fanout.push(stub.deleteManyChunks(ids));
+    }
+    await Promise.all(fanout);
   }
 
   // If the batch was full, we have more work — caller should loop.

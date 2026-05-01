@@ -174,7 +174,12 @@ describe("Phase 28 Fix 4 — shard capacity warning", () => {
     expect(matching).toBeTruthy();
     // The structured payload includes the soft-cap value + phase tag
     // for downstream filtering.
-    expect(matching).toContain('"phase":"28-warning-only"');
+    // Phase 32 Fix 4 \u2014 the phase tag flipped from `28-warning-only`
+    // to `32-cap-aware` when placement actually started skipping
+    // full shards. The structured-warning shape is otherwise
+    // unchanged; Logpush queries that filtered on
+    // `event:shard_capacity_soft_cap_exceeded` continue to fire.
+    expect(matching).toContain('"phase":"32-cap-aware"');
     expect(matching).toContain('"softCapBytes"');
   });
 });

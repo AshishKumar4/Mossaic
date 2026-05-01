@@ -305,6 +305,33 @@ export class UserDOCore extends DurableObject<Env> {
       // column already exists
     }
 
+    // Phase 32 Fix 5 — inline-tier graceful migration.
+    //
+    // Tracks per-tenant cumulative bytes stored in the inline tier
+    // (`files.inline_data` BLOBs). `vfsWriteFile` consults this on
+    // every write ≤ INLINE_LIMIT and falls through to the chunked
+    // tier once `inline_bytes_used >= INLINE_TIER_CAP` (1 GiB) — the
+    // soft ceiling prevents the inline tier from monopolizing the
+    // UserDO's ~10 GiB SQLite quota.
+    //
+    // Maintained by `recordWriteUsage`'s `deltaInlineBytes`
+    // parameter, called from `commitInlineTier` (positive delta)
+    // and `hardDeleteFileRow` (negative delta when the deleted
+    // row had `inline_data IS NOT NULL`).
+    //
+    // Defaults to 0; legacy rows behave as if no inline bytes are
+    // accounted, so the cap is effectively only enforced for
+    // POST-Phase-32 writes. That is correct behaviour: a tenant
+    // already over the cap on legacy data continues to use inline
+    // for the rows that already exist; new writes spill to chunked.
+    try {
+      this.sql.exec(
+        "ALTER TABLE quota ADD COLUMN inline_bytes_used INTEGER NOT NULL DEFAULT 0"
+      );
+    } catch {
+      // column already exists
+    }
+
     // ── file_versions table ─────────────────────────────────────
     // S3-style versioning. Each row is one historical snapshot of a
     // (path_id, version_id) pair. `path_id` is the stable `files.file_id`
@@ -473,6 +500,30 @@ export class UserDOCore extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS vfs_meta (
         key   TEXT PRIMARY KEY,
         value TEXT NOT NULL
+      )
+    `);
+
+    // Phase 32 Fix 4 \u2014 skip-full-shard placement.
+    //
+    // Persistent per-shard byte-count cache. Refreshed every
+    // ~30 min by `monitorShardCapacity` from the alarm path.
+    // \`placeChunk\` reads this table to construct a `fullShards`
+    // skip-set: rendezvous winners that are at-or-over the soft
+    // cap fall over to the next-best score so writes never land
+    // on a near-capacity shard. Backward-compat: empty cache
+    // (no rows) \u2192 `placeChunk` is byte-equivalent to the
+    // pre-Phase-32 deterministic top-1 winner; the test pool +
+    // brand-new tenants exhibit identical placement until the
+    // first capacity poll runs.
+    //
+    // Cold-cache scenarios (no entry for a particular shard)
+    // are treated as \"not full\" \u2014 better to write to an
+    // un-measured shard than to refuse the write under-spec'd.
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS shard_storage_cache (
+        shard_index   INTEGER PRIMARY KEY,
+        bytes_stored  INTEGER NOT NULL,
+        refreshed_at  INTEGER NOT NULL
       )
     `);
 

@@ -546,6 +546,43 @@ export class ShardDO extends DurableObject<Env> {
   }
 
   /**
+   * Phase 32 Fix 3 \u2014 batched chunk-ref drop.
+   *
+   * Reviewer Q3 flagged the rmrf subrequest blast: with
+   * BATCH_LIMIT=200 and poolSize=32, the per-file
+   * \`vfsRemoveRecursive\` loop fanned out up to 200 \xd7 32 = 6400
+   * subrequests \u2014 over the Workers paid cap of 1000.
+   *
+   * This RPC accepts an array of file_ids and processes them in
+   * a single DO turn (one SQL transaction). The caller groups
+   * file_ids by shard_index FIRST, then issues ONE RPC per shard
+   * with the full list \u2014 worst case poolSize subrequests
+   * regardless of BATCH_LIMIT.
+   *
+   * Idempotent per fileId: \`removeFileRefs\` does nothing on a
+   * file_id with no chunk_refs (the SELECT returns 0 rows; the
+   * loop body is a no-op). Total \`marked\` is the sum across
+   * input file_ids.
+   *
+   * Bounded input: callers should chunk arrays > 1000 into
+   * multiple RPCs to stay under any future SQLite parameter
+   * limits, but this implementation iterates rather than
+   * batching SQL so the prepared-statement parameter count is
+   * always 1.
+   */
+  async deleteManyChunks(
+    fileIds: readonly string[]
+  ): Promise<{ marked: number }> {
+    this.ensureInit();
+    let totalMarked = 0;
+    for (const fileId of fileIds) {
+      const r = await this.removeFileRefs(fileId);
+      totalMarked += r.marked;
+    }
+    return { marked: totalMarked };
+  }
+
+  /**
    * Existence + liveness probe for a set of chunk hashes (audit C2).
    *
    * Returns the subset of `hashes` that are present on this shard
