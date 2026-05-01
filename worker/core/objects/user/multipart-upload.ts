@@ -854,7 +854,14 @@ export async function vfsFinalizeMultipart(
   //     5 GB boundary. Must run AFTER commitRename succeeds (we own
   //     the row) but BEFORE marking the session finalized so a
   //     post-finalize crash doesn't double-count on retry.
-  recordWriteUsage(durableObject, userId, totalSize, 1);
+  //
+  // Phase 36 \u2014 only fires for the non-versioning branch.
+  // commitVersion (the versioning branch above) now self-accounts
+  // via recordWriteUsage. Calling here too would double-count
+  // bytes + file_count on every versioning multipart finalize.
+  if (!versioning) {
+    recordWriteUsage(durableObject, userId, totalSize, 1);
+  }
 
   // 12. Mark session finalized + clear staging across touched shards.
   durableObject.sql.exec(
