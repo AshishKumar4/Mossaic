@@ -197,6 +197,50 @@ export interface VFSClient {
     versionId: string,
     opts: VersionMarkOpts
   ): Promise<void>;
+
+  /**
+   * Phase 38 — Yjs snapshot read.
+   *
+   * Returns the full `Y.encodeStateAsUpdate(doc)` bytes for a
+   * yjs-mode file. Decode with `Y.applyUpdate(localDoc, bytes)`
+   * to recover the entire `Y.Doc` — including every named shared
+   * type (`Y.XmlFragment`, `Y.Map`, `Y.Array`, `Y.Text`, …) the
+   * server's live doc currently holds.
+   *
+   * Use cases: Tiptap/ProseMirror editors (default
+   * `Y.XmlFragment("default")`), Notion-style block editors
+   * (Y.Map of Y.XmlFragments + Y.Array for block ordering),
+   * any consumer seeding a fresh `Y.Doc` without first opening
+   * a WebSocket.
+   *
+   * Pairs with `commitYjsSnapshot(path, doc)` for round-trip.
+   *
+   * Throws `EINVAL` for non-yjs paths, `EACCES` for encrypted
+   * yjs files (server cannot materialise — use `openYDoc`).
+   */
+  readYjsSnapshot(p: string): Promise<Uint8Array>;
+
+  /**
+   * Phase 38 — Yjs snapshot commit.
+   *
+   * Encodes the supplied `Y.Doc` via
+   * `Y.encodeStateAsUpdate(doc)`, wraps with the
+   * `YJS_SNAPSHOT_MAGIC` 4-byte prefix, and routes through
+   * `writeFile`. The server detects the magic and applies the
+   * bytes via `Y.applyUpdate` — merging with the live
+   * server-side doc so concurrent editors (via `openYDoc`) see
+   * the new state immediately.
+   *
+   * Yjs CRDT semantics guarantee that applying the same update
+   * on every peer converges to the same state — safe with active
+   * editors.
+   *
+   * Composes with versioning: when the tenant has versioning
+   * enabled, this writeFile creates a `file_versions` row whose
+   * content IS the snapshot bytes, so `listVersions` /
+   * `restoreVersion` work as expected with snapshot history.
+   */
+  commitYjsSnapshot(p: string, doc: import("yjs").Doc): Promise<void>;
 }
 
 /**
@@ -304,6 +348,15 @@ export interface UserDOClient {
     path: string,
     enabled: boolean
   ): Promise<void>;
+  /**
+   * Phase 38 — return `Y.encodeStateAsUpdate(doc)` bytes for a
+   * yjs-mode file so SDK consumers can decode the FULL Y.Doc and
+   * use arbitrary named shared types (Y.XmlFragment, Y.Map, …).
+   */
+  vfsReadYjsSnapshot(
+    scope: VFSScope,
+    path: string
+  ): Promise<Uint8Array>;
   // NOTE: WebSocket upgrade for live Yjs editing does NOT use typed
   // RPC. Cloudflare DO RPC cannot serialize a Response with a
   // `webSocket` field across the RPC boundary. The SDK calls
@@ -1530,6 +1583,74 @@ export class VFS implements VFSClient {
     } catch (err) {
       throw mapServerError(err, { path: p, syscall: "open" });
     }
+  }
+
+  /**
+   * Phase 38 — return the FULL `Y.encodeStateAsUpdate(doc)` bytes
+   * for a yjs-mode file. Decode with `Y.applyUpdate(localDoc, bytes)`
+   * to recover the entire `Y.Doc` — including all named shared
+   * types (`Y.XmlFragment`, `Y.Map`, `Y.Array`, multiple `Y.Text`s).
+   *
+   * Use cases:
+   *  - Tiptap / ProseMirror editors (default `Y.XmlFragment("default")`)
+   *  - Notion-style block editors (`Y.Map<blockId, Y.XmlFragment>` plus
+   *    a top-level `Y.Array` for block ordering)
+   *  - Any consumer that needs to seed a new `Y.Doc` from the
+   *    server's current state without first opening a WebSocket.
+   *
+   * Pairs with `commitYjsSnapshot(path, doc)` for the round-trip.
+   *
+   * Throws:
+   *  - `EINVAL` if path is not a yjs-mode regular file.
+   *  - `EACCES` if the file is encrypted (server cannot materialise
+   *    an encrypted doc; round-trip via `openYDoc` instead).
+   */
+  async readYjsSnapshot(p: string): Promise<Uint8Array> {
+    try {
+      return await this.user().vfsReadYjsSnapshot(this.scope(), p);
+    } catch (err) {
+      throw mapServerError(err, { path: p, syscall: "read" });
+    }
+  }
+
+  /**
+   * Phase 38 — write the current state of a `Y.Doc` as a
+   * snapshot update. Encodes via `Y.encodeStateAsUpdate(doc)`,
+   * wraps with the `YJS_SNAPSHOT_MAGIC` 4-byte prefix, and routes
+   * through the standard `writeFile` path. The server detects
+   * the magic and applies the bytes via `Y.applyUpdate` —
+   * merging with the live server-side doc so concurrent editors
+   * (via `openYDoc`) see the new state immediately.
+   *
+   * The Yjs CRDT semantics guarantee that applying the same
+   * update on every peer converges to the same state, so this
+   * is a safe operation even with active editors.
+   *
+   * Use cases:
+   *  - Initialise a new yjs-mode file from a Y.Doc built offline.
+   *  - Seed a path with a Tiptap document built via the editor's
+   *    JSON-to-Y.XmlFragment converter.
+   *  - Commit a "save point" snapshot under versioning ON
+   *    (Phase 38 + Phase 13 versioning compose: the snapshot
+   *    write creates a `file_versions` row with the snapshot
+   *    bytes preserved as the version's content).
+   *
+   * Pairs with `readYjsSnapshot(path)` for the round-trip.
+   *
+   * @param p path to a yjs-mode file
+   * @param doc the Y.Doc whose current state to commit
+   */
+  async commitYjsSnapshot(
+    p: string,
+    doc: import("yjs").Doc
+  ): Promise<void> {
+    // Lazy-load yjs so the main bundle stays free of the
+    // 250 KB peer dep — same boundary as `openYDoc`.
+    const Y = await import("yjs");
+    const { wrapYjsSnapshot } = await import("./yjs-internal");
+    const updateBytes = Y.encodeStateAsUpdate(doc);
+    const wrapped = wrapYjsSnapshot(updateBytes);
+    await this.writeFile(p, wrapped);
   }
 
   /**

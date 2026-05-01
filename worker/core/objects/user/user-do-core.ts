@@ -2166,6 +2166,95 @@ export class UserDOCore extends DurableObject<Env> {
   }
 
   /**
+   * Phase 38 — return the full `Y.encodeStateAsUpdate(doc)` bytes
+   * for a yjs-mode file so SDK consumers can decode arbitrary
+   * named shared types (`Y.XmlFragment`, `Y.Map`, `Y.Array`,
+   * multiple `Y.Text`s — Tiptap/ProseMirror, Notion-style block
+   * editors).
+   *
+   * Pairs with the SDK's `vfs.readYjsSnapshot(path)`. The path
+   * MUST be a yjs-mode file; non-yjs paths (mode_yjs=0) throw
+   * EINVAL because the bytes wouldn't parse via `Y.applyUpdate`.
+   *
+   * Encryption-aware: encrypted yjs files have NO server-side
+   * materialised doc (the server doesn't hold the key); this RPC
+   * therefore throws EACCES. Encrypted-tenant consumers should
+   * round-trip via `openYDoc` + decrypted op-log replay.
+   */
+  async vfsReadYjsSnapshot(
+    scope: VFSScope,
+    path: string
+  ): Promise<Uint8Array> {
+    this.gateVfs(scope);
+    const { isYjsMode } = await import("./vfs-ops");
+    const { resolvePathFollow } = await import("./path-walk");
+    const userId =
+      scope.sub !== undefined
+        ? `${scope.tenant}::${scope.sub}`
+        : scope.tenant;
+    const r = resolvePathFollow(this, userId, path);
+    // Phase 38 sub-agent (a) finding — distinguish ENOENT /
+    // ENOTDIR / ELOOP / EISDIR / EINVAL on path resolution. Pre-fix
+    // every non-"file" kind collapsed to EINVAL with the misleading
+    // message "not a regular file", breaking the standard fs-style
+    // error contract a Tiptap consumer expects.
+    if (r.kind === "ENOENT") {
+      throw new VFSError(
+        "ENOENT",
+        `readYjsSnapshot: path not found: ${path}`
+      );
+    }
+    if (r.kind === "ENOTDIR") {
+      throw new VFSError(
+        "ENOTDIR",
+        `readYjsSnapshot: path component is not a directory: ${path}`
+      );
+    }
+    if (r.kind === "ELOOP") {
+      throw new VFSError(
+        "ELOOP",
+        `readYjsSnapshot: too many symbolic links: ${path}`
+      );
+    }
+    if (r.kind === "dir") {
+      throw new VFSError(
+        "EISDIR",
+        `readYjsSnapshot: path is a directory: ${path}`
+      );
+    }
+    if (r.kind !== "file") {
+      throw new VFSError(
+        "EINVAL",
+        `readYjsSnapshot: not a regular file: ${path}`
+      );
+    }
+    if (!isYjsMode(this, userId, r.leafId)) {
+      throw new VFSError(
+        "EINVAL",
+        `readYjsSnapshot: path is not in yjs-mode: ${path}`
+      );
+    }
+    // Encryption-aware: server cannot materialise an encrypted
+    // doc. Surface as EACCES so the SDK can fall back to a
+    // client-side `openYDoc` + state-vector dance.
+    const encRow = this.sql
+      .exec(
+        "SELECT encryption_mode FROM files WHERE file_id=? AND user_id=?",
+        r.leafId,
+        userId
+      )
+      .toArray()[0] as { encryption_mode: string | null } | undefined;
+    if (encRow?.encryption_mode != null) {
+      throw new VFSError(
+        "EACCES",
+        `readYjsSnapshot: encrypted yjs files cannot be materialised server-side; use openYDoc instead: ${path}`
+      );
+    }
+    const { readYjsSnapshotBytes } = await import("./yjs");
+    return readYjsSnapshotBytes(this, scope, r.leafId);
+  }
+
+  /**
    * Open a Yjs WebSocket session against `path`. The path MUST be a
    * yjs-mode file. The returned Response carries the client side
    * of a WebSocketPair (status 101); the server side is accepted

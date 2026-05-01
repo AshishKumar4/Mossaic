@@ -97,6 +97,63 @@ export const YJS_SYNC_STEP_2 = 1;
 export const YJS_UPDATE = 2;
 export const YJS_AWARENESS = 3;
 
+/**
+ * Phase 38 — magic-prefix that distinguishes a snapshot payload
+ * (`Y.encodeStateAsUpdate(doc)` bytes wrapped for `writeFile`)
+ * from legacy plaintext-via-`Y.Text("content")` payloads.
+ *
+ * Bytes: `0x59 0x4A 0x53 0x31` — ASCII "YJS1". Chosen because:
+ *
+ *  1. No valid Yjs binary update or `Y.encodeStateAsUpdate` output
+ *     starts with these 4 bytes (Yjs updates begin with a varint
+ *     for the update format version, currently 0x00 — never 0x59).
+ *  2. The byte sequence is plain ASCII so a hex-dump / `file(1)`
+ *     inspection of a chunk on a ShardDO is self-describing.
+ *  3. Versioned (`YJS1` → potentially `YJS2`) so we can evolve the
+ *     wrapper format without ambiguity.
+ *
+ * Pairs with `hasYjsSnapshotMagic(bytes)` for detection and the
+ * SDK's `commitYjsSnapshot(path, doc)` helper for emission.
+ */
+export const YJS_SNAPSHOT_MAGIC: Uint8Array = new Uint8Array([
+  0x59, 0x4a, 0x53, 0x31,
+]);
+
+/**
+ * Phase 38 — true iff `bytes` starts with `YJS_SNAPSHOT_MAGIC`.
+ * Cheap (4-byte prefix check); safe on short inputs (returns
+ * false for `bytes.byteLength < 4`).
+ */
+export function hasYjsSnapshotMagic(bytes: Uint8Array): boolean {
+  if (bytes.byteLength < YJS_SNAPSHOT_MAGIC.byteLength) return false;
+  for (let i = 0; i < YJS_SNAPSHOT_MAGIC.byteLength; i++) {
+    if (bytes[i] !== YJS_SNAPSHOT_MAGIC[i]) return false;
+  }
+  return true;
+}
+
+/**
+ * Phase 38 — wrap raw `Y.encodeStateAsUpdate(doc)` bytes with the
+ * snapshot magic prefix. The result is the byte payload to pass
+ * to `vfs.writeFile(yjsPath, payload)` so the server applies it
+ * via `Y.applyUpdate` instead of stuffing the bytes into
+ * `Y.Text("content")`.
+ *
+ * Used by the SDK's `commitYjsSnapshot(path, doc)` helper. Lives
+ * here on the server for symmetry with `hasYjsSnapshotMagic` and
+ * because the same wrapper encoding is used by future server-side
+ * snapshot-emit paths (e.g. version-mark could re-emit the head
+ * snapshot bytes when a tenant calls `restoreVersion`).
+ */
+export function wrapYjsSnapshot(updateBytes: Uint8Array): Uint8Array {
+  const out = new Uint8Array(
+    YJS_SNAPSHOT_MAGIC.byteLength + updateBytes.byteLength
+  );
+  out.set(YJS_SNAPSHOT_MAGIC, 0);
+  out.set(updateBytes, YJS_SNAPSHOT_MAGIC.byteLength);
+  return out;
+}
+
 /** Result of bumping the seq counter — pure function exposed for tests. */
 export function computeNextSeq(currentNextSeq: number): {
   seq: number;
@@ -719,13 +776,22 @@ export class YjsRuntime {
         "./vfs-versions"
       );
       if (isVersioningEnabled(this.durableObject, userId)) {
-        // Snapshot the materialized text as inline_data on the
-        // version row. CompactlyBA the chunked machinery would
-        // require splitting the snapshot into chunks; for v1 we
-        // inline. Yjs-mode files are typically text; the 64KB cap
-        // matches the inline tier.
-        const text = doc.getText("content").toString();
-        const bytes = new TextEncoder().encode(text);
+        // Phase 38 — snapshot the FULL Y.Doc state as
+        // `Y.encodeStateAsUpdate(doc)` bytes wrapped with
+        // `YJS_SNAPSHOT_MAGIC`. This preserves arbitrary named
+        // shared types (Y.XmlFragment for Tiptap/ProseMirror,
+        // Y.Map for Notion-style block editors, Y.Array, multiple
+        // Y.Texts). Pre-Phase-38 this stored only the flattened
+        // `Y.Text("content")` UTF-8 bytes, which threw away every
+        // other shared type. Existing Y.Text("content") files
+        // continue to work because the encoded state still
+        // contains that type as a top-level entry.
+        //
+        // Stored magic-wrapped so a subsequent restoreVersion on
+        // a yjs-mode path can be detected and routed through
+        // `writeYjsBytes` (which itself dispatches on the magic).
+        const stateBytes = Y.encodeStateAsUpdate(doc);
+        const wrapped = wrapYjsSnapshot(stateBytes);
         const { generateId } = await import("../../lib/utils");
         versionId = generateId();
         const now = Date.now();
@@ -740,14 +806,14 @@ export class YjsRuntime {
           pathId,
           versionId,
           userId,
-          size: bytes.byteLength,
+          size: wrapped.byteLength,
           mode: 0o644,
           mtimeMs: now,
           chunkSize: 0,
           chunkCount: 0,
           fileHash: "",
-          mimeType: "text/plain",
-          inlineData: bytes,
+          mimeType: "application/octet-stream",
+          inlineData: wrapped,
           userVisible: true,
           label: opts.label,
           metadata: metaRow?.metadata
@@ -851,24 +917,74 @@ export class YjsRuntime {
     };
   }
 
-  /** Materialise → encode → return current doc state as bytes. */
+  /**
+   * Materialise → encode → return current doc state as bytes.
+   *
+   * Option A semantics (legacy, default): returns the contents of
+   * `Y.Text("content")` as UTF-8 bytes. This preserves the
+   * `vfs.readFile(yjsPath)` contract used by every existing
+   * client — the Y.Doc is still arbitrarily-typed underneath, but
+   * the readFile surface flattens to the conventional "content"
+   * named Y.Text for backwards compatibility.
+   *
+   * Phase 38: callers that want the FULL Y.Doc state (so they can
+   * register `Y.XmlFragment`, `Y.Map`, `Y.Array`, or any other
+   * named shared types — Tiptap/ProseMirror/Notion-style block
+   * editors) should call `readSnapshot()` which returns
+   * `Y.encodeStateAsUpdate(doc)` bytes. Decode with `Y.applyUpdate`
+   * on a fresh `Y.Doc` to recover all shared types.
+   */
   async readMaterialised(
     scope: VFSScope,
     pathId: string
   ): Promise<Uint8Array> {
     const doc = await this.getDoc(scope, pathId);
-    // For Option A's writeFile semantics we expose the contents
-    // of a Y.Text named "content". If the doc has none yet, an
-    // empty buffer.
     const text = doc.getText("content");
     return new TextEncoder().encode(text.toString());
   }
 
   /**
-   * Apply a Uint8Array as the new "content" Y.Text via a Yjs
-   * transaction. This is what writeFile does when a yjs-mode
-   * file is the target — it merges into the live CRDT instead
-   * of replacing the storage.
+   * Phase 38 — return full `Y.encodeStateAsUpdate(doc)` bytes so
+   * clients can decode arbitrary named shared types
+   * (`Y.XmlFragment`, `Y.Map`, `Y.Array`, `Y.Text`, …). The bytes
+   * are directly applicable via `Y.applyUpdate(localDoc, bytes)`
+   * to recover the full document state.
+   *
+   * Used by the SDK's `vfs.readYjsSnapshot(path)` helper. Pairs
+   * with `writeSnapshot()` (which detects a magic-prefixed
+   * payload and applies it as a state update).
+   */
+  async readSnapshot(
+    scope: VFSScope,
+    pathId: string
+  ): Promise<Uint8Array> {
+    const doc = await this.getDoc(scope, pathId);
+    return Y.encodeStateAsUpdate(doc);
+  }
+
+  /**
+   * Apply a Uint8Array via a Yjs transaction. Two payload shapes
+   * are supported:
+   *
+   * 1. **Snapshot update (Phase 38)** — bytes prefixed with the
+   *    `YJS_SNAPSHOT_MAGIC` 4-byte sequence (`0x59 0x4A 0x53 0x31`,
+   *    "YJS1") followed by `Y.encodeStateAsUpdate(doc)` output.
+   *    Applied as a CRDT state update (`Y.applyUpdate`) so the
+   *    document gains/merges all shared types from the snapshot
+   *    (Y.XmlFragment, Y.Map, Y.Array, multiple Y.Texts under
+   *    arbitrary names — anything Tiptap/ProseMirror or a
+   *    Notion-style block editor produces).
+   *
+   * 2. **Legacy bytes (Option A)** — anything else is treated as
+   *    UTF-8 plaintext to set as the value of `Y.Text("content")`.
+   *    Existing `vfs.writeFile(yjsPath, "text")` consumers keep
+   *    working byte-for-byte; this is the contract every test in
+   *    `tests/integration/yjs.test.ts` (and `encryption-yjs.test.ts`)
+   *    pinned before Phase 38.
+   *
+   * Capture-and-broadcast semantics are identical for both paths:
+   * the emitted update is appended to `yjs_oplog`, broadcast to
+   * connected sockets, and triggers opportunistic compaction.
    */
   async writeMaterialised(
     scope: VFSScope,
@@ -877,24 +993,89 @@ export class YjsRuntime {
     poolSize: number,
     bytes: Uint8Array
   ): Promise<void> {
+    const isSnapshot = hasYjsSnapshotMagic(bytes);
+
+    // Phase 38 sub-agent (c) finding — reject snapshot writes on
+    // encrypted yjs files. The server cannot materialise an
+    // encrypted Y.Doc (no key); applying a plaintext snapshot
+    // update would either:
+    //   (a) silently inject plaintext bytes into an op-log that
+    //       all clients expect to be encrypted envelopes —
+    //       breaking the file permanently for every decrypting
+    //       client; or
+    //   (b) succeed loading the (encrypted) doc cache via a
+    //       failed `Y.applyUpdate` on envelope bytes, leaving
+    //       the in-memory cache in an inconsistent state.
+    // Either is silent data corruption. Surface as EACCES so the
+    // SDK can route the user to `openYDoc` (which encrypts each
+    // outbound update individually).
+    //
+    // Legacy `Y.Text("content")` writes (`isSnapshot === false`)
+    // pre-date Phase 38 — they continue to work via the standard
+    // encrypted-yjs path, which intercepts each emitted update
+    // and encrypts it client-side before it reaches the server.
+    // For the SERVER this is moot: writeYjsBytes is only ever
+    // called for plaintext yjs files (the encrypted client-side
+    // path uses `compactEncryptedYjs` / WS frames directly).
+    // Defending here is belt-and-suspenders — a malicious or
+    // confused caller cannot inject plaintext into an encrypted
+    // file via writeFile.
+    if (isSnapshot && isPathEncryptedYjs(this.durableObject, pathId)) {
+      throw new VFSError(
+        "EACCES",
+        "writeYjsBytes: snapshot writes are not supported on encrypted yjs files; use openYDoc + per-frame encryption instead"
+      );
+    }
     const doc = await this.getDoc(scope, pathId);
-    const text = doc.getText("content");
-    const newContent = new TextDecoder().decode(bytes);
 
     // Capture the update emitted by this transaction so we can
-    // persist + broadcast it. We attach a one-shot observer.
-    // Box the captured value so TS doesn't over-narrow across the
-    // closure boundary.
+    // persist + broadcast it. Box the captured value so TS
+    // doesn't over-narrow across the closure boundary.
     const capture: { update: Uint8Array | null } = { update: null };
     const onUpdate = (update: Uint8Array, origin: unknown) => {
       if (origin === "writeFile") capture.update = update;
     };
     doc.on("update", onUpdate);
     try {
-      doc.transact(() => {
-        text.delete(0, text.length);
-        text.insert(0, newContent);
-      }, "writeFile");
+      if (isSnapshot) {
+        // Phase 38 — apply the post-magic bytes as a Yjs state
+        // update inside a transaction so the resulting MERGED
+        // update (which incorporates only the new info, not the
+        // entire prior state) is what we persist + broadcast.
+        // Yjs guarantees that applying the merged update on any
+        // peer converges to the same state.
+        const updateBytes = bytes.subarray(YJS_SNAPSHOT_MAGIC.byteLength);
+        // Defensive parse — if the post-magic bytes are NOT a
+        // valid Yjs update (collision: a user authored bytes that
+        // happen to start with `YJS1` but aren't a snapshot),
+        // `Y.applyUpdate` throws. We surface that as EINVAL so a
+        // SDK consumer gets a clear error rather than the doc
+        // cache being left in a partially-updated state. The
+        // emitted-update capture remains null and no oplog row is
+        // written — this write is effectively a no-op the caller
+        // can retry without the spurious magic prefix.
+        try {
+          doc.transact(() => {
+            Y.applyUpdate(doc, updateBytes, "writeFile");
+          }, "writeFile");
+        } catch (err) {
+          throw new VFSError(
+            "EINVAL",
+            `writeYjsBytes: invalid snapshot — bytes after the YJS_SNAPSHOT_MAGIC prefix are not a valid Y.encodeStateAsUpdate output: ${
+              (err as Error).message
+            }`
+          );
+        }
+      } else {
+        // Legacy Option A — overwrite Y.Text("content") with the
+        // UTF-8 decoding of the bytes.
+        const text = doc.getText("content");
+        const newContent = new TextDecoder().decode(bytes);
+        doc.transact(() => {
+          text.delete(0, text.length);
+          text.insert(0, newContent);
+        }, "writeFile");
+      }
     } finally {
       doc.off("update", onUpdate);
     }
@@ -1118,6 +1299,26 @@ export async function readYjsAsBytes(
 ): Promise<Uint8Array> {
   // yjsRuntime is now an async lazy accessor.
   return (await durableObject.getYjsRuntime()).readMaterialised(scope, pathId);
+}
+
+/**
+ * Phase 38 — return `Y.encodeStateAsUpdate(doc)` bytes for a
+ * yjs-mode file so SDK consumers can decode the FULL Y.Doc and
+ * use arbitrary named shared types (`Y.XmlFragment`, `Y.Map`,
+ * `Y.Array`, multiple `Y.Text` instances under arbitrary names —
+ * everything Tiptap/ProseMirror or a Notion-style block editor
+ * produces).
+ *
+ * Pairs with `vfs.readYjsSnapshot(path)` on the SDK side. Symmetric
+ * with `readYjsAsBytes` (the legacy text-flatten read used by
+ * `vfs.readFile`).
+ */
+export async function readYjsSnapshotBytes(
+  durableObject: UserDO,
+  scope: VFSScope,
+  pathId: string
+): Promise<Uint8Array> {
+  return (await durableObject.getYjsRuntime()).readSnapshot(scope, pathId);
 }
 
 /**
