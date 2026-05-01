@@ -269,16 +269,13 @@ theorem readObserve_no_op (s : UserState) (path path' : String) :
 
 -- ─── Linearizability for the full write sequence ────────────────────────
 
-/-- After ANY single Op, readFile path returns either the same result as
-before, or a different result. This is trivially true; the *meaningful*
-claim is that the change happens atomically at exactly one Op
-(commitRename) for the target path. -/
-theorem readFile_changes_only_at_state_change (s : UserState) (op : Op) (path : String) :
-    (step s op).readFile path = s.readFile path ∨
-    (step s op).readFile path ≠ s.readFile path := by
-  by_cases h : (step s op).readFile path = s.readFile path
-  · exact Or.inl h
-  · exact Or.inr h
+-- Note: a `readFile_changes_only_at_state_change` theorem
+-- (`P ∨ ¬P` shape; pattern 4 vacuous) was removed in Phase 51.
+-- The meaningful linearizability claim — that `readFile` flips
+-- atomically at `commitRename` and is unchanged under `beginWrite` —
+-- is captured by `readFile_unchanged_under_beginWrite` above and the
+-- witness theorems below (`witness_full_write_visible`,
+-- `witness_during_write_invisible`).
 
 -- ─── Non-vacuity sanity checks ──────────────────────────────────────────
 
