@@ -280,6 +280,18 @@ interface AdaptiveState {
   errorsRecovered: number;
 }
 
+/**
+ * Per-chunk transfer retry budget (parallelUpload + parallelDownload).
+ *
+ * Distinct from `shared/constants.ts::MAX_RETRIES` (3, used by single-
+ * shot worker-side operations); transfer's per-chunk loop tolerates a
+ * higher count because each retry is a single chunk, the work is
+ * already partitioned, and the failure mode is typically a transient
+ * shard EAGAIN that resolves on retry. Lowering this would cause
+ * spurious whole-upload failures under transient pressure.
+ */
+const TRANSFER_MAX_RETRIES = 5;
+
 function quantile(arr: number[], q: number): number {
   if (arr.length === 0) return 0;
   const sorted = [...arr].sort((a, b) => a - b);
@@ -409,7 +421,7 @@ async function runAdaptiveDownloadEngine(
     });
   }
 
-  const MAX_RETRIES = 5;
+  const MAX_RETRIES = TRANSFER_MAX_RETRIES;
   function aborted(signal?: AbortSignal): boolean {
     if (signal?.aborted) return true;
     if (isAborted && isAborted()) return true;
@@ -688,7 +700,7 @@ export async function parallelUpload(
   }
 
   // Upload one chunk with retry. Returns hash on success.
-  const MAX_RETRIES = 5;
+  const MAX_RETRIES = TRANSFER_MAX_RETRIES;
   async function uploadOne(
     idx: number,
     signal?: AbortSignal
