@@ -12,6 +12,7 @@ import { placeChunk, POOL_FULL } from "../../../../../shared/placement";
 import { loadFullShards } from "../shard-capacity";
 import {
   commitVersion,
+  dropTmpRowAfterVersionCommit,
   isVersioningEnabled,
 } from "../vfs-versions";
 import {
@@ -28,6 +29,8 @@ import {
   resolveParent,
   userIdFor,
   findLiveFile,
+  FILE_HEAD_JOIN,
+  assertHeadNotTombstoned,
 } from "./helpers";
 import {
   abortTempFile,
@@ -163,7 +166,7 @@ export async function vfsOpenReadStream(
   // `files.chunk_size` would be STALE (0) for versioned tenants —
   // producing `Math.floor(0/0) === NaN` in `vfsCreateReadStream`.
   // Pinning chunkSize at open-time eliminates that race.
-  const row = durableObject.sql
+  const rowRaw = durableObject.sql
     .exec(
       `SELECT f.file_id, f.file_size, f.chunk_size, f.chunk_count,
               f.inline_data, f.mode_yjs, f.head_version_id,
@@ -172,8 +175,7 @@ export async function vfsOpenReadStream(
               fv.chunk_count AS head_chunk_count,
               fv.inline_data AS head_inline
          FROM files f
-         LEFT JOIN file_versions fv
-           ON fv.path_id = f.file_id AND fv.version_id = f.head_version_id
+         ${FILE_HEAD_JOIN}
         WHERE f.file_id=? AND f.user_id=? AND f.status='complete'`,
       r.leafId,
       userId
@@ -194,13 +196,7 @@ export async function vfsOpenReadStream(
         head_inline: ArrayBuffer | null;
       }
     | undefined;
-  if (!row) throw new VFSError("ENOENT", "openReadStream: file vanished");
-  if (row.head_version_id !== null && row.head_deleted === 1) {
-    throw new VFSError(
-      "ENOENT",
-      `openReadStream: head version is a tombstone for ${path}`
-    );
-  }
+  const row = assertHeadNotTombstoned(rowRaw, "openReadStream", path);
 
   // Yjs-mode short-circuit. Yjs files persist as an op-log +
   // checkpoint pair (`yjs_oplog` / `yjs_checkpoints`), NOT as
@@ -892,18 +888,9 @@ export async function vfsCommitWriteStream(
     // redundant tmp files row WITHOUT chunk fan-out (chunks belong
     // to the new version under refId=tmpId).
     if (liveRow) {
-      durableObject.sql.exec(
-        "DELETE FROM file_chunks WHERE file_id = ?",
-        handle.tmpId
-      );
-      durableObject.sql.exec(
-        "DELETE FROM file_tags WHERE path_id = ?",
-        handle.tmpId
-      );
-      durableObject.sql.exec(
-        "DELETE FROM files WHERE file_id = ?",
-        handle.tmpId
-      );
+      dropTmpRowAfterVersionCommit(durableObject, handle.tmpId, {
+        hasChunks: true,
+      });
     }
     // Versioned stream-commit either added a fresh path
     // (commitRename branch above bumped via the commitRename hook)
