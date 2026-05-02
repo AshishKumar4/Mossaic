@@ -46,6 +46,11 @@ export {
   type ListFilesPage,
   type ListVersionsOpts,
   type VersionMarkOpts,
+  type BeginMultipartUploadOpts,
+  type MultipartUploadHandle,
+  type PutMultipartChunkResult,
+  type FinalizeMultipartUploadResult,
+  type AbortMultipartUploadResult,
 } from "./vfs";
 
 // cap constants — surfaced for client-side pre-validation

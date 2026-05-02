@@ -97,6 +97,11 @@ export type {
   VersionMarkOpts,
   VersionInfo,
   DropVersionsPolicy,
+  BeginMultipartUploadOpts,
+  MultipartUploadHandle,
+  PutMultipartChunkResult,
+  FinalizeMultipartUploadResult,
+  AbortMultipartUploadResult,
 } from "./vfs";
 
 // cap constants — surfaced for client-side pre-validation.
