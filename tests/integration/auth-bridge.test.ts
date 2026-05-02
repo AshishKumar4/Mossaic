@@ -40,24 +40,7 @@ let aliceSessionJWT: string;
 let bobUserId: string;
 let bobSessionJWT: string;
 
-async function signupAndLogin(
-  email: string
-): Promise<{ userId: string; jwt: string }> {
-  const password = "test-password-123";
-  // Signup creates the auth row + quota row on `auth:${email}` DO.
-  const signupRes = await SELF.fetch("https://test/api/auth/signup", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email, password }),
-  });
-  expect(signupRes.status).toBe(200);
-  const { userId, token } = (await signupRes.json()) as {
-    userId: string;
-    email: string;
-    token: string;
-  };
-  return { userId, jwt: token };
-}
+import { signup as signupAndLogin } from "./_helpers";
 
 async function bridgeMint(jwt: string): Promise<Response> {
   return SELF.fetch("https://test/api/auth/vfs-token", {

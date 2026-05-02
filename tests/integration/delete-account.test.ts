@@ -23,28 +23,19 @@ interface E {
 const E = env as unknown as E;
 const NS = "default";
 
+import { signup as signupHelper, mintVfsToken } from "./_helpers";
+
+// Local shape preserved (`{ userId, token }`) so existing callers
+// don't need rewriting; the helper returns `{ userId, jwt }`.
 async function signup(email: string): Promise<{
   userId: string;
   token: string;
 }> {
-  const res = await SELF.fetch("https://test/api/auth/signup", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email, password: "test-password-123" }),
-  });
-  expect(res.status).toBe(200);
-  return (await res.json()) as { userId: string; token: string };
+  const r = await signupHelper(email);
+  return { userId: r.userId, token: r.jwt };
 }
 
-async function mintVfsBearer(sessionJwt: string): Promise<string> {
-  const res = await SELF.fetch("https://test/api/auth/vfs-token", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${sessionJwt}` },
-  });
-  expect(res.status).toBe(200);
-  const { token } = (await res.json()) as { token: string };
-  return token;
-}
+const mintVfsBearer = mintVfsToken;
 
 describe("DELETE /api/auth/account", () => {
   it("D1 — wipes file rows + folders + quota on the data DO", async () => {
