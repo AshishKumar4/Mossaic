@@ -53,11 +53,3 @@ export function hexToBytes(hex: string): Uint8Array {
   return out;
 }
 
-/**
- * Generate a random hex string of the given byte length.
- */
-export function randomHex(byteLength: number): string {
-  const bytes = new Uint8Array(byteLength);
-  crypto.getRandomValues(bytes);
-  return bytesToHex(bytes);
-}

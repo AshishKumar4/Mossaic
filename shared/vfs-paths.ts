@@ -48,11 +48,6 @@ export function normalizePath(path: string): string[] {
   return out;
 }
 
-/** True iff the path normalizes to root ([]). */
-export function isRoot(path: string): boolean {
-  return normalizePath(path).length === 0;
-}
-
 /** Last segment of the normalized path, or "" for root. */
 export function basename(path: string): string {
   const segs = normalizePath(path);
