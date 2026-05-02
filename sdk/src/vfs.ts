@@ -153,6 +153,69 @@ export interface VFSClient {
     handle: WriteHandle;
   }>;
 
+  // ── Manual multipart upload ─────────────────────────────────────
+  //
+  // Lower-level API for advanced clients that need direct control
+  // over chunk submission (custom backpressure, hand-rolled retries,
+  // resumable batchers, multi-process upload coordination).
+  // `writeFile()` autopilots over multipart internally — most users
+  // do not need these methods.
+  //
+  // Wire shapes are stable: each call maps 1:1 to the same
+  // `/api/vfs/multipart/*` endpoints `parallelUpload` uses
+  // internally. The returned `MultipartUploadHandle` is freely
+  // serialisable and can cross process boundaries.
+
+  /**
+   * Mint a multipart upload session.
+   *
+   * The handle's `sessionToken` carries the upload's poolSize +
+   * chunk plan; chunk PUTs validate against it without a UserDO
+   * round-trip. The handle is opaque to callers but its fields are
+   * stable wire shape — serialise and resume from another process
+   * if needed.
+   */
+  beginMultipartUpload(
+    p: string,
+    opts: BeginMultipartUploadOpts
+  ): Promise<MultipartUploadHandle>;
+
+  /**
+   * Submit a single chunk by index. Idempotent under
+   * `(handle.uploadId, index, contentHash)` — re-PUTs of the same
+   * bytes return `{accepted: true, status: "deduplicated"}`.
+   *
+   * `chunk` accepts Uint8Array, ArrayBuffer, or Blob; everything
+   * else throws synchronously. Caller's responsibility to chunk
+   * the source at `handle.chunkSize` boundaries.
+   */
+  putMultipartChunk(
+    handle: MultipartUploadHandle,
+    index: number,
+    chunk: Uint8Array | ArrayBuffer | Blob
+  ): Promise<PutMultipartChunkResult>;
+
+  /**
+   * Atomic commit. Caller passes the per-chunk content hashes in
+   * index order. Server cross-checks against landed chunks; mismatch
+   * throws `EAGAIN` (transient — retry the missing chunks) or
+   * `EINVAL` (chunk hash list malformed).
+   */
+  finalizeMultipartUpload(
+    handle: MultipartUploadHandle,
+    chunkHashList: readonly string[]
+  ): Promise<FinalizeMultipartUploadResult>;
+
+  /**
+   * Drop the session. Chunks GC via the existing alarm sweeper;
+   * callers MUST NOT rely on instant chunk reclamation. Idempotent
+   * — aborting an already-finalised or already-aborted session
+   * returns `{aborted: false}` rather than throwing.
+   */
+  abortMultipartUpload(
+    handle: MultipartUploadHandle
+  ): Promise<AbortMultipartUploadResult>;
+
   // Low-level escape hatch
   openManifest(p: string): Promise<OpenManifestResult>;
   /**
@@ -557,10 +620,10 @@ export interface UserDOClient {
    * + the expected `next_seq` for CAS. Server appends the checkpoint
    * atomically and drops oplog rows below it.
    *
-   * `opts.userVisible: true` emits a user-visible `file_versions`
-   * row when versioning is enabled for the tenant (mirroring the
-   * plain-yjs `vfsFlushYjs` semantics). The optional label gives
-   * the version a ≤128-char human label.
+   * `opts.userVisible: true` emits a user-visible
+   * `file_versions` row when versioning is enabled for the tenant
+   * (mirroring the plain-yjs `vfsFlushYjs` semantics). The optional
+   * label gives the version a ≤128-char human label.
    */
   vfsCompactEncryptedYjs(
     scope: VFSScope,
@@ -740,6 +803,131 @@ export interface VersionMarkOpts {
    * visible) by design.
    */
   userVisible?: boolean;
+}
+
+// ── Manual multipart-upload surface ─────────────────────────────────
+
+/**
+ * Opaque session handle for manual multipart upload. Returned by
+ * {@link VFSClient.beginMultipartUpload} and consumed by the
+ * remaining three multipart methods.
+ *
+ * Fields are stable wire shape — the handle can be `JSON.stringify`'d
+ * and resumed from another process. Resuming requires the same
+ * tenant credentials and a reachable `/api/vfs/multipart/*` route
+ * (any worker hostname behind the same JWT_SECRET works because the
+ * sessionToken is the load-bearing auth).
+ */
+export interface MultipartUploadHandle {
+  /** Server-assigned upload identifier. Stable for the session lifetime. */
+  uploadId: string;
+  /** Absolute VFS path the upload commits to on finalize. */
+  path: string;
+  /**
+   * Server-chosen chunk size (bytes). Caller MUST chunk the source
+   * at this boundary. May differ from the requested `chunkSize`;
+   * see `shared/chunking.ts` for the adaptive sizing logic.
+   */
+  chunkSize: number;
+  /** Total number of chunks the source must produce. */
+  expectedChunks: number;
+  /** Snapshotted pool size; informational only — opaque to callers. */
+  poolSize: number;
+  /**
+   * Bearer-style session token. PUT/status calls require it on
+   * `X-Session-Token`. Distinct from the API key on `Authorization`.
+   */
+  sessionToken: string;
+  /** Wall-clock millisecond timestamp after which the session is invalid. */
+  expiresAtMs: number;
+}
+
+/** Options for {@link VFSClient.beginMultipartUpload}. */
+export interface BeginMultipartUploadOpts {
+  /**
+   * Total payload size in bytes. Server uses this to compute
+   * `expectedChunks`; mismatch on finalize throws `EINVAL`.
+   */
+  size: number;
+  /**
+   * Requested chunk size. Server may round up or clamp (see
+   * `shared/chunking.ts`). Default: server's adaptive choice for
+   * the given `size`.
+   */
+  chunkSize?: number;
+  /** POSIX file mode. Default 0o644. */
+  mode?: number;
+  /** MIME type recorded on the file row. Default sniff from path. */
+  mimeType?: string;
+  /** Plain JSON-shaped metadata; validated server-side. */
+  metadata?: Record<string, unknown> | null;
+  /** Tags applied on finalize; validated server-side. */
+  tags?: readonly string[];
+  /** Per-version flags; meaningful only on versioning-on tenants. */
+  version?: VersionMarkOpts;
+  /** End-to-end encryption stamp. */
+  encryption?: { mode: "convergent" | "random"; keyId?: string };
+  /**
+   * Resume an existing session by `uploadId` instead of minting a
+   * new one. Server validates the session is still alive; callers
+   * SHOULD then read `landed[]` (via a follow-up status call) to
+   * skip already-uploaded chunks.
+   */
+  resumeFrom?: string;
+  /** Session TTL in milliseconds. Server clamps to its policy. */
+  ttlMs?: number;
+}
+
+/** Result of {@link VFSClient.putMultipartChunk}. */
+export interface PutMultipartChunkResult {
+  /** Server's recorded SHA-256 of the chunk bytes (lowercase hex). */
+  chunkHash: string;
+  /**
+   * `true` when the server stored or deduplicated this chunk.
+   * `false` is impossible under current server semantics —
+   * mis-PUTs throw rather than return false. The field is reserved
+   * so future server flavours (e.g. accept-only-on-quorum) can
+   * surface accept/reject without breaking the wire shape.
+   */
+  accepted: boolean;
+  /**
+   * Server's status: `created` (new bytes landed), `deduplicated`
+   * (matched an existing chunk), `superseded` (re-PUT of a
+   * previously-landed chunk under the same index).
+   */
+  status: "created" | "deduplicated" | "superseded";
+}
+
+/** Result of {@link VFSClient.finalizeMultipartUpload}. */
+export interface FinalizeMultipartUploadResult {
+  /** Absolute VFS path the upload committed to. Echoes `handle.path`. */
+  path: string;
+  /** Stable `files.file_id` of the committed path. */
+  pathId: string;
+  /**
+   * `file_versions.version_id` of the new head. Always present on
+   * versioning-on tenants; empty string on versioning-off tenants
+   * (server still computes it but does not surface it). Callers
+   * MAY check `versionId.length > 0` rather than gating on
+   * versioning state directly.
+   */
+  versionId: string;
+  /** File size in bytes (echoes `opts.size`). */
+  size: number;
+  /** Server-recorded SHA-256 of the assembled file (lowercase hex). */
+  fileHash: string;
+  /** True iff the file was uploaded with end-to-end encryption. */
+  isEncrypted: boolean;
+}
+
+/** Result of {@link VFSClient.abortMultipartUpload}. */
+export interface AbortMultipartUploadResult {
+  /**
+   * `true` when the session was active and is now dropped;
+   * `false` when the session was already finalised or aborted
+   * (idempotent abort).
+   */
+  aborted: boolean;
 }
 
 /**
@@ -1743,6 +1931,43 @@ export class VFS implements VFSClient {
     return createWriteStreamWithHandleRpc(this.user(), this.scope(), p, opts);
   }
 
+  // ── Manual multipart upload (HTTP-only surface) ───────────────────
+  //
+  // The binding client (DO RPC) has no need for the manual multipart
+  // surface — `writeFile` and `createWriteStream` route directly
+  // through the DO's RPC methods without a public chunk PUT path.
+  // Callers who reach `VFS.beginMultipartUpload` are misusing the
+  // binding client; surface a clear EINVAL pointing them at
+  // `createMossaicHttpClient`.
+
+  async beginMultipartUpload(
+    _p: string,
+    _opts: BeginMultipartUploadOpts
+  ): Promise<MultipartUploadHandle> {
+    throw new EINVAL({ syscall: "beginMultipartUpload-binding-mode" });
+  }
+
+  async putMultipartChunk(
+    _handle: MultipartUploadHandle,
+    _index: number,
+    _chunk: Uint8Array | ArrayBuffer | Blob
+  ): Promise<PutMultipartChunkResult> {
+    throw new EINVAL({ syscall: "putMultipartChunk-binding-mode" });
+  }
+
+  async finalizeMultipartUpload(
+    _handle: MultipartUploadHandle,
+    _chunkHashList: readonly string[]
+  ): Promise<FinalizeMultipartUploadResult> {
+    throw new EINVAL({ syscall: "finalizeMultipartUpload-binding-mode" });
+  }
+
+  async abortMultipartUpload(
+    _handle: MultipartUploadHandle
+  ): Promise<AbortMultipartUploadResult> {
+    throw new EINVAL({ syscall: "abortMultipartUpload-binding-mode" });
+  }
+
   // ── Low-level escape hatch (caller-orchestrated multi-invocation reads) ──
 
   async openManifest(p: string): Promise<OpenManifestResult> {
@@ -2095,8 +2320,8 @@ export class VFS implements VFSClient {
           "yj"
         );
 
-        // Step 5: submit with CAS. Forward userVisible/label opts
-        // so a user-visible flush emits a `file_versions` row on
+        // Step 5: submit with CAS. Forward opts so a
+        // user-visible flush emits a `file_versions` row on
         // versioning-on tenants — mirrors the plain-yjs
         // `vfsFlushYjs` semantics.
         const result = await this.user().vfsCompactEncryptedYjs(

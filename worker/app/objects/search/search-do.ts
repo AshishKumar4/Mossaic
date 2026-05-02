@@ -1,6 +1,10 @@
 import { DurableObject } from "cloudflare:workers";
 import type { EnvApp as Env } from "@shared/types";
 import type { VectorSpace } from "@shared/embedding-types";
+import {
+  applyMigrationOnce,
+  ensureMigrationsTable,
+} from "@core/lib/migrations";
 
 /**
  * SearchDO — Durable Object for multi-modal vector storage.
@@ -23,6 +27,8 @@ export class SearchDO extends DurableObject<Env> {
   private ensureInit(): void {
     if (this.initialized) return;
     this.initialized = true;
+
+    ensureMigrationsTable(this.sql);
 
     // Main vectors table with space column for multi-modal support
     this.sql.exec(`
@@ -54,18 +60,18 @@ export class SearchDO extends DurableObject<Env> {
       )
     `);
 
-    // Migrate: add space column to existing tables if they don't have it.
-    // SQLite's ALTER TABLE ADD COLUMN is safe to call — it's a no-op if the column exists.
-    try {
-      this.sql.exec("ALTER TABLE vectors ADD COLUMN space TEXT NOT NULL DEFAULT 'text'");
-    } catch {
-      // Column already exists or table was created with it
-    }
-    try {
-      this.sql.exec("ALTER TABLE vector_metadata ADD COLUMN space TEXT NOT NULL DEFAULT 'text'");
-    } catch {
-      // Column already exists
-    }
+    // Add `space` column to existing tables when missing (legacy
+    // single-space schema → multi-modal schema).
+    applyMigrationOnce(this.sql, "vectors_add_space", () =>
+      this.sql.exec(
+        "ALTER TABLE vectors ADD COLUMN space TEXT NOT NULL DEFAULT 'text'"
+      )
+    );
+    applyMigrationOnce(this.sql, "vector_metadata_add_space", () =>
+      this.sql.exec(
+        "ALTER TABLE vector_metadata ADD COLUMN space TEXT NOT NULL DEFAULT 'text'"
+      )
+    );
 
     // Create index for efficient space-scoped queries
     this.sql.exec(`

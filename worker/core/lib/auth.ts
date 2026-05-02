@@ -119,22 +119,39 @@ export function getCursorSecret(env: { JWT_SECRET?: string }): string {
 }
 
 /**
+ * Sign an HS256 JWT with the given claims, expiring at the given
+ * absolute wall-clock millisecond timestamp.
+ *
+ * Centralised because the `setProtectedHeader({ alg: "HS256" })` +
+ * `setIssuedAt()` + `setExpirationTime(secondsSinceEpoch)` chain was
+ * duplicated across 6 mint sites (login, VFS, multipart, download,
+ * share, preview). `expiresAtMs` is in milliseconds (caller-friendly);
+ * jose wants seconds, so we floor-divide here once.
+ */
+export async function signScopedJwt(
+  secret: Uint8Array,
+  claims: Record<string, unknown>,
+  expiresAtMs: number
+): Promise<string> {
+  return new SignJWT(claims)
+    .setProtectedHeader({ alg: "HS256" })
+    .setIssuedAt()
+    .setExpirationTime(Math.floor(expiresAtMs / 1000))
+    .sign(secret);
+}
+
+/**
  * Sign a JWT with userId and email claims.
  */
 export async function signJWT(
   env: Env,
   payload: { userId: string; email: string }
 ): Promise<string> {
-  const secret = getSecret(env);
-  return new SignJWT({ sub: payload.userId, email: payload.email })
-    .setProtectedHeader({ alg: "HS256" })
-    .setIssuedAt()
-    // jose's `setExpirationTime` interprets numeric input as
-    // seconds-since-epoch (per the JWT `exp` claim spec). The previous
-    // call passed milliseconds, producing tokens with `exp` ~year 57000
-    // — i.e. never-expiring sessions. Convert to seconds.
-    .setExpirationTime(Math.floor((Date.now() + JWT_EXPIRATION_MS) / 1000))
-    .sign(secret);
+  return signScopedJwt(
+    getSecret(env),
+    { sub: payload.userId, email: payload.email },
+    Date.now() + JWT_EXPIRATION_MS
+  );
 }
 
 /**
@@ -225,19 +242,13 @@ export async function signVFSToken(
   payload: { ns: string; tenant: string; sub?: string },
   ttlMs: number = JWT_EXPIRATION_MS
 ): Promise<string> {
-  const secret = getSecret(env);
   const claims: Record<string, unknown> = {
     scope: "vfs",
     ns: payload.ns,
     tn: payload.tenant,
   };
   if (payload.sub !== undefined) claims.sub = payload.sub;
-  return new SignJWT(claims)
-    .setProtectedHeader({ alg: "HS256" })
-    .setIssuedAt()
-    // Seconds-since-epoch per JWT `exp` claim spec.
-    .setExpirationTime(Math.floor((Date.now() + ttlMs) / 1000))
-    .sign(secret);
+  return signScopedJwt(getSecret(env), claims, Date.now() + ttlMs);
 }
 
 /**
@@ -313,7 +324,6 @@ export async function signVFSMultipartToken(
   payload: Omit<MultipartSessionTokenPayload, "scope" | "iat" | "exp">,
   ttlMs: number = MULTIPART_DEFAULT_TTL_MS
 ): Promise<{ token: string; expiresAtMs: number }> {
-  const secret = getSecret(env);
   const ttl = Math.min(Math.max(ttlMs, 60_000), MULTIPART_MAX_TTL_MS);
   const expiresAtMs = Date.now() + ttl;
   const claims: Record<string, unknown> = {
@@ -327,11 +337,7 @@ export async function signVFSMultipartToken(
     totalSize: payload.totalSize,
   };
   if (payload.sub !== undefined) claims.sub = payload.sub;
-  const token = await new SignJWT(claims)
-    .setProtectedHeader({ alg: "HS256" })
-    .setIssuedAt()
-    .setExpirationTime(Math.floor(expiresAtMs / 1000))
-    .sign(secret);
+  const token = await signScopedJwt(getSecret(env), claims, expiresAtMs);
   return { token, expiresAtMs };
 }
 
@@ -418,7 +424,6 @@ export async function signVFSDownloadToken(
   payload: Omit<DownloadTokenPayload, "scope" | "iat" | "exp">,
   ttlMs: number = DOWNLOAD_TOKEN_DEFAULT_TTL_MS
 ): Promise<{ token: string; expiresAtMs: number }> {
-  const secret = getSecret(env);
   const ttl = Math.min(Math.max(ttlMs, 60_000), MULTIPART_MAX_TTL_MS);
   const expiresAtMs = Date.now() + ttl;
   const claims: Record<string, unknown> = {
@@ -428,11 +433,7 @@ export async function signVFSDownloadToken(
     tn: payload.tn,
   };
   if (payload.sub !== undefined) claims.sub = payload.sub;
-  const token = await new SignJWT(claims)
-    .setProtectedHeader({ alg: "HS256" })
-    .setIssuedAt()
-    .setExpirationTime(Math.floor(expiresAtMs / 1000))
-    .sign(secret);
+  const token = await signScopedJwt(getSecret(env), claims, expiresAtMs);
   return { token, expiresAtMs };
 }
 
@@ -556,17 +557,17 @@ export async function signShareToken(
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
   const expiresAtMs = Date.now() + ttlMs;
-  const token = await new SignJWT({
-    scope: VFS_SHARE_SCOPE,
-    userId: payload.userId,
-    fileIds: [...payload.fileIds],
-    albumName: payload.albumName,
-    jti,
-  })
-    .setProtectedHeader({ alg: "HS256" })
-    .setIssuedAt()
-    .setExpirationTime(Math.floor(expiresAtMs / 1000))
-    .sign(secret);
+  const token = await signScopedJwt(
+    secret,
+    {
+      scope: VFS_SHARE_SCOPE,
+      userId: payload.userId,
+      fileIds: [...payload.fileIds],
+      albumName: payload.albumName,
+      jti,
+    },
+    expiresAtMs
+  );
   return { token, expiresAtMs, jti };
 }
 

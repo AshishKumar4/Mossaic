@@ -14,6 +14,7 @@ import { createFolder, listFolders, getFolderPath } from "./folders";
 import { getQuota, updateUsage } from "./quota";
 import { UserDOCore } from "@core/objects/user/user-do-core";
 import { insertAuditLog } from "@core/objects/user/vfs/audit-log";
+import { FILE_HEAD_JOIN } from "@core/objects/user/vfs/helpers";
 import {
   appAuthScopeFor,
   appGate,
@@ -246,8 +247,7 @@ export class UserDO extends UserDOCore {
       .exec(
         `SELECT f.*
            FROM files f
-           LEFT JOIN file_versions fv
-             ON fv.path_id = f.file_id AND fv.version_id = f.head_version_id
+           ${FILE_HEAD_JOIN}
           WHERE f.user_id = ?
             AND IFNULL(f.parent_id, '') = IFNULL(?, '')
             AND f.file_name = ?
@@ -322,8 +322,7 @@ export class UserDO extends UserDOCore {
       .exec(
         `SELECT f.parent_id, f.file_name, f.mime_type, f.updated_at
            FROM files f
-           LEFT JOIN file_versions fv
-             ON fv.path_id = f.file_id AND fv.version_id = f.head_version_id
+           ${FILE_HEAD_JOIN}
           WHERE f.file_id = ?
             AND f.status != 'deleted'
             AND (f.head_version_id IS NULL OR fv.deleted IS NULL OR fv.deleted = 0)`,
@@ -435,8 +434,7 @@ export class UserDO extends UserDOCore {
       .exec(
         `SELECT f.*
            FROM files f
-           LEFT JOIN file_versions fv
-             ON fv.path_id = f.file_id AND fv.version_id = f.head_version_id
+           ${FILE_HEAD_JOIN}
           WHERE f.user_id = ?
             AND f.status != 'deleted'
             AND (f.head_version_id IS NULL OR fv.deleted IS NULL OR fv.deleted = 0)
@@ -473,8 +471,7 @@ export class UserDO extends UserDOCore {
         `SELECT f.file_id, f.file_name, f.file_size, f.mime_type,
                 f.parent_id, f.created_at, f.updated_at
            FROM files f
-           LEFT JOIN file_versions fv
-             ON fv.path_id = f.file_id AND fv.version_id = f.head_version_id
+           ${FILE_HEAD_JOIN}
           WHERE f.user_id = ?
             AND f.status = 'complete'
             AND f.mime_type LIKE 'image/%'
@@ -618,8 +615,7 @@ export class UserDO extends UserDOCore {
       .exec(
         `SELECT f.file_id, f.file_name, f.mime_type, f.file_size
            FROM files f
-           LEFT JOIN file_versions fv
-             ON fv.path_id = f.file_id AND fv.version_id = f.head_version_id
+           ${FILE_HEAD_JOIN}
           WHERE f.user_id = ?
             AND f.status = 'complete'
             AND f.indexed_at IS NULL

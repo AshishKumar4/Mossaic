@@ -12,23 +12,6 @@ export function generateId(): string {
   return `${timestamp}${randomStr}`;
 }
 
-/**
- * Create a JSON error response.
- */
-export function errorResponse(
-  message: string,
-  status: number = 400
-): Response {
-  return Response.json({ error: message }, { status });
-}
-
-/**
- * Create a JSON success response.
- */
-export function jsonResponse<T>(data: T, status: number = 200): Response {
-  return Response.json(data, { status });
-}
-
 // ── VFS DO naming ──────────────────────────────────────────────────────
 //
 // The VFS uses a *new* DO name pattern that the legacy app does NOT

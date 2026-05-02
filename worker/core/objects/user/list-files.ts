@@ -34,7 +34,11 @@ import {
 // Stat raw shape; mirrors VFSStatRaw fields we surface.
 import type { VFSStatRaw } from "../../../../shared/vfs-types";
 import { gidFromTenant, inoFromId, uidFromTenant } from "../../../../shared/ino";
-import { readFolderRevision } from "./vfs/helpers";
+import {
+  readFolderRevision,
+  userIdFor,
+  FILE_HEAD_JOIN,
+} from "./vfs/helpers";
 
 export interface ListFilesItemRaw {
   path: string;
@@ -833,8 +837,7 @@ function listChildFiles(
   const sql = `
     SELECT f.file_id AS id, ${orderCol} AS ov
       FROM files f
-      LEFT JOIN file_versions fv
-        ON fv.path_id = f.file_id AND fv.version_id = f.head_version_id
+      ${FILE_HEAD_JOIN}
      WHERE ${where.join(" AND ")}
      ORDER BY ${orderCol} ${dirSql}, f.file_id ASC
      LIMIT ?
@@ -1000,11 +1003,6 @@ function clampLimit(n: number | undefined): number {
   return n;
 }
 
-function userIdFor(scope: VFSScope): string {
-  if (scope.sub !== undefined) return `${scope.tenant}::${scope.sub}`;
-  return scope.tenant;
-}
-
 function chooseDriver(opts: ListFilesOpts): "tags" | "files" {
   if (opts.tags && opts.tags.length > 0) return "tags";
   return "files";
@@ -1113,8 +1111,7 @@ function listByFiles(
   const sql = `
     SELECT f.file_id AS file_id, ${orderCol} AS ov
       FROM files f
-      LEFT JOIN file_versions fv
-        ON fv.path_id = f.file_id AND fv.version_id = f.head_version_id
+      ${FILE_HEAD_JOIN}
      WHERE ${where.join(" AND ")}
      ORDER BY ${orderCol} ${dirSql}, f.file_id ASC
      LIMIT ?
@@ -1339,8 +1336,7 @@ function listSingleTag(
     SELECT f.file_id AS pid, ${orderCol} AS ov
       FROM file_tags t
       JOIN files f ON f.file_id = t.path_id
-      LEFT JOIN file_versions fv
-        ON fv.path_id = f.file_id AND fv.version_id = f.head_version_id
+      ${FILE_HEAD_JOIN}
      WHERE ${where.join(" AND ")}
      ORDER BY ${orderCol} ${dirSql}, f.file_id ASC
      LIMIT ?

@@ -385,6 +385,54 @@ The HTTP client always addresses canonical Mossaic routes:
 
 Every SDK consumer (SPA, CLI, third-party Worker) hits the same surface; there is no override for routing through alternative endpoints. Apps that want their own auth boundary in front of Mossaic mint VFS Bearer tokens at their own auth route (e.g. the photo-library's `POST /api/auth/vfs-token`) and pass the resulting token as `apiKey`.
 
+### Manual multipart upload (advanced)
+
+For callers that need direct control over chunk submission — custom backpressure, hand-rolled retries, resumable batchers, multi-process upload coordination — the SDK exposes the four multipart primitives directly on the HTTP client:
+
+```ts
+import {
+  createMossaicHttpClient,
+  type MultipartUploadHandle,
+} from "@mossaic/sdk/http";
+import { hashChunk } from "@mossaic/sdk/http";
+
+const client = createMossaicHttpClient({ url: "https://...", apiKey: token });
+
+// 1. Begin — server picks chunkSize, returns expectedChunks count.
+const handle: MultipartUploadHandle = await client.beginMultipartUpload(
+  "/large.bin",
+  { size: source.byteLength, mimeType: "application/octet-stream" }
+);
+
+// 2. PUT each chunk. Caller chunks the source at handle.chunkSize.
+const hashes: string[] = [];
+for (let i = 0; i < handle.expectedChunks; i++) {
+  const start = i * handle.chunkSize;
+  const end = Math.min(start + handle.chunkSize, source.byteLength);
+  const slice = source.subarray(start, end);
+  const r = await client.putMultipartChunk(handle, i, slice);
+  hashes.push(r.chunkHash);
+}
+
+// 3. Finalize — atomic commit.
+const result = await client.finalizeMultipartUpload(handle, hashes);
+console.log(`uploaded ${result.size} bytes to ${result.path}`);
+
+// On failure, ALWAYS abort to release the session (chunks GC via the
+// existing alarm sweeper).
+// await client.abortMultipartUpload(handle);
+```
+
+**This is a manual surface for advanced clients.** `writeFile()` autopilots multipart internally with adaptive concurrency, retries, and the AIMD controller; `parallelUpload()` exposes the same engine with progress events. Reach for the manual surface when you need:
+
+- **Cross-process resume**: `JSON.stringify(handle)` is stable wire shape — pass the handle to another worker / VM / process and call `putMultipartChunk` from there.
+- **Custom upload schedulers**: feed handle.chunkSize-sized buffers from a producer queue with non-default concurrency policy.
+- **Out-of-band chunk validation**: PUT a chunk, validate its `chunkHash` against your own SHA-256, queue retries on mismatch.
+
+`abortMultipartUpload` is idempotent — aborting an already-finalized or already-aborted session returns `{aborted: false}` rather than throwing.
+
+The binding-mode client (`createVFS(env, opts)`) does **not** support these methods — they throw `EINVAL` because DO RPC has no public chunk-PUT path. Use the HTTP client (`createMossaicHttpClient(...)`) for manual multipart.
+
 ---
 
 ## Universal preview pipeline

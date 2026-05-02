@@ -1,7 +1,13 @@
 import type { UserDOCore as UserDO } from "../user-do-core";
 import { VFSError, type VFSScope } from "../../../../../shared/vfs-types";
 import { insertAuditLog } from "./audit-log";
-import { bumpFolderRevision, resolveOrThrow, userIdFor } from "./helpers";
+import {
+  bumpFolderRevision,
+  resolveOrThrow,
+  userIdFor,
+  FILE_HEAD_JOIN,
+  assertHeadNotTombstoned,
+} from "./helpers";
 
 /**
  * Refuse to mutate the archive bit on a tombstoned-head row.
@@ -33,8 +39,7 @@ function ensureNotTombstoned(
     .exec(
       `SELECT f.head_version_id, fv.deleted AS head_deleted
          FROM files f
-         LEFT JOIN file_versions fv
-           ON fv.path_id = f.file_id AND fv.version_id = f.head_version_id
+         ${FILE_HEAD_JOIN}
         WHERE f.file_id = ? AND f.user_id = ?`,
       fileId,
       userId
@@ -42,6 +47,12 @@ function ensureNotTombstoned(
     .toArray()[0] as
     | { head_version_id: string | null; head_deleted: number | null }
     | undefined;
+  // Note: `archive` allows operating on a row whose `files` entry
+  // exists but whose head_version is missing (un-versioned legacy
+  // file pre-versioning enablement). Only error when the head row
+  // EXISTS and is tombstoned. So we do an explicit check rather
+  // than the generic `assertHeadNotTombstoned` which throws on
+  // a missing `files` row.
   if (
     row !== undefined &&
     row.head_version_id !== null &&

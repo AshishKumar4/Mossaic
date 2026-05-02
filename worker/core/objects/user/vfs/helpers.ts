@@ -6,6 +6,7 @@ import {
   type VFSStatRaw,
 } from "../../../../../shared/vfs-types";
 import { gidFromTenant, inoFromId, uidFromTenant } from "../../../../../shared/ino";
+import { BASE_POOL_SIZE, BYTES_PER_SHARD } from "../../../../../shared/constants";
 import { normalizePath, VFSPathError } from "../../../../../shared/vfs-paths";
 import { resolvePath, resolvePathFollow } from "../path-walk";
 
@@ -439,9 +440,7 @@ export function recordWriteUsage(
   // do NOT shrink it; the `newPool > row.pool_size` guard below
   // is the load-bearing check. (Shrinking would orphan chunks
   // pinned to high shard indices via `file_chunks.shard_index`.)
-  const BASE_POOL = 32;
-  const BYTES_PER_SHARD = 5 * 1024 * 1024 * 1024;
-  const newPool = BASE_POOL + Math.floor(Math.max(0, row.storage_used) / BYTES_PER_SHARD);
+  const newPool = BASE_POOL_SIZE + Math.floor(Math.max(0, row.storage_used) / BYTES_PER_SHARD);
   if (newPool > row.pool_size) {
     durableObject.sql.exec(
       "UPDATE quota SET pool_size = ? WHERE user_id = ?",
@@ -587,4 +586,60 @@ export function readFolderRevision(
     )
     .toArray()[0] as { revision: number } | undefined;
   return r?.revision ?? 0;
+}
+
+// ── tombstone-gate helpers ──────────────────────────────────────────
+//
+// The head-version-tombstone gate guards every read/preview/archive
+// path that resolves a file_id to bytes. The structural pattern
+// is the same everywhere:
+//
+//   SELECT f.<...>, fv.deleted AS head_deleted, fv.<...>
+//     FROM files f
+//     LEFT JOIN file_versions fv
+//       ON fv.path_id = f.file_id AND fv.version_id = f.head_version_id
+//    WHERE f.file_id = ? AND f.user_id = ?
+//   if (row.head_version_id !== null && row.head_deleted === 1) throw ENOENT
+//
+// Each callsite needs its own column projection (size, mime,
+// inline_data, chunk_size, …), so a single "loadHead returning a
+// fixed shape" helper would force-widen every consumer. Instead we
+// publish the JOIN as a SQL constant and the tombstone check as a
+// typed predicate; callsites compose them with their own SELECT
+// list and downstream type assertion.
+
+/**
+ * Canonical JOIN clause that brings `file_versions` columns of the
+ * head version onto a `files` row. Use as `${FILE_HEAD_JOIN}` inside
+ * a tagged template, or string-concat into a query.
+ *
+ * Always followed by a `head_deleted === 1` check via
+ * {@link assertHeadNotTombstoned} on the returned row.
+ */
+export const FILE_HEAD_JOIN =
+  "LEFT JOIN file_versions fv ON fv.path_id = f.file_id AND fv.version_id = f.head_version_id";
+
+/**
+ * Throws `ENOENT` when the head version row is a tombstone (i.e.
+ * `head_version_id` resolves to a `file_versions` row with
+ * `deleted = 1`). Returns the row narrowed to non-tombstoned on
+ * success (compile-time only — runtime cost is two field reads).
+ *
+ * Pass any row that includes `head_version_id` and `head_deleted`
+ * fields. Extra fields are preserved (TypeScript narrows via the
+ * generic).
+ */
+export function assertHeadNotTombstoned<
+  T extends { head_version_id: string | null; head_deleted: number | null }
+>(row: T | undefined, syscall: string, path: string): T {
+  if (!row) {
+    throw new VFSError("ENOENT", `${syscall}: file vanished${path ? `: ${path}` : ""}`);
+  }
+  if (row.head_version_id !== null && row.head_deleted === 1) {
+    throw new VFSError(
+      "ENOENT",
+      `${syscall}: head version is a tombstone${path ? ` for ${path}` : ""}`
+    );
+  }
+  return row;
 }

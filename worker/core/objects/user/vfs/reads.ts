@@ -10,7 +10,13 @@ import {
 import { READFILE_MAX } from "../../../../../shared/inline";
 import { vfsShardDOName } from "../../../lib/utils";
 import { resolvePath } from "../path-walk";
-import { resolveOrThrow, statForResolved, userIdFor } from "./helpers";
+import {
+  resolveOrThrow,
+  statForResolved,
+  userIdFor,
+  FILE_HEAD_JOIN,
+  assertHeadNotTombstoned,
+} from "./helpers";
 import { isYjsMode } from "./metadata";
 
 /**
@@ -439,8 +445,7 @@ export async function vfsReadFile(
     .exec(
       `SELECT f.head_version_id, fv.deleted AS head_deleted
          FROM files f
-         LEFT JOIN file_versions fv
-           ON fv.path_id = f.file_id AND fv.version_id = f.head_version_id
+         ${FILE_HEAD_JOIN}
         WHERE f.file_id=? AND f.user_id=?`,
       r.leafId,
       userId
@@ -448,6 +453,8 @@ export async function vfsReadFile(
     .toArray()[0] as
     | { head_version_id: string | null; head_deleted: number | null }
     | undefined;
+  // Tombstone semantics here are version-aware: an explicit
+  // historical `opts.versionId` reads bypass head tombstone.
   if (
     headRow !== undefined &&
     headRow.head_version_id !== null &&
@@ -650,7 +657,7 @@ export async function vfsOpenManifest(
   // size=0, chunks=[]) for yjs files; the SDK would then issue
   // chunk GETs and get nothing (or worse: a stale pre-yjs-toggle
   // chunk).
-  const row = durableObject.sql
+  const rowRaw = durableObject.sql
     .exec(
       `SELECT f.file_id, f.file_size, f.chunk_size, f.chunk_count,
               f.inline_data, f.mode_yjs, f.head_version_id,
@@ -659,8 +666,7 @@ export async function vfsOpenManifest(
               fv.chunk_size AS head_chunk_size,
               fv.chunk_count AS head_chunk_count
          FROM files f
-         LEFT JOIN file_versions fv
-           ON fv.path_id = f.file_id AND fv.version_id = f.head_version_id
+         ${FILE_HEAD_JOIN}
         WHERE f.file_id=? AND f.user_id=? AND f.status!='deleted'`,
       r.leafId,
       userId
@@ -681,13 +687,7 @@ export async function vfsOpenManifest(
         head_chunk_count: number | null;
       }
     | undefined;
-  if (!row) throw new VFSError("ENOENT", "openManifest: file vanished");
-  if (row.head_version_id !== null && row.head_deleted === 1) {
-    throw new VFSError(
-      "ENOENT",
-      `openManifest: head version is a tombstone for ${path}`
-    );
-  }
+  const row = assertHeadNotTombstoned(rowRaw, "openManifest", path);
 
   // Yjs-mode short-circuit. Materialize the live Y.Doc once and
   // report it as inlined. Caller (download-token route)
@@ -811,13 +811,12 @@ export async function vfsReadChunk(
   //
   // Also pull `mode_yjs` so yjs files materialize from the live
   // Y.Doc, matching `vfsReadFile` and `vfsOpenManifest`.
-  const inlineRow = durableObject.sql
+  const inlineRowRaw = durableObject.sql
     .exec(
       `SELECT f.inline_data, f.mode_yjs, f.head_version_id,
               fv.deleted AS head_deleted, fv.inline_data AS head_inline
          FROM files f
-         LEFT JOIN file_versions fv
-           ON fv.path_id = f.file_id AND fv.version_id = f.head_version_id
+         ${FILE_HEAD_JOIN}
         WHERE f.file_id=? AND f.user_id=? AND f.status!='deleted'`,
       r.leafId,
       userId
@@ -831,13 +830,7 @@ export async function vfsReadChunk(
         head_inline: ArrayBuffer | null;
       }
     | undefined;
-  if (!inlineRow) throw new VFSError("ENOENT", "readChunk: file vanished");
-  if (inlineRow.head_version_id !== null && inlineRow.head_deleted === 1) {
-    throw new VFSError(
-      "ENOENT",
-      `readChunk: head version is a tombstone for ${path}`
-    );
-  }
+  const inlineRow = assertHeadNotTombstoned(inlineRowRaw, "readChunk", path);
   // Yjs-mode: materialize and serve as a single chunk. Caller's
   // manifest reported `inlined: true, chunks: []`; only
   // chunkIndex===0 is valid and returns the full materialized bytes.

@@ -28,18 +28,7 @@ interface TestEnv {
 }
 const TEST_ENV = env as unknown as TestEnv;
 
-async function signup(
-  email: string
-): Promise<{ userId: string; jwt: string }> {
-  const res = await SELF.fetch("https://test/api/auth/signup", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email, password: "test-password-123" }),
-  });
-  expect(res.status).toBe(200);
-  const body = (await res.json()) as { userId: string; token: string };
-  return { userId: body.userId, jwt: body.token };
-}
+import { signup } from "./_helpers";
 
 async function mintShareToken(
   sessionJWT: string,
