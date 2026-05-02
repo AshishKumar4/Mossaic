@@ -13,6 +13,7 @@ import { loadFullShards } from "../shard-capacity";
 import {
   commitVersion,
   dropTmpRowAfterVersionCommit,
+  insertVersionChunk,
   isVersioningEnabled,
 } from "../vfs-versions";
 import {
@@ -855,16 +856,7 @@ export async function vfsCommitWriteStream(
     }
     const versionId = generateId();
     for (const c of tmpChunks) {
-      durableObject.sql.exec(
-        `INSERT INTO version_chunks
-           (version_id, chunk_index, chunk_hash, chunk_size, shard_index)
-         VALUES (?, ?, ?, ?, ?)`,
-        versionId,
-        c.chunk_index,
-        c.chunk_hash,
-        c.chunk_size,
-        c.shard_index
-      );
+      insertVersionChunk(durableObject, versionId, c);
     }
     commitVersion(durableObject, {
       pathId,

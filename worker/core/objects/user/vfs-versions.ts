@@ -190,6 +190,46 @@ export function dropTmpRowAfterVersionCommit(
   durableObject.sql.exec("DELETE FROM files WHERE file_id = ?", tmpId);
 }
 
+/** Single chunk row written into a version's manifest. */
+export interface VersionChunkRow {
+  chunk_index: number;
+  chunk_hash: string;
+  chunk_size: number;
+  shard_index: number;
+}
+
+/**
+ * Insert a single `version_chunks` row. Mirrors the 5-column shape
+ * used by every versioned-write callsite (streams commit, multipart
+ * finalize, copy-file chunked, mutations renameOverwriteVersioned).
+ *
+ * Each callsite previously inlined the same 5-line INSERT against a
+ * different chunk source (file_chunks for streams, the multipart
+ * `collected` Map, version_chunks for copy/rename). Chunk sources
+ * differ; the INSERT does not.
+ *
+ * Note: callers that interleave INSERTs with shard putChunk fan-out
+ * (copy-file, mutations) call this PER CHUNK inside the inner loop;
+ * callers that collect first then INSERT (streams, multipart) call
+ * it in a tight loop after the source is materialised. Both patterns
+ * are well-served by the row-at-a-time signature.
+ */
+export function insertVersionChunk(
+  durableObject: UserDO,
+  versionId: string,
+  row: VersionChunkRow
+): void {
+  durableObject.sql.exec(
+    `INSERT INTO version_chunks (version_id, chunk_index, chunk_hash, chunk_size, shard_index)
+     VALUES (?, ?, ?, ?, ?)`,
+    versionId,
+    row.chunk_index,
+    row.chunk_hash,
+    row.chunk_size,
+    row.shard_index
+  );
+}
+
 /**
  * Operator helper: toggle versioning for a tenant. Idempotent;
  * affects only future writes (existing files / versions unchanged).

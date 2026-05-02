@@ -61,6 +61,7 @@ import {
 import {
   commitVersion,
   dropTmpRowAfterVersionCommit,
+  insertVersionChunk,
   isVersioningEnabled,
 } from "./vfs-versions";
 import {
@@ -730,16 +731,12 @@ export async function vfsFinalizeMultipart(
     const versionId = generateId();
     for (let i = 0; i < session.total_chunks; i++) {
       const row = collected.get(i)!;
-      durableObject.sql.exec(
-        `INSERT INTO version_chunks
-           (version_id, chunk_index, chunk_hash, chunk_size, shard_index)
-         VALUES (?, ?, ?, ?, ?)`,
-        versionId,
-        i,
-        row.hash,
-        row.size,
-        idxToShard[i]
-      );
+      insertVersionChunk(durableObject, versionId, {
+        chunk_index: i,
+        chunk_hash: row.hash,
+        chunk_size: row.size,
+        shard_index: idxToShard[i],
+      });
     }
 
     // commitVersion: inserts the file_versions row AND atomically

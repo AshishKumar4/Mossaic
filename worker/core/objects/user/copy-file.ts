@@ -32,6 +32,7 @@ import { generateId, vfsShardDOName } from "../../lib/utils";
 import {
   commitVersion,
   dropTmpRowAfterVersionCommit,
+  insertVersionChunk,
   isVersioningEnabled,
   shardRefId,
 } from "./vfs-versions";
@@ -703,15 +704,7 @@ async function copyVersioned(
             c.chunk_index,
             userId
           );
-          durableObject.sql.exec(
-            `INSERT INTO version_chunks (version_id, chunk_index, chunk_hash, chunk_size, shard_index)
-             VALUES (?, ?, ?, ?, ?)`,
-            newVersionId,
-            c.chunk_index,
-            c.chunk_hash,
-            c.chunk_size,
-            c.shard_index
-          );
+          insertVersionChunk(durableObject, newVersionId, c);
         }
       })
     );

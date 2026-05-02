@@ -5,10 +5,7 @@ import { verifyVFSToken, VFSConfigError } from "../lib/auth";
 import { vfsUserDOName } from "../lib/utils";
 import type { UserDOCore } from "../objects/user/user-do-core";
 import type { VFSScope } from "../../../shared/vfs-types";
-import {
-  edgeCacheLookup,
-  edgeCachePut,
-} from "../lib/edge-cache";
+import { edgeCacheServe } from "../lib/edge-cache";
 import { userIdFor } from "../objects/user/vfs/helpers";
 
 /**
@@ -761,22 +758,19 @@ vfs.post("/openManifest", async (c) => {
       cacheControl: "private, max-age=31536000, immutable",
       waitUntil: c.executionCtx.waitUntil.bind(c.executionCtx),
     };
-    const cached = await edgeCacheLookup(cacheOpts);
-    if (cached) return cached;
-
-    const m = await stub.vfsOpenManifest(c.var.scope, path);
-    const fresh = new Response(JSON.stringify({ manifest: m }), {
-      status: 200,
-      headers: {
-        "Content-Type": "application/json",
-        // Manifest is keyed on (fileId, headVersionId) which is
-        // immutable for a given version. Year-long cache safe;
-        // overwrites land on a different key.
-        "Cache-Control": "private, max-age=31536000, immutable",
-      },
+    return await edgeCacheServe(cacheOpts, async () => {
+      const m = await stub.vfsOpenManifest(c.var.scope, path);
+      return new Response(JSON.stringify({ manifest: m }), {
+        status: 200,
+        headers: {
+          "Content-Type": "application/json",
+          // Manifest is keyed on (fileId, headVersionId) which is
+          // immutable for a given version. Year-long cache safe;
+          // overwrites land on a different key.
+          "Cache-Control": "private, max-age=31536000, immutable",
+        },
+      });
     });
-    edgeCachePut(cacheOpts, fresh);
-    return fresh;
   } catch (err) {
     const r = errToResponse(err);
     return c.json(r.body, r.status as 400);
@@ -818,32 +812,29 @@ vfs.post("/readChunk", async (c) => {
       cacheControl: "public, max-age=31536000, immutable",
       waitUntil: c.executionCtx.waitUntil.bind(c.executionCtx),
     };
-    const cached = await edgeCacheLookup(cacheOpts);
-    if (cached) return cached;
-
-    const buf = await stub.vfsReadChunk(
-      c.var.scope,
-      path,
-      body.chunkIndex
-    );
-    const fresh = new Response(buf, {
-      status: 200,
-      headers: {
-        "Content-Type": "application/octet-stream",
-        // Per-version per-chunk-index immutable. Overwrites
-        // create a new headVersionId → different cache key.
-        "Cache-Control": "public, max-age=31536000, immutable",
-        // Vary on Authorization so any intermediary CDN keys
-        // cached entries by Bearer token and never serves a
-        // tenant-A response to a tenant-B request whose URL
-        // happens to collide. The cache key already includes a
-        // per-user namespace; Vary is the wire assertion that
-        // downstream caches honour the same axis.
-        Vary: "Authorization",
-      },
+    return await edgeCacheServe(cacheOpts, async () => {
+      const buf = await stub.vfsReadChunk(
+        c.var.scope,
+        path,
+        body.chunkIndex
+      );
+      return new Response(buf, {
+        status: 200,
+        headers: {
+          "Content-Type": "application/octet-stream",
+          // Per-version per-chunk-index immutable. Overwrites
+          // create a new headVersionId → different cache key.
+          "Cache-Control": "public, max-age=31536000, immutable",
+          // Vary on Authorization so any intermediary CDN keys
+          // cached entries by Bearer token and never serves a
+          // tenant-A response to a tenant-B request whose URL
+          // happens to collide. The cache key already includes a
+          // per-user namespace; Vary is the wire assertion that
+          // downstream caches honour the same axis.
+          Vary: "Authorization",
+        },
+      });
     });
-    edgeCachePut(cacheOpts, fresh);
-    return fresh;
   } catch (err) {
     const r = errToResponse(err);
     return c.json(r.body, r.status as 400);
