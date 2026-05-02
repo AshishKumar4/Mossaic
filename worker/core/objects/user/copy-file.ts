@@ -29,7 +29,12 @@ import type { UserDOCore as UserDO } from "./user-do-core";
 import type { ShardDO } from "../shard/shard-do";
 import { VFSError, type VFSScope } from "../../../../shared/vfs-types";
 import { generateId, vfsShardDOName } from "../../lib/utils";
-import { commitVersion, isVersioningEnabled, shardRefId } from "./vfs-versions";
+import {
+  commitVersion,
+  dropTmpRowAfterVersionCommit,
+  isVersioningEnabled,
+  shardRefId,
+} from "./vfs-versions";
 import { findLiveFile } from "./vfs/helpers";
 
 interface CopyOpts {
@@ -651,14 +656,9 @@ async function copyVersioned(
     if (liveDst) {
       // Drop the redundant tmp row WITHOUT chunk fan-out (inline
       // bytes live in the file_versions row, not on shards).
-      durableObject.sql.exec(
-        "DELETE FROM file_tags WHERE path_id = ?",
-        tmpId
-      );
-      durableObject.sql.exec(
-        "DELETE FROM files WHERE file_id = ?",
-        tmpId
-      );
+      dropTmpRowAfterVersionCommit(durableObject, tmpId, {
+        hasChunks: false,
+      });
     }
     await applyCopySideEffects(durableObject, userId, pathId, opts, now, srcRow.file_id);
     return;
@@ -755,18 +755,9 @@ async function copyVersioned(
     // version_chunks under newVersionId, refed on shards via
     // newRefId). Skip the shard fan-out: chunks belong to the new
     // version.
-    durableObject.sql.exec(
-      "DELETE FROM file_chunks WHERE file_id = ?",
-      tmpId
-    );
-    durableObject.sql.exec(
-      "DELETE FROM file_tags WHERE path_id = ?",
-      tmpId
-    );
-    durableObject.sql.exec(
-      "DELETE FROM files WHERE file_id = ?",
-      tmpId
-    );
+    dropTmpRowAfterVersionCommit(durableObject, tmpId, {
+      hasChunks: true,
+    });
   }
   await applyCopySideEffects(durableObject, userId, pathId, opts, now, srcRow.file_id);
 }
