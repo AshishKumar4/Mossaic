@@ -23,24 +23,12 @@ interface E {
 const E = env as unknown as E;
 const NS = "default";
 
-import { signup as signupHelper, mintVfsToken } from "./_helpers";
-
-// Local shape preserved (`{ userId, token }`) so existing callers
-// don't need rewriting; the helper returns `{ userId, jwt }`.
-async function signup(email: string): Promise<{
-  userId: string;
-  token: string;
-}> {
-  const r = await signupHelper(email);
-  return { userId: r.userId, token: r.jwt };
-}
-
-const mintVfsBearer = mintVfsToken;
+import { signup, mintVfsToken as mintVfsBearer } from "./_helpers";
 
 describe("DELETE /api/auth/account", () => {
   it("D1 — wipes file rows + folders + quota on the data DO", async () => {
     const email = "delete-d1@test.example";
-    const { userId, token: sessionJwt } = await signup(email);
+    const { userId, jwt: sessionJwt } = await signup(email);
 
     // Write a small file via canonical VFS.
     const vfsToken = await mintVfsBearer(sessionJwt);
@@ -115,7 +103,7 @@ describe("DELETE /api/auth/account", () => {
 
   it("D2 — login with the same credentials returns 401 after delete", async () => {
     const email = "delete-d2@test.example";
-    const { token: sessionJwt } = await signup(email);
+    const { jwt: sessionJwt } = await signup(email);
 
     const delRes = await SELF.fetch("https://test/api/auth/account", {
       method: "DELETE",
@@ -133,7 +121,7 @@ describe("DELETE /api/auth/account", () => {
 
   it("D3 — idempotent on a second call", async () => {
     const email = "delete-d3@test.example";
-    const { token: sessionJwt } = await signup(email);
+    const { jwt: sessionJwt } = await signup(email);
 
     const first = await SELF.fetch("https://test/api/auth/account", {
       method: "DELETE",
