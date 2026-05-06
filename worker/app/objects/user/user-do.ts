@@ -60,6 +60,52 @@ export class UserDO extends UserDOCore {
     return super.fetch(request);
   }
 
+  /**
+   * Override Core's alarm to chain through the App-side search-index
+   * reconciler (Phase 23 Blindspot fix). Core's alarm sweeps tmp
+   * upload rows + expired multipart sessions; the App layer adds a
+   * sweep of `indexed_at IS NULL` files to catch cases where the
+   * SPA crashed between `multipart/finalize` and the index POST.
+   *
+   * The reconciler is best-effort: any error is logged and swallowed
+   * so it never blocks Core's alarm reschedule logic.
+   */
+  override async alarm(): Promise<void> {
+    await super.alarm();
+    try {
+      const { reconcileUnindexedFiles } = await import(
+        "../../routes/search"
+      );
+      const scope = (this as unknown as {
+        loadScope(): { tenant: string; sub?: string } | null;
+      }).loadScope();
+      if (scope === null) return;
+      const userId =
+        scope.sub !== undefined ? `${scope.tenant}::${scope.sub}` : scope.tenant;
+      const env = this.envPublic as unknown as EnvApp;
+      const { reconciled } = await reconcileUnindexedFiles(env, userId, 25);
+      if (reconciled > 0) {
+        // Re-arm a soonish alarm so we drain backlog without
+        // waiting for the next ambient tick. Core's alarm
+        // already sets a 60s reschedule when its own batches
+        // fill, so this is the AT-LEAST cadence; it's safe to
+        // also set here because the storage API takes the
+        // earlier of competing alarms.
+        const cur = await this.ctx.storage.getAlarm();
+        const target = Date.now() + 60_000;
+        if (cur === null || cur > target) {
+          await this.ctx.storage.setAlarm(target);
+        }
+      }
+    } catch (err) {
+      console.warn(
+        `index reconciler alarm hook failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+    }
+  }
+
   // ── App-only RPCs ────────────────────────────────────────────────
   //
   // All methods below are TYPED RPCs callable from App routes via
@@ -337,6 +383,225 @@ export class UserDO extends UserDOCore {
     return getQuota(this, userId);
   }
 
+  // ── Search-index reconciler (Phase 23 Blindspot fix) ──────────────
+  //
+  // The SPA's POST /api/index/file is fire-and-forget on
+  // `executionCtx.waitUntil`. If the SPA crashes between
+  // `multipart/finalize` and the index POST, OR if the worker isolate
+  // is evicted mid-`indexFile`, the file lands in canonical VFS but
+  // is never search-indexed → silent search miss for the file's
+  // lifetime.
+  //
+  // The reconciler closes the gap: every committed file gets an
+  // `indexed_at` timestamp on success; periodic alarm sweeps the
+  // `indexed_at IS NULL` set and re-fires `indexFile`.
+
+  /**
+   * Mark a file as successfully indexed. Called from `indexFile`
+   * after both text-space and CLIP-space (when applicable) upserts
+   * complete without error.
+   */
+  async appMarkFileIndexed(fileId: string): Promise<void> {
+    this.ensureInit();
+    this.sql.exec(
+      "UPDATE files SET indexed_at = ? WHERE file_id = ?",
+      Date.now(),
+      fileId
+    );
+  }
+
+  /**
+   * Return up to `limit` files that are committed (status='complete')
+   * but have not yet been search-indexed. Ordered oldest-first to
+   * give freshly-uploaded files some grace before the reconciler
+   * picks them up; this keeps reconciler load low under steady-state
+   * (where most files index promptly via the SPA callback).
+   */
+  async appListUnindexedFiles(
+    userId: string,
+    limit: number
+  ): Promise<
+    Array<{
+      file_id: string;
+      file_name: string;
+      mime_type: string;
+      file_size: number;
+    }>
+  > {
+    this.ensureInit();
+    const rows = this.sql
+      .exec(
+        `SELECT file_id, file_name, mime_type, file_size
+         FROM files
+         WHERE user_id = ?
+           AND status = 'complete'
+           AND indexed_at IS NULL
+         ORDER BY created_at ASC
+         LIMIT ?`,
+        userId,
+        Math.min(Math.max(1, limit), 100)
+      )
+      .toArray() as Array<{
+        file_id: string;
+        file_name: string;
+        mime_type: string;
+        file_size: number;
+      }>;
+    return rows;
+  }
+
+  // ── Account deletion ─────────────────────────────────────────────
+  //
+  // Two-DO purge: the data DO (`vfs:default:<userId>`) holds files,
+  // folders, quota, yjs state, and dispatches chunk-GC RPCs to all
+  // ShardDOs that hold this user's bytes. The auth DO (`auth:<email>`)
+  // holds the password hash. The route layer is responsible for
+  // calling BOTH — we expose the two halves as separate typed RPCs
+  // so the route can sequence them.
+  //
+  // Idempotent: re-running on an already-wiped DO is a no-op (all
+  // SELECTs return empty; the RPC reports 0 affected rows).
+
+  /**
+   * Wipe ALL data for a tenant from this UserDO. Hard-deletes every
+   * file row through the canonical `hardDeleteFileRow` path so chunks
+   * are dispatched to ShardDOs for refcount-decrement and eventual
+   * sweep. Drops folders, file_versions, file_tags, file_variants,
+   * yjs_oplog/yjs_meta, vfs_dirent, multipart staging, and zeroes out
+   * the quota row.
+   *
+   * SAFETY: callable only with the userId already authenticated by
+   * the App route. The DO has no concept of admin keys — it trusts
+   * its caller (the App route's authMiddleware).
+   *
+   * Returns the count of file rows + folder rows + version rows
+   * removed for verification by the caller.
+   */
+  async appWipeAccountData(userId: string): Promise<{
+    filesRemoved: number;
+    foldersRemoved: number;
+    versionsRemoved: number;
+    chunksRemovedFromShards: number;
+  }> {
+    this.ensureInit();
+
+    // Lazy import to keep the App-side bundle's Core dependency
+    // explicit. `hardDeleteFileRow` lives in core; we call it with
+    // the canonical (userId, scope) pair — scope is reconstructed
+    // from the DO's persisted scope row.
+    const { hardDeleteFileRow } = await import(
+      "@core/objects/user/vfs/write-commit"
+    );
+
+    // Reconstruct the scope. For App tenants we know it's
+    // (ns="default", tenant=userId, sub=undefined) — that's how
+    // `auth-bridge` mints the VFS token (see
+    // `worker/app/routes/auth.ts:155`). The `vfs_meta` row may not
+    // exist if the DO is brand-new and never had a VFS call run; in
+    // that case there's nothing to wipe and we short-circuit.
+    const scope = { ns: "default", tenant: userId } as const;
+
+    // Pull every file_id (including soft-deleted and uploading rows
+    // — wipe means EVERYTHING). hardDeleteFileRow handles each.
+    const fileRows = this.sql
+      .exec(
+        "SELECT file_id FROM files WHERE user_id = ?",
+        userId
+      )
+      .toArray() as { file_id: string }[];
+
+    let chunksRemoved = 0;
+    for (const { file_id } of fileRows) {
+      try {
+        // Best-effort: count chunks before delete for telemetry.
+        const c = this.sql
+          .exec(
+            "SELECT COUNT(*) AS n FROM file_chunks WHERE file_id = ?",
+            file_id
+          )
+          .toArray()[0] as { n: number } | undefined;
+        if (c) chunksRemoved += c.n;
+        await hardDeleteFileRow(this, userId, scope, file_id);
+      } catch {
+        // Continue purging even if one file's shard fan-out fails;
+        // worst case is a small chunk-orphan that the alarm sweeper
+        // catches on the next tick.
+      }
+    }
+
+    // Folder rows.
+    const folderRowCount = (
+      this.sql
+        .exec("SELECT COUNT(*) AS n FROM folders WHERE user_id = ?", userId)
+        .toArray()[0] as { n: number }
+    ).n;
+    this.sql.exec("DELETE FROM folders WHERE user_id = ?", userId);
+
+    // Version rows.
+    let versionRowCount = 0;
+    try {
+      versionRowCount = (
+        this.sql
+          .exec(
+            "SELECT COUNT(*) AS n FROM file_versions WHERE user_id = ?",
+            userId
+          )
+          .toArray()[0] as { n: number }
+      ).n;
+      this.sql.exec("DELETE FROM file_versions WHERE user_id = ?", userId);
+    } catch {
+      // file_versions may not exist on older schemas; ignore.
+    }
+
+    // Tags / variants / dirents — best-effort drops.
+    for (const sql of [
+      "DELETE FROM file_tags WHERE user_id = ?",
+      "DELETE FROM file_variants WHERE user_id = ?",
+      "DELETE FROM vfs_dirent WHERE user_id = ?",
+      "DELETE FROM yjs_oplog WHERE user_id = ?",
+      "DELETE FROM yjs_meta WHERE user_id = ?",
+      "DELETE FROM upload_sessions WHERE user_id = ?",
+    ]) {
+      try {
+        this.sql.exec(sql, userId);
+      } catch {
+        // Table may not exist (schema-version-dependent); ignore.
+      }
+    }
+
+    // Quota: zero out (don't drop the row — keeps schema invariants
+    // if the same userId ever signs up again on this DO instance,
+    // though in practice the email→userId mapping makes that
+    // impossible).
+    this.sql.exec(
+      "UPDATE quota SET storage_used = 0, file_count = 0, pool_size = 32 WHERE user_id = ?",
+      userId
+    );
+
+    return {
+      filesRemoved: fileRows.length,
+      foldersRemoved: folderRowCount,
+      versionsRemoved: versionRowCount,
+      chunksRemovedFromShards: chunksRemoved,
+    };
+  }
+
+  /**
+   * Wipe the auth row on the auth DO. Called against the
+   * `auth:<email>` DO; drops the password hash + auth identity.
+   * Idempotent — returns false if no row matched.
+   */
+  async appWipeAuthRow(email: string): Promise<{ removed: boolean }> {
+    this.ensureInit();
+    const before = (
+      this.sql
+        .exec("SELECT COUNT(*) AS n FROM auth WHERE email = ?", email)
+        .toArray()[0] as { n: number }
+    ).n;
+    this.sql.exec("DELETE FROM auth WHERE email = ?", email);
+    return { removed: before > 0 };
+  }
+
   // ── Internal aggregator ──────────────────────────────────────────
 
   private getUserStats(userId: string): UserStats {
@@ -351,8 +616,14 @@ export class UserDO extends UserDOCore {
             storage_used: number;
             storage_limit: number;
             file_count: number;
+            pool_size: number;
           })
-        : { storage_used: 0, storage_limit: 107374182400, file_count: 0 };
+        : {
+            storage_used: 0,
+            storage_limit: 107374182400,
+            file_count: 0,
+            pool_size: 32,
+          };
 
     // Files by status
     const statusRows = this.sql
@@ -434,6 +705,7 @@ export class UserDO extends UserDOCore {
       totalFiles: Math.max(actualFileCount, quota.file_count),
       totalStorageUsed: quota.storage_used,
       quotaLimit: quota.storage_limit,
+      poolSize: quota.pool_size ?? 32,
       filesByStatus,
       mimeDistribution,
       recentUploads,

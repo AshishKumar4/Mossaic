@@ -571,6 +571,28 @@ export class UserDOCore extends DurableObject<Env> {
       // column already exists
     }
 
+    // Phase 23 Blindspot fix: indexed_at marks files that have been
+    // search-indexed (text+CLIP via `indexFile` in worker/app/routes/
+    // search.ts). NULL = not yet indexed. The reconciler alarm
+    // (`runIndexReconcile`) sweeps NULL rows on a periodic cadence
+    // and re-queues them. Pre-fix, if the SPA crashed between
+    // `multipart/finalize` and `POST /api/index/file` the file
+    // landed in canonical VFS but was never indexed → silent search
+    // miss for the lifetime of the file.
+    try {
+      this.sql.exec("ALTER TABLE files ADD COLUMN indexed_at INTEGER");
+    } catch {
+      // column already exists
+    }
+    // Sparse index — most files are indexed within seconds of finalize,
+    // so the reconciler scan should be fast: the partial index makes
+    // `WHERE indexed_at IS NULL` an index-only scan.
+    this.sql.exec(`
+      CREATE INDEX IF NOT EXISTS idx_files_indexed_at_null
+        ON files(file_id)
+        WHERE indexed_at IS NULL AND status = 'complete'
+    `);
+
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS file_tags (
         path_id   TEXT NOT NULL,
@@ -653,8 +675,14 @@ export class UserDOCore extends DurableObject<Env> {
     // - Composite PK lets the same file carry multiple renderer
     //   strategies (e.g. a video could have both a "video-poster" thumb
     //   AND a "waveform" medium).
-    // - `chunk_hash` is content-addressed (SHA-256 of variant bytes) so
-    //   identical inputs across users dedupe to one physical chunk.
+    // - `chunk_hash` is content-addressed (SHA-256 of variant bytes).
+    //   Per-shard dedup fires inside `writeChunkInternal`
+    //   (`shard-do.ts:457`) when two writes land on the same shard for
+    //   the same hash. Cross-user/cross-file dedup is NOT achieved by
+    //   construction: `placeChunk` keys on `(userId, fileId,
+    //   chunkIndex)` not on hash, so identical bytes from different
+    //   files generally route to different shards. Same-file replay
+    //   (idempotent retry) is the realistic dedup path.
     // - `ON DELETE CASCADE` removes variant rows when the parent
     //   `files` row is hard-deleted; chunk_refs cleanup is dispatched
     //   by `vfsUnlink` (see worker/core/objects/user/vfs/write-commit.ts).
@@ -1849,6 +1877,16 @@ export class UserDOCore extends DurableObject<Env> {
     this.gateVfs(scope);
     const { vfsListFiles } = await import("./list-files");
     return vfsListFiles(this, scope, opts);
+  }
+
+  async vfsFileInfo(
+    scope: VFSScope,
+    path: string,
+    opts?: { includeStat?: boolean; includeMetadata?: boolean }
+  ): Promise<import("./list-files").ListFilesItemRaw> {
+    this.gateVfs(scope);
+    const { vfsFileInfo } = await import("./list-files");
+    return vfsFileInfo(this, scope, path, opts);
   }
 
   // ── yjs-mode primitives ─────────────────────────────────────

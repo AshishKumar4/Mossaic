@@ -25,6 +25,7 @@ import {
   findLiveFile,
   folderExists,
   poolSizeFor,
+  recordWriteUsage,
   resolveParent,
   userIdFor,
 } from "./helpers";
@@ -595,6 +596,11 @@ async function commitInlineTier(
     plan.now,
     plan.encryption
   );
+  // Record bytes against quota + grow pool size if we crossed a 5 GB
+  // boundary. Inline tier is always small (≤16 KB) so growth here is
+  // accounting-only — but it MUST run because the tenant's first
+  // write might be inline + push file_count from 0 → 1.
+  recordWriteUsage(durableObject, plan.userId, data.byteLength, 1);
 }
 
 /**
@@ -710,6 +716,11 @@ async function commitChunkedTier(
     plan.now,
     plan.encryption
   );
+  // Record bytes against quota + grow pool size on 5 GB boundary
+  // crossings. The next write (or the next chunk PUT in a brand-new
+  // multipart session — chunk PUTs in the SAME session use the
+  // token-frozen poolSize by design) will see the larger pool.
+  recordWriteUsage(durableObject, plan.userId, data.byteLength, 1);
 }
 
 export async function vfsWriteFile(

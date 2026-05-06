@@ -16,6 +16,7 @@ export {
   statForResolved,
   resolveParent,
   poolSizeFor,
+  recordWriteUsage,
   folderExists,
   findLiveFile,
   type ResolvedHit,

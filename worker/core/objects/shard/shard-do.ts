@@ -581,6 +581,50 @@ export class ShardDO extends DurableObject<Env> {
   }
 
   /**
+   * Telemetry RPC (Phase 23 audit Claim 4).
+   *
+   * Returns the bytes currently stored on this shard, the count of
+   * unique chunks (post-dedup), and a soft-cap value for monitoring.
+   * **This is observability only — there is no enforcement here.**
+   * The architecture intentionally lets the SQLite ceiling (~10 GB
+   * per DO) be the hard backstop and relies on `recordWriteUsage`
+   * (`worker/core/objects/user/vfs/helpers.ts:376`) growing the
+   * tenant's pool BEFORE shards fill, so chunks fan out across more
+   * shards rather than concentrating on the original 32.
+   *
+   * Operators can poll this RPC across all shards in a tenant to:
+   *   - Detect skewed chunk distribution (one shard at 90%, others
+   *     at 5%) — a sign that pool growth lagged a burst write.
+   *   - Project capacity ahead of the SQLite ceiling and provision
+   *     the tenant a higher `quota.storage_limit` if needed.
+   *   - Feed dashboards / alerting (Cloudflare Workers Analytics
+   *     Engine, custom KV-backed metrics, etc.).
+   *
+   * Read-only; safe to call concurrently with writes.
+   */
+  async getStorageBytes(): Promise<{
+    bytesStored: number;
+    uniqueChunks: number;
+    softCapBytes: number;
+  }> {
+    this.ensureInit();
+    const row = this.sql
+      .exec(
+        "SELECT COUNT(*) AS unique_chunks, COALESCE(SUM(size), 0) AS bytes FROM chunks WHERE deleted_at IS NULL"
+      )
+      .toArray()[0] as { unique_chunks: number; bytes: number } | undefined;
+    // Soft cap surfaced for monitoring. The hard cap is workerd's
+    // SQLite limit (~10 GB) — we publish 9 GB so dashboards can flag
+    // approach-to-limit before the runtime starts refusing writes.
+    const SOFT_CAP_BYTES = 9 * 1024 * 1024 * 1024;
+    return {
+      bytesStored: row ? row.bytes : 0,
+      uniqueChunks: row ? row.unique_chunks : 0,
+      softCapBytes: SOFT_CAP_BYTES,
+    };
+  }
+
+  /**
    * Drop refs for a fileId. For each ref: delete the chunk_refs row,
    * decrement ref_count, soft-mark with `deleted_at` if it hit 0. The
    * alarm handler does the actual hard-delete after a grace period.

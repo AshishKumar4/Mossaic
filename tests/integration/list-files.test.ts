@@ -93,6 +93,25 @@ describe("listFiles basic (L1, L2, L7, L9)", () => {
       "/photos/b.jpg",
     ]);
   });
+
+  it("fileInfo returns one file with stat, metadata, and tags", async () => {
+    const tenant = "p12-file-info";
+    const vfs = createVFS(envFor(), { tenant });
+    await vfs.mkdir("/docs");
+    await vfs.writeFile("/docs/report.md", "hello", {
+      metadata: { title: "Report" },
+      tags: ["seal:output"],
+    });
+
+    const info = await vfs.fileInfo("/docs/report.md", { includeMetadata: true });
+
+    expect(info.path).toBe("/docs/report.md");
+    expect(info.stat?.isFile()).toBe(true);
+    expect(info.metadata).toEqual({ title: "Report" });
+    expect(info.tags).toEqual(["seal:output"]);
+    await expect(vfs.fileInfo("/docs")).rejects.toMatchObject({ code: "EISDIR" });
+    await expect(vfs.fileInfo("/docs/missing.md")).rejects.toMatchObject({ code: "ENOENT" });
+  });
 });
 
 describe("cursor security (L3, L4)", () => {

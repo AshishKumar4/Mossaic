@@ -2,8 +2,12 @@ import { describe, it, expect } from "vitest";
 import {
   signJWT,
   signVFSToken,
+  signVFSMultipartToken,
+  signVFSDownloadToken,
   verifyJWT,
   verifyVFSToken,
+  verifyVFSMultipartToken,
+  verifyVFSDownloadToken,
   VFSConfigError,
 } from "@core/lib/auth";
 import type { EnvCore as Env } from "@shared/types";
@@ -226,5 +230,105 @@ describe("Graceful JWT_SECRET rotation (multi-secret verify)", () => {
       await verifyJWT(envWith(newSecret), tokenFresh)
     ).not.toBeNull();
     expect(await verifyJWT(envWith(oldSecret), tokenFresh)).toBeNull();
+  });
+
+  /**
+   * Phase 23 Fix 2 — extend rotation coverage to multipart-session
+   * and download tokens. Pre-fix, both verifiers called `getSecret`
+   * directly and rejected previous-secret tokens, so rotating
+   * JWT_SECRET would kill in-flight multipart uploads and pre-minted
+   * download URLs. The fix routes both through `verifyAgainstSecrets`.
+   */
+
+  it("verifyVFSMultipartToken accepts a previous-secret session token during rotation", async () => {
+    const oldSecret = "secret-old-aaaaaaaaaaaaaaaaaaa";
+    const newSecret = "secret-new-bbbbbbbbbbbbbbbbbbb";
+    const { token } = await signVFSMultipartToken(envWith(oldSecret), {
+      uploadId: "u-mp-1",
+      ns: "default",
+      tn: "alice",
+      poolSize: 32,
+      totalChunks: 4,
+      chunkSize: 1_048_576,
+      totalSize: 4_194_304,
+    });
+    const rotEnv = envWith(newSecret, oldSecret);
+    const verified = await verifyVFSMultipartToken(rotEnv, token);
+    expect(verified).not.toBeNull();
+    expect(verified!.uploadId).toBe("u-mp-1");
+    expect(verified!.tn).toBe("alice");
+    expect(verified!.poolSize).toBe(32);
+  });
+
+  it("verifyVFSMultipartToken rejects after PREVIOUS is removed (rotation complete)", async () => {
+    const oldSecret = "secret-old-aaaaaaaaaaaaaaaaaaa";
+    const newSecret = "secret-new-bbbbbbbbbbbbbbbbbbb";
+    const { token } = await signVFSMultipartToken(envWith(oldSecret), {
+      uploadId: "u-mp-2",
+      ns: "default",
+      tn: "alice",
+      poolSize: 32,
+      totalChunks: 1,
+      chunkSize: 1024,
+      totalSize: 1024,
+    });
+    // Rotation finished, previous unset — old-secret tokens dead.
+    const verified = await verifyVFSMultipartToken(envWith(newSecret), token);
+    expect(verified).toBeNull();
+  });
+
+  it("verifyVFSDownloadToken accepts a previous-secret download token during rotation", async () => {
+    const oldSecret = "secret-old-aaaaaaaaaaaaaaaaaaa";
+    const newSecret = "secret-new-bbbbbbbbbbbbbbbbbbb";
+    const { token } = await signVFSDownloadToken(envWith(oldSecret), {
+      fileId: "f-1",
+      ns: "default",
+      tn: "alice",
+    });
+    const rotEnv = envWith(newSecret, oldSecret);
+    const verified = await verifyVFSDownloadToken(rotEnv, token);
+    expect(verified).not.toBeNull();
+    expect(verified!.fileId).toBe("f-1");
+    expect(verified!.tn).toBe("alice");
+  });
+
+  it("verifyVFSDownloadToken rejects after PREVIOUS is removed", async () => {
+    const oldSecret = "secret-old-aaaaaaaaaaaaaaaaaaa";
+    const newSecret = "secret-new-bbbbbbbbbbbbbbbbbbb";
+    const { token } = await signVFSDownloadToken(envWith(oldSecret), {
+      fileId: "f-2",
+      ns: "default",
+      tn: "alice",
+    });
+    const verified = await verifyVFSDownloadToken(envWith(newSecret), token);
+    expect(verified).toBeNull();
+  });
+
+  it("multipart tokens cannot be replayed as download tokens (scope binding)", async () => {
+    const secret = "secret-shared-aaaaaaaaaaaaaaaaaaaa";
+    const { token: mpToken } = await signVFSMultipartToken(envWith(secret), {
+      uploadId: "u-mp-3",
+      ns: "default",
+      tn: "alice",
+      poolSize: 32,
+      totalChunks: 1,
+      chunkSize: 1024,
+      totalSize: 1024,
+    });
+    // The multipart token is correctly signed but has scope=vfs-mp;
+    // the download verifier rejects on scope mismatch.
+    const asDl = await verifyVFSDownloadToken(envWith(secret), mpToken);
+    expect(asDl).toBeNull();
+  });
+
+  it("download tokens cannot be replayed as multipart tokens (scope binding)", async () => {
+    const secret = "secret-shared-aaaaaaaaaaaaaaaaaaaa";
+    const { token: dlToken } = await signVFSDownloadToken(envWith(secret), {
+      fileId: "f-3",
+      ns: "default",
+      tn: "alice",
+    });
+    const asMp = await verifyVFSMultipartToken(envWith(secret), dlToken);
+    expect(asMp).toBeNull();
   });
 });

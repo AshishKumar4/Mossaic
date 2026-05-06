@@ -52,6 +52,7 @@ import {
   userIdFor,
   resolveParent,
   poolSizeFor,
+  recordWriteUsage,
   folderExists,
 } from "./vfs-ops";
 import {
@@ -690,7 +691,13 @@ export async function vfsFinalizeMultipart(
     session.leaf
   );
 
-  // 11. Mark session finalized + clear staging across touched shards.
+  // 11. Record bytes against quota + grow pool size if we crossed a
+  //     5 GB boundary. Must run AFTER commitRename succeeds (we own
+  //     the row) but BEFORE marking the session finalized so a
+  //     post-finalize crash doesn't double-count on retry.
+  recordWriteUsage(durableObject, userId, totalSize, 1);
+
+  // 12. Mark session finalized + clear staging across touched shards.
   durableObject.sql.exec(
     "UPDATE upload_sessions SET status = 'finalized' WHERE upload_id = ?",
     uploadId
@@ -708,7 +715,7 @@ export async function vfsFinalizeMultipart(
     })
   );
 
-  // 12. Reconstruct the absolute path from (parent_id, leaf) so the
+  // 13. Reconstruct the absolute path from (parent_id, leaf) so the
   //     route layer can dispatch follow-on side effects
   //     (preview pre-gen via ctx.waitUntil) without re-querying.
   const finalizedPath = reconstructFinalizedPath(

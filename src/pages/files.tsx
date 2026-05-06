@@ -572,6 +572,7 @@ function EnhancedFileRow({
           <Button
             variant="ghost"
             size="icon"
+            aria-label="Download"
             className="h-8 w-8"
             onClick={() => onDownload(file)}
             title="Download"
@@ -582,6 +583,7 @@ function EnhancedFileRow({
         <Button
           variant="ghost"
           size="icon"
+          aria-label="Delete"
           className="h-8 w-8 hover:text-destructive"
           onClick={() => {
             if (confirm("Delete this file?")) onDelete(file);

@@ -347,9 +347,14 @@ export async function verifyVFSMultipartToken(
   env: Env,
   token: string
 ): Promise<MultipartSessionTokenPayload | null> {
-  const secret = getSecret(env);
+  // Multi-secret aware (Phase 23 Fix 2). Tokens minted under the OLD
+  // JWT_SECRET stay valid through a rotation window so in-flight
+  // multipart sessions don't get killed when an operator rotates the
+  // signing key — see `docs/operations.md` §6.10.
+  const result = await verifyAgainstSecrets(env, token);
+  if (result === null) return null;
   try {
-    const { payload } = await jwtVerify(token, secret);
+    const { payload } = result;
     if (payload.scope !== VFS_MP_SCOPE) return null;
     if (typeof payload.uploadId !== "string" || payload.uploadId.length === 0)
       return null;
@@ -431,14 +436,22 @@ export async function signVFSDownloadToken(
   return { token, expiresAtMs };
 }
 
-/** Verify a download token. */
+/**
+ * Verify a download token.
+ *
+ * Multi-secret aware (Phase 23 Fix 2). Pre-minted download URLs
+ * (e.g. shareable thumbnail links handed to a CDN) stay valid
+ * through a JWT_SECRET rotation window — see `docs/operations.md`
+ * §6.10.
+ */
 export async function verifyVFSDownloadToken(
   env: Env,
   token: string
 ): Promise<DownloadTokenPayload | null> {
-  const secret = getSecret(env);
+  const result = await verifyAgainstSecrets(env, token);
+  if (result === null) return null;
   try {
-    const { payload } = await jwtVerify(token, secret);
+    const { payload } = result;
     if (payload.scope !== VFS_DL_SCOPE) return null;
     if (typeof payload.fileId !== "string" || payload.fileId.length === 0)
       return null;

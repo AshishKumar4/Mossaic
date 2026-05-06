@@ -40,6 +40,7 @@ export {
   type WriteFileOpts,
   type CopyFileOpts,
   type PatchMetadataOpts,
+  type FileInfoOpts,
   type ListFilesOpts,
   type ListFilesItem,
   type ListFilesPage,

@@ -292,15 +292,24 @@ export async function preGenerateStandardVariants(
       // no observable change beyond a wasted render — acceptable on
       // the rare double-finalize path; on the hot path each variant
       // is fresh.
-      await renderAndStoreVariant(
-        durableObject,
-        scope,
-        args.fileId,
-        args.path,
-        args.mimeType,
-        args.fileName,
-        args.fileSize,
-        variant
+      //
+      // Phase 23 audit Claim 7: gate through `withRenderSlot` so
+      // concurrent finalize bursts don't fan out >MAX_CONCURRENT_RENDERS
+      // simultaneous Cloudflare Images binding calls — that path will
+      // 429 under sustained load and the silent-drop in this catch
+      // would manifest as user-visible "no preview" on first gallery
+      // click. The slot bound is module-global per worker isolate.
+      await withRenderSlot(() =>
+        renderAndStoreVariant(
+          durableObject,
+          scope,
+          args.fileId,
+          args.path,
+          args.mimeType,
+          args.fileName,
+          args.fileSize,
+          variant
+        )
       );
     } catch (err) {
       // Best-effort. Log to console; never throw out of waitUntil.
@@ -311,4 +320,63 @@ export async function preGenerateStandardVariants(
       );
     }
   }
+}
+
+/**
+ * Concurrency bound for in-flight preview renders within a single
+ * worker isolate (Phase 23 audit Claim 7).
+ *
+ * Cloudflare Images binding (and the JS-only renderer code paths) all
+ * compete for the same per-isolate CPU + bound-binding budget. Without
+ * a bound, a bulk-import of 200 photos finalizing on background
+ * `ctx.waitUntil` slots would spawn 200 concurrent `renderAndStoreVariant`
+ * promises × 3 variants = 600 in-flight renders; Cloudflare Images
+ * starts returning 429, the renderer throws, and the catch in
+ * `preGenerateStandardVariants` silently drops the variant. The user
+ * lands on a gallery with a sea of broken thumbnails and the only
+ * remediation is on-demand re-render (cold-path latency +800ms each).
+ *
+ * 6 was picked from the audit recommendation (4-8): an isolate
+ * comfortably handles 6 concurrent IMAGES binding calls, which
+ * corresponds to roughly 2 fully-rendering files at a time (3 variants
+ * each). For very small files / fast renders the bound just gates the
+ * theoretical max — average concurrency stays much lower.
+ *
+ * Implementation: a Promise-chain semaphore. We don't pull in a
+ * dependency; the `slots` array tracks in-flight Promises and a new
+ * caller awaits the earliest-completing slot when at capacity. Promises
+ * are GC'd after settling so the array doesn't grow.
+ */
+const MAX_CONCURRENT_RENDERS = 6;
+let inFlight = 0;
+const waiters: Array<() => void> = [];
+
+async function withRenderSlot<T>(fn: () => Promise<T>): Promise<T> {
+  if (inFlight >= MAX_CONCURRENT_RENDERS) {
+    await new Promise<void>((resolve) => waiters.push(resolve));
+  }
+  inFlight++;
+  try {
+    return await fn();
+  } finally {
+    inFlight--;
+    const next = waiters.shift();
+    if (next !== undefined) next();
+  }
+}
+
+/**
+ * Test-only: read the current concurrency state. Exported for the
+ * `tests/integration/preview-concurrency.test.ts` regression suite.
+ */
+export function _renderSlotStateForTests(): {
+  inFlight: number;
+  waiting: number;
+  max: number;
+} {
+  return {
+    inFlight,
+    waiting: waiters.length,
+    max: MAX_CONCURRENT_RENDERS,
+  };
 }
