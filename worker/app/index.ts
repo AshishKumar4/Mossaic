@@ -96,7 +96,27 @@ app.route("/api/vfs", vfsRoutes);
 // Health check
 app.get("/api/health", (c) => c.json({ status: "ok", timestamp: Date.now() }));
 
-// Fall through to ASSETS for non-API routes (SPA)
-app.all("*", (c) => c.env.ASSETS.fetch(c.req.raw));
+// Fall through to ASSETS for non-API routes (SPA).
+//
+// Phase 50 hardening: unmatched `/api/*` paths must NOT fall
+// through to ASSETS — that returned the SPA's index.html (200) on
+// a typo'd API URL, which is confusing for SDK consumers and
+// triggers a 500 in test-env where ASSETS is unbound. Now we
+// 404 cleanly for `/api/*`, and only non-API misses serve the SPA
+// shell. The fallback to a bare 404 when ASSETS itself is missing
+// (as in tests) keeps the route deterministic across environments.
+app.all("*", (c) => {
+  const url = new URL(c.req.url);
+  if (url.pathname.startsWith("/api/")) {
+    return c.json({ error: "Not Found" }, 404);
+  }
+  if (
+    typeof (c.env as { ASSETS?: { fetch: (req: Request) => Promise<Response> } })
+      .ASSETS?.fetch !== "function"
+  ) {
+    return c.text("Not Found", 404);
+  }
+  return c.env.ASSETS.fetch(c.req.raw);
+});
 
 export default app;
