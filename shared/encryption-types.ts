@@ -1,5 +1,5 @@
 /**
- * Phase 15 — opt-in end-to-end encryption types.
+ * opt-in end-to-end encryption types.
  *
  * Pure type definitions. No runtime dependencies. Tree-shakeable.
  *
@@ -96,7 +96,7 @@ export interface EnvelopeParts {
   ct: Uint8Array;
 }
 
-/** Envelope format version. v1 corresponds to Phase 15. */
+/** Envelope format version. v1 corresponds to. */
 export const ENVELOPE_VERSION = 1;
 
 /** Plaintext sentinel — stored as version byte 0 for non-encrypted blobs. */

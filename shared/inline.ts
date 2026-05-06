@@ -2,8 +2,8 @@
  * Inline tier + per-method size caps.
  *
  * Files at or below INLINE_LIMIT are stored directly in `files.inline_data`
- * (set in Phase 3 write paths) and read back without any ShardDO subrequest
- * (Phase 2 read paths). This is the single biggest unlock for
+ * (set in write paths) and read back without any ShardDO subrequest
+ * (read paths). This is the single biggest unlock for
  * isomorphic-git's loose-object workload, where most blobs are < 1 KB.
  *
  * READFILE_MAX / WRITEFILE_MAX are the per-method caps enforced before

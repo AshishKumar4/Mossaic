@@ -11,6 +11,7 @@ export default defineConfig({
       "@": path.resolve(__dirname, "./src"),
       "@shared": path.resolve(__dirname, "./shared"),
       "@core": path.resolve(__dirname, "./worker/core"),
+      "@app": path.resolve(__dirname, "./worker/app"),
     },
   },
   server: {

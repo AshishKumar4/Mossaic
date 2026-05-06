@@ -1,5 +1,5 @@
 import { Hono, type Context } from "hono";
-import type { Env } from "@shared/types";
+import type { EnvApp as Env } from "@shared/types";
 import { signJWT, VFSConfigError } from "@core/lib/auth";
 
 const auth = new Hono<{ Bindings: Env }>();

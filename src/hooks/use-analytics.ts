@@ -1,6 +1,6 @@
 import { useState, useCallback, useEffect } from "react";
 import { api, ApiError } from "@/lib/api";
-import type { AnalyticsOverview } from "@shared/types";
+import type { AnalyticsOverview } from "@app/types";
 
 interface AnalyticsState {
   data: AnalyticsOverview | null;

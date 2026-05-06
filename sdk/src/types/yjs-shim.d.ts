@@ -1,5 +1,5 @@
 /**
- * Phase 14 — Yjs ambient module shim.
+ * Yjs ambient module shim.
  *
  * Workspace consumers that don't need live collaborative editing
  * may not install `yjs` or `y-protocols` (they're optional peer

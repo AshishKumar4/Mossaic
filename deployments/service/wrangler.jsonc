@@ -29,30 +29,17 @@
   "compatibility_date": "2026-03-01",
   "compatibility_flags": ["nodejs_compat"],
 
-  // Phase 11: esbuild path-alias config. Wrangler invokes esbuild
-  // for bundling and esbuild's `alias` map is keyed by FULL module
-  // specifier (no wildcard support; one entry per leaf module).
-  // The set below mirrors the `@shared/*` modules consumed by
-  // worker/core/. Adding a new shared/ file used from Core requires
-  // adding an entry here too. The production `wrangler.jsonc`
+  // esbuild path-alias config. Wrangler invokes esbuild for
+  // bundling; esbuild's `alias` map is keyed by FULL module
+  // specifier (no wildcard support). Only the @shared/* leaves
+  // actually imported by worker/core/ need entries — the rest
+  // of worker/core uses relative `../../../shared/...` paths
+  // which esbuild resolves natively. The production `wrangler.jsonc`
   // doesn't need this because the Cloudflare vite-plugin resolves
   // `@shared` automatically (see vite.config.ts).
   "alias": {
-    "@shared/placement": "../../shared/placement.ts",
-    "@shared/types": "../../shared/types.ts",
     "@shared/vfs-types": "../../shared/vfs-types.ts",
-    "@shared/crypto": "../../shared/crypto.ts",
-    "@shared/chunking": "../../shared/chunking.ts",
-    "@shared/inline": "../../shared/inline.ts",
-    "@shared/ino": "../../shared/ino.ts",
-    "@shared/vfs-paths": "../../shared/vfs-paths.ts",
-    "@shared/constants": "../../shared/constants.ts",
-    "@shared/embedding-types": "../../shared/embedding-types.ts",
-    "@shared/metadata-caps": "../../shared/metadata-caps.ts",
-    "@shared/metadata-validate": "../../shared/metadata-validate.ts",
-    "@shared/metadata-merge": "../../shared/metadata-merge.ts",
-    "@shared/encryption-types": "../../shared/encryption-types.ts",
-    "@shared/encryption": "../../shared/encryption.ts"
+    "@shared/encryption-types": "../../shared/encryption-types.ts"
   },
 
   "durable_objects": {

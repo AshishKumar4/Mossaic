@@ -175,7 +175,7 @@ E2E categories (≥58 SDK + ≥10 functional):
 | A — Auth & scope isolation | `tests/e2e/a-auth.test.ts` | 5 |
 | B — Basic file ops | `tests/e2e/b-fileops.test.ts` | 10 |
 | C — Streaming + Phase 13 metadata | `tests/e2e/c-streaming.test.ts` | 5 |
-| D — Phase 12 metadata/tags/copy/listFiles | `tests/e2e/d-phase12.test.ts` | 12 |
+| D — metadata/tags/copy/listFiles | `tests/e2e/d-metadata.test.ts` | 12 |
 | E — Versioning | `tests/e2e/e-versioning.test.ts` | 8 |
 | F — Yjs (over wss://) | `tests/e2e/f-yjs.test.ts` | 6 |
 | G — Tenant isolation | `tests/e2e/g-tenant-iso.test.ts` | 4 |

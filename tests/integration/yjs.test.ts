@@ -49,7 +49,7 @@ import {
   EINVAL,
   ENOENT,
 } from "../../sdk/src/index";
-import { VFS_MODE_YJS_BIT } from "../../sdk/src/yjs-mode-bit";
+import { VFS_MODE_YJS_BIT } from "@shared/constants";
 import { openYDoc } from "../../sdk/src/yjs";
 import { vfsUserDOName } from "@core/lib/utils";
 

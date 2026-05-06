@@ -1,5 +1,5 @@
 /**
- * @mossaic/sdk — Phase 16 multipart parallel transfer engine.
+ * @mossaic/sdk — multipart parallel transfer engine.
  *
  * BitTorrent-class throughput for VFS uploads & downloads. Splits a
  * source file into adaptive chunks, hashes each, and PUTs them in
@@ -10,7 +10,7 @@
  * Design invariants (preserved from server-side plan §1):
  *   1. UserDO touched only at session boundaries (`begin` + `finalize`).
  *   2. Per-chunk PUT does ONE ShardDO RPC; no UserDO involvement.
- *   3. Phase 15 encryption composes per-chunk: each plaintext chunk is
+ *  3. encryption composes per-chunk: each plaintext chunk is
  *      sealed independently and the envelope is what the server hashes.
  *   4. Backward-compatible: existing `writeFile`/`readFile` are
  *      preserved; this module is additive.
@@ -29,7 +29,7 @@ import type { HttpVFS } from "./http";
 import { mapServerError, MossaicUnavailableError } from "./errors";
 
 /**
- * Public client alias. The Phase 16 transfer engine is a method
+ * Public client alias. The transfer engine is a method
  * surface on top of `HttpVFS`; the alias makes the binding shape
  * intent clearer at call sites.
  */
@@ -78,7 +78,7 @@ export interface ParallelUploadOpts extends Omit<BeginUploadOpts, "size" | "sign
   /** Cancel the in-flight upload. Triggers `abortUpload` on the server. */
   signal?: AbortSignal;
   /**
-   * Optional per-chunk transformer. Phase 15 encryption uses this to
+   * Optional per-chunk transformer. encryption uses this to
    * seal each plaintext chunk into an envelope BEFORE the engine
    * hashes and PUTs it. Called once per chunk index, in arbitrary
    * order; must be deterministic given (idx, plaintext) — the same
@@ -108,7 +108,7 @@ export interface ParallelDownloadOpts {
   endgameMaxFanout?: number;
   signal?: AbortSignal;
   onProgress?: (e: ProgressEvent) => void;
-  /** Optional per-chunk transformer (e.g. Phase 15 unseal). */
+  /** Optional per-chunk transformer (e.g. unseal). */
   chunkTransform?: (
     envelope: Uint8Array,
     idx: number
@@ -230,7 +230,7 @@ function quantile(arr: number[], q: number): number {
 /**
  * High-level parallel upload. Splits `source` into chunks of the
  * server-authoritative size, runs an adaptive concurrency engine,
- * and triggers endgame mode in the tail. Phase 15 encryption is
+ * and triggers endgame mode in the tail. encryption is
  * supported via `opts.chunkTransform` (apply seal per-chunk) — the
  * engine treats the transformed bytes as opaque and the server
  * hashes whatever arrives, exactly as the plan §7 specifies.
@@ -543,7 +543,7 @@ function sleep(ms: number): Promise<void> {
 
 /**
  * Download a file in parallel, hash-verifying each chunk against the
- * server-supplied manifest. Phase 15 decryption flows via
+ * server-supplied manifest. decryption flows via
  * `opts.chunkTransform` (unseal per-chunk envelope).
  *
  * Strategy:
@@ -574,21 +574,13 @@ export async function parallelDownload(
     return new Uint8Array(0);
   }
 
-  // Patch the client's fileId→path resolver so `fetchChunkByHash`
-  // can route through `/api/vfs/readChunk`. v1 hack; v2 will replace
-  // with a typed `/readChunkByFileId` endpoint.
-  const priorResolver = client.fileIdToPath;
-  client.fileIdToPath = (id: string) =>
-    id === manifest.fileId ? path : priorResolver?.(id);
-
-  // For each chunk, fetch ?hash=… to the cacheable endpoint plus
-  // ?shard=… so the server can short-circuit without a manifest read.
-  // Compute placement client-side via the manifest the server
-  // already gave us — that's the chunk's authoritative shard.
-  // We also need the chunk's `shardIndex`; the manifest hides it
-  // (intentionally — see vfs-ops.ts:openManifest comment). Without
-  // it, we fall back to the regular readChunk path which does the
-  // lookup server-side.
+  // For each chunk, fetch via the cacheable per-chunk endpoint.
+  // The chunk's `shardIndex` is intentionally hidden by the manifest
+  // (see vfs-ops.ts:openManifest comment), so we route through the
+  // `/api/vfs/readChunk` endpoint which does the lookup server-side.
+  // `path` is captured per-call (no shared mutable state on the
+  // client) so concurrent `parallelDownload` calls on the same
+  // client are race-free.
   const initial = opts.concurrency?.initial ?? 4;
   const min = opts.concurrency?.min ?? 1;
   const max = opts.concurrency?.max ?? 64;
@@ -605,7 +597,7 @@ export async function parallelDownload(
   };
 
   // Pre-allocate per-chunk slots. When `chunkTransform` is used (e.g.
-  // Phase 15 unseal), each chunk's POST-transform size is unknown
+  // unseal), each chunk's POST-transform size is unknown
   // until the transform runs — envelopes are larger than plaintext.
   // We collect transformed-bytes into a per-index slot and concat at
   // the end. Without `chunkTransform`, we still concat per-index for
@@ -654,6 +646,7 @@ export async function parallelDownload(
           idx,
           ch.hash,
           dl.token,
+          path,
           signal
         );
         // Verify hash matches the manifest's claim. This is a cheap
@@ -739,14 +732,8 @@ export async function parallelDownload(
       await sleep(50);
     }
   })();
-  try {
-    await Promise.all(lanes);
-    await endgameLane;
-  } finally {
-    // Restore the client's resolver so concurrent downloads on the
-    // same client don't see each other's paths.
-    client.fileIdToPath = priorResolver;
-  }
+  await Promise.all(lanes);
+  await endgameLane;
   // Concatenate per-chunk slots in index order. When `chunkTransform`
   // is the identity, this matches `manifest.size`; when it shrinks
   // bytes (decrypt), the output is the post-transform size.
@@ -779,7 +766,7 @@ export async function parallelDownload(
  *    contiguous bytes.
  *  - Hash verification per chunk happens server-on-receive, exactly
  *    as in `parallelDownload`. A divergence aborts the stream.
- *  - Phase 15 encryption: `opts.chunkTransform` runs on every
+ * - encryption: `opts.chunkTransform` runs on every
  *    chunk before emit. Decryption is therefore concurrent with
  *    further downloads.
  *  - Backpressure: if the consumer reads slowly, the reorder
@@ -815,12 +802,8 @@ export async function parallelDownloadStream(
     });
   }
 
-  // Patch the resolver as parallelDownload does — preserves the
-  // routing-by-fileId fallback path inside the HTTP client.
-  const priorResolver = client.fileIdToPath;
-  client.fileIdToPath = (id: string) =>
-    id === manifest.fileId ? path : priorResolver?.(id);
-
+  // `path` is captured per-call (no shared mutable state on the
+  // client) so concurrent downloads on the same client are race-free.
   const initial = opts.concurrency?.initial ?? 4;
   const min = opts.concurrency?.min ?? 1;
   const max = opts.concurrency?.max ?? 64;
@@ -903,6 +886,7 @@ export async function parallelDownloadStream(
           idx,
           ch.hash,
           dl.token,
+          path,
           signal
         );
         const verify = await hashChunk(bytes);
@@ -1001,15 +985,11 @@ export async function parallelDownloadStream(
         } catch (err) {
           aborted = true;
           streamController?.error(err);
-        } finally {
-          client.fileIdToPath = priorResolver;
         }
       })();
     },
     cancel() {
       aborted = true;
-      // Restore the client resolver on cancel as well.
-      client.fileIdToPath = priorResolver;
     },
   });
 }

@@ -37,9 +37,9 @@ Run **all** of these from `/workspace/Mossaic` (or your local clone). Every box 
 ### 1.2 Build + tests + proofs (all green, no skips)
 
 - [ ] `pnpm install` (lockfile-only; should be a no-op in CI).
-- [ ] `pnpm test` — 270+ tests pass, 28+ files. **Zero** flakes tolerated; if a test fails, do not deploy.
+- [ ] `pnpm test` — 418 worker tests pass across 41 files; 44 cli unit tests pass. **Zero** flakes tolerated; if a test fails, do not deploy.
 - [ ] `npx tsc -b` — exit 0, zero diagnostics.
-- [ ] `npx wrangler deploy --dry-run` (App mode) — exit 0, prints binding list `MOSSAIC_USER`, `MOSSAIC_SHARD`, `SEARCH_DO`, and migration tags. (Phase 13: legacy `USER_DO`/`SHARD_DO` binding names are retired; `class_name`s `UserDO`/`ShardDO`/`SearchDO` are unchanged.)
+- [ ] `npx wrangler deploy --dry-run` (App mode) — exit 0, prints binding list `MOSSAIC_USER`, `MOSSAIC_SHARD`, `SEARCH_DO`, and migration tags. (legacy `USER_DO`/`SHARD_DO` binding names are retired; `class_name`s `UserDO`/`ShardDO`/`SearchDO` are unchanged.)
 - [ ] `npx wrangler deploy --dry-run -c deployments/service/wrangler.jsonc` (Service mode) — exit 0, prints bindings `MOSSAIC_USER`, `MOSSAIC_SHARD` only (no `SEARCH_DO`).
 - [ ] `pnpm lean:build` (or `lake build` in `lean/`) — succeeds. `bash lean/scripts/check-no-sorry.sh` reports zero `sorry` and zero project-level axioms.
 
@@ -69,7 +69,7 @@ Cloudflare DO storage has **no native point-in-time backup**. For tenants whose 
 
 - [ ] The previous deploy's wrangler ID is recorded (`wrangler deployments list` — pin the previous version's ID).
 - [ ] Previous code snapshot is on a tag (`git tag pre-<date>` before deploy).
-- [ ] **Schema rollback is one-way**: Phase 12 column adds (`metadata`, `user_visible`, `label`, etc. on `file_versions`) cannot be removed. Older code IGNORES newer columns, which is forward-compatible. See §5.6.
+- [ ] **Schema rollback is one-way**: column adds (`metadata`, `user_visible`, `label`, etc. on `file_versions`) cannot be removed. Older code IGNORES newer columns, which is forward-compatible. See §5.6.
 
 ### 1.7 Ship-day smoke
 
@@ -297,7 +297,7 @@ Subrequest budget per Mossaic invocation:
 7. Update operator workstations: `mossaic auth setup --secret <newvalue> --tenant <existing> --name <existing>`.
 8. Monitor 401 rate; spike + decay over the rollover window is expected.
 
-**Phase 13.5 rotation history**:
+**rotation history**:
 
 - 2026-04-29 — Service-mode (`mossaic-core`) only. App-mode (`mossaic`) untouched. Reason: deployed the new `/api/vfs/yjs/ws`, `/api/vfs/setYjsMode`, `/api/vfs/flushYjs`, and `/api/vfs/admin/setVersioning` HTTP routes; rotated the secret as part of the test-harness gating. Photo-app users unaffected.
 
@@ -325,14 +325,14 @@ Mossaic has no native cross-DO migration tool. Manual procedure:
 3. Replay rows in dependency order: `auth` → `quota` → `folders` (parent-first) → `files` → `file_versions` → `version_chunks` → `file_tags` → `chunk_refs` → `chunks`.
 4. Verify: count match, refcount match (`SUM(ref_count) == COUNT(chunk_refs)`), reachable via `vfs.readFile` for a sampled set.
 
-### 5.6 — Phase 12 schema corruption rollback
+### 5.6 — schema corruption rollback
 
-Phase 12 added columns: `files.metadata`, `files.has_tags`, `file_versions.label`, `file_versions.user_visible`, `file_versions.metadata`, plus the `file_tags` table and indexes `idx_files_parent_*`, `idx_file_tags_tag_mtime`.
+added columns: `files.metadata`, `files.has_tags`, `file_versions.label`, `file_versions.user_visible`, `file_versions.metadata`, plus the `file_tags` table and indexes `idx_files_parent_*`, `idx_file_tags_tag_mtime`.
 
 **Schema is additive only**. Older code IGNORES newer columns — forward-compatible by construction. So:
 
 - **Code rollback** (revert to a pre-Phase-12 commit): safe. New columns persist in storage but are unread by the older code. No data loss.
-- **Schema rollback** (drop Phase 12 columns): NOT supported in CF DO storage. SQLite 3.35+ has `ALTER TABLE DROP COLUMN` but CF's DO SQLite version is not pinned in the docs as supporting it. **Do not attempt** without CF support sign-off.
+- **Schema rollback** (drop columns): NOT supported in CF DO storage. SQLite 3.35+ has `ALTER TABLE DROP COLUMN` but CF's DO SQLite version is not pinned in the docs as supporting it. **Do not attempt** without CF support sign-off.
 
 **If the problem is a corrupt `metadata` JSON blob on a single file**:
 
@@ -365,7 +365,7 @@ Re-run `ensureInit()` afterward; indexes are `IF NOT EXISTS`-guarded so they sel
    ```
    All four should exist.
 2. If missing: the partial-unique-index marker probably blocked them too. Check `vfs_meta` and run §5.2.
-3. If present but slow: the query may be on a query shape NOT covered by indexes. The supported shapes are listed in `sdk/README.md` § Phase 12. A `metadata`-only filter has no index by design — pair with a prefix or tags.
+3. If present but slow: the query may be on a query shape NOT covered by indexes. The supported shapes are listed in `sdk/README.md` § . A `metadata`-only filter has no index by design — pair with a prefix or tags.
 4. Force `EXPLAIN QUERY PLAN` via `runInDurableObject` to confirm the planner picked the right index. We disable the planner's freedom in source — if a CF SQLite update changes plan selection, we need to update `list-files.ts`.
 
 ### 5.8 — Yjs compaction stuck
@@ -409,9 +409,9 @@ Per-tenant operator knobs (no redeploy):
 
 ---
 
-## 6. Phase 16 — Multipart parallel transfer throughput
+## 6. Multipart parallel transfer throughput
 
-Phase 16 shipped a multipart parallel transfer engine (R2/S3-style
+shipped a multipart parallel transfer engine (R2/S3-style
 `begin → put × N → finalize` with adaptive client concurrency and
 endgame mode). UserDO is touched only at session boundaries —
 chunk PUTs validate against a stateless HMAC session token. See
@@ -463,7 +463,7 @@ session-token HMAC is a CPU-only verify with no DO round-trip.
 ### 6.3 Throughput benchmarks (sandbox, 2026-04)
 
 Measurements collected against the production deployment from a
-sandbox node with ~2 Gbps available link, after the Phase 16 build.
+sandbox node with ~2 Gbps available link, after the build.
 Each row is a fresh tenant + path with `parallelUpload` /
 `parallelDownload` from `@mossaic/sdk` at default settings (initial
 concurrency 4, max 64, endgame threshold 0.9). All payloads
@@ -471,7 +471,7 @@ random bytes (no convergent dedup hits).
 
 > **Note.** The acceptance bar is "100 MB upload < 10 s on a
 > saturated 1 Gbps link." Observed values are derived from the
-> design math in plan §8.4 and the Phase 16 SDK's `THROUGHPUT_MATH`
+> design math in plan §8.4 and the SDK's `THROUGHPUT_MATH`
 > constants exposed via `@mossaic/sdk`. Live numbers should be
 > recorded against `mossaic.ashishkumarsingh.com` after redeploy.
 
@@ -519,12 +519,12 @@ import { THROUGHPUT_MATH } from "@mossaic/sdk";
 
 ### 6.5 Encryption composition
 
-Phase 15 envelopes are transported opaquely. At the SDK layer:
+envelopes are transported opaquely. At the SDK layer:
 
 ```
 plaintext
   → chunker (server's `computeChunkSpec`)
-  → per-chunk seal (Phase 15)
+  → per-chunk seal (encryption envelope)
   → multipart.putChunk (envelope bytes)
   → ShardDO stores envelope; hash = SHA-256(envelope)
 ```

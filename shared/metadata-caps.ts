@@ -1,5 +1,5 @@
 /**
- * Phase 12: caps for the new metadata + tags surface.
+ * caps for the new metadata + tags surface.
  *
  * Shared between the SDK (for client-side pre-validation) and the
  * worker (for authoritative enforcement). Both layers throw

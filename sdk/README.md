@@ -5,7 +5,7 @@ Cloudflare-Worker-native VFS over Mossaic. fs/promises-shaped, isomorphic-git co
 > For the canonical shape of every public API (`MossaicEnv`, `WriteFileOpts`, `YDocHandle`, HTTP envelope), see the **[integration guide](../docs/integration-guide.md)**. This README is a DX walkthrough; the integration guide is the source of truth.
 
 ```
-                                  Phases 10–12 architecture
+                                          Architecture
                                   ─────────────────────────
 ┌────────────────┐  1 DO RPC      ┌─────────────────────────┐   N internal    ┌─────────────────┐
 │ Consumer       │ ─────────────► │  MOSSAIC_USER  (Core)   │ ──────────────► │ MOSSAIC_SHARD   │
@@ -21,7 +21,7 @@ Cloudflare-Worker-native VFS over Mossaic. fs/promises-shaped, isomorphic-git co
                                   │  + listFiles cursor     │                    tenant by name)
                                   │    (HMAC w/ JWT_SECRET) │
                                   └────────────┬────────────┘
-                                               │ (Phase 11 split)
+                                               │ (App vs Core split)
                                                │ App: UserDO extends UserDOCore
                                                │       └─ + _legacyFetch (byte-pinned)
                                                │       └─ + SearchDO (App-only, not in SDK)
@@ -35,7 +35,7 @@ Cloudflare-Worker-native VFS over Mossaic. fs/promises-shaped, isomorphic-git co
                                   └──────────────────────────┘
 ```
 
-The runtime split (Phase 11):
+The runtime split:
 
 | Mode          | DO bindings                    | Routes mounted                  | Use case |
 |---------------|--------------------------------|---------------------------------|----------|
@@ -45,9 +45,9 @@ The runtime split (Phase 11):
 
 Per-DO-instance state pinned to a `(ns, tenant, sub?)` tuple:
 
-- **VFS metadata**: `files`, `folders`, `file_versions`, `chunk_refs`, `file_tags` (Phase 12), plus indexes `idx_files_parent_mtime`, `idx_files_parent_name`, `idx_files_parent_size`, `idx_file_tags_tag_mtime`.
-- **Yjs (Phase 10)**: `yjs_oplog`, `yjs_meta`. WebSocket transport uses Cloudflare's [Hibernation API](https://developers.cloudflare.com/durable-objects/api/websockets/#hibernation-api) — idle sockets cost $0; per-socket state survives hibernation via `serializeAttachment`.
-- **listFiles cursor (Phase 12)**: opaque base64 payload `{v,ob,d,ov,pid,sig}`. `sig` is HMAC-SHA256 truncated to 128 bits, keyed off `env.JWT_SECRET` (the same Workers secret used for VFS tokens — there is **no** dev fallback string in source). Tampered or wrong-secret cursors throw `EINVAL`.
+- **VFS metadata**: `files`, `folders`, `file_versions`, `chunk_refs`, `file_tags`, plus indexes `idx_files_parent_mtime`, `idx_files_parent_name`, `idx_files_parent_size`, `idx_file_tags_tag_mtime`.
+- **Yjs**: `yjs_oplog`, `yjs_meta`. WebSocket transport uses Cloudflare's [Hibernation API](https://developers.cloudflare.com/durable-objects/api/websockets/#hibernation-api) — idle sockets cost $0; per-socket state survives hibernation via `serializeAttachment`.
+- **listFiles cursor**: opaque base64 payload `{v,ob,d,ov,pid,sig}`. `sig` is HMAC-SHA256 truncated to 128 bits, keyed off `env.JWT_SECRET` (the same Workers secret used for VFS tokens — there is **no** dev fallback string in source). Tampered or wrong-secret cursors throw `EINVAL`.
 - **Tenant boundary**: DO instances are named `vfs:${ns}:${tenant}[:${sub}]`. Different triples → different DO instances → different SQLite databases. Cross-tenant Yjs broadcast and cross-tenant listFiles cursors are structurally impossible (each DO has its own `YjsRuntime` and its own SQLite).
 
 ---
@@ -429,7 +429,7 @@ await vfs.dropVersions("/notes.md", {
 await vfs.dropVersions("/notes.md", {});
 ```
 
-Returns `{ dropped, kept }`. Chunks whose last reference was dropped become eligible for the Phase 3 alarm sweeper after its 30s grace.
+Returns `{ dropped, kept }`. Chunks whose last reference was dropped become eligible for the alarm sweeper after its 30s grace.
 
 ### Cross-version dedup
 
@@ -455,7 +455,7 @@ The two products **compose**. A Worker can hold both bindings: Artifacts for sou
 
 ## Live editing with Yjs (per-file CRDT mode)
 
-Phase 10 adds **native Yjs** as a per-file mode. A regular file can be promoted to "yjs-mode" with a one-line `setYjsMode` call; from then on, every `writeFile` becomes a CRDT transaction, `readFile` materialises the current state, and any number of clients can co-edit live over a WebSocket.
+adds **native Yjs** as a per-file mode. A regular file can be promoted to "yjs-mode" with a one-line `setYjsMode` call; from then on, every `writeFile` becomes a CRDT transaction, `readFile` materialises the current state, and any number of clients can co-edit live over a WebSocket.
 
 ### Mental model
 
@@ -492,7 +492,7 @@ export default {
     handle.doc.getText("content").insert(0, "DRAFT — ");
     // ... edits propagate to every other open client ...
 
-    // Phase 13: presence / cursors / selections via y-protocols/awareness.
+    // Presence / cursors / selections via y-protocols/awareness.
     handle.awareness.setLocalState({ name: "alice", cursor: 7 });
     handle.awareness.on("change", () => {
       // remote awareness states arrived — render them
@@ -528,9 +528,9 @@ if ((stat.mode & VFS_MODE_YJS_BIT) !== 0) {
 - **isomorphic-git interop**: a tracked file can be promoted in-place. Once promoted, blob hashes change every transaction (the underlying chunks are Yjs updates, not the file content), so don't expect Git-friendly diffs against earlier commits — promote a file when you want CRDT semantics, not on the source you want Git to track.
 - **`yjs` and `y-protocols` peer dependencies**: install both in your consumer Worker. Mossaic does NOT bundle them. Tested against `yjs >=13.6.0`, `y-protocols >=1.0.6`.
 - **Awareness is relay-only and never persisted.** The server forwards awareness frames between connected editors but never writes them to SQLite. On DO eviction the per-pathId Awareness instance resets; clients re-broadcast their state on reconnect (this is the same behavior as a vanilla y-websocket server).
-- **`YDocHandle` shape (Phase 13).** `{ doc: Y.Doc, awareness: Awareness, synced: Promise<void>, close(): Promise<void>, flush({ label? }): Promise<{ versionId, checkpointSeq }>, onClose(cb), onError(cb) }`. Note: there is no `handle.on("sync")` or `handle.on("update")` event-emitter surface. Subscribe to `doc` and `awareness` instances directly via their respective `on(...)` methods.
+- **`YDocHandle` shape.** `{ doc: Y.Doc, awareness: Awareness, synced: Promise<void>, close(): Promise<void>, flush({ label? }): Promise<{ versionId, checkpointSeq }>, onClose(cb), onError(cb) }`. Note: there is no `handle.on("sync")` or `handle.on("update")` event-emitter surface. Subscribe to `doc` and `awareness` instances directly via their respective `on(...)` methods.
 
-## End-to-end encryption (opt-in, Phase 15)
+## End-to-end encryption (opt-in, )
 
 Mossaic optionally encrypts file content with AES-GCM-256 before it leaves the consumer Worker. The Mossaic server NEVER decrypts user data — it stores opaque envelopes and the per-file `(encryption_mode, encryption_key_id)` columns. Loss of the master key = permanent data loss; there is no recovery path.
 
@@ -636,9 +636,9 @@ Mossaic NEVER auto-encrypts. Pre-Phase-15 files remain plaintext until the consu
 - [`lean/Mossaic/Vfs/Encryption.lean`](../lean/Mossaic/Vfs/Encryption.lean) — formal proof obligations + the single new `AES_GCM_IND_CPA` axiom.
 - [`@mossaic/cli`](../cli/README.md) — `mossaic encrypt`, `mossaic decrypt-readback`, `mossaic rotate-key` for command-line use.
 
-## Phase 12: copy, metadata, tags, indexed listFiles, version marks
+## copy, metadata, tags, indexed listFiles, version marks
 
-Phase 12 extends the surface with five additive primitives. None change Phase 11 byte-equivalence: a tenant that never calls these methods sees no behavior change. All caps are enforced server-side and live in `shared/metadata-caps.ts`.
+extends the surface with five additive primitives. None change byte-equivalence: a tenant that never calls these methods sees no behavior change. All caps are enforced server-side and live in `shared/metadata-caps.ts`.
 
 | Cap | Default | Purpose |
 |---|---|---|
@@ -771,7 +771,7 @@ await vfs.listFiles({
 
 ### `markVersion(path, versionId, opts)` — label + user-visible flag
 
-Phase 12 splits versions into **opportunistic** (e.g. Yjs compaction snapshots, `userVisible=0`) and **user-visible** (`writeFile`, `copyFile`, `restoreVersion`, `flush()`, `markVersion`). The flag is **monotonic** — once visible, always visible. `userVisible: false` on `markVersion` is rejected `EINVAL`.
+splits versions into **opportunistic** (e.g. Yjs compaction snapshots, `userVisible=0`) and **user-visible** (`writeFile`, `copyFile`, `restoreVersion`, `flush()`, `markVersion`). The flag is **monotonic** — once visible, always visible. `userVisible: false` on `markVersion` is rejected `EINVAL`.
 
 ```ts
 const versions = await vfs.listVersions("/notes/today.md");
@@ -811,7 +811,7 @@ await handle.close();
 
 The compaction snapshot captures whatever the live `Y.Doc` holds at the moment of the flush. Local edits made on this handle are streamed to the server via the open WebSocket synchronously inside `doc.transact`, so the compaction always observes them.
 
-### Wire summary (Phase 12)
+### Wire summary
 
 | Method | Binding RPC | HTTP route |
 |---|---|---|
@@ -1055,7 +1055,7 @@ The SDK ships with:
 - `tests/integration/streaming.test.ts` — read/write streams, byte-range, handle-based primitives
 - `tests/integration/tenant-isolation.test.ts` — cross-tenant impossibility
 - `tests/integration/readmany-stat.test.ts` — git-status-style batched lstat
-- ... plus path-walk, ino, refcount, migration, legacy-smoke, vfs-read, vfs-write
+- ... plus path-walk, ino, refcount, migration, app-smoke, vfs-read, vfs-write
 
 Run `pnpm test` at the repo root.
 

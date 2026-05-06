@@ -28,7 +28,7 @@ import {
   DropdownMenuTrigger,
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
-import type { GalleryPhoto } from "@shared/types";
+import type { GalleryPhoto } from "@app/types";
 
 type FilterType = "all" | "photos" | "videos";
 type SortOrder = "newest" | "oldest";

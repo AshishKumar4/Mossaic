@@ -227,7 +227,7 @@ export class HttpVFS implements VFSClient {
       );
       return;
     }
-    // Bytes path — Phase 13: when opts include metadata/tags/version,
+    // Bytes path — when opts include metadata/tags/version,
     // switch to multipart/form-data so the meta payload rides along
     // with the binary bytes. Without those opts we keep the legacy
     // octet-stream envelope (smaller, no FormData allocation).
@@ -407,7 +407,7 @@ export class HttpVFS implements VFSClient {
     return new Uint8Array(await res.arrayBuffer());
   }
 
-  // ── Phase 9: versioning ───────────────────────────────────────────────
+  // ── versioning ───────────────────────────────────────────────
   // The HTTP fallback router (worker/routes/vfs.ts) gains matching
   // POST endpoints. Wire-shape mirrors the binding-client surface:
   // listVersions returns VersionInfo[] with `id`; restoreVersion
@@ -462,7 +462,7 @@ export class HttpVFS implements VFSClient {
     return (await res.json()) as { dropped: number; kept: number };
   }
 
-  // ── Phase 12 ──────────────────────────────────────────────────────────
+  // ── ──────────────────────────────────────────────────────────
 
   async patchMetadata(
     p: string,
@@ -538,7 +538,7 @@ export class HttpVFS implements VFSClient {
     );
   }
 
-  // ── Phase 16: multipart parallel transfer ───────────────────────────
+  // ── multipart parallel transfer ───────────────────────────
   //
   // Thin wire helpers used by `sdk/src/transfer.ts`. They speak the
   // shapes declared in `shared/multipart.ts`. Each method maps 1:1 to
@@ -667,32 +667,26 @@ export class HttpVFS implements VFSClient {
     return (await res.json()) as import("../../shared/multipart").DownloadTokenResponse;
   }
 
-  /** Cacheable per-chunk GET. Token is the download token from `multipartDownloadToken`. */
+  /**
+   * Cacheable per-chunk GET. The download token is the value from
+   * `multipartDownloadToken`. The caller MUST pass the file's `path`
+   * — this method internally hits `/api/vfs/readChunk` which is
+   * keyed by path, not fileId. The token's `fileId` is also passed
+   * through for forward-compat with a future
+   * `/api/vfs/readChunkByFileId` endpoint that will let us drop the
+   * `path` round-trip; until then `path` is required.
+   */
   async fetchChunkByHash(
     fileId: string,
     idx: number,
     hash: string,
     token: string,
+    path: string,
     signal?: AbortSignal
   ): Promise<Uint8Array> {
-    // Resolve the shard index by computing client-side placement.
-    // We don't have userId on this side (token is opaque), so we
-    // fall back: pass `?hash=` and the cache endpoint walks shards.
-    // For v1 the SDK pre-resolves the shard from the manifest by
-    // including all shard probes — but the multipart route accepts
-    // ?hash= and one-shard-at-a-time when ?shard= is absent. To
-    // keep v1 simple, we omit ?shard= and rely on the server's
-    // hash hint + manifest lookup. This pays one extra UserDO RPC
-    // on cold cache but the immutable cache covers the warm path.
-    //
-    // Actually the server REQUIRES ?shard= in v1 (see
-    // multipart-routes.ts). We rendezvous-place in the client:
-    // shardIndex requires `userId` and `poolSize` neither of which
-    // are in the token. So the SDK uses a different path: it walks
-    // each shard candidate via the existing /readChunk endpoint
-    // when the cache misses. For simplicity we just call /readChunk
-    // (which goes through UserDO) — this is the safe fallback.
-    void hash; // unused — read path doesn't need to verify here
+    void hash; // read path doesn't need to verify here — caller does post-fetch verification
+    void fileId; // forward-compat: a typed /readChunkByFileId endpoint will use this
+    void token; // bearer auth on /readChunk uses this.apiKey; download token is for the future endpoint
     const url = `${this.base}/api/vfs/readChunk`;
     const res = await this.fetcher(url, {
       method: "POST",
@@ -701,24 +695,13 @@ export class HttpVFS implements VFSClient {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        // We need a path. fileId-by-itself isn't enough on the
-        // current /readChunk. The SDK passes a synthetic path-by-
-        // fileId via a separate endpoint; for v1 the parallel
-        // download takes path + manifest from the SDK caller and
-        // uses the manifest's chunk index alone.
-        //
-        // Bridge: the public parallel-download surface is keyed
-        // by `path` (not fileId), so this signature is reachable
-        // only from a context where the caller HAS the path. We
-        // don't have it here. Concrete fix: change the public API
-        // to pass path through.
-        path: this.fileIdToPath?.(fileId) ?? fileId,
+        path,
         chunkIndex: idx,
       }),
       signal,
     });
     if (!res.ok) {
-      await this.throwHttp(res, "open", undefined);
+      await this.throwHttp(res, "open", path);
     }
     return new Uint8Array(await res.arrayBuffer());
   }
@@ -746,14 +729,6 @@ export class HttpVFS implements VFSClient {
     throw mapServerError(synthetic, { syscall, path });
   }
 
-  /**
-   * Optional path resolver for `fetchChunkByHash`. The
-   * `parallelDownload` driver in `transfer.ts` patches this on the
-   * client instance before calling `fetchChunkByHash` so the worker
-   * can resolve `fileId → path`. v1 hack; v2 should add a typed
-   * `/readChunkByFileId` endpoint server-side.
-   */
-  fileIdToPath?: (fileId: string) => string | undefined;
 }
 
 /**

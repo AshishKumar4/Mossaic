@@ -16,7 +16,9 @@
       "@cloudflare/vitest-pool-workers"
     ],
     "paths": {
-      "@shared/*": ["./shared/*"]
+      "@shared/*": ["./shared/*"],
+      "@core/*": ["./worker/core/*"],
+      "@app/*": ["./worker/app/*"]
     }
   },
   "include": ["tests", "shared", "worker"]

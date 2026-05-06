@@ -7,7 +7,7 @@ import { useSharedImageLoader } from "@/hooks/use-image-loader";
 import { Spinner } from "@/components/ui/spinner";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
-import type { SharedAlbumPhotosResponse } from "@shared/types";
+import type { SharedAlbumPhotosResponse } from "@app/types";
 
 interface SharedPhoto {
   fileId: string;

@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import type { Env } from "@shared/types";
+import type { EnvApp as Env } from "@shared/types";
 import { authMiddleware } from "@core/lib/auth";
 import { shardDOName, userDOName } from "@core/lib/utils";
 import { placeChunk } from "@shared/placement";
@@ -62,7 +62,7 @@ upload.put("/chunk/:fileId/:chunkIndex", async (c) => {
   const fileId = c.req.param("fileId");
   const chunkIndex = parseInt(c.req.param("chunkIndex"));
   const chunkHash = c.req.header("X-Chunk-Hash") || "";
-  // Phase 7 NOTE: this legacy route honors the client-supplied
+  // NOTE: this legacy route honors the client-supplied
   // `X-Pool-Size` header for back-compat with existing user-facing app
   // clients that read the pool size from `init` and echo it back. The
   // server's true pool_size is in `quota.pool_size` and is the source

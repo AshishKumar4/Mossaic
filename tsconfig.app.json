@@ -14,8 +14,9 @@
     "noEmit": true,
     "paths": {
       "@/*": ["./src/*"],
-      "@shared/*": ["./shared/*"]
+      "@shared/*": ["./shared/*"],
+      "@app/*": ["./worker/app/*"]
     }
   },
-  "include": ["src", "shared"]
+  "include": ["src", "shared", "worker/app/types.ts"]
 }

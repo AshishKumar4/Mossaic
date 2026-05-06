@@ -26,7 +26,7 @@ import {
   TooltipTrigger,
   TooltipContent,
 } from "@/components/ui/tooltip";
-import type { ShardStats, CompletedTransferStats } from "@shared/types";
+import type { ShardStats, CompletedTransferStats } from "@app/types";
 
 const container = {
   hidden: { opacity: 0 },

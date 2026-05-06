@@ -1,5 +1,5 @@
 /**
- * Phase 16 — Multipart parallel transfer engine, server-side.
+ * Multipart parallel transfer engine, server-side.
  *
  * This module implements three UserDO RPCs:
  *
@@ -45,13 +45,13 @@ import {
   type ShardMultipartManifestRow,
 } from "../../../../shared/multipart";
 import {
-  commitRenameExternal,
-  hardDeleteFileRowExternal,
-  abortTempFileExternal,
-  userIdForExternal,
-  resolveParentExternal,
-  poolSizeForExternal,
-  folderExistsExternal,
+  commitRename,
+  hardDeleteFileRow,
+  abortTempFile,
+  userIdFor,
+  resolveParent,
+  poolSizeFor,
+  folderExists,
 } from "./vfs-ops";
 import {
   validateLabel,
@@ -125,7 +125,7 @@ export async function vfsBeginMultipart(
   path: string,
   opts: VFSBeginMultipartOpts
 ): Promise<MultipartBeginResponse> {
-  const userId = userIdForExternal(scope);
+  const userId = userIdFor(scope);
 
   // Validate inputs up front.
   if (
@@ -155,14 +155,14 @@ export async function vfsBeginMultipart(
   }
 
   // Cold begin — resolve parent + reject folder collisions.
-  const { parentId, leaf } = resolveParentExternal(durableObject, userId, path);
-  if (folderExistsExternal(durableObject, userId, parentId, leaf)) {
+  const { parentId, leaf } = resolveParent(durableObject, userId, path);
+  if (folderExists(durableObject, userId, parentId, leaf)) {
     throw new VFSError(
       "EISDIR",
       `beginMultipart: target is a directory: ${path}`
     );
   }
-  // Phase 15: enforce mode-history-monotonic across multipart writes,
+  // enforce mode-history-monotonic across multipart writes,
   // exactly as `vfsWriteFile` does.
   const incomingEncryption: EncryptionStampOpts | undefined = opts.encryption
     ? { mode: opts.encryption.mode, keyId: opts.encryption.keyId }
@@ -218,7 +218,7 @@ export async function vfsBeginMultipart(
   void serverChunkCount; // unused but documents the parallel spec
 
   const tmpId = generateId();
-  const poolSize = poolSizeForExternal(durableObject, userId);
+  const poolSize = poolSizeFor(durableObject, userId);
   const now = Date.now();
   const ttl =
     typeof opts.ttlMs === "number" && opts.ttlMs > 0
@@ -451,7 +451,7 @@ export async function vfsAbortMultipart(
   scope: VFSScope,
   uploadId: string
 ): Promise<{ ok: true }> {
-  const userId = userIdForExternal(scope);
+  const userId = userIdFor(scope);
   const row = durableObject.sql
     .exec(
       `SELECT * FROM upload_sessions WHERE upload_id = ? AND user_id = ?`,
@@ -503,7 +503,7 @@ export async function vfsAbortMultipart(
   // populated (finalize never ran), so nothing else to clean on
   // UserDO. Use the existing helper — drops file_chunks (no-op),
   // file_tags (no-op), then files.
-  await abortTempFileExternal(durableObject, userId, scope, uploadId);
+  await abortTempFile(durableObject, userId, scope, uploadId);
 
   return { ok: true };
 }
@@ -526,7 +526,7 @@ export async function vfsFinalizeMultipart(
   uploadId: string,
   chunkHashList: readonly string[]
 ): Promise<MultipartFinalizeResponse> {
-  const userId = userIdForExternal(scope);
+  const userId = userIdFor(scope);
 
   // 1. Lookup session.
   const session = durableObject.sql
@@ -691,7 +691,7 @@ export async function vfsFinalizeMultipart(
   // 10. Atomic supersede via existing commitRename. If a live row
   //     exists at (parent, leaf), it's hard-deleted (chunks GC'd via
   //     deleteChunks fan-out inside hardDeleteFileRow).
-  await commitRenameExternal(
+  await commitRename(
     durableObject,
     userId,
     scope,
@@ -750,7 +750,7 @@ export async function vfsGetMultipartStatus(
   expiresAtMs: number;
   status: string;
 }> {
-  const userId = userIdForExternal(scope);
+  const userId = userIdFor(scope);
   const row = durableObject.sql
     .exec(
       `SELECT * FROM upload_sessions WHERE upload_id = ? AND user_id = ?`,
@@ -849,7 +849,7 @@ export async function sweepExpiredMultipartSessions(
   ).n;
 
   // Suppress unused warning for the existing helper signature.
-  void hardDeleteFileRowExternal;
+  void hardDeleteFileRow;
 
   return { swept: stale.length, remaining: stillOpen > 0 };
 }

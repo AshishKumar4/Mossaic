@@ -28,7 +28,7 @@ export type VFSErrorCode =
   | "ENOTEMPTY"
   | "EAGAIN"
   | "EMOSSAIC_UNAVAILABLE"
-  // Phase 15 — encryption surface.
+  // encryption surface.
   | "EBADF"
   | "ENOTSUP";
 
@@ -50,8 +50,8 @@ const ERRNO: Record<VFSErrorCode, number> = {
   ENOTEMPTY: -39,
   EAGAIN: -11, // POSIX EAGAIN — rate-limit / try-again
   EMOSSAIC_UNAVAILABLE: -111, // ECONNREFUSED-equivalent
-  EBADF: -9, // Phase 15: encryption-mode mismatch on a path's history.
-  ENOTSUP: -95, // Phase 15: chmod-style encrypt-in-place not supported.
+  EBADF: -9, // encryption-mode mismatch on a path's history.
+  ENOTSUP: -95, // chmod-style encrypt-in-place not supported.
 };
 
 const HUMAN: Record<VFSErrorCode, string> = {

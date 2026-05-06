@@ -1,5 +1,5 @@
 /**
- * Phase 15 — encryption CLI commands.
+ * encryption CLI commands.
  *
  *   mossaic encrypt <local-file> <remote-path> [--password <pw>] [--mode convergent|random] [--key-id <id>]
  *     Encrypts a local file with a PBKDF2-derived master key, then

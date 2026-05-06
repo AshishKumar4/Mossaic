@@ -1,4 +1,4 @@
-import type { CompletedTransferStats } from "@shared/types";
+import type { CompletedTransferStats } from "@app/types";
 
 const MAX_HISTORY = 20;
 let stats: CompletedTransferStats[] = [];

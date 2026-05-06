@@ -1,7 +1,7 @@
 /**
  * `@mossaic/sdk/yjs` — opt-in Yjs adapter.
  *
- * Phase 10 adds per-file CRDT mode to Mossaic. Files toggled into
+ * Adds per-file CRDT mode to Mossaic. Files toggled into
  * yjs-mode (via `vfs.setYjsMode(path, true)` or
  * `vfs.chmod(path, { yjs: true })`) live as a Yjs op log in the
  * UserDO; live editors connect via a Hibernation-API WebSocket and
@@ -42,29 +42,28 @@ import {
   encodeAwarenessUpdate,
 } from "y-protocols/awareness";
 import type { VFS } from "./vfs";
-import { VFS_MODE_YJS_BIT as _VFS_MODE_YJS_BIT } from "./yjs-mode-bit";
+import { VFS_MODE_YJS_BIT } from "../../shared/constants";
 
 /**
- * Bit set on `stat.mode` for files in yjs-mode. Re-exported from
- * `./yjs-mode-bit` so consumers can pull it from EITHER the main
- * `@mossaic/sdk` import OR `@mossaic/sdk/yjs`. The two re-exports
- * share a single source-of-truth definition.
+ * Bit set on `stat.mode` for files in yjs-mode. Re-exported here so
+ * consumers can pull it from EITHER the main `@mossaic/sdk` import
+ * OR `@mossaic/sdk/yjs`. Single source-of-truth: shared/constants.ts.
  */
-export const VFS_MODE_YJS_BIT = _VFS_MODE_YJS_BIT;
+export { VFS_MODE_YJS_BIT };
 
 // ── Wire protocol tags (mirror worker/objects/user/yjs.ts) ─────────────
 const YJS_SYNC_STEP_1 = 0;
 const YJS_SYNC_STEP_2 = 1;
 const YJS_UPDATE = 2;
 /**
- * Phase 13 — awareness relay. Payload is `encodeAwarenessUpdate(...)`
+ * awareness relay. Payload is `encodeAwarenessUpdate(...)`
  * from `y-protocols/awareness`; relayed by the server but never
  * persisted (resets on DO eviction; clients re-broadcast on reconnect).
  */
 const YJS_AWARENESS = 3;
 
 /**
- * Phase 15 — server → client advisory: "your op-log is approaching
+ * server → client advisory: "your op-log is approaching
  * the compaction threshold; please run vfs.compactYjs(path)". Payload
  * is a uint32 BE seq count. The SDK exposes this as the
  * `handle.onCompactNeeded?` callback.
@@ -119,7 +118,7 @@ export interface YDocHandle {
   readonly doc: Y.Doc;
 
   /**
-   * Phase 13 — y-protocols/awareness instance for cursors,
+   * y-protocols/awareness instance for cursors,
    * selections, and presence. Local state is set via
    * `awareness.setLocalState({...})` and broadcast to the server,
    * which relays to other connected editors. The server NEVER
@@ -151,7 +150,7 @@ export interface YDocHandle {
   close(): Promise<void>;
 
   /**
-   * Phase 12: explicit flush — triggers a Yjs compaction on the
+   * explicit flush — triggers a Yjs compaction on the
    * server whose checkpoint emits a USER-VISIBLE Mossaic version
    * row (when versioning is enabled for the tenant). Optionally
    * attach a human-readable `label` to the version.
@@ -182,7 +181,7 @@ export interface YDocHandle {
   onError(cb: (err: unknown) => void): void;
 
   /**
-   * Phase 15 — true iff the underlying file is encrypted. The SDK
+   * true iff the underlying file is encrypted. The SDK
    * encrypts outbound sync_step_2 / update / awareness frames and
    * decrypts inbound ones. Server-side compaction is disabled for
    * encrypted yjs files; the consumer is responsible for calling
@@ -192,7 +191,7 @@ export interface YDocHandle {
   readonly encrypted: boolean;
 
   /**
-   * Phase 15 — register a callback for the server's compact-please
+   * register a callback for the server's compact-please
    * advisory (tag-4 frame). The argument is the current op-log seq
    * count. Called at most once per handle until manually re-armed.
    *
@@ -232,11 +231,11 @@ export async function openYDoc(
   path: string,
   opts: OpenYDocOptions = {}
 ): Promise<YDocHandle> {
-  // Phase 15: detect encryption status BEFORE the WS upgrade so that
+  // detect encryption status BEFORE the WS upgrade so that
   // a config-less consumer attempting to open an encrypted yjs file
   // gets EACCES synchronously (no WS connection wasted; no opaque
   // frames flowing through the consumer's reactive layer). For
-  // plaintext yjs files behaviour is identical to Phase 14.
+  // plaintext yjs files behaviour is identical to the no-encryption path.
   let fileEnc: { mode: "convergent" | "random"; keyId?: string } | undefined;
   try {
     const stat = await vfs.stat(path);
@@ -277,7 +276,7 @@ export async function openYDoc(
   const doc = opts.doc ?? new Y.Doc();
   const awareness = new Awareness(doc);
 
-  // Phase 15: encryption helpers (lazy-loaded once per handle).
+  // encryption helpers (lazy-loaded once per handle).
   // Encrypt PAYLOAD bytes (NOT the tag prefix) for tags 1/2/3 when
   // the file is encrypted; tag 0 (sync_step_1) stays plaintext —
   // state vectors are clientID→seq maps and don't reveal content.
@@ -336,12 +335,12 @@ export async function openYDoc(
   };
   doc.on("update", onLocalUpdate);
 
-  // Phase 13 — outbound awareness pump. y-protocols emits an
+  // outbound awareness pump. y-protocols emits an
   // `update` event whenever the local Awareness state changes
   // (added/updated/removed clientIDs). We send the encoded update
   // to the server which relays to other peers. Origin === ws means
   // the update arrived FROM the server; don't echo back.
-  // Phase 15: when encrypted, the awareness payload is wrapped in
+  // when encrypted, the awareness payload is wrapped in
   // an envelope with AAD='aw' (distinct from 'yj' so a yjs envelope
   // can't be replayed as awareness or vice versa).
   const onLocalAwareness = (
@@ -400,7 +399,7 @@ export async function openYDoc(
     if (!bytes || bytes.byteLength === 0) return;
     const tag = bytes[0];
     const body = bytes.subarray(1);
-    // Phase 15: when the file is encrypted, tags 1/2/3 carry envelope
+    // when the file is encrypted, tags 1/2/3 carry envelope
     // bytes; we decrypt before dispatch. Tag 0 stays plaintext (state
     // vectors are content-free). Tag 4 is the compact-please advisory
     // and is plaintext (it's a uint32 BE seq count).
@@ -484,14 +483,14 @@ export async function openYDoc(
         return;
       }
       case YJS_AWARENESS: {
-        // Phase 13 — apply remote awareness update. Origin === ws
+        // apply remote awareness update. Origin === ws
         // tells our outbound pump (`onLocalAwareness`) not to echo
         // this back to the server.
         applyAwarenessUpdate(awareness, body, ws);
         return;
       }
       case YJS_COMPACT_PLEASE: {
-        // Phase 15 — server advisory. body[0..3] = uint32 BE seq count.
+        // server advisory. body[0..3] = uint32 BE seq count.
         if (body.byteLength < 4) return;
         const seqCount =
           ((body[0] ?? 0) << 24) |
@@ -559,7 +558,7 @@ export async function openYDoc(
       versionId: string | null;
       checkpointSeq: number;
     }> {
-      // Phase 12: call the typed RPC. The compaction snapshot
+      // call the typed RPC. The compaction snapshot
       // captures whatever the live Y.Doc currently holds — local
       // edits made on this handle are streamed to the server via
       // the open WebSocket BEFORE flush() runs (each Yjs update

@@ -1,7 +1,7 @@
 import { SignJWT, jwtVerify } from "jose";
 import type { Context, MiddlewareHandler } from "hono";
 import { JWT_EXPIRATION_MS } from "../../../shared/constants";
-import type { Env } from "../../../shared/types";
+import type { EnvCore as Env } from "../../../shared/types";
 
 /**
  * Thrown at request-time when `JWT_SECRET` is missing or empty.
@@ -224,7 +224,7 @@ export async function verifyVFSToken(
   }
 }
 
-// ── Phase 16: multipart session + download tokens ──────────────────────
+// ── multipart session + download tokens ──────────────────────
 //
 // Two new HMAC token shapes layered onto the same `JWT_SECRET` via
 // scope-discrimination claims:

@@ -1,5 +1,5 @@
 import { useMemo, useRef, useEffect, useState } from "react";
-import type { GalleryPhoto } from "@shared/types";
+import type { GalleryPhoto } from "@app/types";
 import { PhotoThumbnail } from "./photo-thumbnail";
 
 interface JustifiedGridProps {

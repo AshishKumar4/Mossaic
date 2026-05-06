@@ -80,15 +80,15 @@ export interface VFSClient {
   symlink(target: string, p: string): Promise<void>;
   chmod(p: string, mode: number): Promise<void>;
   rename(src: string, dst: string): Promise<void>;
-  /** Phase 12: deep-merge metadata + add/remove tags atomically. */
+  /** deep-merge metadata + add/remove tags atomically. */
   patchMetadata(
     p: string,
     patch: Record<string, unknown> | null,
     opts?: PatchMetadataOpts
   ): Promise<void>;
-  /** Phase 12: same-tenant copyFile (chunk-refcount-aware). */
+  /** same-tenant copyFile (chunk-refcount-aware). */
   copyFile(src: string, dest: string, opts?: CopyFileOpts): Promise<void>;
-  /** Phase 12: indexed listFiles with HMAC-signed cursor pagination. */
+  /** indexed listFiles with HMAC-signed cursor pagination. */
   listFiles(opts?: ListFilesOpts): Promise<ListFilesPage>;
 
   // Streams (HTTP fallback throws EINVAL for these in v1)
@@ -118,7 +118,7 @@ export interface VFSClient {
     range?: { start?: number; end?: number }
   ): Promise<Uint8Array>;
 
-  // Phase 9: file-level versioning (only meaningful when the tenant
+  // file-level versioning (only meaningful when the tenant
   // has versioning enabled; the binding client surfaces these methods
   // on every VFS instance for type-stability, but they throw ENOENT
   // / EINVAL on tenants without versioning).
@@ -131,7 +131,7 @@ export interface VFSClient {
     p: string,
     policy: DropVersionsPolicy
   ): Promise<{ dropped: number; kept: number }>;
-  /** Phase 12: set per-version label and/or user-visible flag. */
+  /** set per-version label and/or user-visible flag. */
   markVersion(
     p: string,
     versionId: string,
@@ -194,21 +194,21 @@ export interface UserDOClient {
     path: string
   ): Promise<void>;
   vfsChmod(scope: VFSScope, path: string, mode: number): Promise<void>;
-  /** Phase 12: deep-merge metadata + add/remove tags atomically. */
+  /** deep-merge metadata + add/remove tags atomically. */
   vfsPatchMetadata(
     scope: VFSScope,
     path: string,
     patch: Record<string, unknown> | null,
     opts?: PatchMetadataOpts
   ): Promise<void>;
-  /** Phase 12: same-tenant copyFile. */
+  /** same-tenant copyFile. */
   vfsCopyFile(
     scope: VFSScope,
     src: string,
     dest: string,
     opts?: CopyFileOpts
   ): Promise<void>;
-  /** Phase 12: indexed listFiles + paginated cursor. */
+  /** indexed listFiles + paginated cursor. */
   vfsListFiles(
     scope: VFSScope,
     opts?: ListFilesOpts
@@ -222,7 +222,7 @@ export interface UserDOClient {
     }>;
     cursor?: string;
   }>;
-  /** Phase 10: flip the per-file Yjs-mode bit. */
+  /** flip the per-file Yjs-mode bit. */
   vfsSetYjsMode(
     scope: VFSScope,
     path: string,
@@ -268,7 +268,7 @@ export interface UserDOClient {
     range?: { start?: number; end?: number }
   ): Promise<Uint8Array>;
 
-  // Phase 9: versioning RPCs. The wire shape uses `versionId`
+  // versioning RPCs. The wire shape uses `versionId`
   // (server-side VersionRow) — the VFS class maps to the public
   // `VersionInfo` shape with `id` for ergonomic Node-style.
   vfsListVersions(
@@ -297,21 +297,21 @@ export interface UserDOClient {
     path: string,
     policy: DropVersionsPolicy
   ): Promise<{ dropped: number; kept: number }>;
-  /** Phase 12: set per-version label / mark user-visible. */
+  /** set per-version label / mark user-visible. */
   vfsMarkVersion(
     scope: VFSScope,
     path: string,
     versionId: string,
     opts: VersionMarkOpts
   ): Promise<void>;
-  /** Phase 12: explicit flush of a yjs-mode file → user-visible version. */
+  /** explicit flush of a yjs-mode file → user-visible version. */
   vfsFlushYjs(
     scope: VFSScope,
     path: string,
     opts?: { label?: string }
   ): Promise<{ versionId: string | null; checkpointSeq: number }>;
   /**
-   * Phase 15: client-driven compaction of an encrypted yjs file. The
+   * client-driven compaction of an encrypted yjs file. The
    * client supplies a checkpoint envelope (encrypted state-as-update)
    * + the expected `next_seq` for CAS. Server appends the checkpoint
    * atomically and drops oplog rows below it.
@@ -323,7 +323,7 @@ export interface UserDOClient {
     expectedNextSeq: number
   ): Promise<{ checkpointSeq: number; opsReaped: number }>;
   /**
-   * Phase 15: read raw oplog rows for a yjs-mode file. Used by the
+   * read raw oplog rows for a yjs-mode file. Used by the
    * client-side compactor to fetch encrypted op envelopes for
    * local replay.
    */
@@ -354,7 +354,7 @@ export interface UserDOClient {
  *     consumer's wrangler MUST declare it for the DO class to instantiate.
  *
  * Naming: the canonical binding names are `MOSSAIC_USER` / `MOSSAIC_SHARD`
- * (Phase 13 — prefixed for consumer-env safety). Renaming the binding
+ * (prefixed for consumer-env safety). Renaming the binding
  * `name` while keeping `class_name` is data-safe per CF docs:
  * https://developers.cloudflare.com/durable-objects/reference/durable-objects-migrations/
  *
@@ -389,11 +389,11 @@ export interface CreateVFSOptions {
   /** Optional sub-tenant id. */
   sub?: string;
   /**
-   * Phase 9: opt-in S3-style versioning. When `'enabled'`, every
+   * opt-in S3-style versioning. When `'enabled'`, every
    * writeFile creates a new historical version (chunks dedupe via
    * content-addressing); unlink writes a tombstone version
    * (chunks NOT decremented). The default `'disabled'` is
-   * byte-equivalent to Phase 8 — no version rows touched, no head
+   * byte-equivalent to no version rows touched, no head
    * pointer used.
    *
    * The flag is also stored server-side per tenant; the SDK option
@@ -410,7 +410,7 @@ export interface CreateVFSOptions {
    */
   versioning?: "enabled" | "disabled";
   /**
-   * Phase 15: opt-in end-to-end encryption.
+   * opt-in end-to-end encryption.
    *
    * When set, `writeFile(p, d, { encrypted: true })` AES-GCM-encrypts
    * `d` client-side before sending; `readFile(p)` auto-detects
@@ -448,7 +448,7 @@ export interface CreateVFSOptions {
 }
 
 /**
- * Phase 9: shape of a row returned by `vfs.listVersions(path)`.
+ * shape of a row returned by `vfs.listVersions(path)`.
  * Newest-first iteration order.
  */
 export interface VersionInfo {
@@ -462,20 +462,20 @@ export interface VersionInfo {
   mode: number;
   /** True iff this version is a tombstone (an unlink mark). */
   deleted: boolean;
-  /** Phase 12: optional human-readable label. */
+  /** optional human-readable label. */
   label?: string | null;
   /**
-   * Phase 12: true if this version was created by an explicit
+   * true if this version was created by an explicit
    * user-facing operation (writeFile, restoreVersion, flush()).
    * False for opportunistic Yjs compactions and pre-Phase-12 rows.
    */
   userVisible?: boolean;
-  /** Phase 12: snapshot of files.metadata at this version (when requested). */
+  /** snapshot of files.metadata at this version (when requested). */
   metadata?: Record<string, unknown> | null;
 }
 
 /**
- * Phase 12: per-version flags accepted by `writeFile`, `copyFile`,
+ * per-version flags accepted by `writeFile`, `copyFile`,
  * and `markVersion`.
  */
 export interface VersionMarkOpts {
@@ -491,8 +491,8 @@ export interface VersionMarkOpts {
 }
 
 /**
- * Phase 12: extended writeFile options. Defaults preserve Phase 11
- * behavior bit-identically.
+ * Extended writeFile options. Defaults preserve plain `writeFile`
+ * behavior bit-identically — every option is opt-in.
  */
 export interface WriteFileOpts {
   mode?: number;
@@ -516,7 +516,7 @@ export interface WriteFileOpts {
    */
   version?: VersionMarkOpts;
   /**
-   * Phase 15: opt-in encryption for this write.
+   * opt-in encryption for this write.
    *
    * - `true`: use the VFS instance's `encryption` config defaults.
    *   EINVAL if `createVFS` was called without `encryption`.
@@ -537,7 +537,7 @@ export interface WriteFileOpts {
 }
 
 /**
- * Phase 12: copyFile options.
+ * copyFile options.
  */
 export interface CopyFileOpts {
   /** Overrides src metadata for the dest. `undefined` inherits src. */
@@ -550,7 +550,7 @@ export interface CopyFileOpts {
 }
 
 /**
- * Phase 12: patchMetadata options.
+ * patchMetadata options.
  */
 export interface PatchMetadataOpts {
   addTags?: readonly string[];
@@ -558,7 +558,7 @@ export interface PatchMetadataOpts {
 }
 
 /**
- * Phase 12: listFiles options.
+ * listFiles options.
  */
 export interface ListFilesOpts {
   /** Path prefix (e.g. "/photos/2026/"). Resolves to a folder. */
@@ -584,7 +584,7 @@ export interface ListFilesOpts {
   includeMetadata?: boolean;
 }
 
-/** Phase 12: a single row returned by listFiles. */
+/** a single row returned by listFiles. */
 export interface ListFilesItem {
   /** Absolute path with leading slash. */
   path: string;
@@ -604,7 +604,7 @@ export interface ListFilesPage {
   cursor?: string;
 }
 
-/** Phase 12: listVersions options. */
+/** listVersions options. */
 export interface ListVersionsOpts {
   limit?: number;
   /** When true, filter to versions with user_visible = 1. */
@@ -614,7 +614,7 @@ export interface ListVersionsOpts {
 }
 
 /**
- * Phase 9: retention-policy parameters for `vfs.dropVersions(path, policy)`.
+ * retention-policy parameters for `vfs.dropVersions(path, policy)`.
  *
  * The CURRENT head version is ALWAYS preserved, regardless of filters
  * (S3 invariant). Surviving versions = (head) ∪ (exceptVersions) ∪
@@ -651,7 +651,7 @@ export class VFS implements VFSClient {
   readonly promises: VFS;
 
   /**
-   * Phase 9: auto-enable-versioning latch. The first write or
+   * auto-enable-versioning latch. The first write or
    * versioning-related call on a VFS instance with
    * `versioning: 'enabled'` triggers a one-shot
    * `adminSetVersioning(userId, true)` server call. Subsequent
@@ -660,7 +660,7 @@ export class VFS implements VFSClient {
    * is a no-op server-side.
    */
   private versioningLatched = false;
-  // Phase 14: explicit fields instead of constructor parameter
+  // explicit fields instead of constructor parameter
   // properties — `erasableSyntaxOnly` rejects the shorthand.
   private readonly env: MossaicEnv;
   private readonly opts: CreateVFSOptions;
@@ -682,7 +682,7 @@ export class VFS implements VFSClient {
   }
 
   /**
-   * Phase 15: best-effort cleanup of in-memory key material when the
+   * best-effort cleanup of in-memory key material when the
    * consumer is done with this VFS instance.
    *
    * If `opts.encryption` was supplied with raw 32-byte master key
@@ -761,9 +761,9 @@ export class VFS implements VFSClient {
     p: string,
     opts?: { encoding?: "utf8"; version?: string }
   ): Promise<Uint8Array | string> {
-    // Phase 15: pre-flight stat to detect encryption ONLY when the
+    // pre-flight stat to detect encryption ONLY when the
     // consumer's VFS instance has an encryption config. Without
-    // encryption config, behaviour is byte-identical to Phase 14 —
+    // encryption config, behaviour is byte-identical to
     // exactly one outbound RPC (the consumer-fixture test pins this).
     // With encryption config, we pay one extra RPC per readFile in
     // exchange for the security feature; this is the documented cost.
@@ -869,7 +869,7 @@ export class VFS implements VFSClient {
     let bytes =
       typeof data === "string" ? new TextEncoder().encode(data) : data;
 
-    // Phase 15: encryption flow. If the consumer signaled
+    // encryption flow. If the consumer signaled
     // `encrypted: truthy`, we encrypt `bytes` to a single envelope
     // before sending. The server stamps `files.encryption_*` columns
     // via the `opts.encryption` payload we pass; on read, the SDK's
@@ -980,7 +980,7 @@ export class VFS implements VFSClient {
 
   async chmod(p: string, mode: number): Promise<void>;
   /**
-   * Phase 10 overload: pass `{ yjs: true }` to flip the per-file
+   * overload: pass `{ yjs: true }` to flip the per-file
    * Yjs-mode bit. Demoting back to plain (`{ yjs: false }`) is
    * rejected EINVAL on the server — it would lose CRDT history.
    *
@@ -1004,7 +1004,7 @@ export class VFS implements VFSClient {
   }
 
   /**
-   * Phase 10 alias: explicit, type-stable form of
+   * alias: explicit, type-stable form of
    * `chmod(p, { yjs: enabled })`. Prefer this over the chmod
    * overload when you don't need the dual-shape ergonomics —
    * isomorphic-git and other fs/promises consumers will find
@@ -1020,7 +1020,7 @@ export class VFS implements VFSClient {
   }
 
   /**
-   * Phase 12: deep-merge a metadata patch onto a file, optionally
+   * deep-merge a metadata patch onto a file, optionally
    * adding/removing tags atomically.
    *
    * - `patch === null`: clear the metadata blob (UPDATE files SET
@@ -1048,7 +1048,7 @@ export class VFS implements VFSClient {
   }
 
   /**
-   * Phase 12: same-tenant copyFile.
+   * same-tenant copyFile.
    *
    * Three-tier behavior:
    *   - Inline files: bytes-only copy (no shard work).
@@ -1082,7 +1082,7 @@ export class VFS implements VFSClient {
   }
 
   /**
-   * Phase 12: indexed listFiles with HMAC-signed cursor pagination.
+   * indexed listFiles with HMAC-signed cursor pagination.
    *
    * Filters: `prefix` (path), `tags` (AND, ≤8 per query),
    * `metadata` (post-filter; pair with prefix or tags for index-driven
@@ -1127,7 +1127,7 @@ export class VFS implements VFSClient {
   }
 
   /**
-   * Phase 10: open a WebSocket against a yjs-mode file. Internal —
+   * open a WebSocket against a yjs-mode file. Internal —
    * the consumer-facing API is `openYDoc` from the
    * `@mossaic/sdk/yjs` subpath, which wraps this in a Yjs-aware
    * client object.
@@ -1199,7 +1199,7 @@ export class VFS implements VFSClient {
   }
 
   /**
-   * Phase 13: createWriteStream accepts the same `WriteFileOpts` shape
+   * createWriteStream accepts the same `WriteFileOpts` shape
    * as `writeFile` — including `metadata`, `tags`, and `version`. The
    * fields are validated at begin-time (caller fails fast on cap
    * violations) and applied at commit-time.
@@ -1262,7 +1262,7 @@ export class VFS implements VFSClient {
     }
   }
 
-  // ── Phase 9: file-level versioning ────────────────────────────────────
+  // ── file-level versioning ────────────────────────────────────
 
   /**
    * List historical versions of a path, newest-first. Includes
@@ -1292,7 +1292,7 @@ export class VFS implements VFSClient {
   }
 
   /**
-   * Phase 12: set per-version metadata flags. `userVisible` is
+   * set per-version metadata flags. `userVisible` is
    * monotonic — the worker rejects `false` with EINVAL.
    */
   async markVersion(
@@ -1308,7 +1308,7 @@ export class VFS implements VFSClient {
   }
 
   /**
-   * Phase 12: explicit flush of a yjs-mode file. Triggers a Yjs
+   * explicit flush of a yjs-mode file. Triggers a Yjs
    * compaction whose checkpoint emits a USER-VISIBLE Mossaic
    * version row (when versioning is enabled for the tenant).
    * Internal — called by `YDocHandle.flush` from the
@@ -1326,7 +1326,7 @@ export class VFS implements VFSClient {
   }
 
   /**
-   * Phase 15 — client-driven compaction for an encrypted yjs file.
+   * client-driven compaction for an encrypted yjs file.
    *
    * The server cannot materialise an encrypted yjs doc, so this
    * method runs entirely in the SDK:
@@ -1340,7 +1340,7 @@ export class VFS implements VFSClient {
    *      On EBUSY (race), retry up to 3 times with exp backoff.
    *
    * Plain (non-encrypted) yjs files compact server-side automatically
-   * on every 50 ops or 60 seconds (Phase 10) — calling `compactYjs`
+   * on every 50 ops or 60 seconds — calling `compactYjs`
    * on a plain file is a no-op.
    *
    * @param p path to the yjs-mode file
@@ -1474,7 +1474,7 @@ export class VFS implements VFSClient {
   /**
    * Drop versions per a retention policy. Head version is always
    * preserved. Chunks whose last reference was dropped are reaped
-   * by the Phase 3 alarm sweeper after its 30s grace.
+   * by the alarm sweeper after its 30s grace.
    */
   async dropVersions(
     p: string,

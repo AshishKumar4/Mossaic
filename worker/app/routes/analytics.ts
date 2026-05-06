@@ -1,10 +1,6 @@
 import { Hono } from "hono";
-import type {
-  Env,
-  ShardStats,
-  UserStats,
-  AnalyticsOverview,
-} from "@shared/types";
+import type { EnvApp as Env } from "@shared/types";
+import type { ShardStats, UserStats, AnalyticsOverview } from "../types";
 import { authMiddleware } from "@core/lib/auth";
 import { userDOName, shardDOName } from "@core/lib/utils";
 

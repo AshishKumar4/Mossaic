@@ -1,5 +1,5 @@
 /**
- * Phase 10 — native Yjs per-file mode.
+ * native Yjs per-file mode.
  *
  * Storage shape: a yjs-mode file at path `pathId` is materialised
  * by replaying a sequence of binary Y.Doc updates stored in
@@ -15,7 +15,7 @@
  *
  * Each op is ALSO a refcounted chunk_refs entry on its ShardDO.
  * The synthetic file_id for the ref is `${pathId}#yjs#${seq}`,
- * which means the existing Phase 1 chunk_refs PK
+ * which means the existing chunk_refs PK
  * `(chunk_hash, file_id, chunk_index)` keeps every op as its own
  * refcountable slot. When compaction drops historical ops, we
  * dispatch `deleteChunks(${pathId}#yjs#${seq})` per touched shard
@@ -33,7 +33,7 @@
  * strictly less than the new checkpoint's seq. The checkpoint
  * itself is a row in yjs_oplog with kind='checkpoint'.
  *
- * Versioning interop (Phase 9): when versioning is enabled for
+ * Versioning interop: when versioning is enabled for
  * the tenant, every successful compaction ALSO creates a Mossaic
  * version row whose inline_data references the checkpoint chunk
  * hash (or, for small docs, contains the encoded state inline).
@@ -61,9 +61,11 @@ import { VFSError, type VFSScope } from "../../../../shared/vfs-types";
 import { hashChunk } from "../../../../shared/crypto";
 import { vfsShardDOName } from "../../lib/utils";
 import { placeChunkForVersion } from "./vfs-versions";
+import { VFS_MODE_YJS_BIT } from "../../../../shared/constants";
 
-/** POSIX-style mode bit reused as the SDK-facing yjs flag. */
-export const VFS_MODE_YJS_BIT = 0o4000; // S_ISUID — repurposed since we don't enforce setuid
+// Re-exported so existing internal imports of VFS_MODE_YJS_BIT from
+// this module keep working.
+export { VFS_MODE_YJS_BIT };
 
 /**
  * Compaction thresholds. Tunable knobs.
@@ -86,8 +88,8 @@ export function yjsShardRefId(pathId: string, seq: number): string {
 
 /**
  * Yjs sync protocol message types (subset we actually use).
- * Standard Yjs protocol from y-protocols/sync, plus the Phase 13
- * awareness tag whose payload is `encodeAwarenessUpdate(awareness, [...ids])`
+ * Standard Yjs protocol from y-protocols/sync, plus an awareness
+ * tag whose payload is `encodeAwarenessUpdate(awareness, [...ids])`
  * from y-protocols/awareness — relayed but NEVER persisted.
  */
 export const YJS_SYNC_STEP_1 = 0;
@@ -236,7 +238,7 @@ async function appendUpdate(
 
   // Update meta counters that depend on `kind`. The seq counter is
   // already advanced; this updates checkpoint-tracking only.
-  // Phase 15: also track `bytes_since_last_compact` for the
+  // also track `bytes_since_last_compact` for the
   // backpressure check on encrypted yjs files (see
   // {@link checkEncryptedYjsBackpressure}).
   if (kind === "op") {
@@ -265,7 +267,7 @@ async function appendUpdate(
   return seq;
 }
 
-// ── Phase 15: backpressure on encrypted yjs op-log ─────────────────────
+// ── backpressure on encrypted yjs op-log ─────────────────────
 
 /** Op-count threshold at which the server broadcasts a compact-please advisory. */
 export const COMPACT_ADVISORY_THRESHOLD = 100;
@@ -277,7 +279,7 @@ export const COMPACT_LOG_BYTES_HARD_LIMIT = 100 * 1024 * 1024;
 export const COMPACT_INACTIVITY_BAN_MS = 7 * 24 * 60 * 60 * 1000;
 
 /**
- * Phase 15: read `files.encryption_mode` to detect if a yjs-mode file
+ * read `files.encryption_mode` to detect if a yjs-mode file
  * is encrypted. Used to route the WS message handler between the
  * plaintext (materialise + apply + broadcast) path and the encrypted
  * (opaque-relay only) path.
@@ -487,7 +489,7 @@ export class YjsRuntime {
   private readonly sockets = new Map<string, Set<WebSocket>>();
 
   /**
-   * Phase 13 — Awareness relay (presence / cursors / selections).
+   * Awareness relay (presence / cursors / selections).
    *
    * One `Awareness` instance per pathId, lazily created. Held only in
    * memory; on DO eviction these reset and clients re-broadcast their
@@ -536,7 +538,7 @@ export class YjsRuntime {
     update: Uint8Array,
     fromSocket: WebSocket
   ): Promise<void> {
-    // Phase 15: encrypted awareness — opaque relay only. Server can't
+    // encrypted awareness — opaque relay only. Server can't
     // decrypt the frame to extract clientIDs, so the
     // disconnect-removal bookkeeping isn't possible. The cost is
     // that survivors won't see a synthetic "removed" frame when a
@@ -617,7 +619,7 @@ export class YjsRuntime {
    *
    * Returns the assigned seq number.
    *
-   * Phase 15: when the file is encrypted, the `update` bytes are an
+   * when the file is encrypted, the `update` bytes are an
    * AES-GCM envelope produced by the SDK. The server CANNOT decrypt
    * — it just appends-and-broadcasts. Server-side compaction is
    * disabled for encrypted yjs (the consumer compacts via
@@ -634,7 +636,7 @@ export class YjsRuntime {
   ): Promise<number> {
     const encrypted = isPathEncryptedYjs(this.durableObject, pathId);
     if (!encrypted) {
-      // Plaintext path — original Phase 10 behaviour.
+      // Plaintext path — original behaviour.
       const doc = await this.getDoc(scope, pathId);
       Y.applyUpdate(doc, update, "remote");
       const seq = await appendUpdate(
@@ -672,7 +674,7 @@ export class YjsRuntime {
       "op"
     );
     this.broadcast(pathId, encodeUpdateMessage(update), excludeSocket);
-    // Phase 15 advisory: when the encrypted op-log crosses the soft
+    // advisory: when the encrypted op-log crosses the soft
     // threshold, broadcast a tag-4 compact-please frame to ALL
     // connected sockets (including the originator — the SDK ignores
     // duplicate advisories until manually re-armed).
@@ -722,7 +724,7 @@ export class YjsRuntime {
       pathId,
       ckSeq
     );
-    // Phase 12: when versioning is enabled for the tenant AND this
+    // when versioning is enabled for the tenant AND this
     // compaction is a user-visible flush, emit a Mossaic version row.
     // Opportunistic compactions (userVisible:false) skip this — the
     // op log itself is the live history.
@@ -777,7 +779,7 @@ export class YjsRuntime {
   }
 
   /**
-   * Phase 15 — client-driven compaction for encrypted Yjs files.
+   * client-driven compaction for encrypted Yjs files.
    *
    * The server CANNOT materialise an encrypted doc, so compaction
    * must be initiated by a client that holds the master key. The
@@ -953,7 +955,7 @@ export class YjsRuntime {
     if (!set) return;
     set.delete(ws);
 
-    // Phase 13 — Awareness disconnect cleanup. Synthesize a "removed"
+    // Awareness disconnect cleanup. Synthesize a "removed"
     // frame for any clientIDs this socket owned and broadcast to
     // remaining peers, then drop the socket's clientID set.
     const owned = this.clientIDsBySocket.get(ws);
@@ -1061,7 +1063,7 @@ export class YjsRuntime {
 // protocol bytes are hand-rolled and match the Yjs sync protocol's
 // type tags so any standard y-websocket-compatible client can talk
 // to us. (Awareness frames live on a separate type tag and are
-// broadcast-only, never persisted — Phase 10 ships a stub.)
+// broadcast-only, never persisted — ships a stub.)
 
 /** Frame an update as a single-byte-tagged message. */
 export function encodeUpdateMessage(update: Uint8Array): Uint8Array {
@@ -1129,7 +1131,7 @@ export async function readYjsAsBytes(
   scope: VFSScope,
   pathId: string
 ): Promise<Uint8Array> {
-  // Phase 14: yjsRuntime is now an async lazy accessor.
+  // yjsRuntime is now an async lazy accessor.
   return (await durableObject.getYjsRuntime()).readMaterialised(scope, pathId);
 }
 
@@ -1145,7 +1147,7 @@ export async function writeYjsBytes(
   poolSize: number,
   bytes: Uint8Array
 ): Promise<void> {
-  // Phase 14: yjsRuntime is now an async lazy accessor.
+  // yjsRuntime is now an async lazy accessor.
   return (await durableObject.getYjsRuntime()).writeMaterialised(
     scope,
     userId,

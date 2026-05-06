@@ -7,9 +7,9 @@ import { resolvePath } from "./path-walk";
 import { placeChunk } from "../../../../shared/placement";
 
 /**
- * Audit H4 — placement function for the Phase 9 versioning path.
+ * Audit H4 — placement function for the versioning path.
  *
- * The Phase 9 invariant — "two writes of the same content share the
+ * The invariant — "two writes of the same content share the
  * same chunk row, refcount = (number of versions referencing it)" —
  * requires that an identical content hash always lands on the same
  * shard. The previous code computed `placeChunk(userId, hash, 0, poolSize)`
@@ -73,11 +73,11 @@ export function placeChunkForVersion(
 }
 
 /**
- * Phase 9 — file-level versioning (S3-style, opt-in).
+ * file-level versioning (S3-style, opt-in).
  *
  * Per-tenant `quota.versioning_enabled` toggles whether writes
  * create historical version rows. When OFF, behavior is byte-equivalent
- * to Phase 8 (no version rows ever inserted, no head pointer used,
+ * to (no version rows ever inserted, no head pointer used,
  * no readFile-by-version-id surface). When ON, the write path:
  *
  *   1. Resolves / creates a stable `files` row at (parent_id, name)
@@ -92,7 +92,7 @@ export function placeChunkForVersion(
  * a tombstone version (deleted=1, no chunks).
  *
  * Refcount semantics: chunks are pushed to ShardDO with a synthetic
- * file_id of `${path_id}#${version_id}`. Phase 1's chunk_refs
+ * file_id of `${path_id}#${version_id}`. chunk_refs
  * (chunk_hash, file_id, chunk_index) PK becomes naturally
  * per-version — refcount per chunk hash equals "number of versions
  * still referencing it", and the alarm sweeper reclaims chunks
@@ -111,18 +111,18 @@ export interface VersionRow {
   size: number;
   mode: number;
   deleted: boolean;
-  /** Phase 12: optional human-readable label. */
+  /** optional human-readable label. */
   label?: string | null;
   /**
-   * Phase 12: true iff this version was created by an explicit
+   * true iff this version was created by an explicit
    * user-facing op (writeFile, restoreVersion, flush()). False for
    * Yjs opportunistic compactions and pre-Phase-12 rows.
    */
   userVisible?: boolean;
-  /** Phase 12: snapshot of metadata at this version (when requested). */
+  /** snapshot of metadata at this version (when requested). */
   metadata?: Record<string, unknown> | null;
   /**
-   * Phase 15: per-version encryption stamp. Undefined for plaintext
+   * per-version encryption stamp. Undefined for plaintext
    * (default for pre-Phase-15 rows and explicit plaintext writes).
    */
   encryption?: { mode: "convergent" | "random"; keyId?: string };
@@ -212,7 +212,7 @@ export function commitVersion(
     inlineData: Uint8Array | null;
     deleted?: boolean;
     /**
-     * Phase 12: per-version flags. All optional; defaults preserve
+     * per-version flags. All optional; defaults preserve
      * Phase-9 behavior (NULL label, user_visible=0, NULL metadata).
      *
      * - `userVisible`: when truthy, sets `file_versions.user_visible = 1`.
@@ -227,7 +227,7 @@ export function commitVersion(
     label?: string | null;
     metadata?: Uint8Array | null;
     /**
-     * Phase 15: per-version encryption stamp. Mirrors the column on
+     * per-version encryption stamp. Mirrors the column on
      * `files`. When set, the columns on both `file_versions` (this
      * row) and `files` (the head row) are updated. The `data` payload
      * has already been written; this is metadata only.
@@ -263,7 +263,7 @@ export function commitVersion(
   );
   // Update head pointer to the new version. Tombstones also become
   // the head — readers find them by mtime_ms and then check deleted.
-  // Phase 15: also stamp `files.encryption_mode` + `files.encryption_key_id`
+  // also stamp `files.encryption_mode` + `files.encryption_key_id`
   // so non-versioned reads (`stat`, `readFile`) reflect the latest mode.
   durableObject.sql.exec(
     `UPDATE files
@@ -301,7 +301,7 @@ export interface VersionContent {
   fileHash: string;
   mimeType: string;
   /**
-   * Phase 15: per-version encryption stamp. NULL for plaintext (default
+   * per-version encryption stamp. NULL for plaintext (default
    * for pre-Phase-15 rows and for plaintext writes). When set, the SDK
    * decrypts the bytes (envelope-stream stored in `inline_data` or
    * across `version_chunks`) before returning them to the consumer.
@@ -372,9 +372,9 @@ export function listVersions(
   pathId: string,
   opts: {
     limit?: number;
-    /** Phase 12: filter to versions with `user_visible = 1`. */
+    /** filter to versions with `user_visible = 1`. */
     userVisibleOnly?: boolean;
-    /** Phase 12: include the metadata snapshot per row. */
+    /** include the metadata snapshot per row. */
     includeMetadata?: boolean;
   } = {}
 ): VersionRow[] {
@@ -418,7 +418,7 @@ export function listVersions(
       userVisible: r.user_visible === 1,
       label: r.label,
     };
-    // Phase 15: surface per-version encryption stamp.
+    // surface per-version encryption stamp.
     if (r.encryption_mode === "convergent" || r.encryption_mode === "random") {
       const enc: { mode: "convergent" | "random"; keyId?: string } = {
         mode: r.encryption_mode,
@@ -444,7 +444,7 @@ export function listVersions(
 }
 
 /**
- * Phase 12: set per-version flags. Idempotent. Throws EINVAL on
+ * set per-version flags. Idempotent. Throws EINVAL on
  *   - userVisible:false (the flag is monotonic; demoting is not
  *     supported because consumers may have built durable bookmarks
  *     against the version_id and silently flipping it would break
@@ -529,7 +529,7 @@ export function resolvePathId(
  * Decrement chunk_refs across a set of versions on every shard the
  * versions touched, then DELETE the file_versions + version_chunks
  * rows. The ShardDO alarm sweeper handles blob hard-delete after the
- * 30s grace per Phase 3.
+ * 30s grace per.
  *
  * Returns the count of versions reaped.
  */
@@ -770,7 +770,7 @@ export async function restoreVersion(
       fileHash: src.fileHash,
       mimeType: src.mimeType,
       inlineData: new Uint8Array(src.inlineData),
-      // Phase 15: restore preserves the source version's encryption mode.
+      // restore preserves the source version's encryption mode.
       encryption: src.encryption,
     });
     return { versionId: newVersionId };
@@ -893,7 +893,7 @@ export async function restoreVersion(
     fileHash: src.fileHash,
     mimeType: src.mimeType,
     inlineData: null,
-    // Phase 15: restore preserves the source version's encryption mode.
+    // restore preserves the source version's encryption mode.
     encryption: src.encryption,
   });
   return { versionId: newVersionId };

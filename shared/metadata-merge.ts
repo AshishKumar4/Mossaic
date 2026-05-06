@@ -1,5 +1,5 @@
 /**
- * Phase 12: deep-merge for metadata patches.
+ * deep-merge for metadata patches.
  *
  * Pure function. Models the `patchMetadata` semantics:
  *   - The patch is recursively merged with the existing metadata.

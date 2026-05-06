@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import type { Env } from "@shared/types";
+import type { EnvApp as Env } from "@shared/types";
 import { userDOName, shardDOName } from "@core/lib/utils";
 
 const shared = new Hono<{ Bindings: Env }>();

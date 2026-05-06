@@ -61,7 +61,7 @@ export type {
   DropVersionsPolicy,
 } from "./vfs";
 
-// Phase 12 cap constants — surfaced for client-side pre-validation.
+// cap constants — surfaced for client-side pre-validation.
 export {
   METADATA_MAX_BYTES,
   TAGS_MAX_PER_FILE,
@@ -72,7 +72,7 @@ export {
 } from "../../shared/metadata-caps";
 
 // Yjs-mode bit constant — pure value, no Yjs runtime needed.
-export { VFS_MODE_YJS_BIT } from "./yjs-mode-bit";
+export { VFS_MODE_YJS_BIT } from "../../shared/constants";
 
 // Token issuance helpers (operator-side; needs JWT_SECRET in env).
 export { issueVFSToken, verifyVFSToken, type VFSTokenPayload } from "./auth";
@@ -80,7 +80,7 @@ export { issueVFSToken, verifyVFSToken, type VFSTokenPayload } from "./auth";
 // Re-export shared scope shape for typed scopes in client code.
 export type { VFSScope } from "../../shared/vfs-types";
 
-// Phase 16: parallel multipart transfer engine.
+// parallel multipart transfer engine.
 export {
   parallelUpload,
   parallelDownload,

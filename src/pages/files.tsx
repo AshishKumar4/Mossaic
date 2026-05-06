@@ -30,7 +30,8 @@ import { FilePreviewPanel } from "@/components/files/file-preview";
 import { Lightbox } from "@/components/gallery/lightbox";
 import { Spinner } from "@/components/ui/spinner";
 import { cn, formatBytes, formatDate } from "@/lib/utils";
-import type { UserFile, GalleryPhoto } from "@shared/types";
+import type { UserFile } from "@shared/types";
+import type { GalleryPhoto } from "@app/types";
 
 type ViewMode = "list" | "grid";
 

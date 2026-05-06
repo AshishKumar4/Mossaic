@@ -3,10 +3,10 @@
  * VFS RPC surface or the legacy fetch routes.
  *
  * dedupePaths(userId): resolve legacy duplicate (parent_id, file_name)
- * rows that pre-date the Phase 1 UNIQUE partial index. The migration
+ * rows that pre-date the UNIQUE partial index. The migration
  * tries to add the index lazily in ensureInit, but if existing data
- * has live duplicates the CREATE throws and is swallowed (Phase 1's
- * try/catch). This routine is the manual cleanup pass:
+ * has live duplicates the CREATE throws and is swallowed by
+ * ensureInit's try/catch. This routine is the manual cleanup pass:
  *
  *   1. Identify groups of (user_id, IFNULL(parent_id,''), file_name)
  *      where >1 rows have status != 'deleted'.
@@ -187,7 +187,7 @@ export async function dedupePaths(
 
   // ── Pass 3: re-create the UNIQUE partial indexes ───────────────────────
   //
-  // Phase 1's lazy ensureInit attempts these every cold start; if
+  // lazy ensureInit attempts these every cold start; if
   // duplicates blocked them then, they may now succeed. Both creations
   // are idempotent (IF NOT EXISTS). On still-duplicated state, a
   // second swallow happens here too — the result flags reflect what
@@ -223,7 +223,7 @@ export async function dedupePaths(
 /**
  * Drop a single losing file row + its file_chunks, then dispatch
  * deleteChunks RPC to each touched shard. Mirrors the inline-rename
- * GC path from Phase 3's commitRename, but here the file_id is the
+ * GC path from commitRename, but here the file_id is the
  * old loser, not a freshly-superseded one.
  *
  * `scope` selects the shard name pattern:

@@ -6,7 +6,7 @@
  * SDK consumers lives here.
  */
 
-/** Multi-tenant scope. Phase 2 uses tenant as the SQL `user_id`; Phase 4 wires the full vfs:ns:tenant DO-name pattern. */
+/** Multi-tenant scope. uses tenant as the SQL `user_id`; wires the full vfs:ns:tenant DO-name pattern. */
 export interface VFSScope {
   /** Logical namespace (operator-side). Defaults to "default" in the SDK factory. */
   ns: string;
@@ -33,7 +33,7 @@ export interface VFSStatRaw {
   /** 53-bit safe integer derived deterministically from the row's id (file_id / folder_id). */
   ino: number;
   /**
-   * Phase 15: per-file encryption stamp. Undefined for plaintext
+   * per-file encryption stamp. Undefined for plaintext
    * (default for pre-Phase-15 rows and explicit plaintext writes).
    * The SDK consults this on readFile to decide whether to attempt
    * decryption. NULL/undefined → return server bytes verbatim.
@@ -54,7 +54,7 @@ export interface OpenManifestResult {
 }
 
 /**
- * Path resolution result. Phase 2's read-side ops (vfsStat/lstat/exists/readlink/...)
+ * Path resolution result. read-side ops (vfsStat/lstat/exists/readlink/...)
  * all flow through resolvePath() and discriminate on `kind`.
  */
 export type ResolveResult =
@@ -88,7 +88,7 @@ export type VFSErrorCode =
   | "EBUSY"
   | "EINVAL"
   | "EAGAIN"
-  // Phase 15 — opt-in E2E encryption error surface (per plan §4.6).
+  // opt-in E2E encryption error surface (per plan §4.6).
   // - EBADF: writeFile attempted with a different encryption mode than
   //   the existing path's history, OR plaintext write to an encrypted
   //   path. Mode-history-monotonic enforcement.

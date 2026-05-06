@@ -7,7 +7,7 @@
 import type { Command } from "commander";
 import { registerAuth } from "./auth.js";
 import { registerFileOps } from "./fileops.js";
-import { registerPhase12 } from "./phase12.js";
+import { registerMetadata } from "./metadata.js";
 import { registerVersions } from "./versions.js";
 import { registerYjs } from "./yjs.js";
 import { registerToken } from "./token.js";
@@ -17,7 +17,7 @@ import { registerTransfer } from "./transfer.js";
 export function registerCommands(program: Command): void {
   registerAuth(program);
   registerFileOps(program);
-  registerPhase12(program);
+  registerMetadata(program);
   registerVersions(program);
   registerYjs(program);
   registerToken(program);

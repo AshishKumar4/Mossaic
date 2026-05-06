@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import type { Env } from "@shared/types";
+import type { EnvApp as Env } from "@shared/types";
 import type { VectorSpace } from "@shared/embedding-types";
 
 /**

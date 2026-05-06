@@ -1,5 +1,5 @@
 /**
- * Phase 12: indexed listFiles primitive.
+ * indexed listFiles primitive.
  *
  * Index selection:
  *   - prefix only → idx_files_parent_mtime (or _name / _size).

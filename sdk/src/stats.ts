@@ -48,7 +48,7 @@ export class VFSStat {
   readonly blocks: number;
 
   /**
-   * Phase 15: per-file encryption stamp. Undefined for plaintext
+   * per-file encryption stamp. Undefined for plaintext
    * files (default for pre-Phase-15 rows and explicit plaintext
    * writes). Consumers wanting to detect encrypted files can call
    * `stat(p)` and inspect this field.

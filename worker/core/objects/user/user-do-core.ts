@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
-import type { Env } from "../../../../shared/types";
+import type { EnvCore as Env } from "../../../../shared/types";
 import {
-  hardDeleteFileRowExternal,
+  hardDeleteFileRow,
   vfsAbortWriteStream,
   vfsAppendWriteStream,
   vfsBeginWriteStream,
@@ -38,7 +38,7 @@ import type {
 } from "../../../../shared/vfs-types";
 import { VFSError } from "../../../../shared/vfs-types";
 import { dedupePaths, type DedupeResult } from "./admin";
-// Phase 14: type-only import. The YjsRuntime class is loaded
+// type-only import. The YjsRuntime class is loaded
 // lazily via `await import("./yjs")` inside `getYjsRuntime()` so
 // non-collab consumers don't pay the ~250 KB yjs + y-protocols
 // type-erase tax in the main bundle. The static type import is
@@ -58,15 +58,15 @@ export class UserDOCore extends DurableObject<Env> {
   sql: SqlStorage;
   /**
    * Public alias for the protected `env` from the DurableObject base
-   * class. Phase 2 vfs-ops needs to dispatch ShardDO subrequests by
-   * binding name; without this alias TS rejects external access. The
-   * base class's `env` remains protected; we shadow it.
+   * class. vfs-ops needs to dispatch ShardDO subrequests by binding
+   * name; without this alias TS rejects external access. The base
+   * class's `env` remains protected; we shadow it.
    */
   envPublic: Env;
   /**
-   * Phase 10: per-DO YjsRuntime cache. Lazily constructed on first
-   * access so the import isn't evaluated for tenants that never use
-   * yjs-mode files. Holds the in-memory `Y.Doc` cache + the live
+   * Per-DO YjsRuntime cache. Lazily constructed on first access so
+   * the import isn't evaluated for tenants that never use yjs-mode
+   * files. Holds the in-memory `Y.Doc` cache + the live
    * WebSocket sets per pathId. State on disk (yjs_oplog, yjs_meta,
    * shard chunks) survives DO hibernation; the runtime instance does
    * not — it gets rebuilt cold from the op log on the first access
@@ -83,8 +83,8 @@ export class UserDOCore extends DurableObject<Env> {
   }
 
   /**
-   * Phase 14: lazy YjsRuntime accessor — async because the class
-   * itself is loaded via dynamic `import("./yjs")`. Non-collab
+   * Lazy YjsRuntime accessor — async because the class itself is
+   * loaded via dynamic `import("./yjs")`. Non-collab
    * tenants never call this method; the entire yjs/y-protocols
    * graph is dead-code-eliminated from the consumer's bundle.
    *
@@ -102,11 +102,10 @@ export class UserDOCore extends DurableObject<Env> {
   }
 
   /**
-   * Phase 11: `protected` so the App subclass (`UserDO` in
-   * worker/app) can call `this.ensureInit()` from its own
-   * `_legacyFetch` handler without the schema migration silently
-   * being skipped on the legacy /signup path. Body is unchanged
-   * from Phase 10.
+   * `protected` so the App subclass (`UserDO` in worker/app) can call
+   * `this.ensureInit()` from its own `_legacyFetch` handler without
+   * the schema migration silently being skipped on the legacy
+   * /signup path.
    */
   protected ensureInit(): void {
     if (this.initialized) return;
@@ -222,7 +221,7 @@ export class UserDOCore extends DurableObject<Env> {
     // soft-deleted duplicates don't block migration.
     //
     // If existing data has live duplicates, this CREATE throws and is
-    // swallowed; the admin dedupe route (Phase 6) resolves them later.
+    // swallowed; the admin dedupe route resolves them later.
     try {
       this.sql.exec(`
         CREATE UNIQUE INDEX IF NOT EXISTS uniq_files_parent_name
@@ -251,7 +250,7 @@ export class UserDOCore extends DurableObject<Env> {
         ON folders(user_id, parent_id)
     `);
 
-    // ── Phase 8: per-tenant rate-limit state (token bucket) ──────────────
+    // ── per-tenant rate-limit state (token bucket) ──────────────
     //
     // Token-bucket limiter applied to VFS RPC methods (not the legacy
     // fetch handler). State persists across DO hibernation so the
@@ -283,8 +282,8 @@ export class UserDOCore extends DurableObject<Env> {
       // column already exists
     }
 
-    // ── Phase 9: per-tenant versioning toggle (S3-style, opt-in) ─────────
-    // versioning_enabled: NULL/0 = disabled (Phase 8 byte-equivalent
+    // ── per-tenant versioning toggle (S3-style, opt-in) ─────────
+    // versioning_enabled: NULL/0 = disabled (byte-equivalent
     // behavior); 1 = every writeFile/unlink creates a `file_versions`
     // row, readFile resolves the head version, and historical
     // readFile(path, {version: id}) becomes available. The default is
@@ -297,7 +296,7 @@ export class UserDOCore extends DurableObject<Env> {
       // column already exists
     }
 
-    // ── Phase 9: file_versions table ─────────────────────────────────────
+    // ── file_versions table ─────────────────────────────────────
     // S3-style versioning. Each row is one historical snapshot of a
     // (path_id, version_id) pair. `path_id` is the stable `files.file_id`
     // (Design A: sticky path identity — the first writeFile creates a
@@ -311,7 +310,7 @@ export class UserDOCore extends DurableObject<Env> {
     // Chunked tier: chunk metadata lives in `version_chunks` (mirrors
     // file_chunks but keyed by version_id). ShardDO chunk_refs use a
     // synthetic file_id of `${path_id}#${version_id}` so per-version
-    // refcount is independent — the alarm sweeper from Phase 3
+    // refcount is independent — the alarm sweeper
     // reclaims chunks when the last version referencing them is
     // dropped. No new GC plumbing.
     //
@@ -380,10 +379,10 @@ export class UserDOCore extends DurableObject<Env> {
       // column already exists
     }
 
-    // ── Phase 10: Yjs per-file mode ──────────────────────────────────────
+    // ── Yjs per-file mode ──────────────────────────────────────
     //
-    // mode_yjs: opt-in per FILE bit. 0 = plain bytes (Phase 1-9
-    // behavior); 1 = the file is a Yjs CRDT op log. Storage is a
+    // mode_yjs: opt-in per FILE bit. 0 = plain bytes (default);
+    // 1 = the file is a Yjs CRDT op log. Storage is a
     // sequence of Yjs binary updates appended as chunks under the
     // existing refcounted machinery; readFile materializes the
     // Y.Doc and returns a serialised view; writeFile applies the
@@ -468,7 +467,7 @@ export class UserDOCore extends DurableObject<Env> {
       )
     `);
 
-    // ── Phase 12: metadata + tags + version label/visibility ─────────────
+    // ── metadata + tags + version label/visibility ─────────────
     //
     // Schema-only additions delivered via the existing idempotent
     // ensureInit path. NO new wrangler migration tag — additive
@@ -512,10 +511,10 @@ export class UserDOCore extends DurableObject<Env> {
       // column already exists
     }
 
-    // ── Phase 15: opt-in end-to-end encryption ───────────────────────────
+    // ── opt-in end-to-end encryption ───────────────────────────
     //
     // Two columns on `files` and two on `file_versions` carry the
-    // per-file encryption mode + opaque keyId label. Pre-Phase-15 rows
+    // per-file encryption mode + opaque keyId label. pre-encryption rows
     // get NULL by default — the SDK treats NULL as "plaintext" and
     // returns the bytes verbatim, preserving full backward compatibility.
     //
@@ -591,7 +590,7 @@ export class UserDOCore extends DurableObject<Env> {
         WHERE status = 'complete'
     `);
 
-    // ── Phase 16: multipart upload sessions ──────────────────────────────
+    // ── multipart upload sessions ──────────────────────────────
     //
     // Per-tenant table tracking open / finalized / aborted multipart
     // upload sessions. The `upload_id` is the same value as the tmp
@@ -722,11 +721,11 @@ export class UserDOCore extends DurableObject<Env> {
   }
 
   /**
-   * Phase 10 + 11: top-level fetch entry. Core's fetch handles the
-   * Yjs WebSocket upgrade; every other request returns 404. The
-   * App subclass (`UserDO` in `worker/app/objects/user/user-do.ts`)
-   * overrides this method to delegate non-WS HTTP traffic to the
-   * legacy photo-app handler whose body is byte-pinned.
+   * Top-level fetch entry. Core's fetch handles the Yjs WebSocket
+   * upgrade; every other request returns 404. The App subclass
+   * (`UserDO` in `worker/app/objects/user/user-do.ts`) overrides
+   * this method to delegate non-WS HTTP traffic to the legacy
+   * photo-app handler whose body is byte-pinned.
    *
    * Service-mode deployments (deployments/service/wrangler.jsonc)
    * bind `class_name: "UserDOCore"` directly and never see the
@@ -745,7 +744,7 @@ export class UserDOCore extends DurableObject<Env> {
   }
 
   /**
-   * Phase 10: WebSocket upgrade entry. Path-encoded params:
+   * WebSocket upgrade entry. Path-encoded params:
    *   /yjs/ws?path=<encoded path>&ns=<ns>&tenant=<tenant>[&sub=<sub>]
    *
    * Yjs binary frames flow over the WebSocket; the upgrade is the
@@ -784,21 +783,21 @@ export class UserDOCore extends DurableObject<Env> {
       );
     }
   }
-  // ── VFS RPC surface (Phase 2: read-side) ───────────────────────────────
+  // ── VFS RPC surface (read-side) ───────────────────────────────
   //
   // Cloudflare DO RPC: any public async method on the DO class is callable
   // from a holder of the stub via `stub.methodName(args)`. The consumer
   // pays exactly one subrequest per call regardless of internal fan-out.
   // See sdk-impl-plan §5.3 for the full contract; these are the read-side
-  // methods that land in Phase 2. Write-side and streaming methods come
+  // methods that land in. Write-side and streaming methods come
   // in Phases 3 and 4.
   //
-  // Each method calls ensureInit() so the schema migrations (Phase 1)
+  // Each method calls ensureInit() so the schema migrations
   // run before any VFS access on a DO that hasn't seen any legacy
   // /fetch traffic yet.
 
   /**
-   * Phase 8 gate: ensureInit + per-tenant rate-limit check. Every
+   * gate: ensureInit + per-tenant rate-limit check. Every
    * VFS RPC method calls this BEFORE delegating to vfs-ops. The
    * legacy fetch handler is unaffected — it has its own ensureInit
    * and is exempt from the new rate limiter (back-compat with the
@@ -945,7 +944,7 @@ export class UserDOCore extends DurableObject<Env> {
       const userId =
         scope.sub !== undefined ? `${scope.tenant}::${scope.sub}` : scope.tenant;
       try {
-        await hardDeleteFileRowExternal(this, userId, scope, file_id);
+        await hardDeleteFileRow(this, userId, scope, file_id);
       } catch {
         // Best-effort: a transient ShardDO error leaves the row
         // intact; the next alarm fires on the same row. The 1h
@@ -954,7 +953,7 @@ export class UserDOCore extends DurableObject<Env> {
       }
     }
 
-    // Phase 16: sweep expired multipart sessions in the same alarm
+    // sweep expired multipart sessions in the same alarm
     // cadence. The same `scope` works for every session row because
     // the scope is the persisted tenant identity for THIS DO instance
     // (tenant + optional sub) — multipart sessions can't span
@@ -1018,7 +1017,7 @@ export class UserDOCore extends DurableObject<Env> {
 
   /**
    * readFile() — returns Uint8Array bytes. EISDIR/EFBIG/ENOENT/ELOOP.
-   * Phase 9: pass `opts.versionId` to read a historical version
+   * pass `opts.versionId` to read a historical version
    * directly. Tombstone versions throw ENOENT.
    */
   async vfsReadFile(
@@ -1049,7 +1048,7 @@ export class UserDOCore extends DurableObject<Env> {
     return vfsReadChunk(this, scope, path, chunkIndex);
   }
 
-  // ── VFS RPC surface (Phase 3: write-side) ──────────────────────────────
+  // ── VFS RPC surface (write-side) ──────────────────────────────
   //
   // Atomic writes (temp-id-then-rename), hard delete with chunk GC fan-out,
   // and the supporting mutating ops. Each method runs inside a single
@@ -1064,8 +1063,8 @@ export class UserDOCore extends DurableObject<Env> {
 
   /**
    * writeFile() — atomic, last-writer-wins. Inline tier ≤16KB;
-   * chunked otherwise. Phase 12 extends the opts to carry metadata,
-   * tags, and version flags; defaults preserve Phase 11 behavior.
+   * chunked otherwise. extends the opts to carry metadata,
+   * tags, and version flags; defaults preserve behavior.
    */
   async vfsWriteFile(
     scope: VFSScope,
@@ -1077,7 +1076,7 @@ export class UserDOCore extends DurableObject<Env> {
       metadata?: Record<string, unknown> | null;
       tags?: readonly string[];
       version?: { label?: string; userVisible?: boolean };
-      // Phase 15: optional encryption stamp. Server NEVER decrypts —
+      // optional encryption stamp. Server NEVER decrypts —
       // it just records `encryption_mode` + `encryption_key_id` on the
       // file row so the SDK knows what to do on read.
       encryption?: { mode: "convergent" | "random"; keyId?: string };
@@ -1149,7 +1148,7 @@ export class UserDOCore extends DurableObject<Env> {
     return vfsRemoveRecursive(this, scope, path, cursor);
   }
 
-  // ── Phase 4: streaming + handle-based stream primitives ───────────────
+  // ── streaming + handle-based stream primitives ───────────────
   //
   // Two shapes per stream direction:
   //
@@ -1167,7 +1166,7 @@ export class UserDOCore extends DurableObject<Env> {
   //
   // The handle-based primitives are the load-bearing surface — the
   // stream wrappers are convenience built on top. Both share the
-  // commit-rename atomicity protocol from Phase 3.
+  // commit-rename atomicity protocol.
 
   /** openReadStream — open a read handle. Caller pumps via vfsPullReadStream. */
   async vfsOpenReadStream(
@@ -1231,7 +1230,7 @@ export class UserDOCore extends DurableObject<Env> {
     return vfsAppendWriteStream(this, scope, handle, chunkIndex, data);
   }
 
-  /** commitWriteStream — atomic supersede + rename (Phase 3 protocol). */
+  /** commitWriteStream — atomic supersede + rename (protocol). */
   async vfsCommitWriteStream(
     scope: VFSScope,
     handle: VFSWriteHandle
@@ -1264,7 +1263,7 @@ export class UserDOCore extends DurableObject<Env> {
     return vfsCreateWriteStream(this, scope, path, opts);
   }
 
-  // ── Phase 16: multipart parallel transfer engine ─────────────────────
+  // ── multipart parallel transfer engine ─────────────────────
   //
   // Three RPCs forming the upload session boundary. Per-chunk PUTs do
   // NOT touch UserDO — they validate the session token in the route
@@ -1331,13 +1330,13 @@ export class UserDOCore extends DurableObject<Env> {
     return vfsGetMultipartStatus(this, scope, uploadId);
   }
 
-  // ── Phase 9: file-level versioning RPCs ───────────────────────────────
+  // ── file-level versioning RPCs ───────────────────────────────
   //
   // Opt-in per tenant via `adminSetVersioning(tenant, enabled)`.
   // Subsequent writeFile/unlink calls insert file_versions rows;
   // readFile resolves the head version (or an explicit version_id).
   // Refcount-per-version is enforced via synthetic shard ref keys
-  // `${pathId}#${versionId}`. The Phase 3 alarm sweeper reaps chunks
+  // `${pathId}#${versionId}`. The alarm sweeper reaps chunks
   // whose last reference was dropped.
 
   /** Newest-first list of versions for a path. ENOENT if path doesn't exist. */
@@ -1366,7 +1365,7 @@ export class UserDOCore extends DurableObject<Env> {
   }
 
   /**
-   * Phase 12: mark a version's label and/or user-visible flag.
+   * mark a version's label and/or user-visible flag.
    * `userVisible:false` is rejected EINVAL — the bit is monotonic.
    */
   async vfsMarkVersion(
@@ -1393,7 +1392,7 @@ export class UserDOCore extends DurableObject<Env> {
   }
 
   /**
-   * Phase 12: explicit flush of a yjs-mode file. Triggers a Yjs
+   * explicit flush of a yjs-mode file. Triggers a Yjs
    * compaction whose checkpoint emits a user-visible version row
    * (when versioning is enabled for the tenant) and an optional
    * label. Returns the new version_id (or null if versioning is
@@ -1448,7 +1447,7 @@ export class UserDOCore extends DurableObject<Env> {
   }
 
   /**
-   * Phase 15 — client-driven compaction for encrypted Yjs files.
+   * client-driven compaction for encrypted Yjs files.
    *
    * The server CANNOT decrypt the oplog, so the client builds the
    * checkpoint locally (decrypt all ops → apply → encode state →
@@ -1500,7 +1499,7 @@ export class UserDOCore extends DurableObject<Env> {
   }
 
   /**
-   * Phase 15 — read raw oplog rows (envelope bytes) for a yjs-mode
+   * read raw oplog rows (envelope bytes) for a yjs-mode
    * file. Used by the client-side compactor: it fetches all ops
    * since `last_checkpoint_seq`, decrypts them, and rebuilds the
    * checkpoint locally.
@@ -1628,7 +1627,7 @@ export class UserDOCore extends DurableObject<Env> {
   /**
    * Drop versions per a retention policy. Head version is always
    * preserved (S3 invariant). Returns counts. Chunks whose last
-   * version reference was dropped are reaped by the Phase 3 alarm
+   * version reference was dropped are reaped by the alarm
    * sweeper after its 30s grace.
    */
   async vfsDropVersions(
@@ -1676,12 +1675,12 @@ export class UserDOCore extends DurableObject<Env> {
     return { enabled: isVersioningEnabled(this, userId) };
   }
 
-  // ── Phase 6: admin tooling ────────────────────────────────────────────
+  // ── admin tooling ────────────────────────────────────────────
   //
   // Operator-only RPC. Not exposed through the legacy /api/* routes
   // and not surfaced on the SDK's VFS class. Holders of the binding
   // can call it directly via stub.adminDedupePaths(userId, scope?)
-  // when migrating legacy data that pre-dates the Phase 1 UNIQUE
+  // when migrating legacy data that pre-dates the UNIQUE
   // partial index.
 
   /**
@@ -1697,7 +1696,7 @@ export class UserDOCore extends DurableObject<Env> {
     return dedupePaths(this, userId, scope);
   }
 
-  // ── Phase 12: metadata + tags primitives ──────────────────────────────
+  // ── metadata + tags primitives ──────────────────────────────
 
   /**
    * Deep-merge a metadata patch into the path's metadata blob,
@@ -1716,7 +1715,7 @@ export class UserDOCore extends DurableObject<Env> {
   }
 
   /**
-   * Phase 12: same-tenant copyFile. Manifest-only copy for chunked +
+   * same-tenant copyFile. Manifest-only copy for chunked +
    * versioned tiers; bytes-only copy for inline tier; bytes-snapshot
    * fork for yjs-mode src. See `copy-file.ts` for the refcount and
    * atomicity contracts.
@@ -1738,7 +1737,7 @@ export class UserDOCore extends DurableObject<Env> {
   }
 
   /**
-   * Phase 12: indexed listFiles. Drives an HMAC-signed cursor for
+   * indexed listFiles. Drives an HMAC-signed cursor for
    * stable pagination. Tag intersection capped at 8 tags/query.
    * See `list-files.ts` for index selection and cursor semantics.
    */
@@ -1764,7 +1763,7 @@ export class UserDOCore extends DurableObject<Env> {
     return vfsListFiles(this, scope, opts);
   }
 
-  // ── Phase 10: yjs-mode primitives ─────────────────────────────────────
+  // ── yjs-mode primitives ─────────────────────────────────────
 
   /**
    * Toggle the per-file `mode_yjs` bit. Currently only 0 → 1 is
@@ -1853,8 +1852,7 @@ export class UserDOCore extends DurableObject<Env> {
    * memory between frames — workerd will instantiate, dispatch,
    * then evict. Idle WebSockets cost $0.
    *
-   * Design notes (after surveying @cloudflare/agents + capnweb for
-   * Phase 10):
+    * Design notes (after surveying @cloudflare/agents + capnweb):
    *
    * - Yjs sync-protocol frames are BINARY (Uint8Array). agents-sdk's
    *   `@callable` JSON-RPC pattern only carries text frames; capnweb
@@ -1908,7 +1906,7 @@ export class UserDOCore extends DurableObject<Env> {
     try {
       switch (decoded.kind) {
         case "syncStep1": {
-          // Phase 15: encrypted yjs files cannot be materialised
+          // encrypted yjs files cannot be materialised
           // server-side (the oplog rows are AES-GCM envelopes the
           // server cannot decrypt). Send an empty sync_step_2 so the
           // client unblocks its `await synced` and the doc starts
@@ -1922,7 +1920,7 @@ export class UserDOCore extends DurableObject<Env> {
             ws.send(encodeSyncStep2(new Uint8Array(0)));
             return;
           }
-          // Plaintext path — original Phase 13 behaviour.
+          // Plaintext path — original behaviour.
           const Y = await import("yjs");
           const doc = await (await this.getYjsRuntime()).getDoc(att.scope, att.pathId);
           const diff = Y.encodeStateAsUpdate(doc, decoded.stateVector);
@@ -1959,7 +1957,7 @@ export class UserDOCore extends DurableObject<Env> {
           return;
         }
         case "awareness": {
-          // Phase 13 — relay awareness frames; never persisted.
+          // relay awareness frames; never persisted.
           await (await this.getYjsRuntime()).relayAwareness(
             att.scope,
             att.pathId,
