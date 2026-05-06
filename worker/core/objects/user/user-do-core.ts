@@ -48,7 +48,13 @@ import type {
 } from "../../../../shared/preview-types";
 import { VFSError } from "../../../../shared/vfs-types";
 import { vfsShardDOName } from "../../lib/utils";
+import { logError, logInfo } from "../../lib/logger";
 import { dedupePaths, type DedupeResult } from "./admin";
+import {
+  insertAuditLog,
+  loadAuditLogMaxRows,
+  reapAuditLog,
+} from "./vfs/audit-log";
 // type-only import. The YjsRuntime class is loaded
 // lazily via `await import("./yjs")` inside `getYjsRuntime()` so
 // non-collab consumers don't pay the ~250 KB yjs + y-protocols
@@ -920,6 +926,36 @@ export class UserDOCore extends DurableObject<Env> {
       // column already exists
     }
 
+    // ── Phase 42: audit_log table ────────────────────────────────────────
+    //
+    // Per-tenant append-only audit trail of every destructive
+    // operation. See `worker/core/objects/user/vfs/audit-log.ts`
+    // for the helper API + retention policy. Idempotent CREATE \u2014
+    // existing tenants pick up the table on next ensureInit.
+    //
+    // Index on (op, ts DESC) supports the "last N entries of op X"
+    // query without a full scan; primary key (id) supports point
+    // lookups + retention sweeps that DELETE the oldest rows.
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS audit_log (
+        id          TEXT PRIMARY KEY,
+        ts          INTEGER NOT NULL,
+        op          TEXT NOT NULL,
+        actor       TEXT NOT NULL,
+        target      TEXT NOT NULL,
+        payload     TEXT,
+        request_id  TEXT
+      )
+    `);
+    this.sql.exec(`
+      CREATE INDEX IF NOT EXISTS idx_audit_log_op_ts
+        ON audit_log(op, ts DESC)
+    `);
+    this.sql.exec(`
+      CREATE INDEX IF NOT EXISTS idx_audit_log_ts
+        ON audit_log(ts DESC)
+    `);
+
     // ── Audit H6: surface UNIQUE INDEX failure on legacy data ────────────
     //
     // The previous code swallowed the throw silently when the file
@@ -1229,11 +1265,20 @@ export class UserDOCore extends DurableObject<Env> {
         scope.sub !== undefined ? `${scope.tenant}::${scope.sub}` : scope.tenant;
       try {
         await hardDeleteFileRow(this, userId, scope, file_id);
-      } catch {
-        // Best-effort: a transient ShardDO error leaves the row
-        // intact; the next alarm fires on the same row. The 1h
-        // staleness window is large enough that retry storms are
-        // bounded.
+      } catch (err) {
+        // Phase 42 \u2014 surface alarm-handler errors via structured
+        // log + counter. Pre-Phase-42 the bare `catch {}` ate
+        // every error including permanent failures (corrupted tmp
+        // row, ShardDO outage). Now: log via `logError`, bump the
+        // `alarm_failures` counter in `vfs_meta`, and CONTINUE \u2014
+        // alarms have at-least-once retry; throwing would just
+        // get the alarm replayed without progress on the
+        // remaining batch.
+        this.recordAlarmFailure(
+          "stale_tmp_sweep",
+          file_id,
+          err
+        );
       }
     }
 
@@ -1249,8 +1294,9 @@ export class UserDOCore extends DurableObject<Env> {
       );
       const r = await sweepExpiredMultipartSessions(this, () => scope);
       multipartHasMore = r.remaining;
-    } catch {
-      // Best-effort.
+    } catch (err) {
+      // Phase 42 \u2014 visible failure (was bare swallow).
+      this.recordAlarmFailure("multipart_sweep", "", err);
     }
 
     // Phase 28 Fix 4 — shard capacity warning poll. Throttled to
@@ -1273,14 +1319,76 @@ export class UserDOCore extends DurableObject<Env> {
         const { monitorShardCapacity } = await import("./shard-capacity");
         await monitorShardCapacity(this, scope, poolRow.pool_size);
       }
-    } catch {
-      // Best-effort.
+    } catch (err) {
+      // Phase 42 \u2014 visible failure (was bare swallow).
+      this.recordAlarmFailure("shard_capacity_poll", "", err);
+    }
+
+    // Phase 42 \u2014 audit-log retention sweep. Trim oldest rows when
+    // count exceeds the configured cap. Cheap (one COUNT + one
+    // bounded DELETE); fires inline so retention pressure
+    // amortizes across alarm ticks.
+    try {
+      const max = loadAuditLogMaxRows(this);
+      const reaped = reapAuditLog(this, max);
+      if (reaped > 0) {
+        const tenantId =
+          scope.sub !== undefined
+            ? `${scope.ns}::${scope.tenant}::${scope.sub}`
+            : `${scope.ns}::${scope.tenant}`;
+        logInfo(
+          "audit-log retention reaped rows",
+          { tenantId },
+          { event: "audit_log_reaped", reaped, max }
+        );
+      }
+    } catch (err) {
+      this.recordAlarmFailure("audit_log_reap", "", err);
     }
 
     // Reschedule if the batch was capped, otherwise fall through —
     // the next gated VFS call will re-arm via ensureStaleSweepScheduled.
     if (rows.length === 200 || multipartHasMore) {
       await this.ctx.storage.setAlarm(Date.now() + 60_000);
+    }
+  }
+
+  /**
+   * Phase 42 \u2014 record an alarm-handler failure visibly. Logs the
+   * error via `logError` (so Logpush surfaces it) AND bumps the
+   * persistent `alarm_failures` counter in `vfs_meta`. Operators
+   * who notice the counter rising can grep Logpush by
+   * `event: "alarm_handler_failed"` for the specific stack.
+   *
+   * Never throws \u2014 alarm handlers swallow their own observability
+   * failures so a failed log/counter doesn't compound into a
+   * failed alarm.
+   */
+  private recordAlarmFailure(
+    sweepKind: string,
+    targetId: string,
+    err: unknown
+  ): void {
+    const scope = this.loadScope();
+    const tenantId = scope
+      ? scope.sub !== undefined
+        ? `${scope.ns}::${scope.tenant}::${scope.sub}`
+        : `${scope.ns}::${scope.tenant}`
+      : "unknown";
+    logError(
+      "alarm handler failure",
+      { tenantId },
+      err,
+      { event: "alarm_handler_failed", sweepKind, targetId }
+    );
+    try {
+      this.sql.exec(
+        `INSERT INTO vfs_meta (key, value)
+         VALUES ('alarm_failures', '1')
+         ON CONFLICT(key) DO UPDATE SET value = CAST((CAST(value AS INTEGER) + 1) AS TEXT)`
+      );
+    } catch {
+      // observability failure must not block alarm continuation.
     }
   }
 
@@ -2054,6 +2162,12 @@ export class UserDOCore extends DurableObject<Env> {
   ): Promise<{ enabled: boolean }> {
     this.gateVfsWrite(this.adminScopeFor(userId));
     setVersioningEnabled(this, userId, enabled);
+    insertAuditLog(this, {
+      op: "adminSetVersioning",
+      actor: "operator",
+      target: userId,
+      payload: JSON.stringify({ enabled }),
+    });
     return { enabled };
   }
 
@@ -2082,7 +2196,14 @@ export class UserDOCore extends DurableObject<Env> {
     scope: VFSScope
   ): Promise<DedupeResult> {
     this.gateVfsWrite(scope);
-    return dedupePaths(this, userId, scope);
+    const result = await dedupePaths(this, userId, scope);
+    insertAuditLog(this, {
+      op: "adminDedupePaths",
+      actor: "operator",
+      target: userId,
+      payload: JSON.stringify(result),
+    });
+    return result;
   }
 
   /**
@@ -2116,7 +2237,20 @@ export class UserDOCore extends DurableObject<Env> {
   }> {
     this.gateVfsWrite(scope);
     const { reapTombstonedHeads } = await import("./admin-tombstones");
-    return reapTombstonedHeads(this, userId, scope, opts);
+    const result = await reapTombstonedHeads(this, userId, scope, opts);
+    insertAuditLog(this, {
+      op: "adminReapTombstonedHeads",
+      actor: "operator",
+      target: userId,
+      payload: JSON.stringify({
+        mode: opts.mode,
+        dryRun: result.dryRun,
+        scanned: result.scanned,
+        hardDeleted: result.hardDeleted,
+        walkedBack: result.walkedBack,
+      }),
+    });
+    return result;
   }
 
   /**
@@ -2172,6 +2306,17 @@ export class UserDOCore extends DurableObject<Env> {
     await preGenerateStandardVariants(this, scope, {
       ...args,
       headVersionId,
+    });
+    insertAuditLog(this, {
+      op: "adminPreGenerateStandardVariants",
+      actor: "operator",
+      target: args.fileId,
+      payload: JSON.stringify({
+        path: args.path,
+        mimeType: args.mimeType,
+        headVersionId,
+        isEncrypted: args.isEncrypted,
+      }),
     });
   }
 

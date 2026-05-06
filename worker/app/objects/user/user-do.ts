@@ -13,6 +13,7 @@ import { listFiles, deleteFile, getFile } from "./files";
 import { createFolder, listFolders, getFolderPath } from "./folders";
 import { getQuota, updateUsage } from "./quota";
 import { UserDOCore } from "@core/objects/user/user-do-core";
+import { insertAuditLog } from "@core/objects/user/vfs/audit-log";
 import {
   appAuthScopeFor,
   appGate,
@@ -775,12 +776,83 @@ export class UserDO extends UserDOCore {
       userId
     );
 
+    insertAuditLog(this, {
+      op: "adminWipeAccountData",
+      actor: userId,
+      target: userId,
+      payload: JSON.stringify({
+        filesRemoved: fileRows.length,
+        foldersRemoved: folderRowCount,
+        versionsRemoved: versionRowCount,
+        chunksRemovedFromShards: chunksRemoved,
+      }),
+    });
+
     return {
       filesRemoved: fileRows.length,
       foldersRemoved: folderRowCount,
       versionsRemoved: versionRowCount,
       chunksRemovedFromShards: chunksRemoved,
     };
+  }
+
+  /**
+   * Phase 42 \u2014 audit-log a share-link mint. Public surface so
+   * `worker/app/routes/auth.ts` can record the mint after
+   * `signShareToken` succeeds. The token itself never touches the
+   * DO (HMAC-only); this RPC exists purely so operators can query
+   * "did this tenant mint a share link to fileId X?" against the
+   * tenant's UserDO audit_log.
+   */
+  async appAuditShareLinkMint(
+    userId: string,
+    args: {
+      jti: string;
+      expiresAtMs: number;
+      fileCount: number;
+      albumName: string;
+    }
+  ): Promise<void> {
+    appGate(this, appScopeFor(userId));
+    insertAuditLog(this, {
+      op: "shareLinkMint",
+      actor: userId,
+      target: args.jti,
+      payload: JSON.stringify({
+        expiresAtMs: args.expiresAtMs,
+        fileCount: args.fileCount,
+        albumName: args.albumName,
+      }),
+    });
+  }
+
+  /**
+   * Phase 42 \u2014 audit-log an account-delete attempt + outcome.
+   * Public surface so `worker/app/routes/auth.ts` can record the
+   * destructive operation; the appWipeAccountData / appWipeAuthRow
+   * pair has its own audit emissions for the data + auth wipes
+   * but the user-facing "I asked to delete my account" event
+   * deserves its own trail entry.
+   */
+  async appAuditAccountDelete(
+    userId: string,
+    args: {
+      email: string;
+      filesRemoved: number;
+      authRemoved: boolean;
+    }
+  ): Promise<void> {
+    appGate(this, appScopeFor(userId));
+    insertAuditLog(this, {
+      op: "accountDelete",
+      actor: userId,
+      target: userId,
+      payload: JSON.stringify({
+        email: args.email,
+        filesRemoved: args.filesRemoved,
+        authRemoved: args.authRemoved,
+      }),
+    });
   }
 
   /**

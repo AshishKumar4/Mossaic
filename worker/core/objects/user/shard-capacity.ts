@@ -39,6 +39,7 @@ import type { UserDOCore } from "./user-do-core";
 import type { ShardDO } from "../shard/shard-do";
 import type { VFSScope } from "../../../../shared/vfs-types";
 import { vfsShardDOName } from "../../lib/utils";
+import { logWarn } from "../../lib/logger";
 
 /** Soft cap matches `ShardDO.getStorageBytes`'s published value. */
 const SOFT_CAP_BYTES = 9 * 1024 * 1024 * 1024;
@@ -152,14 +153,16 @@ export async function monitorShardCapacity(
   // with grep-friendly fields. We log per-shard rather than batched
   // so the operator can see the histogram (which shards are hot,
   // which aren't) at a glance.
+  const tenantId = scope.sub
+    ? `${scope.ns}::${scope.tenant}::${scope.sub}`
+    : `${scope.ns}::${scope.tenant}`;
   for (const s of snapshots) {
     if (s.exceedsCap) {
-      console.warn(
-        JSON.stringify({
+      logWarn(
+        "shard capacity soft cap exceeded",
+        { tenantId },
+        {
           event: "shard_capacity_soft_cap_exceeded",
-          tenant: scope.tenant,
-          ns: scope.ns,
-          sub: scope.sub,
           shardIndex: s.shardIndex,
           bytesStored: s.bytesStored,
           softCapBytes: SOFT_CAP_BYTES,
@@ -170,7 +173,7 @@ export async function monitorShardCapacity(
           // shards that are at-cap so operators can verify
           // growth is keeping pace.
           phase: "32-cap-aware",
-        })
+        }
       );
     }
   }

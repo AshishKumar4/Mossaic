@@ -34,6 +34,7 @@ import {
 } from "../../../../shared/vfs-types";
 import { computeChunkSpec } from "../../../../shared/chunking";
 import { generateId, vfsShardDOName } from "../../lib/utils";
+import { logError } from "../../lib/logger";
 import { placeChunk } from "../../../../shared/placement";
 import {
   signVFSMultipartToken,
@@ -1063,11 +1064,15 @@ export async function sweepExpiredMultipartSessions(
           nextAttempts,
           row.upload_id
         );
-        // eslint-disable-next-line no-console
-        console.error(
-          `[mossaic:P1-5] multipart session ${row.upload_id} poisoned after ${nextAttempts} abort attempts: ${
-            err instanceof Error ? err.message : String(err)
-          }`
+        logError(
+          "multipart session poisoned after abort attempts",
+          {},
+          err,
+          {
+            event: "multipart_session_poisoned",
+            uploadId: row.upload_id,
+            attempts: nextAttempts,
+          }
         );
       } else {
         // Bump the attempt counter; leave status='open' so the

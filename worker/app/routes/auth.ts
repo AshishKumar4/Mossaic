@@ -7,6 +7,7 @@ import {
   signVFSToken,
   VFSConfigError,
 } from "@core/lib/auth";
+import { ctxFromHono, logError, logInfo } from "@core/lib/logger";
 import { userStub, userStubByName } from "../lib/user-stub";
 
 const auth = new Hono<{
@@ -225,6 +226,36 @@ auth.post("/share-token", authMiddleware(), async (c) => {
       fileIds: body.fileIds as string[],
       albumName,
     });
+    // Phase 42 \u2014 audit-log the mint. Persist on the owner's UserDO
+    // so an operator querying "who minted share tokens?" gets the
+    // full trail per-tenant. Best-effort: a failure here doesn't
+    // block the mint (the token is already signed).
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (userStub(c.env, userId) as any).appAuditShareLinkMint(userId, {
+        jti,
+        expiresAtMs,
+        fileCount: body.fileIds.length,
+        albumName,
+      });
+    } catch (auditErr) {
+      logError(
+        "share-token mint audit-log failed",
+        ctxFromHono(c),
+        auditErr,
+        { event: "share_token_audit_failed" }
+      );
+    }
+    logInfo(
+      "share-token minted",
+      ctxFromHono(c),
+      {
+        event: "share_token_minted",
+        jti,
+        fileCount: body.fileIds.length,
+        expiresAtMs,
+      }
+    );
     return c.json({ token, expiresAtMs, jti });
   } catch (err) {
     if (err instanceof VFSConfigError) {
@@ -286,10 +317,11 @@ auth.delete("/account", authMiddleware(), async (c) => {
   try {
     dataReport = await userStub(c.env, userId).appWipeAccountData(userId);
   } catch (err) {
-    console.error(
-      `appWipeAccountData failed for userId=${userId}: ${
-        err instanceof Error ? err.message : String(err)
-      }`
+    logError(
+      "account-delete: appWipeAccountData failed",
+      ctxFromHono(c),
+      err,
+      { event: "account_delete_data_wipe_failed", userId }
     );
   }
 
@@ -301,12 +333,45 @@ auth.delete("/account", authMiddleware(), async (c) => {
     );
     authRemoved = r.removed;
   } catch (err) {
-    console.error(
-      `appWipeAuthRow failed for email=${email}: ${
-        err instanceof Error ? err.message : String(err)
-      }`
+    logError(
+      "account-delete: appWipeAuthRow failed",
+      ctxFromHono(c),
+      err,
+      { event: "account_delete_auth_wipe_failed", email }
     );
   }
+
+  // Phase 42 \u2014 audit-log the account-delete on the tenant's
+  // UserDO. Best-effort: failure here doesn't change the response.
+  // The DataDO audit row is the user-facing event; the per-table
+  // audits (adminWipeAccountData) provide a granular byte/file
+  // count.
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (userStub(c.env, userId) as any).appAuditAccountDelete(userId, {
+      email,
+      filesRemoved: dataReport.filesRemoved,
+      authRemoved,
+    });
+  } catch (err) {
+    logError(
+      "account-delete: audit-log emission failed",
+      ctxFromHono(c),
+      err,
+      { event: "account_delete_audit_failed", userId }
+    );
+  }
+
+  logInfo(
+    "account-delete completed",
+    ctxFromHono(c),
+    {
+      event: "account_delete_completed",
+      userId,
+      filesRemoved: dataReport.filesRemoved,
+      authRemoved,
+    }
+  );
 
   return c.json({
     ok: true,

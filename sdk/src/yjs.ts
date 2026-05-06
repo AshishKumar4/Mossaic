@@ -43,6 +43,7 @@ import {
 } from "y-protocols/awareness";
 import type { VFS } from "./vfs";
 import { VFS_MODE_YJS_BIT } from "../../shared/constants";
+import { ENOENT } from "./errors";
 
 /**
  * Bit set on `stat.mode` for files in yjs-mode. Re-exported here so
@@ -240,10 +241,24 @@ export async function openYDoc(
   try {
     const stat = await vfs.stat(path);
     fileEnc = stat.encryption;
-  } catch {
-    // stat may fail because the file doesn't exist yet; openYDoc
-    // creates it via the WS upgrade. In that case, encryption is
-    // never set on a non-existent path — no decision to make.
+  } catch (err) {
+    // Phase 41 Fix 3 (audit 40C top-4): the previous bare `catch {}`
+    // swallowed every stat error. Rationale was "ENOENT is fine —
+    // openYDoc creates the file via the WS upgrade", but that also
+    // ate transient errors (network blip, EBUSY, EAGAIN, etc.). On
+    // an encrypted-tenant deployment, a transient stat failure
+    // would leave `fileEnc = undefined` and the subsequent code
+    // would open the WebSocket in PLAINTEXT mode against an
+    // ENCRYPTED file — a real correctness defect.
+    //
+    // Fix: only swallow ENOENT (the documented "file doesn't exist
+    // yet" case). Any other error propagates — the consumer sees a
+    // typed error rather than a silently-degraded plaintext
+    // session. Fail-safe-secure: if we can't tell whether the file
+    // is encrypted, refuse to proceed.
+    if (!(err instanceof ENOENT)) {
+      throw err;
+    }
   }
   if (fileEnc !== undefined) {
     const config = (vfs as unknown as { opts: { encryption?: unknown } }).opts

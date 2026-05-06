@@ -2,7 +2,7 @@
 
 Mathlib4-backed formal verification of Mossaic VFS invariants in Lean 4.
 
-**Status (Phase 30 honest accounting):** **172 theorems**, zero `sorry`, zero project axioms. The only axioms used are Lean's three kernel axioms: `propext`, `Classical.choice`, `Quot.sound`, plus Mathlib's transitive use of them.
+**Status (Phase 43 honest accounting):** **226 theorems**, zero `sorry`, zero project axioms. The only axioms used are Lean's three kernel axioms: `propext`, `Classical.choice`, `Quot.sound`, plus Mathlib's transitive use of them.
 
 ```bash
 cd lean && lake build
@@ -133,27 +133,75 @@ EXTENDED modules (1):
     the legacy `commitRename` byte-equivalence holds; prior versions
     are preserved across overwrite.
 
-## Theorem totals (Phase 30 post-additions)
+## Phase 43 additions
+
+Phase 43 adds Lean theorem coverage for Phase 32 / 32.5 / 36 / 36b /
+37 / 38 / 39b — work that landed without theorems and was tracked by
+@lean-invariant tags pointing at non-existent Lean modules. The two
+xref failures (`Cache.bust_token_completeness`,
+`Refcount.restoreChunkRef_atomic`) are now resolved.
+
+NEW modules (4):
+
+  - **`Cache.lean`** (11 theorems) — Phase 36/36b edge-cache + version
+    cache key. Proves `bust_token_completeness` (every metadata
+    mutation bumps the bust token), `cache_key_extensional`,
+    `commit_version_bumps_state`, plus distinctness witnesses.
+  - **`Yjs.lean`** (15 theorems) — Phase 38 Yjs magic-prefix wire
+    format. Proves `wrap_then_detect_roundtrip`,
+    `magic_collision_defense`, `backward_compat_short_payloads`, and
+    distinctness from any Yjs varint first byte.
+  - **`ShareToken.lean`** (6 theorems) — Phase 32.5 HMAC verify.
+    Proves `forged_token_rejected`, `wrong_scope_rejected`,
+    `multi_secret_rotation_window`, `payload_pins_tenancy`. Uses
+    `opaque` model declarations to avoid axioms.
+  - **`RPC.lean`** (12 theorems) — Phase 39b batch RPCs. Proves
+    `batch_preserves_order`, `batch_index_correspondence`,
+    `single_rpc_per_shard_def`, `missing_chunk_returns_null`,
+    `batch_rpc_atomicity`.
+
+EXTENDED modules (3):
+
+  - **`Versioning.lean`** (+6 theorems) — Phase 36 commitVersion
+    accounting. `commitVersion_idempotent`, `accounting_balanced`,
+    `versioning_on_pool_growth_works`, `pool_growth_monotonic`.
+  - **`Quota.lean`** (+12 theorems) — Phase 32 skip-full placement
+    (`skip_full_shard_returns_non_full`, `skip_full_shard_in_bounds`,
+    `pool_full_at_zero_pool`), Phase 25 inline-tier migration
+    threshold (`inline_migration_threshold`,
+    `inline_overflow_rejected`), and Phase 7 server-authoritative
+    pool fact.
+  - **`Refcount.lean`** (+2 theorems, +1 RestoreStatus type)
+    — Phase 32 Fix C2 restoreChunkRef. Proves
+    `restoreChunkRef_atomic` (refs/chunks update together, no race
+    window) and `restoreChunkRef_liveRefs_bump` (numerical
+    consequence: liveRefs grows by 1 in lockstep with refCount).
+
+## Theorem totals (Phase 43 post-additions)
 
 | Module | Theorems | Notes |
 |---|--:|---|
 | `Common.lean` | 1 | UniqueBy.nil. |
-| `Tenant.lean` | 15 | I3 tenant isolation. |
-| `Refcount.lean` | 41 | I1, including Phase 12 copyFile + metadata. |
-| `Gc.lean` | 10 | I5 GC safety. |
+| `Tenant.lean` | 14 | I3 tenant isolation. |
+| `Refcount.lean` | 39 | I1 + Phase 12 copyFile + Phase 32 restoreChunkRef atomicity. |
+| `Gc.lean` | 9 | I5 GC safety. |
 | `AtomicWrite.lean` | 11 | I2 linearizability. |
-| `Versioning.lean` | 13 | I4 sortedness + Phase 12 user_visible. |
+| `Versioning.lean` | 19 | I4 sortedness + Phase 12 user_visible + Phase 36 commitVersion. |
 | `Encryption.lean` | 1 | refcount-blindness only. |
 | `Multipart.lean` | 10 | Phase 24 base + Phase 30 versioning split (§4). |
-| `Quota.lean` | 10 | Pool-growth correctness. |
-| `Preview.lean` | 15 | file_variants invariants. |
-| `Tombstone.lean` | 13 | NEW (Phase 30) — Phase 25 tombstone consistency. |
-| `HistoryPreservation.lean` | 14 | NEW (Phase 30) — Phase 27 Fix 5/6/7. |
-| `StreamRouting.lean` | 12 | NEW (Phase 30) — Phase 27.5 read-stream routing. |
+| `Quota.lean` | 22 | Pool-growth + Phase 32 skip-full + Phase 25 inline-tier + server-auth. |
+| `Preview.lean` | 13 | file_variants invariants. |
+| `Tombstone.lean` | 11 | Phase 25 tombstone consistency. |
+| `HistoryPreservation.lean` | 14 | Phase 27 Fix 5/6/7. |
+| `StreamRouting.lean` | 12 | Phase 27.5 read-stream routing. |
+| `Cache.lean` | 11 | NEW (Phase 43) — Phase 36/36b cache-key + bust-token completeness. |
+| `Yjs.lean` | 15 | NEW (Phase 43) — Phase 38 Yjs magic-prefix wire format. |
+| `ShareToken.lean` | 6 | NEW (Phase 43) — Phase 32.5 HMAC share-token verify. |
+| `RPC.lean` | 12 | NEW (Phase 43) — Phase 39b batch RPC ordering + atomicity. |
 | `Generated/Placement.lean` | 0 | Documentation. |
 | `Generated/ShardDO.lean` | 3 | Re-exports. |
 | `Generated/UserDO.lean` | 3 | Re-exports. |
-| **Total** | **172** | (was 128 post-Phase-24; +44 in Phase 30) |
+| **Total** | **226** | (+44 NEW in Phase 43; +10 EXTENDED) |
 
 Plus **0 project axioms** (unchanged from Phase 24) and **0 sorrys**.
 
@@ -163,7 +211,7 @@ Architecturally inspired by [AshishKumar4/TSLean](https://github.com/AshishKumar
 
 Mathlib4 v4.29.0 lets us prove the numerical refcount equality (`List.countP`-based) and the listVersions sortedness (`List.pairwise_mergeSort`) directly, without recourse to project axioms.
 
-## Layout (post-Phase-30)
+## Layout (post-Phase-43)
 
 ```
 lean/
@@ -171,22 +219,26 @@ lean/
 ├── lakefile.lean                   (Mathlib v4.29.0 dependency)
 ├── lean-toolchain                  (leanprover/lean4:v4.29.0)
 ├── lake-manifest.json              (auto-generated; pinned)
-├── Mossaic.lean                    (root, re-exports all 14 modules)
+├── Mossaic.lean                    (root, re-exports all 18 modules)
 ├── Mossaic/
 │   ├── Vfs/
 │   │   ├── Common.lean             (Hash/PathId/TimeMs aliases, UniqueBy)
 │   │   ├── Tenant.lean             (I3)
-│   │   ├── Refcount.lean           (I1, full numerical equality)
+│   │   ├── Refcount.lean           (I1, full numerical equality + Phase 32 restoreChunkRef)
 │   │   ├── Gc.lean                 (I5, no axiom)
 │   │   ├── AtomicWrite.lean        (I2, full linearizability)
-│   │   ├── Versioning.lean         (I4, full sortedness via Mathlib)
+│   │   ├── Versioning.lean         (I4 sortedness + Phase 36 commitVersion accounting)
 │   │   ├── Encryption.lean         (refcount-blindness only — Phase 24 cleanup)
 │   │   ├── Multipart.lean          (idempotence + supersession + Phase 27 versioning split)
-│   │   ├── Quota.lean              (Phase 24: pool-growth correctness)
-│   │   ├── Preview.lean            (Phase 24: file_variants invariants)
-│   │   ├── Tombstone.lean          (Phase 30 NEW: Phase 25 tombstone consistency)
-│   │   ├── HistoryPreservation.lean (Phase 30 NEW: Phase 27 Fix 5/6/7)
-│   │   └── StreamRouting.lean      (Phase 30 NEW: Phase 27.5 read-stream routing)
+│   │   ├── Quota.lean              (pool-growth + Phase 32 skip-full + Phase 25 inline-tier)
+│   │   ├── Preview.lean            (file_variants invariants)
+│   │   ├── Tombstone.lean          (Phase 25 tombstone consistency)
+│   │   ├── HistoryPreservation.lean (Phase 27 Fix 5/6/7)
+│   │   ├── StreamRouting.lean      (Phase 27.5 read-stream routing)
+│   │   ├── Cache.lean              (Phase 43 NEW: Phase 36/36b cache-key + bust-token)
+│   │   ├── Yjs.lean                (Phase 43 NEW: Phase 38 magic-prefix wire format)
+│   │   ├── ShareToken.lean         (Phase 43 NEW: Phase 32.5 HMAC verify)
+│   │   └── RPC.lean                (Phase 43 NEW: Phase 39b batch RPC ordering)
 │   └── Generated/
 │       ├── ShardDO.lean            (re-exports for shard-do.ts)
 │       ├── UserDO.lean             (re-exports for user-do.ts)
