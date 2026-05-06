@@ -1,36 +1,44 @@
 #!/usr/bin/env bash
-# Verify zero `sorry` in must-have Lean proofs.
+# Verify zero `sorry` and zero project `axiom` in Mossaic Lean proofs.
 #
-# Strategy: use `lake env lean --print-axioms` indirectly via grep on the
-# build output. Simpler: rely on Lean's compiler — if any `sorry` is used
-# as a tactic in a definition, `lake build` emits a warning of the form
-# `declaration uses 'sorry'`. We grep `lake build` output for that.
+# Strategy: rely on Lean's compiler emitting a warning when a definition
+# uses `sorry`. A `lake build` warning of the form
+# `declaration uses 'sorry'` triggers a failure.
 #
-# This is the load-bearing check: if a proof secretly uses `sorry`, lake's
-# warning will catch it.
+# For axioms, we grep the source files directly for any line beginning
+# with `axiom` (modulo whitespace) — that catches every project-level
+# declaration. Kernel axioms (`Classical.choice`, `propext`, `Quot.sound`)
+# live in core Lean, not in our project, so they don't appear in the grep.
 
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-# Run `lake build` and capture warnings about sorry.
+# 1. Run lake build and capture sorry warnings.
 output=$(lake build 2>&1 || true)
 
 # Filter for files we care about (must-have only).
-must_have_pattern='Mossaic/Vfs/(Common|Tenant|Refcount|Gc)\.lean|Mossaic/Generated/(ShardDO|UserDO|Placement)\.lean'
+must_have_pattern='Mossaic/Vfs/(Common|Tenant|Refcount|Gc|AtomicWrite|Versioning)\.lean|Mossaic/Generated/(ShardDO|UserDO|Placement)\.lean'
 
-# Look for "declaration uses 'sorry'" warnings on must-have files.
 sorry_warnings=$(echo "$output" | grep -E "declaration uses .sorry." | grep -E "$must_have_pattern" || true)
 
 if [[ -n "$sorry_warnings" ]]; then
-  echo "FAIL: sorry detected in must-have proofs:"
+  echo "FAIL: sorry detected in proof files:"
   echo "$sorry_warnings"
   exit 1
 fi
 
-# Sanity check: confirm `lake build` succeeded.
+# 2. Project axioms.
+project_axioms=$(grep -rnE '^axiom|^[[:space:]]+axiom' Mossaic/ || true)
+if [[ -n "$project_axioms" ]]; then
+  echo "FAIL: project-level axiom declarations found:"
+  echo "$project_axioms"
+  exit 1
+fi
+
+# 3. Confirm `lake build` succeeded.
 if echo "$output" | grep -q "Build completed successfully"; then
-  echo "OK: lake build succeeded; zero sorry in must-have proofs."
+  echo "OK: lake build succeeded; zero sorry; zero project axioms."
   exit 0
 elif echo "$output" | grep -q "build failed"; then
   echo "FAIL: lake build failed."
@@ -38,10 +46,9 @@ elif echo "$output" | grep -q "build failed"; then
   exit 1
 fi
 
-# Fall-through: build neither succeeded nor failed visibly. Treat as OK
-# only if the output had a "Built" indicator and no error: lines.
+# Fall-through: build neither succeeded nor failed visibly.
 if echo "$output" | grep -q "Built Mossaic" && ! echo "$output" | grep -q "^error:"; then
-  echo "OK: zero sorry in must-have proofs."
+  echo "OK: zero sorry; zero project axioms."
   exit 0
 fi
 

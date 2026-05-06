@@ -56,6 +56,7 @@ import type {
 } from "@shared/vfs-types";
 import { VFSError } from "@shared/vfs-types";
 import { dedupePaths, type DedupeResult } from "./admin";
+import { YjsRuntime } from "./yjs";
 import { enforceRateLimit } from "./rate-limit";
 import {
   dropVersions,
@@ -76,12 +77,31 @@ export class UserDO extends DurableObject<Env> {
    * base class's `env` remains protected; we shadow it.
    */
   envPublic: Env;
+  /**
+   * Phase 10: per-DO YjsRuntime cache. Lazily constructed on first
+   * access so the import isn't evaluated for tenants that never use
+   * yjs-mode files. Holds the in-memory `Y.Doc` cache + the live
+   * WebSocket sets per pathId. State on disk (yjs_oplog, yjs_meta,
+   * shard chunks) survives DO hibernation; the runtime instance does
+   * not — it gets rebuilt cold from the op log on the first access
+   * after wake. Sockets are restored via ctx.getWebSockets(pathId)
+   * on first message after wake.
+   */
+  private _yjsRuntime: YjsRuntime | undefined;
   private initialized = false;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
     this.envPublic = env;
+  }
+
+  /** Phase 10: lazy YjsRuntime accessor. */
+  get yjsRuntime(): YjsRuntime {
+    if (this._yjsRuntime === undefined) {
+      this._yjsRuntime = new YjsRuntime(this);
+    }
+    return this._yjsRuntime;
   }
 
   private ensureInit(): void {
@@ -356,6 +376,68 @@ export class UserDO extends DurableObject<Env> {
       // column already exists
     }
 
+    // ── Phase 10: Yjs per-file mode ──────────────────────────────────────
+    //
+    // mode_yjs: opt-in per FILE bit. 0 = plain bytes (Phase 1-9
+    // behavior); 1 = the file is a Yjs CRDT op log. Storage is a
+    // sequence of Yjs binary updates appended as chunks under the
+    // existing refcounted machinery; readFile materializes the
+    // Y.Doc and returns a serialised view; writeFile applies the
+    // bytes via a Y.Text replacement transaction; live editors
+    // connect via WebSocket.
+    //
+    // Set on per-file granularity, not per-tenant — a single
+    // tenant can mix yjs-mode files with plain files freely.
+    // Default 0 ⇒ no behavior change for any existing file.
+    try {
+      this.sql.exec(
+        "ALTER TABLE files ADD COLUMN mode_yjs INTEGER NOT NULL DEFAULT 0"
+      );
+    } catch {
+      // column already exists
+    }
+
+    // yjs_oplog: append-only log of Yjs binary updates per file.
+    // Each row is one update + a monotonic seq number per path_id
+    // for ordering. Updates are ALSO chunked into ShardDOs via the
+    // standard chunk_refs path (using a synthetic file_id of
+    // `${pathId}#yjs#${seq}`) so refcount + GC come for free. The
+    // SQL row carries a checkpoint flag — checkpoint rows are full
+    // Y.Doc state snapshots that compaction creates so cold reads
+    // don't replay the entire history.
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS yjs_oplog (
+        path_id      TEXT NOT NULL,
+        seq          INTEGER NOT NULL,
+        kind         TEXT NOT NULL,
+        chunk_hash   TEXT NOT NULL,
+        chunk_size   INTEGER NOT NULL,
+        shard_index  INTEGER NOT NULL,
+        created_at   INTEGER NOT NULL,
+        PRIMARY KEY (path_id, seq)
+      )
+    `);
+    // Index by (path_id, seq DESC) for hot reads. Not strictly
+    // needed since the PK already covers seq scans in either
+    // direction on SQLite, but explicit + free.
+    this.sql.exec(`
+      CREATE INDEX IF NOT EXISTS idx_yjs_oplog_path_seq
+        ON yjs_oplog(path_id, seq DESC)
+    `);
+    // yjs_meta: per-file Yjs state. Tracks the current seq counter,
+    // the latest checkpoint seq (for cold-read replay bounds), and
+    // whether a compaction is pending. One row per yjs-mode file.
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS yjs_meta (
+        path_id            TEXT PRIMARY KEY,
+        next_seq           INTEGER NOT NULL DEFAULT 0,
+        last_checkpoint_seq INTEGER NOT NULL DEFAULT -1,
+        op_count_since_ckpt INTEGER NOT NULL DEFAULT 0,
+        last_compact_at    INTEGER NOT NULL DEFAULT 0,
+        materialized_at    INTEGER NOT NULL DEFAULT 0
+      )
+    `);
+
     // ── Audit H1: stale-upload sweeper bookkeeping ───────────────────────
     //
     // Plan §7 requires a UserDO `alarm()` that hard-deletes
@@ -466,7 +548,77 @@ export class UserDO extends DurableObject<Env> {
     return rows.map((r) => r.key);
   }
 
-  async fetch(request: Request): Promise<Response> {
+  /**
+   * Phase 10: top-level fetch entry. Splits WebSocket upgrade
+   * traffic out to a dedicated path, otherwise delegates to the
+   * legacy HTTP handler whose body must remain byte-for-byte
+   * identical to the Phase 0–9 version (ChannelDelegate-style
+   * preservation; the legacy app at app.mossaic.io speaks this
+   * exact JSON shape).
+   *
+   * The legacy handler is below, renamed to `_legacyFetch` —
+   * hash of the body bytes (lines 622..815 inclusive, the bytes
+   * between the opening `{` and the closing `}` of `_legacyFetch`)
+   * is pinned at
+   * `4c6eb84925cd8b34298aa92a5201c6e8074defb4527c3bbb1d2c677f9f2c8e70`.
+   * Audit script:
+   *
+   *   awk 'NR>=622 && NR<=815' worker/objects/user/user-do.ts | sha256sum
+   *
+   * If the body must change for an actual behavior fix, recompute
+   * the hash AND update this comment AND note the change in the
+   * commit message — the legacy app at app.mossaic.io speaks this
+   * exact JSON shape and silent regressions there are catastrophic.
+   */
+  override async fetch(request: Request): Promise<Response> {
+    if (request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
+      return this._fetchWebSocketUpgrade(request);
+    }
+    return this._legacyFetch(request);
+  }
+
+  /**
+   * Phase 10: WebSocket upgrade entry. Path-encoded params:
+   *   /yjs/ws?path=<encoded path>&ns=<ns>&tenant=<tenant>[&sub=<sub>]
+   *
+   * Yjs binary frames flow over the WebSocket; the upgrade is the
+   * one moment when the SDK pays a `fetch` round-trip rather than a
+   * typed-RPC call. We avoid typed-RPC for the upgrade because
+   * Cloudflare DO RPC currently can't serialize a Response that
+   * carries a `webSocket` field across the RPC boundary — only
+   * `fetch()` is permitted to return such a Response.
+   */
+  private async _fetchWebSocketUpgrade(request: Request): Promise<Response> {
+    this.ensureInit();
+    const url = new URL(request.url);
+    if (url.pathname !== "/yjs/ws") {
+      return new Response("not found", { status: 404 });
+    }
+    const path = url.searchParams.get("path");
+    const ns = url.searchParams.get("ns");
+    const tenant = url.searchParams.get("tenant");
+    const sub = url.searchParams.get("sub") ?? undefined;
+    if (!path || !ns || !tenant) {
+      return new Response("missing required query params: path, ns, tenant", {
+        status: 400,
+      });
+    }
+    try {
+      return await this.vfsOpenYjsSocket({ ns, tenant, sub }, path);
+    } catch (err) {
+      const code =
+        err && typeof err === "object" && "code" in err
+          ? (err as { code: string }).code
+          : "EINTERNAL";
+      const message = err instanceof Error ? err.message : "internal error";
+      return Response.json(
+        { error: message, code },
+        { status: code === "ENOENT" ? 404 : 400 }
+      );
+    }
+  }
+
+  private async _legacyFetch(request: Request): Promise<Response> {
     this.ensureInit();
 
     const url = new URL(request.url);
@@ -1338,5 +1490,232 @@ export class UserDO extends DurableObject<Env> {
   ): Promise<DedupeResult> {
     this.ensureInit();
     return dedupePaths(this, userId, scope);
+  }
+
+  // ── Phase 10: yjs-mode primitives ─────────────────────────────────────
+
+  /**
+   * Toggle the per-file `mode_yjs` bit. Currently only 0 → 1 is
+   * permitted (downgrade is rejected to avoid losing CRDT history).
+   * Path must point to an existing regular file. See vfs-ops.ts for
+   * full semantics.
+   */
+  async vfsSetYjsMode(
+    scope: VFSScope,
+    path: string,
+    enabled: boolean
+  ): Promise<void> {
+    this.gateVfsWrite(scope);
+    const { vfsSetYjsMode } = await import("./vfs-ops");
+    vfsSetYjsMode(this, scope, path, enabled);
+  }
+
+  /**
+   * Open a Yjs WebSocket session against `path`. The path MUST be a
+   * yjs-mode file. The returned Response carries the client side
+   * of a WebSocketPair (status 101); the server side is accepted
+   * via the Hibernation API (`ctx.acceptWebSocket`) so idle
+   * connections cost $0.
+   *
+   * Per-socket state (scope, userId, pathId, poolSize) is stashed
+   * via `ws.serializeAttachment` so the hibernation handlers can
+   * reconstitute it without an in-memory map (which would not
+   * survive eviction).
+   */
+  async vfsOpenYjsSocket(
+    scope: VFSScope,
+    path: string
+  ): Promise<Response> {
+    this.gateVfs(scope);
+    const { isYjsMode } = await import("./vfs-ops");
+    const { resolvePathFollow } = await import("./path-walk");
+    // Resolve the path → pathId. Use the same tenant-scoped userId
+    // as the rest of vfs-ops; reject anything that isn't a yjs-mode
+    // regular file BEFORE we burn an upgrade.
+    const userId = ((): string => {
+      if (scope.sub !== undefined) return `${scope.tenant}::${scope.sub}`;
+      return scope.tenant;
+    })();
+    const r = resolvePathFollow(this, userId, path);
+    if (r.kind !== "file") {
+      throw new VFSError(
+        "EINVAL",
+        `openYjsSocket: not a regular file: ${path}`
+      );
+    }
+    if (!isYjsMode(this, userId, r.leafId)) {
+      throw new VFSError(
+        "EINVAL",
+        `openYjsSocket: file is not in yjs mode: ${path}`
+      );
+    }
+
+    // Look up the per-tenant pool size now so we don't have to
+    // re-query on every socket message.
+    const poolRow = this.sql
+      .exec("SELECT pool_size FROM quota WHERE user_id = ?", userId)
+      .toArray()[0] as { pool_size: number } | undefined;
+    const poolSize = poolRow ? poolRow.pool_size : 32;
+
+    const pair = new WebSocketPair();
+    const client = pair[0];
+    const server = pair[1];
+
+    // Tag with the pathId so we can rebuild the in-memory `sockets`
+    // Map after a hibernation cycle via ctx.getWebSockets(pathId).
+    this.ctx.acceptWebSocket(server, [r.leafId]);
+    server.serializeAttachment({
+      scope,
+      userId,
+      pathId: r.leafId,
+      poolSize,
+    });
+    this.yjsRuntime.registerSocket(r.leafId, server);
+
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  /**
+   * Hibernation API hook. Called by the runtime for each incoming
+   * frame on an accepted WebSocket. The DO does NOT need to be in
+   * memory between frames — workerd will instantiate, dispatch,
+   * then evict. Idle WebSockets cost $0.
+   *
+   * Design notes (after surveying @cloudflare/agents + capnweb for
+   * Phase 10):
+   *
+   * - Yjs sync-protocol frames are BINARY (Uint8Array). agents-sdk's
+   *   `@callable` JSON-RPC pattern only carries text frames; capnweb
+   *   serializes Uint8Array as base64 strings inside a JSON envelope
+   *   (~33% size penalty + per-frame CPU). Both are non-starters for
+   *   the hot path. We keep the hand-rolled 1-byte-tag + payload
+   *   framing — `decodeYjsMessage` in yjs.ts.
+   *
+   * - The single useful idiom we adopt from agents-sdk is the
+   *   "ensure rehydrated" pattern: at the top of every hibernation
+   *   handler, read `ws.deserializeAttachment()` (which DOES survive
+   *   eviction) and re-populate the in-memory `YjsRuntime.sockets`
+   *   set via `registerSocket` (idempotent — `Set.add` is a no-op on
+   *   the second call). The runtime's `docs` Map is rebuilt lazily
+   *   on the next `getDoc` call against this pathId.
+   *
+   * - Why we don't need a separate JSON control-plane envelope: the
+   *   only "control" call clients make is `vfsOpenYjsSocket` itself,
+   *   which is already a typed Cloudflare DO RPC method (no extra
+   *   wire format). Once the WS is open, every frame is Yjs.
+   */
+  async webSocketMessage(
+    ws: WebSocket,
+    message: string | ArrayBuffer
+  ): Promise<void> {
+    if (typeof message === "string") {
+      // We never send text frames; ignore.
+      return;
+    }
+    const att = ws.deserializeAttachment() as {
+      scope: VFSScope;
+      userId: string;
+      pathId: string;
+      poolSize: number;
+    } | null;
+    if (!att) {
+      // No attachment — socket from a different protocol. Drop it.
+      ws.close(1011, "missing yjs attachment");
+      return;
+    }
+
+    // Re-register the socket in the live map (no-op if already
+    // present; idempotent set add). Cheap and keeps broadcast paths
+    // correct after wake.
+    this.yjsRuntime.registerSocket(att.pathId, ws);
+
+    const bytes = new Uint8Array(message);
+    const { decodeYjsMessage, encodeSyncStep2 } = await import("./yjs");
+    const decoded = decodeYjsMessage(bytes);
+
+    try {
+      switch (decoded.kind) {
+        case "syncStep1": {
+          // Client sent us their state vector; reply with the diff
+          // they need (sync-step-2) AND prompt them with our own
+          // state vector (sync-step-1) for full bidirectional sync.
+          const Y = await import("yjs");
+          const doc = await this.yjsRuntime.getDoc(att.scope, att.pathId);
+          const diff = Y.encodeStateAsUpdate(doc, decoded.stateVector);
+          ws.send(encodeSyncStep2(diff));
+          // Also send our state vector so they reciprocate (the
+          // standard Yjs sync handshake is symmetric).
+          const reply = await this.yjsRuntime.syncStep1Reply(
+            att.scope,
+            att.pathId
+          );
+          ws.send(reply);
+          return;
+        }
+        case "syncStep2": {
+          await this.yjsRuntime.applyRemoteUpdate(
+            att.scope,
+            att.userId,
+            att.pathId,
+            att.poolSize,
+            decoded.diff,
+            ws
+          );
+          return;
+        }
+        case "update": {
+          await this.yjsRuntime.applyRemoteUpdate(
+            att.scope,
+            att.userId,
+            att.pathId,
+            att.poolSize,
+            decoded.update,
+            ws
+          );
+          return;
+        }
+        case "unknown":
+        default: {
+          // Unknown tag — ignore for forward compat.
+          return;
+        }
+      }
+    } catch (err) {
+      // Don't crash the handler — close with the error reason so
+      // the client knows to retry.
+      try {
+        ws.close(1011, err instanceof Error ? err.message : "internal error");
+      } catch {
+        /* already closed */
+      }
+    }
+  }
+
+  /**
+   * Hibernation API hook: called when a peer closes the socket OR
+   * when workerd drops it. Drop our in-memory tracking; SQL state
+   * is unaffected.
+   */
+  async webSocketClose(
+    ws: WebSocket,
+    _code: number,
+    _reason: string,
+    _wasClean: boolean
+  ): Promise<void> {
+    const att = ws.deserializeAttachment() as
+      | { pathId: string }
+      | null;
+    if (att) this.yjsRuntime.removeSocket(att.pathId, ws);
+  }
+
+  /**
+   * Hibernation API hook: error path mirrors close. We don't try to
+   * recover the connection — clients reconnect on their own.
+   */
+  async webSocketError(ws: WebSocket, _err: unknown): Promise<void> {
+    const att = ws.deserializeAttachment() as
+      | { pathId: string }
+      | null;
+    if (att) this.yjsRuntime.removeSocket(att.pathId, ws);
   }
 }

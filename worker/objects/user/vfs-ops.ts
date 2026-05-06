@@ -21,6 +21,7 @@ import {
   shardRefId,
 } from "./vfs-versions";
 import { resolvePath, resolvePathFollow } from "./path-walk";
+import { purgeYjs, readYjsAsBytes, writeYjsBytes } from "./yjs";
 
 /**
  * Phase 2 read-side VFS operations.
@@ -173,7 +174,7 @@ function statForResolved(
   // file or symlink: same SQL row.
   const row = durableObject.sql
     .exec(
-      `SELECT file_id, file_size, mode, node_kind, symlink_target, inline_data, updated_at
+      `SELECT file_id, file_size, mode, mode_yjs, node_kind, symlink_target, inline_data, updated_at
          FROM files
         WHERE file_id=? AND user_id=? AND status!='deleted'`,
       r.leafId,
@@ -184,6 +185,7 @@ function statForResolved(
         file_id: string;
         file_size: number;
         mode: number | null;
+        mode_yjs: number;
         node_kind: string | null;
         symlink_target: string | null;
         inline_data: ArrayBuffer | null;
@@ -243,7 +245,10 @@ function statForResolved(
       const vsize = head.inline_data ? head.inline_data.byteLength : head.size;
       return {
         type: "file",
-        mode: head.mode,
+        // Phase 10: surface the yjs-mode bit on stat.mode. The
+        // mode_yjs flag lives on the `files` row (not the version
+        // row) so it's invariant across versions of the same path.
+        mode: head.mode | (row.mode_yjs === 1 ? 0o4000 : 0),
         size: vsize,
         mtimeMs: head.mtime_ms,
         uid,
@@ -262,7 +267,8 @@ function statForResolved(
     : row.file_size;
   return {
     type: "file",
-    mode: row.mode ?? 0o644,
+    // Phase 10: surface the yjs-mode bit on stat.mode (0o4000).
+    mode: (row.mode ?? 0o644) | (row.mode_yjs === 1 ? 0o4000 : 0),
     size,
     mtimeMs: row.updated_at,
     uid,
@@ -654,6 +660,17 @@ export async function vfsReadFile(
   if (r.kind !== "file") {
     // symlink would have been followed; if we got here it's something else
     throw new VFSError("EINVAL", `readFile: not a regular file: ${path}`);
+  }
+
+  // Phase 10: yjs-mode fork. If the file has mode_yjs=1 we MUST
+  // materialize from the op log + checkpoint instead of file_chunks
+  // / file_versions. Even if a head_version_id exists (compaction
+  // snapshots ALSO emit Mossaic versions when versioning is on),
+  // the live truth is the YjsRuntime materialized doc. Routing
+  // through readYjsAsBytes ensures readFile reflects unflushed
+  // ops still cached in the in-memory Y.Doc.
+  if (isYjsMode(durableObject, userId, r.leafId)) {
+    return readYjsAsBytes(durableObject, scope, r.leafId);
   }
 
   // Phase 9: versioning fork. If the path has a head_version_id, OR
@@ -1393,6 +1410,46 @@ export async function vfsWriteFile(
   const mimeType = opts.mimeType ?? "application/octet-stream";
   const now = Date.now();
 
+  // Phase 10: yjs-mode fork. If the target file already exists
+  // and has mode_yjs=1, route the bytes through the YjsRuntime.
+  // Semantics (Option A): the `data` Uint8Array becomes the new
+  // value of the Y.Text("content") inside the doc, emitted as a
+  // single CRDT update under origin "writeFile". Versioning fork
+  // is bypassed here — yjs op log + periodic checkpoints ARE the
+  // history; compaction (not writeFile) creates Mossaic version
+  // rows when versioning is also enabled.
+  //
+  // Use IFNULL on parent_id to make the lookup work for files at
+  // the root (parent_id is NULL there) — bare `=` against NULL
+  // never matches in SQL. Status filter mirrors findLiveFile but
+  // only excludes 'deleted'/'uploading' tombstones; 'complete'
+  // matches.
+  {
+    const existing = durableObject.sql
+      .exec(
+        `SELECT file_id, mode_yjs FROM files
+           WHERE user_id=? AND IFNULL(parent_id,'')=IFNULL(?,'')
+             AND file_name=? AND status='complete'`,
+        userId,
+        parentId,
+        leaf
+      )
+      .toArray()[0] as
+      | { file_id: string; mode_yjs: number }
+      | undefined;
+    if (existing && existing.mode_yjs === 1) {
+      await writeYjsBytes(
+        durableObject,
+        scope,
+        userId,
+        existing.file_id,
+        poolSizeFor(durableObject, userId),
+        data
+      );
+      return;
+    }
+  }
+
   // Phase 9: versioning fork. When the tenant has versioning ON,
   // every writeFile creates a new file_versions row referenced by
   // a per-version synthetic shard key, and the `files` row is just
@@ -1711,6 +1768,16 @@ export async function vfsUnlink(
       deleted: true,
     });
     return;
+  }
+
+  // Phase 10: yjs-mode files have their content in yjs_oplog +
+  // shard chunks under refs `${pathId}#yjs#${seq}`, NOT in
+  // file_chunks. We must drop those refs (so chunk_refs / refcount
+  // gives the alarm sweeper a chance to free shard storage) and
+  // wipe the per-path oplog/meta rows BEFORE the files row goes,
+  // so we still know `r.leafId`.
+  if (r.kind === "file" && isYjsMode(durableObject, userId, r.leafId)) {
+    await purgeYjs(durableObject, scope, r.leafId);
   }
 
   await hardDeleteFileRow(durableObject, userId, scope, r.leafId);
@@ -2055,6 +2122,81 @@ export function vfsChmod(
       userId
     );
   }
+}
+
+/**
+ * Phase 10: toggle the per-file `mode_yjs` bit. Separate from
+ * `vfsChmod(path, mode: number)` because the wire shape is a
+ * boolean, not a POSIX mode number. Setting from 0 → 1 promotes
+ * a regular file into yjs mode; the existing bytes (if any) are
+ * read once and replayed into a fresh Y.Doc as the initial
+ * "content" Y.Text. Toggling 1 → 0 is rejected with EINVAL —
+ * downgrading would lose CRDT history; if you need that,
+ * readFile + write a new non-yjs file at a different path.
+ *
+ * The promotion path runs in the caller (vfsWriteFileYjs branch
+ * picks up the mode bit before any write) — this function ONLY
+ * flips the column.
+ */
+export function vfsSetYjsMode(
+  durableObject: UserDO,
+  scope: VFSScope,
+  path: string,
+  enabled: boolean
+): void {
+  const userId = userIdFor(scope);
+  const r = resolveOrThrow(durableObject, userId, path, /*follow*/ false);
+  if (r.kind !== "file") {
+    throw new VFSError(
+      "EINVAL",
+      `setYjsMode: not a regular file: ${path}`
+    );
+  }
+  // Look at current state.
+  const row = durableObject.sql
+    .exec(
+      "SELECT mode_yjs FROM files WHERE file_id=? AND user_id=?",
+      r.leafId,
+      userId
+    )
+    .toArray()[0] as { mode_yjs: number } | undefined;
+  if (!row) throw new VFSError("ENOENT", `setYjsMode: file vanished`);
+  const current = row.mode_yjs === 1;
+  if (current === enabled) return; // idempotent
+  if (current && !enabled) {
+    throw new VFSError(
+      "EINVAL",
+      "setYjsMode: cannot demote yjs-mode to plain (would lose CRDT history)"
+    );
+  }
+  // Promotion: flip the bit.
+  durableObject.sql.exec(
+    "UPDATE files SET mode_yjs=1, updated_at=? WHERE file_id=? AND user_id=?",
+    Date.now(),
+    r.leafId,
+    userId
+  );
+}
+
+/**
+ * Read the mode_yjs bit for a path. Returns false for any
+ * non-file or missing row. Used by the read/write branching in
+ * vfsReadFile / vfsWriteFile to decide whether to route through
+ * the YjsRuntime.
+ */
+export function isYjsMode(
+  durableObject: UserDO,
+  userId: string,
+  pathId: string
+): boolean {
+  const row = durableObject.sql
+    .exec(
+      "SELECT mode_yjs FROM files WHERE file_id=? AND user_id=?",
+      pathId,
+      userId
+    )
+    .toArray()[0] as { mode_yjs: number } | undefined;
+  return !!row && row.mode_yjs === 1;
 }
 
 // ── symlink ────────────────────────────────────────────────────────────

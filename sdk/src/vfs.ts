@@ -169,6 +169,17 @@ export interface UserDOClient {
     path: string
   ): Promise<void>;
   vfsChmod(scope: VFSScope, path: string, mode: number): Promise<void>;
+  /** Phase 10: flip the per-file Yjs-mode bit. */
+  vfsSetYjsMode(
+    scope: VFSScope,
+    path: string,
+    enabled: boolean
+  ): Promise<void>;
+  // NOTE: WebSocket upgrade for live Yjs editing does NOT use typed
+  // RPC. Cloudflare DO RPC cannot serialize a Response with a
+  // `webSocket` field across the RPC boundary. The SDK calls
+  // `stub.fetch(/yjs/ws?...)` directly with `Upgrade: websocket`.
+  // See `VFS._openYjsSocketResponse` and `UserDO._fetchWebSocketUpgrade`.
   vfsRename(
     scope: VFSScope,
     src: string,
@@ -565,12 +576,100 @@ export class VFS implements VFSClient {
     }
   }
 
-  async chmod(p: string, mode: number): Promise<void> {
+  async chmod(p: string, mode: number): Promise<void>;
+  /**
+   * Phase 10 overload: pass `{ yjs: true }` to flip the per-file
+   * Yjs-mode bit. Demoting back to plain (`{ yjs: false }`) is
+   * rejected EINVAL on the server — it would lose CRDT history.
+   *
+   * NOTE: this is NOT a posix mode change — the bit is stored in
+   * a separate column (`mode_yjs`) and surfaces on `stat.mode` as
+   * `VFS_MODE_YJS_BIT` (0o4000). If you want to change BOTH posix
+   * mode and the yjs bit, call `chmod(p, mode)` and
+   * `chmod(p, { yjs: true })` separately.
+   */
+  async chmod(p: string, opts: { yjs: boolean }): Promise<void>;
+  async chmod(p: string, modeOrOpts: number | { yjs: boolean }): Promise<void> {
     try {
-      await this.user().vfsChmod(this.scope(), p, mode);
+      if (typeof modeOrOpts === "number") {
+        await this.user().vfsChmod(this.scope(), p, modeOrOpts);
+      } else {
+        await this.user().vfsSetYjsMode(this.scope(), p, modeOrOpts.yjs);
+      }
     } catch (err) {
       throw mapServerError(err, { path: p, syscall: "chmod" });
     }
+  }
+
+  /**
+   * Phase 10 alias: explicit, type-stable form of
+   * `chmod(p, { yjs: enabled })`. Prefer this over the chmod
+   * overload when you don't need the dual-shape ergonomics —
+   * isomorphic-git and other fs/promises consumers will find
+   * the numeric-only `chmod` familiar; the alias is for code that
+   * cares about Yjs explicitly.
+   */
+  async setYjsMode(p: string, enabled: boolean): Promise<void> {
+    try {
+      await this.user().vfsSetYjsMode(this.scope(), p, enabled);
+    } catch (err) {
+      throw mapServerError(err, { path: p, syscall: "chmod" });
+    }
+  }
+
+  /**
+   * Phase 10: open a WebSocket against a yjs-mode file. Internal —
+   * the consumer-facing API is `openYDoc` from the
+   * `@mossaic/sdk/yjs` subpath, which wraps this in a Yjs-aware
+   * client object.
+   *
+   * Why fetch() instead of typed RPC: Cloudflare DO RPC currently
+   * cannot serialize a `Response` carrying a `webSocket` field
+   * across the RPC boundary — only `stub.fetch(req)` is permitted
+   * to return such a Response. We encode the path/scope as URL
+   * query params and use a synthetic internal URL.
+   */
+  async _openYjsSocketResponse(p: string): Promise<Response> {
+    const scope = this.scope();
+    const url = new URL("http://internal/yjs/ws");
+    url.searchParams.set("path", p);
+    url.searchParams.set("ns", scope.ns ?? "default");
+    url.searchParams.set("tenant", scope.tenant);
+    if (scope.sub !== undefined) url.searchParams.set("sub", scope.sub);
+    const name = vfsUserDOName(
+      this.opts.namespace ?? "default",
+      this.opts.tenant,
+      this.opts.sub
+    );
+    const id = this.env.MOSSAIC_USER.idFromName(name);
+    const stub = this.env.MOSSAIC_USER.get(id) as {
+      fetch(req: Request): Promise<Response>;
+    };
+    let response: Response;
+    try {
+      response = await stub.fetch(
+        new Request(url, {
+          headers: { Upgrade: "websocket" },
+        })
+      );
+    } catch (err) {
+      throw mapServerError(err, { path: p, syscall: "open" });
+    }
+    if (response.status !== 101) {
+      // Surface server-side error JSON as a structured error.
+      let msg = `openYjsSocket: server returned ${response.status}`;
+      try {
+        const j = (await response.json()) as { error?: string; code?: string };
+        if (j.error) msg = j.error;
+      } catch {
+        /* ignore parse failure */
+      }
+      throw mapServerError(
+        Object.assign(new Error(msg), { code: "EINVAL" }),
+        { path: p, syscall: "open" }
+      );
+    }
+    return response;
   }
 
   async rename(src: string, dst: string): Promise<void> {

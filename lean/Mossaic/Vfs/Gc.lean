@@ -1,5 +1,5 @@
 /-
-Mossaic.Vfs.Gc — I5: Garbage collection safety.
+Mossaic.Vfs.Gc — I5: Garbage collection safety. Mathlib-backed, NO AXIOM.
 
 Models:
   worker/objects/shard/shard-do.ts:415-455   (alarm sweeper)
@@ -7,42 +7,19 @@ Models:
   worker/objects/shard/shard-do.ts:357-368   (soft-mark on refCount=0)
 
 Audit reference:
-  /workspace/local/audit-report.md §I5 (verdict: Pass; alarm sweeper is
-  the well-tested code path).
+  /workspace/local/audit-report.md §I5.
 
-Invariant statements:
-
+Invariants:
   (G1) `alarm` only hard-deletes chunks whose `refCount = 0`.
-  (G2) `alarm` respects the 30-second grace window: only chunks with
-       `deletedAt + 30000 ≤ now` are eligible for hard-delete.
-  (G3) `alarm` preserves `validState` (Refcount.validState is closed
-       under sweep), conditional on the numerical-equality axiom below.
-  (G4) Resurrection: a chunk with `deletedAt ≠ none ∧ refCount > 0` is
-       NOT hard-deleted; instead its `deletedAt` is cleared.
+  (G2) `alarm` respects the 30-second grace window.
+  (G3) `alarm` preserves `validState` (UNCONDITIONAL — no axiom). The
+       previous version used a documented `axiom` for the numerical
+       refcount=liveRefs equality. With the Mathlib-backed I1 invariant
+       carrying that equality as part of `validState`, we can now derive
+       it as a theorem (`refCount_zero_implies_no_refs` in Refcount.lean).
+  (G4) Resurrection (refCount > 0 with deletedAt set) survives sweep.
 
-What we prove:
-  - Define `alarm` operation.
-  - (G1) `alarm` deletes only refCount=0 chunks past the grace window
-    (`alarm_only_deletes_zero_refCount`, fully unconditional).
-  - (G3) `alarm` preserves `validState` (`alarm_preserves_validState`,
-    conditional on the documented axiom).
-  - (G4) Resurrection is a no-op-on-deletion: the chunk survives
-    (`alarm_unmarks_resurrected`, fully unconditional).
-  - Non-vacuity: `alarm` actually sweeps a concrete state (witness state
-    exhibits a swept chunk).
-
-What we do NOT prove (intentionally out of scope, documented):
-  - Wall-clock alarm fire timeliness (Cloudflare runtime guarantee).
-  - Concurrency between `alarm()` and `putChunk()`/`deleteChunks()` —
-    these are serialized by the DO single-thread; we model `alarm` as
-    a separate atomic Op consistent with that semantics.
-  - Storage capacity tracking (`updateCapacity` at shard-do.ts:470-488)
-    — this is observability, not correctness.
-  - The numerical refCount = liveRefs equality (the I1 numerical gap)
-    is captured by an EXPLICIT AXIOM `numerical_refcount_dangling_axiom`
-    below, not a `sorry`. The axiom is operationally justified by
-    inspection of shard-do.ts and discharged informally; a full Lean
-    proof would require multiset reasoning beyond plain stdlib.
+NO `axiom`, NO `sorry`. Mathlib v4.29.0.
 -/
 
 import Mossaic.Vfs.Refcount
@@ -63,56 +40,15 @@ def eligibleForSweep (c : Chunk) (now : TimeMs) : Bool :=
   | some t => decide (c.refCount = 0) && decide (t + graceWindowMs ≤ now)
   | none   => false
 
-/-- A chunk is "resurrected": soft-marked but refCount went back up. The
-alarm un-marks it (clears deletedAt) instead of deleting. -/
+/-- A chunk is "resurrected": soft-marked but refCount went back up. -/
 def isResurrected (c : Chunk) : Bool :=
   c.deletedAt.isSome && decide (c.refCount > 0)
 
-/-- The `alarm` operation. Mirrors shard-do.ts:390-430:
-  - For each soft-marked chunk past grace:
-    - if `refCount > 0` (resurrected), un-mark (clear deletedAt).
-    - else hard-delete.
-  - Other chunks unchanged. -/
+/-- The `alarm` operation. Mirrors shard-do.ts:415-455. -/
 def alarm (s : ShardState) (now : TimeMs) : ShardState :=
   { s with chunks :=
       (s.chunks.filter (fun c => ¬ eligibleForSweep c now)).map (fun c =>
         if isResurrected c then { c with deletedAt := none } else c) }
-
--- ─── Axiom for the numerical refcount = liveRefs equality ───────────────
-
-/-- Axiom: at any reachable shard state, a chunk eligible for sweep
-(refCount = 0) has no live refs to its hash.
-
-This is the **numerical equality** part of the I1 invariant — proving it
-in Lean 4 stdlib (no Mathlib) requires multiset/cardinality reasoning that
-is not available without Mathlib's `Finset.sum` machinery.
-
-The axiom is justified operationally by inspection of shard-do.ts:
-  - `writeChunkInternal` (lines 180-258) increments refCount for every
-    successful new chunk_refs INSERT (via the conditional `inserted`
-    check at line 200-211).
-  - `removeFileRefs` (lines 324-365) decrements refCount for every
-    removed chunk_refs row.
-  - These are the only mutators of refCount.
-  - Hence, by induction over the operation trace, the numerical
-    equality `chunks.refCount = |chunk_refs filtered by hash|` holds.
-
-We capture this as an axiom rather than a `sorry` so that:
-  (a) `lake build` reports zero `sorry`,
-  (b) the assumption is callable as a lemma in proofs,
-  (c) the gap is explicit and auditable.
-
-Discharging this axiom in Lean is tracked as future work; the structural
-part of I1 (chunk uniqueness, ref uniqueness, ref→chunk existence) IS
-proved unconditionally in `Mossaic.Vfs.Refcount`. -/
-axiom numerical_refcount_dangling_axiom :
-    ∀ (s : ShardState) (now : TimeMs),
-      UniqueBy Chunk.hash s.chunks →
-      UniqueBy ChunkRef.key s.refs →
-      (∀ r ∈ s.refs, ∃ c ∈ s.chunks, c.hash = r.chunkHash) →
-      ∀ (r : ChunkRef) (c : Chunk),
-        r ∈ s.refs → c ∈ s.chunks → c.hash = r.chunkHash →
-        eligibleForSweep c now → False
 
 -- ─── Helper: filter+map preserves UniqueBy ──────────────────────────────
 
@@ -130,52 +66,77 @@ private theorem uniqueBy_filter_map_preserve {β : Type} [DecidableEq β]
   rw [hf a, hf b]
   exact hab
 
--- ─── (G3) alarm preserves validState ────────────────────────────────────
+-- ─── liveRefs is unaffected by alarm (alarm doesn't touch refs) ─────────
 
-/-- `alarm` preserves the `validState` invariant. The proof relies on
-`numerical_refcount_dangling_axiom` to rule out the case where a swept
-chunk's hash had live refs. -/
+theorem alarm_refs (s : ShardState) (now : TimeMs) :
+    (alarm s now).refs = s.refs := rfl
+
+theorem alarm_liveRefs (s : ShardState) (now : TimeMs) (h : Hash) :
+    liveRefs (alarm s now) h = liveRefs s h := rfl
+
+-- ─── (G3) alarm preserves validState — UNCONDITIONAL ────────────────────
+
+/-- `alarm` preserves the `validState` invariant. No axiom: relies on
+the I1 numerical equality `refCount_zero_implies_no_refs`. -/
 theorem alarm_preserves_validState (s : ShardState) (now : TimeMs)
     (hv : validState s) : validState (alarm s now) := by
-  obtain ⟨huC, huR, hrc⟩ := hv
-  refine ⟨?_, ?_, ?_⟩
-  · -- chunk uniqueness: filter+map preserves it because the inner if
-    -- preserves hash.
+  obtain ⟨huC, huR, hrc, hrcEq⟩ := hv
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · -- chunk uniqueness
     unfold alarm
     apply uniqueBy_filter_map_preserve _ _ _ _ _ huC
     intro c
     by_cases hres : isResurrected c <;> simp [hres]
-  · -- ref uniqueness: alarm doesn't touch refs.
+  · -- ref uniqueness
     unfold alarm
     exact huR
-  · -- ref→chunk existence: every ref's chunk must still be present after
-    -- the sweep. Use the axiom to rule out the swept-chunk-with-refs case.
+  · -- ref→chunk existence
     intro r hr
-    have hr' : r ∈ s.refs := by
-      have := hr
-      unfold alarm at this
-      simpa using this
+    have hr' : r ∈ s.refs := hr
     obtain ⟨c, hc, hch⟩ := hrc r hr'
+    -- Show c is NOT eligible for sweep, hence its image survives.
     by_cases hsweep : eligibleForSweep c now
-    · -- c was filtered out. By the axiom, this case is impossible.
-      exact absurd
-        (numerical_refcount_dangling_axiom s now huC huR hrc r c hr' hc hch hsweep)
-        (fun h => h)
-    · -- c survives the filter. Its post-map image has hash unchanged.
+    · -- c eligible ⇒ refCount = 0 ⇒ no ref points at c.hash (by Refcount).
+      -- This contradicts r ∈ refs with chunkHash = c.hash.
+      exfalso
+      have hzero : c.refCount = 0 := by
+        unfold eligibleForSweep at hsweep
+        cases hd : c.deletedAt with
+        | none => rw [hd] at hsweep; simp at hsweep
+        | some _ =>
+          rw [hd] at hsweep
+          simp at hsweep
+          exact hsweep.1
+      -- Use the numerical corollary (no axiom).
+      have hnoref := refCount_zero_implies_no_refs s c
+        ⟨huC, huR, hrc, hrcEq⟩ hc hzero
+      exact hnoref r hr' hch.symm
+    · -- c survives the filter; its image (post-map) has same hash.
       refine ⟨if isResurrected c then { c with deletedAt := none } else c, ?_, ?_⟩
       · unfold alarm
         simp [List.mem_map, List.mem_filter]
         refine ⟨c, ⟨hc, ?_⟩, rfl⟩
         simp [hsweep]
-      · by_cases hres : isResurrected c
-        · simp [hres]; exact hch
-        · simp [hres]; exact hch
+      · by_cases hres : isResurrected c <;> simp [hres] <;> exact hch
+  · -- refCount = liveRefs preservation
+    intro c hc
+    -- c is in (alarm s now).chunks, which is the post-filter, post-map state.
+    -- So c is the image of some c0 ∈ s.chunks where ¬ eligibleForSweep c0 now,
+    -- and either (resurrected ⇒ deletedAt cleared) or (not ⇒ unchanged).
+    -- Either way, c.hash = c0.hash and c.refCount = c0.refCount.
+    unfold alarm at hc
+    simp [List.mem_map, List.mem_filter] at hc
+    obtain ⟨c0, ⟨hc0, hsweep⟩, heq⟩ := hc
+    -- c.refCount = c0.refCount, c.hash = c0.hash regardless of branch.
+    have h_rc : c.refCount = c0.refCount := by
+      by_cases hres : isResurrected c0 <;> simp [hres] at heq <;> rw [← heq]
+    have h_hash : c.hash = c0.hash := by
+      by_cases hres : isResurrected c0 <;> simp [hres] at heq <;> rw [← heq]
+    rw [h_rc, h_hash, alarm_liveRefs]
+    exact hrcEq c0 hc0
 
 -- ─── (G1) alarm only deletes refCount=0 chunks ──────────────────────────
 
-/-- If a chunk was in `s.chunks` but no chunk in `alarm s now |>.chunks`
-has the same hash, then the chunk had refCount=0 (it was eligible for
-sweep). This is fully unconditional — no axiom needed. -/
 theorem alarm_only_deletes_zero_refCount
     (s : ShardState) (now : TimeMs) (c : Chunk)
     (hin : c ∈ s.chunks)
@@ -189,8 +150,7 @@ theorem alarm_only_deletes_zero_refCount
       rw [hd] at hsweep
       simp at hsweep
       exact hsweep.1
-  · -- c survives. Contradiction with hout.
-    exfalso
+  · exfalso
     have himg_in : (if isResurrected c then { c with deletedAt := none } else c) ∈
                    (alarm s now).chunks := by
       unfold alarm
@@ -201,10 +161,8 @@ theorem alarm_only_deletes_zero_refCount
       by_cases hres : isResurrected c <;> simp [hres]
     exact hout _ himg_in himg_hash
 
--- ─── (G4) Resurrection: marked but refCount > 0 — un-mark, do not delete ─
+-- ─── (G4) Resurrection: survive sweep ───────────────────────────────────
 
-/-- A resurrected chunk (refCount > 0 with deletedAt ≠ none and elapsed
-grace) is NOT eligible for sweep — its `eligibleForSweep` is false. -/
 theorem resurrected_not_eligible (c : Chunk) (now : TimeMs)
     (hres : c.refCount > 0) :
     eligibleForSweep c now = false := by
@@ -213,7 +171,6 @@ theorem resurrected_not_eligible (c : Chunk) (now : TimeMs)
   | none => simp
   | some _ => simp; intro h0; omega
 
-/-- A resurrected chunk in s survives `alarm`, with `deletedAt` cleared. -/
 theorem alarm_unmarks_resurrected
     (s : ShardState) (now : TimeMs) (c : Chunk)
     (hin : c ∈ s.chunks) (hres : isResurrected c) :
@@ -221,8 +178,7 @@ theorem alarm_unmarks_resurrected
   unfold alarm
   simp [List.mem_map, List.mem_filter]
   refine ⟨c, ⟨hin, ?_⟩, ?_⟩
-  · -- Eligibility check: refCount > 0 ⇒ not eligible.
-    have hrc : c.refCount > 0 := by
+  · have hrc : c.refCount > 0 := by
       unfold isResurrected at hres
       simp at hres
       exact hres.2
@@ -231,21 +187,17 @@ theorem alarm_unmarks_resurrected
 
 -- ─── Non-vacuity sanity checks ──────────────────────────────────────────
 
-/-- Concrete witness: a state with one swept chunk has its chunk removed. -/
 theorem witness_alarm_sweeps :
     (alarm ({ chunks := [⟨"abc", 100, 0, some 0⟩], refs := [] } : ShardState) 100000).chunks
       = [] := by
   simp [alarm, eligibleForSweep, isResurrected, graceWindowMs]
 
-/-- Concrete witness: a resurrected chunk is preserved (with deletedAt cleared). -/
 theorem witness_alarm_unmarks_resurrected :
     (alarm ({ chunks := [⟨"abc", 100, 1, some 0⟩], refs := [⟨"abc", "f", 0⟩] } : ShardState)
             100000).chunks
       = [⟨"abc", 100, 1, none⟩] := by
   simp [alarm, eligibleForSweep, isResurrected, graceWindowMs]
 
-/-- Liveness: `alarm` is non-trivial — there exists a state where it
-modifies the state. -/
 theorem alarm_changes_state :
     alarm ({ chunks := [⟨"abc", 100, 0, some 0⟩], refs := [] } : ShardState) 100000
       ≠ ({ chunks := [⟨"abc", 100, 0, some 0⟩], refs := [] } : ShardState) := by
