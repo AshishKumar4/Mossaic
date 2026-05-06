@@ -13,24 +13,27 @@
  * `VFSFsError`. All VFS RPC calls go through it.
  */
 
-/** All error codes the VFS surface emits, plus a few that may flow through if isomorphic-git invents new ones. */
+// Server-side codes are the canonical source of truth — defined in
+// `shared/vfs-types.ts::VFSErrorCode`. The SDK extends that union
+// with two synthetic codes that NEVER cross the wire:
+//
+//  - `EROFS`: surfaced by SDK helpers when a binding-mode `VFS`
+//    instance is asked to perform a write the server rejected at a
+//    layer above (e.g. account read-only mode); kept distinct from
+//    server-thrown codes for diagnostic clarity.
+//  - `EMOSSAIC_UNAVAILABLE`: SDK-side network/binding-failure
+//    sentinel used by `mapServerError` when the underlying request
+//    couldn't even reach the server (DNS, TCP, malformed JSON).
+//
+// Importing from shared keeps the server union the single point of
+// truth; adding a code there picks up the SDK's typed surface
+// automatically.
+import type { VFSErrorCode as ServerVFSErrorCode } from "../../shared/vfs-types";
+
 export type VFSErrorCode =
-  | "ENOENT"
-  | "EEXIST"
-  | "EISDIR"
-  | "ENOTDIR"
-  | "EFBIG"
-  | "ELOOP"
-  | "EBUSY"
-  | "EINVAL"
-  | "EACCES"
+  | ServerVFSErrorCode
   | "EROFS"
-  | "ENOTEMPTY"
-  | "EAGAIN"
-  | "EMOSSAIC_UNAVAILABLE"
-  // encryption surface.
-  | "EBADF"
-  | "ENOTSUP";
+  | "EMOSSAIC_UNAVAILABLE";
 
 /**
  * Linux errno integers (libc convention). Matters because some

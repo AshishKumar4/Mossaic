@@ -13,6 +13,7 @@ import { SELF, env } from "cloudflare:test";
 
 import { signJWT } from "@core/lib/auth";
 import { hashChunk } from "@shared/crypto";
+import { mintVfsToken as exchangeVfsToken } from "./_helpers";
 import type { UserDO } from "../../worker/app/objects/user/user-do";
 
 interface E {
@@ -26,13 +27,7 @@ async function mintVfsToken(userId: string, email: string): Promise<string> {
   // exchange it via the auth bridge for a 15-min VFS token (the SPA's
   // `getVfsToken()` flow).
   const sessionToken = await signJWT(TEST_ENV as never, { userId, email });
-  const res = await SELF.fetch("https://test/api/auth/vfs-token", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${sessionToken}` },
-  });
-  expect(res.ok).toBe(true);
-  const { token } = (await res.json()) as { token: string };
-  return token;
+  return exchangeVfsToken(sessionToken);
 }
 
 describe("SPA roundtrip via canonical /api/vfs/* + auth-bridge", () => {
