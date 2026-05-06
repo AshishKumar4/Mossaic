@@ -1,15 +1,21 @@
 /**
- * Minimal Worker entry for the vitest pool harness.
+ * Test Worker entry — re-exports the production Hono app so that
+ * `SELF.fetch` (vitest-pool-workers) drives the *real* request pipeline
+ * end-to-end, including all /api/* routes.
  *
- * The vitest-pool-workers harness uses this as the worker bundle target;
- * the actual DOs live in worker/objects. SELF.fetch is unused by tests —
- * tests drive the DOs directly via env.USER_DO.get(...) etc.
+ * The DO classes (UserDO, ShardDO, SearchDO) are re-exported for
+ * wrangler binding resolution; the test wrangler.test.jsonc declares
+ * matching bindings.
+ *
+ * Existing DO-direct tests (vfs-read, vfs-write, streaming, etc.) drive
+ * the DOs via `env.USER_DO.get(idFromName(...))` and never go through
+ * SELF.fetch — those tests are unaffected by the entrypoint change.
+ *
+ * The Worker-boot smoke test (tests/integration/worker-smoke.test.ts)
+ * uses `SELF.fetch("https://test/api/...")` to exercise the real route
+ * handlers, providing an end-to-end regression gate.
  */
+export { default } from "../worker/index";
 export { UserDO } from "../worker/objects/user/index";
 export { ShardDO } from "../worker/objects/shard/index";
-
-export default {
-  async fetch(): Promise<Response> {
-    return new Response("test-worker");
-  },
-};
+export { SearchDO } from "../worker/objects/search/index";

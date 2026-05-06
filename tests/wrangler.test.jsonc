@@ -6,10 +6,14 @@
   "durable_objects": {
     "bindings": [
       { "name": "USER_DO", "class_name": "UserDO" },
-      { "name": "SHARD_DO", "class_name": "ShardDO" }
+      { "name": "SHARD_DO", "class_name": "ShardDO" },
+      { "name": "SEARCH_DO", "class_name": "SearchDO" }
     ]
   },
   "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["UserDO", "ShardDO"] }
-  ]
+    { "tag": "v1", "new_sqlite_classes": ["UserDO", "ShardDO", "SearchDO"] }
+  ],
+  "vars": {
+    "JWT_SECRET": "test-secret-for-vitest-only"
+  }
 }

@@ -20,11 +20,19 @@ import {
 import { createFolder, listFolders, getFolder, getFolderPath } from "./folders";
 import { getQuota, checkQuota, updateUsage } from "./quota";
 import {
+  vfsAbortWriteStream,
+  vfsAppendWriteStream,
+  vfsBeginWriteStream,
   vfsChmod,
+  vfsCommitWriteStream,
+  vfsCreateReadStream,
+  vfsCreateWriteStream,
   vfsExists,
   vfsLstat,
   vfsMkdir,
   vfsOpenManifest,
+  vfsOpenReadStream,
+  vfsPullReadStream,
   vfsReadChunk,
   vfsReadFile,
   vfsReadlink,
@@ -37,6 +45,8 @@ import {
   vfsSymlink,
   vfsUnlink,
   vfsWriteFile,
+  type VFSReadHandle,
+  type VFSWriteHandle,
 } from "./vfs-ops";
 import type {
   OpenManifestResult,
@@ -664,5 +674,109 @@ export class UserDO extends DurableObject<Env> {
   ): Promise<{ done: boolean; cursor?: string }> {
     this.ensureInit();
     return vfsRemoveRecursive(this, scope, path, cursor);
+  }
+
+  // ── Phase 4: streaming + handle-based stream primitives ───────────────
+  //
+  // Two shapes per stream direction:
+  //
+  //   Read:  vfsOpenReadStream + vfsPullReadStream (handle-based, works
+  //          across separate consumer invocations — the escape hatch
+  //          for files larger than one Worker invocation can fan out)
+  //          and vfsCreateReadStream (returns a ReadableStream over RPC
+  //          for in-the-same-invocation use cases).
+  //
+  //   Write: vfsBeginWriteStream + vfsAppendWriteStream +
+  //          vfsCommitWriteStream / vfsAbortWriteStream (handle-based,
+  //          chunk-by-chunk, resumable across consumer invocations)
+  //          and vfsCreateWriteStream (returns a WritableStream that
+  //          drives the same primitives internally).
+  //
+  // The handle-based primitives are the load-bearing surface — the
+  // stream wrappers are convenience built on top. Both share the
+  // commit-rename atomicity protocol from Phase 3.
+
+  /** openReadStream — open a read handle. Caller pumps via vfsPullReadStream. */
+  async vfsOpenReadStream(
+    scope: VFSScope,
+    path: string
+  ): Promise<VFSReadHandle> {
+    this.ensureInit();
+    return vfsOpenReadStream(this, scope, path);
+  }
+
+  /** pullReadStream — fetch one chunk from an open read handle. Optional byte range within the chunk. */
+  async vfsPullReadStream(
+    scope: VFSScope,
+    handle: VFSReadHandle,
+    chunkIndex: number,
+    range?: { start?: number; end?: number }
+  ): Promise<Uint8Array> {
+    this.ensureInit();
+    return vfsPullReadStream(this, scope, handle, chunkIndex, range);
+  }
+
+  /** createReadStream — return a ReadableStream pulling chunks lazily. Optional byte-range over the file. */
+  async vfsCreateReadStream(
+    scope: VFSScope,
+    path: string,
+    range?: { start?: number; end?: number }
+  ): Promise<ReadableStream<Uint8Array>> {
+    this.ensureInit();
+    return vfsCreateReadStream(this, scope, path, range);
+  }
+
+  /** beginWriteStream — open a write handle. Caller pumps via vfsAppendWriteStream then commits. */
+  async vfsBeginWriteStream(
+    scope: VFSScope,
+    path: string,
+    opts?: { mode?: number; mimeType?: string }
+  ): Promise<VFSWriteHandle> {
+    this.ensureInit();
+    return vfsBeginWriteStream(this, scope, path, opts);
+  }
+
+  /** appendWriteStream — push one chunk. chunkIndex must be sequential. Returns cumulative bytes. */
+  async vfsAppendWriteStream(
+    scope: VFSScope,
+    handle: VFSWriteHandle,
+    chunkIndex: number,
+    data: Uint8Array
+  ): Promise<{ bytesWritten: number }> {
+    this.ensureInit();
+    return vfsAppendWriteStream(this, scope, handle, chunkIndex, data);
+  }
+
+  /** commitWriteStream — atomic supersede + rename (Phase 3 protocol). */
+  async vfsCommitWriteStream(
+    scope: VFSScope,
+    handle: VFSWriteHandle
+  ): Promise<void> {
+    this.ensureInit();
+    return vfsCommitWriteStream(this, scope, handle);
+  }
+
+  /** abortWriteStream — drop the tmp row + queue chunk GC. Idempotent. */
+  async vfsAbortWriteStream(
+    scope: VFSScope,
+    handle: VFSWriteHandle
+  ): Promise<void> {
+    this.ensureInit();
+    return vfsAbortWriteStream(this, scope, handle);
+  }
+
+  /**
+   * createWriteStream — return a WritableStream backed by the handle
+   * primitives. Returns the wrapper { stream, handle } so callers that
+   * need to surface the handle (for resumability or progress tracking)
+   * can grab it.
+   */
+  async vfsCreateWriteStream(
+    scope: VFSScope,
+    path: string,
+    opts?: { mode?: number; mimeType?: string }
+  ): Promise<{ stream: WritableStream<Uint8Array>; handle: VFSWriteHandle }> {
+    this.ensureInit();
+    return vfsCreateWriteStream(this, scope, path, opts);
   }
 }
