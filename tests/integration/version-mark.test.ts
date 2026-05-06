@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
 
 /**
- * Phase 12 — markVersion + listVersions(userVisibleOnly) + Yjs flush.
+ * markVersion + listVersions(userVisibleOnly) + Yjs flush.
  *
  * Pinned invariants:
  *   V1. writeFile on a versioning tenant defaults to user_visible=1.
@@ -32,7 +32,7 @@ function userStub(tenant: string) {
   return E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName(vfsUserDOName(NS, tenant)));
 }
 
-describe("Phase 12 — version flags from writeFile (V1, V2)", () => {
+describe("version flags from writeFile (V1, V2)", () => {
   it("writeFile creates user_visible=1 by default; listVersions filters", async () => {
     const tenant = "p12-mv-default";
     const vfs = createVFS(envFor(), { tenant, versioning: "enabled" });
@@ -85,7 +85,7 @@ describe("Phase 12 — version flags from writeFile (V1, V2)", () => {
   });
 });
 
-describe("Phase 12 — markVersion (V3, V4, V5)", () => {
+describe("markVersion (V3, V4, V5)", () => {
   it("flips user_visible 0 → 1", async () => {
     const tenant = "p12-mv-flip";
     const vfs = createVFS(envFor(), { tenant, versioning: "enabled" });
@@ -150,7 +150,7 @@ describe("Phase 12 — markVersion (V3, V4, V5)", () => {
   });
 });
 
-describe("Phase 12 — Yjs flush() (V6)", () => {
+describe("Yjs flush() (V6)", () => {
   it("flush creates a user-visible version row when versioning is on", async () => {
     const tenant = "p12-mv-yjs-flush";
     const vfs = createVFS(envFor(), { tenant, versioning: "enabled" });

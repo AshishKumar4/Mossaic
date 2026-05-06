@@ -3,7 +3,7 @@ import { env } from "cloudflare:test";
 import git from "isomorphic-git";
 
 /**
- * Phase 6 — isomorphic-git end-to-end smoke.
+ * isomorphic-git end-to-end smoke.
  *
  * Drives a real git workflow against the SDK's VFS:
  *   git.init  → creates .git/ scaffolding via mkdir/writeFile
@@ -20,7 +20,7 @@ import git from "isomorphic-git";
  * If isomorphic-git can complete this round-trip, the SDK's
  * fs/promises shape is correct enough for real-world git workloads.
  *
- * The test is intentionally minimal — Phase 6 is a smoke test, not
+ * The test is intentionally minimal — is a smoke test, not
  * a full git suite. Verifies the wiring; deeper ops (clone, push,
  * merge) are out of scope.
  */

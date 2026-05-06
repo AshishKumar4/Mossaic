@@ -25,7 +25,7 @@ import type {
 } from "../../../../../shared/preview-types";
 import { resolvePath } from "../path-walk";
 import { userIdFor } from "./helpers";
-import { getPlacement } from "../../../lib/placement-resolver";
+import { vfsShardDOName } from "../../../lib/utils";
 import {
   encodeVariantKey,
   findVariantRow,
@@ -146,10 +146,7 @@ export async function vfsReadPreview(
 
   if (row !== null) {
     const env = durableObject.envPublic;
-    const shardName = getPlacement(scope).shardDOName(
-      scope,
-      row.shardIndex
-    );
+    const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, row.shardIndex);
     const stub = env.MOSSAIC_SHARD.get(
       env.MOSSAIC_SHARD.idFromName(shardName)
     );

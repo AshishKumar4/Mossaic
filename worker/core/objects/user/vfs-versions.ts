@@ -1,8 +1,9 @@
 import type { UserDOCore as UserDO } from "./user-do-core";
 import type { ShardDO } from "../shard/shard-do";
 import { VFSError, type VFSScope } from "../../../../shared/vfs-types";
-import { getPlacement } from "../../lib/placement-resolver";
-import { generateId } from "../../lib/utils";
+import { generateId, vfsShardDOName } from "../../lib/utils";
+import { placeChunk } from "../../../../shared/placement";
+import { userIdFor } from "./vfs/helpers";
 import { resolvePath } from "./path-walk";
 
 /**
@@ -71,7 +72,7 @@ export function placeChunkForVersion(
   // routes through the placement abstraction; the resulting
   // integer is identical to the legacy path because the rendezvous
   // score template is invariant across placements (§1.4).
-  return getPlacement(scope).placeChunk(scope, hash, 0, poolSize);
+  return placeChunk(userIdFor(scope), hash, 0, poolSize);
 }
 
 /**
@@ -604,7 +605,7 @@ export async function dropVersionRows(
     // resolve correctly.
     const shardFileId = shardRefId(pathId, versionId);
     for (const { shard_index } of shardRows) {
-      const shardName = getPlacement(scope).shardDOName(scope, shard_index);
+      const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, shard_index);
       const stub = shardNs.get(shardNs.idFromName(shardName));
       await stub.deleteChunks(shardFileId);
     }
@@ -821,7 +822,7 @@ export async function restoreVersion(
   }
   await Promise.all(
     Array.from(byShard.entries()).map(async ([shardIndex, hashes]) => {
-      const shardName = getPlacement(scope).shardDOName(scope, shardIndex);
+      const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, shardIndex);
       const stub = shardNs.get(shardNs.idFromName(shardName));
       const { alive } = await stub.chunksAlive(hashes);
       if (alive.length !== hashes.length) {
@@ -836,7 +837,7 @@ export async function restoreVersion(
   );
 
   for (const c of chunks) {
-    const shardName = getPlacement(scope).shardDOName(scope, c.shard_index);
+    const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, c.shard_index);
     const stub = shardNs.get(shardNs.idFromName(shardName));
     // The chunksAlive pre-flight above guarantees the chunk row is
     // present and live on this shard, so putChunk's existence check

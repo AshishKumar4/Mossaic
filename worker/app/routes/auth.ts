@@ -1,11 +1,24 @@
 import { Hono, type Context } from "hono";
 import type { EnvApp as Env } from "@shared/types";
-import { signJWT, VFSConfigError } from "@core/lib/auth";
-import { userStubByName } from "../lib/user-stub";
+import { authMiddleware, signJWT, signVFSToken, VFSConfigError } from "@core/lib/auth";
+import { userStub, userStubByName } from "../lib/user-stub";
 
-const auth = new Hono<{ Bindings: Env }>();
+const auth = new Hono<{
+  Bindings: Env;
+  Variables: { userId: string; email: string };
+}>();
 
-type AuthCtx = Context<{ Bindings: Env }>;
+type AuthCtx = Context<{
+  Bindings: Env;
+  Variables: { userId: string; email: string };
+}>;
+
+/**
+ * Short-TTL VFS token issued by the auth-bridge. 15 minutes balances
+ * SPA UX (one mint covers a typical browsing session) against blast
+ * radius (token compromise window).
+ */
+const VFS_TOKEN_TTL_MS = 15 * 60 * 1000;
 
 /**
  * Mint a JWT, mapping a missing-secret VFSConfigError to a clean
@@ -59,6 +72,13 @@ auth.post("/signup", async (c) => {
     return c.json({ error: message }, 400);
   }
 
+  // Initialize the canonical (`vfs:default:<userId>`) UserDO with a
+  // default quota row so subsequent `appGetQuota` / `appGetUserStats`
+  // calls return non-zero defaults instead of the all-zeroes fallback.
+  // The auth row stays on the `auth:<email>` DO; the quota row is
+  // duplicated to the data-side DO.
+  await userStub(c.env, result.userId).appInitTenant(result.userId);
+
   const tokenOrResp = await mintJWT(c, result);
   if (typeof tokenOrResp !== "string") return tokenOrResp;
 
@@ -103,6 +123,45 @@ auth.post("/login", async (c) => {
     userId: result.userId,
     email: result.email,
   });
+});
+
+/**
+ * POST /api/auth/vfs-token
+ * Auth-bridge endpoint. Exchanges the App session JWT for a
+ * short-TTL VFS Bearer token bound to the authenticated user's
+ * tenant. The SPA calls this at session start (and on near-expiry
+ * refresh) and uses the returned token as the `Authorization:
+ * Bearer ...` header for canonical `/api/vfs/*` routes.
+ *
+ * Tenant binding: the minted token's `tn` claim is pinned to the
+ * `userId` extracted from the validated session JWT. Callers
+ * cannot specify an arbitrary tenant — cross-tenant impersonation
+ * is impossible without forging the session JWT (which requires
+ * the same `JWT_SECRET`).
+ *
+ * TTL: 15 minutes. Short enough to limit the blast radius of a
+ * compromised token; long enough that an active SPA session
+ * doesn't ping this endpoint constantly. Refresh is the SPA's
+ * responsibility (`api.getVfsToken()` caches with a 60s safety
+ * margin and rebuilds on 401).
+ */
+auth.post("/vfs-token", authMiddleware(), async (c) => {
+  const userId = c.get("userId");
+  const expiresAtMs = Date.now() + VFS_TOKEN_TTL_MS;
+  let token: string;
+  try {
+    token = await signVFSToken(
+      c.env,
+      { ns: "default", tenant: userId },
+      VFS_TOKEN_TTL_MS
+    );
+  } catch (err) {
+    if (err instanceof VFSConfigError) {
+      return c.json({ error: err.message }, 503);
+    }
+    throw err;
+  }
+  return c.json({ token, expiresAtMs });
 });
 
 export default auth;

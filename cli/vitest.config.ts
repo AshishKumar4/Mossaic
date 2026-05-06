@@ -7,12 +7,12 @@ import { defineConfig } from "vitest/config";
  */
 export default defineConfig({
   // Resolve @mossaic/sdk subpaths via the "workspace" condition (TS source)
-  // — matches the SDK's package.json conditional exports added in Phase 14.
+  // — matches the SDK's package.json conditional exports added in.
   // Without this, Vite falls through to ./dist/*.js which doesn't exist
   // until `pnpm -F @mossaic/sdk build` has been run.
   resolve: {
     conditions: ["workspace", "import", "module", "default"],
-    // Phase 15: @shared/* aliases needed because the SDK's source
+    // @shared/* aliases needed because the SDK's source
     // files (resolved via the "workspace" condition) import from
     // @shared/* which the CLI's tsconfig path map already covers
     // for typechecking; the test runner needs the matching runtime

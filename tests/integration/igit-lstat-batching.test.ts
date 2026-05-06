@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { env } from "cloudflare:test";
 
 /**
- * Phase 8 — auto-batched lstat for isomorphic-git workloads.
+ * auto-batched lstat for isomorphic-git workloads.
  *
  * `createIgitFs(vfs, { batchLstat: true })` returns a wrapper that
  * coalesces concurrent lstat calls within a small window into a

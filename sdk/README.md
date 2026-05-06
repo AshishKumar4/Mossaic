@@ -320,28 +320,14 @@ const bytes = await parallelDownload(client, "/photo.jpg", {
 
 `onManifest` fires exactly once after the download token returns, before any `onChunkEvent`. Use it to seed per-chunk UI state and capture `mimeType` for `Blob` construction.
 
-#### `multipartBaseOverride` / `chunkFetchBaseOverride`
+#### Endpoint binding
 
-Advanced consumers (e.g. a custom App on top of Mossaic) can route SDK multipart calls to a different endpoint base:
+The HTTP client always addresses canonical Mossaic routes:
 
-```ts
-const client = createMossaicHttpClient({
-  url: "https://app.example.com",
-  apiKey: appJWT,                         // App-issued JWT, not VFS token
-  multipartBaseOverride: "/api/upload/multipart",  // App-pinned multipart bridge
-  chunkFetchBaseOverride: "/api/download",         // App's chunk download endpoint
-});
-```
+- multipart upload session: `POST /api/vfs/multipart/{begin, finalize, abort, download-token}` and `PUT /api/vfs/multipart/:uploadId/{chunk/:idx, status}`
+- per-chunk read: `POST /api/vfs/readChunk` keyed by `(path, chunkIndex)`
 
-When set, SDK multipart calls land at:
-- `${url}${multipartBaseOverride}/begin`
-- `${url}${multipartBaseOverride}/${uploadId}/chunk/${idx}`
-- `${url}${multipartBaseOverride}/finalize`
-- `${url}${multipartBaseOverride}/abort`
-- `${url}${multipartBaseOverride}/${uploadId}/status`
-- `${url}${multipartBaseOverride}/download-token`
-
-And `fetchChunkByHash` switches from the canonical `POST /api/vfs/readChunk` to a `GET ${chunkFetchBaseOverride}/chunk/${fileId}/${idx}` request. The Mossaic photo-library SPA uses both overrides to route through legacy DO instances; see `OPERATIONS.md` §6.8 for the full architecture.
+Every SDK consumer (SPA, CLI, third-party Worker) hits the same surface; there is no override for routing through alternative endpoints. Apps that want their own auth boundary in front of Mossaic mint VFS Bearer tokens at their own auth route (e.g. the photo-library's `POST /api/auth/vfs-token`) and pass the resulting token as `apiKey`.
 
 ---
 
@@ -363,7 +349,7 @@ const preview = await vfs.readPreview("/photos/sunset.jpg", { variant: "thumb" }
 
 Standard variants: `"thumb"` (256² cover), `"medium"` (768² contain), `"lightbox"` (1920² contain). Custom variants accept `{width, height?, fit?}` and cache under a stable encoded key.
 
-Five built-in renderers dispatch by MIME: `image` (Cloudflare Images), `code-svg` (text/source), `waveform-svg` (audio), `video-poster` (video, Phase 20.1+), `icon-card` (universal fallback). Encrypted files throw `ENOTSUP` — server cannot render ciphertext.
+Five built-in renderers dispatch by MIME: `image` (Cloudflare Images), `code-svg` (text/source), `waveform-svg` (audio), `video-poster` (video, (future)), `icon-card` (universal fallback). Encrypted files throw `ENOTSUP` — server cannot render ciphertext.
 
 Batched manifests for galleries:
 

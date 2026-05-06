@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { env } from "cloudflare:test";
 
 /**
- * Phase 11 — service-mode smoke.
+ * service-mode smoke.
  *
  * Pins the invariant that `UserDOCore` (the SDK-essential class
  * deployed standalone via deployments/service/wrangler.jsonc) is
@@ -13,7 +13,7 @@ import { env } from "cloudflare:test";
  * methods that the SDK promises to consumers — the same calls the
  * `@mossaic/sdk` HTTP fallback and library-mode SDK make.
  *
- * Why this matters: the goal of Phase 11 was to split the photo-app
+ * Why this matters: the goal of was to split the photo-app
  * routes off so the SDK can be deployed standalone (Mode B in the
  * SDK README). This test guards against accidental App-import
  * leakage into Core — if a future change pulls `auth.ts` /
@@ -25,9 +25,7 @@ import { env } from "cloudflare:test";
  *   - vfsWriteFile / vfsReadFile / vfsStat (the three load-bearing
  *     RPCs the SDK exposes through `createVFS`).
  *   - vfsMkdir / vfsReaddir (directory plumbing).
- *   - vfsSetYjsMode / vfsOpenYjsSocket (Phase 10 surface — the
- *     biggest test that the WS upgrade path doesn't accidentally
- *     touch the App's `_legacyFetch`).
+ *   - vfsSetYjsMode / vfsOpenYjsSocket.
  */
 
 import type { UserDOCore } from "@core/objects/user/user-do-core";
@@ -45,7 +43,7 @@ function userStub(tenant: string) {
 
 const SCOPE = (tenant: string) => ({ ns: NS, tenant });
 
-describe("Phase 11 — service-mode VFS smoke (no App surface needed)", () => {
+describe("service-mode VFS smoke (no App surface needed)", () => {
   it("write/read/stat round-trip uses only Core RPC", async () => {
     const tenant = "service-mode-rw";
     const stub = userStub(tenant);

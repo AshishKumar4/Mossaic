@@ -2,10 +2,10 @@ import { describe, it, expect } from "vitest";
 import { SELF, env } from "cloudflare:test";
 
 /**
- * Phase 16 × Phase 15 composition tests.
+ * × composition tests.
  *
- * Verifies that per-chunk envelope encryption (Phase 15) composes
- * cleanly with multipart parallel transfer (Phase 16) via the SDK's
+ * Verifies that per-chunk envelope encryption composes
+ * cleanly with multipart parallel transfer via the SDK's
  * `chunkTransform` hook. The hook seals each plaintext chunk into an
  * envelope BEFORE the multipart engine hashes and PUTs it; the
  * server stores the envelope verbatim and hashes it; the inverse
@@ -24,10 +24,10 @@ import { SELF, env } from "cloudflare:test";
  * Notes:
  *   - We don't pass `opts.encryption` to `parallelUpload` here. The
  *     server's mode-monotonic stamp is set on the FIRST encrypted
- *     write (existing Phase 15 plumbing in vfsBeginMultipart). The
+ *     write (existing plumbing in vfsBeginMultipart). The
  *     transport-only test confirms the byte path; the server-side
- *     stamp behavior is covered in Phase 15's own suite.
- *   - We use Phase 15's `encryptPayload` / `decryptPayload` from
+ *     stamp behavior is covered in own suite.
+ *   - We use `encryptPayload` / `decryptPayload` from
  *     `@mossaic/sdk/encryption` as the chunkTransform implementations.
  */
 
@@ -90,7 +90,7 @@ function configFor(mode: "convergent" | "random"): EncryptionConfig {
   };
 }
 
-describe("Phase 16 × Phase 15 — multipart with per-chunk encryption", () => {
+describe("× multipart with per-chunk encryption", () => {
   it("random mode: plaintext → seal → upload → download → unseal round-trips", async () => {
     const vfs = await clientFor("mp-enc-random-1");
     const config = configFor("random");

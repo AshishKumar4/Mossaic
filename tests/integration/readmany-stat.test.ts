@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { env } from "cloudflare:test";
 
 /**
- * Phase 5 — SDK-driven `readManyStat` integration test.
+ * SDK-driven `readManyStat` integration test.
  *
  * Drives the SDK's `VFS` class directly (not the underlying DO RPC).
  * Verifies:

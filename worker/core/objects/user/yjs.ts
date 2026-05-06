@@ -59,7 +59,7 @@ import type { UserDOCore as UserDO } from "./user-do-core";
 import type { ShardDO } from "../shard/shard-do";
 import { VFSError, type VFSScope } from "../../../../shared/vfs-types";
 import { hashChunk } from "../../../../shared/crypto";
-import { getPlacement } from "../../lib/placement-resolver";
+import { vfsShardDOName } from "../../lib/utils";
 import { placeChunkForVersion } from "./vfs-versions";
 import { VFS_MODE_YJS_BIT } from "../../../../shared/constants";
 
@@ -218,7 +218,7 @@ async function appendUpdate(
 
   const env = durableObject.envPublic;
   const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
-  const shardName = getPlacement(scope).shardDOName(scope, sIdx);
+  const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, sIdx);
   const stub = shardNs.get(shardNs.idFromName(shardName));
   await stub.putChunk(hash, bytes, refId, 0, userId);
 
@@ -346,7 +346,7 @@ async function dropOpsBefore(
   const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
   for (const { seq, shard_index } of rows) {
     const refId = yjsShardRefId(pathId, seq);
-    const shardName = getPlacement(scope).shardDOName(scope, shard_index);
+    const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, shard_index);
     const stub = shardNs.get(shardNs.idFromName(shardName));
     try {
       await stub.deleteChunks(refId);
@@ -390,7 +390,7 @@ async function loadDoc(
       | undefined;
     if (ck) {
       const env = durableObject.envPublic;
-      const shardName = getPlacement(scope).shardDOName(scope, ck.shard_index);
+      const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, ck.shard_index);
       const stub = env.MOSSAIC_SHARD.get(env.MOSSAIC_SHARD.idFromName(shardName));
       const res = await stub.fetch(
         new Request(`http://internal/chunk/${ck.chunk_hash}`)
@@ -418,7 +418,7 @@ async function loadDoc(
 
   const env = durableObject.envPublic;
   for (const op of ops) {
-    const shardName = getPlacement(scope).shardDOName(scope, op.shard_index);
+    const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, op.shard_index);
     const stub = env.MOSSAIC_SHARD.get(env.MOSSAIC_SHARD.idFromName(shardName));
     const res = await stub.fetch(
       new Request(`http://internal/chunk/${op.chunk_hash}`)

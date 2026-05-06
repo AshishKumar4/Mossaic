@@ -8,7 +8,7 @@ import {
 } from "@mossaic/sdk/encryption";
 
 /**
- * Phase 15 — CLI-side unit tests for encryption primitives.
+ * CLI-side unit tests for encryption primitives.
  *
  * These are SDK-encryption smoke tests run in the CLI's vitest pool
  * (Node, not workerd) to confirm that:
@@ -23,7 +23,7 @@ import {
 const SALT = new Uint8Array(32).fill(0xa1);
 const MASTER = new Uint8Array(32).fill(0x42);
 
-describe("CLI / Phase 15 encryption smoke", () => {
+describe("CLI / encryption smoke", () => {
   it("E1 — WebCrypto subtle is available in Node 20+", () => {
     expect(typeof crypto).toBe("object");
     expect(typeof crypto.subtle).toBe("object");

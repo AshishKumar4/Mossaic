@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
 
 /**
- * Phase 8 — per-tenant rate limit enforcement.
+ * per-tenant rate limit enforcement.
  *
  * Token bucket per (tenant, sub?) stored in `quota.rate_limit_*`
  * columns. Refills at rate, allows up to burst, throws `EAGAIN`

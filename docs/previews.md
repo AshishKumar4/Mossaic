@@ -13,7 +13,7 @@ This document is the canonical reference for the preview surface. The integratio
 | `image`        | `image`           | `image/jpeg`, `image/png`, `image/webp`, `image/avif`, `image/gif`, `image/heic` | `image/webp`   | Cloudflare Images binding. Falls through to `icon-card` when the binding is absent. |
 | `code-svg`     | `code-svg`        | `text/*`, `application/json`, `application/javascript`, `application/typescript`, `application/x-yaml`, `application/x-sh` | `image/svg+xml` | First 1024 B / 28 lines. Token-class colouring (keyword/string/comment). Deterministic in input bytes. |
 | `waveform-svg` | `waveform-svg`    | `audio/*`                                              | `image/svg+xml` | First 16 KB → 96 peak buckets → SVG sparkline. Deterministic in input bytes. |
-| `video-poster` | `video-poster`    | `video/*`                                              | `image/svg+xml` | Phase 20 stub: delegates to `icon-card`. Phase 20.1 swaps to a Browser-Run page-1 capture without changing the registry contract. |
+| `video-poster` | `video-poster`    | `video/*`                                              | `image/svg+xml` | the preview pipeline stub: delegates to `icon-card`. a future enhancement swaps to a Browser-Run page-1 capture without changing the registry contract. |
 | `icon-card`    | `icon-card`       | universal fallback (`canRender` is `true`)             | `image/svg+xml` | Renders a deterministic SVG with the file extension, name, and human-readable size. |
 
 The dispatch order is: `image → code-svg → waveform-svg → video-poster → icon-card`. The first renderer whose `canRender(mimeType)` returns `true` wins.
@@ -96,9 +96,9 @@ Files written with per-file encryption (`encryption: { mode: "convergent" | "ran
 `vfs.readPreview()` on an encrypted file throws `ENOTSUP`. Two paths forward:
 
 1. **Don't preview encrypted files.** Acceptable for sensitive documents where a thumbnail would itself be sensitive. The SPA / SDK surface this as a generic file-icon placeholder.
-2. **Render client-side** (Phase 20.1+). The client calls `vfs.readFile()` (which transparently decrypts), pipes the plaintext into a client-side renderer (e.g. `createImageBitmap` for images, the `code-svg` renderer reimplemented in WASM, etc.), and uses the result locally. Bytes never leave the client.
+2. **Render client-side** ((future)). The client calls `vfs.readFile()` (which transparently decrypts), pipes the plaintext into a client-side renderer (e.g. `createImageBitmap` for images, the `code-svg` renderer reimplemented in WASM, etc.), and uses the result locally. Bytes never leave the client.
 
-Phase 20 ships only the server-side path. The encryption boundary is enforced in `vfs/preview.ts:vfsReadPreview` — the gate runs **before** any renderer dispatch, so a misconfigured deploy cannot accidentally expose preview bytes for an encrypted file.
+the preview pipeline ships only the server-side path. The encryption boundary is enforced in `vfs/preview.ts:vfsReadPreview` — the gate runs **before** any renderer dispatch, so a misconfigured deploy cannot accidentally expose preview bytes for an encrypted file.
 
 ---
 
@@ -142,13 +142,13 @@ registry.register(myRenderer);
 registry.register(iconCardRenderer); // ALWAYS register a fallback last.
 ```
 
-The `RendererRegistry` API is currently internal; Phase 20.1 will lift it into the SDK surface so consumers can register PDF / DICOM / domain-specific renderers without forking the worker.
+The `RendererRegistry` API is currently internal; a future enhancement will lift it into the SDK surface so consumers can register PDF / DICOM / domain-specific renderers without forking the worker.
 
 ---
 
 ## 6. Backfill runbook
 
-Existing files written before Phase 20 have no `file_variants` rows. Two options to populate them:
+Existing files written before the preview pipeline have no `file_variants` rows. Two options to populate them:
 
 ### 6.1 Lazy backfill (default)
 

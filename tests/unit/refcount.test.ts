@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
 
 /**
- * Phase 1 — Refcount drift fix tests (sdk-impl-plan §0, §8.1).
+ * Refcount drift fix tests (sdk-impl-plan §0, §8.1).
  *
  * Before the fix: any retried PUT of the same chunk hash for the same
  * (file_id, chunk_index) bumped chunks.ref_count, even though
@@ -148,8 +148,7 @@ describe("ShardDO chunk refcount", () => {
     // Create.
     await putChunk(stub, hash, "f1", 0, "data");
 
-    // Soft-mark via raw SQL (Phase 3 will wire `unlink` to do this; here
-    // we simulate the state to confirm the dedup write path clears it).
+    // Soft-mark via raw SQL.
     await runInDurableObject(stub, async (_instance, state) => {
       state.storage.sql.exec(
         "UPDATE chunks SET deleted_at = ? WHERE hash = ?",

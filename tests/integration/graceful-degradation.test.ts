@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { env, SELF } from "cloudflare:test";
 
 /**
- * Phase 8 — graceful degradation: transport failures map to typed
+ * graceful degradation: transport failures map to typed
  * MossaicUnavailableError, not raw fetch rejection.
  *
  * The SDK's mapServerError + isLikelyUnavailable detect:

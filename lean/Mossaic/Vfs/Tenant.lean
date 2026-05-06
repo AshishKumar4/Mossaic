@@ -6,8 +6,6 @@ Models:
     — validateVfsToken (character class enforcement)
     — vfsUserDOName (canonical UserDO name builder)
     — vfsShardDOName (canonical ShardDO name builder)
-  shared/placement.ts (Phase 17.5 introduces `Placement` interface
-    over the same name builders — see `canonicalPlacement`)
   shared/vfs-types.ts:10-17     (VFSScope)
   tests/integration/tenant-isolation.test.ts:77-86 (`:` rejection test)
 

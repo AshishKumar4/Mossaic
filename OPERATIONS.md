@@ -567,68 +567,44 @@ mode preserves cross-file dedup on encrypted uploads (see plan
 
 ## 6.8 SPA on SDK transfer engine
 
-The SPA at `mossaic.ashishkumarsingh.com` was migrated from a
-hand-rolled chunked transfer engine (~395 LoC of AIMD/processChunk/
-worker/scaleInterval/endgame across `src/hooks/use-upload.ts` +
-`src/hooks/use-download.ts` + `src/lib/api.ts`) onto
-`@mossaic/sdk` 's `parallelUpload` / `parallelDownload`. Audit S1 #4
-closed.
+The SPA at `mossaic.ashishkumarsingh.com` runs the canonical
+`@mossaic/sdk` `parallelUpload` / `parallelDownload` engine pointed
+directly at `/api/vfs/multipart/*`. There is no longer an App-pinned
+multipart bridge — every consumer (SPA, CLI, third-party Workers) hits
+the same canonical surface.
 
 ### 6.8.1 Wire surface
 
 The SPA constructs an `HttpVFS` via
 `src/lib/transfer-client.ts:getTransferClient()` configured with:
 
-- `multipartBaseOverride: "/api/upload/multipart"` — routes SDK
-  multipart calls to the App-pinned bridge.
-- `chunkFetchBaseOverride: "/api/download"` — routes cacheable chunk
-  GETs to the App's existing legacy chunk download endpoint.
-- `apiKey: api.getToken()` — the App's JWT (App's `authMiddleware`
-  validates this, NOT a VFS Bearer token).
+- `apiKey: <VFS Bearer token>` — minted via the App's auth bridge at
+  `POST /api/auth/vfs-token` (the SPA presents its session JWT and
+  receives a 15-min VFS token; see §6.9).
+- No URL overrides — all SDK calls land on `/api/vfs/*` directly.
 
 Endpoint inventory:
 
-| Direction | SDK call | HTTP route | Backed by |
-|---|---|---|---|
-| Upload begin | `multipartBegin` | `POST /api/upload/multipart/begin` | `UserDO.appBeginMultipart` |
-| Upload chunk PUT | `multipartPutChunk` | `PUT /api/upload/multipart/:uploadId/chunk/:idx` | `ShardDO.putChunkMultipart` (legacy `shard:<userId>:<idx>`) |
-| Upload finalize | `multipartFinalize` | `POST /api/upload/multipart/finalize` | `UserDO.appFinalizeMultipart` |
-| Upload abort | `multipartAbort` | `POST /api/upload/multipart/abort` | `UserDO.appAbortMultipart` |
-| Upload status | `multipartStatus` | `GET /api/upload/multipart/:uploadId/status` | `UserDO.appGetMultipartStatus` |
-| Download manifest | `multipartDownloadToken` | `POST /api/upload/multipart/download-token` | `UserDO.appOpenManifest` |
-| Download chunk | `fetchChunkByHash` | `GET /api/download/chunk/:fileId/:idx` | App's existing legacy download route |
+| Direction | SDK call | HTTP route |
+|---|---|---|
+| Upload begin | `multipartBegin` | `POST /api/vfs/multipart/begin` |
+| Upload chunk PUT | `multipartPutChunk` | `PUT /api/vfs/multipart/:uploadId/chunk/:idx` |
+| Upload finalize | `multipartFinalize` | `POST /api/vfs/multipart/finalize` |
+| Upload abort | `multipartAbort` | `POST /api/vfs/multipart/abort` |
+| Upload status | `multipartStatus` | `GET /api/vfs/multipart/:uploadId/status` |
+| Download manifest | `multipartDownloadToken` | `POST /api/vfs/multipart/download-token` |
+| Download chunk | `fetchChunkByHash` | `GET /api/vfs/chunk/:fileId/:idx` |
+| Read whole file | `readFile` | `POST /api/vfs/readFile` |
 
-### 6.8.2 Feature flag — rollback procedure
+### 6.8.2 SPA-side index callback
 
-`FEATURE_VFS_UPLOAD_MULTIPART` (App env binding). Default ON
-(undefined or any value other than `"false"`/`"0"`/`"off"` enables).
+After a canonical multipart finalize, the SPA's `useUpload` hook
+posts the new file's path to `POST /api/index/file`. The App route
+resolves the path → `files.file_id` and schedules semantic indexing
+(text + CLIP) via `executionCtx.waitUntil`. The callback is
+non-fatal — upload succeeds even if indexing fails.
 
-To roll back:
-
-```bash
-wrangler secret put FEATURE_VFS_UPLOAD_MULTIPART  # value: false
-```
-
-The `/api/upload/multipart/*` route returns 404 ENOENT when the
-flag is off. The SPA does NOT auto-fall-back in v1 — uploads will
-fail with a typed network error from `parallelUpload`. To restore
-the legacy single-chunk path during rollback, also revert
-`src/hooks/use-upload.ts` to call `api.uploadInit/uploadChunk/uploadComplete`
-(the legacy methods on `api.ts` are deferred-deletion, scheduled
-for the legacy-routes cleanup phase).
-
-### 6.8.3 Score-template invariance — production data integrity
-
-The new App-pinned multipart route uses `legacyAppPlacement.placeChunk`
-which keys the rendezvous score on `shard:${userId}:${idx}` —
-IDENTICAL to the legacy single-chunk
-upload route's score. **Every existing photo's chunk addressing is
-preserved.** Migration-safety integration test
-`tests/integration/spa-roundtrip-live.test.ts:S2` verifies the
-invariant: bytes uploaded via the new path are byte-equal when
-read back via the legacy `/api/download/chunk/*` endpoint.
-
-### 6.8.4 Per-chunk progress UI
+### 6.8.3 Per-chunk progress UI
 
 The SDK extensions `onChunkEvent` + `onManifest` drive the SPA's
 per-chunk status grid. Every chunk
@@ -642,6 +618,34 @@ preserved.
 displays the AIMD scaling visible on the active-concurrency
 counter — when the SDK's adaptive engine scales up from 4 → 8 →
 12 → … 64 lanes, the SPA UI animates the count.
+
+## 6.9 Auth bridge — SPA session JWT → VFS token
+
+The canonical `/api/vfs/*` surface authenticates via short-lived
+`Bearer <VFS token>` (HS256, signed with `JWT_SECRET`). The App's
+session JWT is a different token shape (issued at signup/login).
+The SPA bridges the two via `POST /api/auth/vfs-token`:
+
+```
+POST /api/auth/vfs-token
+Authorization: Bearer <App session JWT>
+→ 200 { token: <VFS token>, expiresAtMs: <ms> }
+```
+
+The route is gated by `authMiddleware()` — it requires a valid App
+session JWT and pins the minted VFS token's tenant to `c.get('userId')`
+from the validated session. Callers cannot specify arbitrary tenants.
+
+VFS token TTL is 15 minutes. The SPA's `api.getVfsToken()` caches the
+token in memory and refreshes within 60 seconds of expiry.
+
+If `JWT_SECRET` is unset (operator misconfiguration), the route
+returns 503 `EMOSSAIC_UNAVAILABLE`.
+
+Tenant isolation is preserved end-to-end: a token minted under
+userId A cannot read userId B's VFS — `vfsAuth` middleware on the
+canonical routes derives the scope from the token claims, and the
+UserDO's path resolution is per-tenant SQL.
 
 ## 7. Sign-off (per-deploy)
 

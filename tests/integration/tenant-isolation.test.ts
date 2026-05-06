@@ -2,9 +2,9 @@ import { describe, it, expect } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
 
 /**
- * Phase 4 — Tenant isolation tests.
+ * Tenant isolation tests.
  *
- * Two scoping axes ship in Phase 4:
+ * Two scoping axes:
  *   1. The VFS uses `vfs:${ns}:${tenant}[:${sub}]` for UserDO names and
  *      `vfs:${ns}:${tenant}[:${sub}]:s${idx}` for ShardDO names. Two
  *      different (ns, tenant, sub) tuples MUST resolve to different DO
@@ -404,7 +404,7 @@ describe("cross-tenant chunk dedup is structurally impossible", () => {
       ).ref_count;
     });
     // Same (fileId, idx) on retry: ref_count must stay at 1 (the
-    // refcount drift fix from Phase 1).
+    // refcount drift fix from).
     expect(ref).toBe(1);
   });
 });

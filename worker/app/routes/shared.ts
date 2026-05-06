@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import type { EnvApp as Env } from "@shared/types";
-import { legacyAppPlacement } from "@shared/placement";
+import { createVFS } from "@mossaic/sdk";
 import { userStub } from "../lib/user-stub";
 
 const shared = new Hono<{ Bindings: Env }>();
@@ -9,14 +9,11 @@ const shared = new Hono<{ Bindings: Env }>();
  * GET /api/shared/:token/photos
  * Public endpoint — no auth required.
  *
- * The token encodes userId + fileIds. For V1, albums are stored
- * client-side, so the share link includes the userId in the token
- * to enable image fetching.
+ * The token encodes userId + fileIds. Albums are stored client-side in
+ * V1, so the share link includes the userId in the token to enable
+ * image fetching.
  *
  * Token format: base64(JSON({ userId, fileIds, albumName }))
- *
- * typed RPC `appGetFile` replaces the legacy fetch
- * indirection for each file metadata read.
  */
 shared.get("/:token/photos", async (c) => {
   const token = c.req.param("token");
@@ -35,8 +32,7 @@ shared.get("/:token/photos", async (c) => {
 
   const stub = userStub(c.env, userId);
 
-  // Fetch file metadata for each file. Done in parallel — each is one
-  // typed RPC.
+  // Fetch file metadata for each file in parallel.
   const fileResults = await Promise.all(
     fileIds.map((fileId) => stub.appGetFile(fileId))
   );
@@ -61,10 +57,7 @@ shared.get("/:token/photos", async (c) => {
 
 /**
  * GET /api/shared/:token/image/:fileId
- * Public image serving for shared albums.
- *
- * typed RPC `appGetFileManifest`. ShardDO addressing stays
- * on legacy naming.
+ * Public image bytes for shared albums via canonical `vfs.readFile()`.
  */
 shared.get("/:token/image/:fileId", async (c) => {
   const token = c.req.param("token");
@@ -82,66 +75,29 @@ shared.get("/:token/image/:fileId", async (c) => {
     return c.json({ error: "Unauthorized" }, 403);
   }
 
-  const manifest = await userStub(c.env, userId).appGetFileManifest(fileId);
-  if (!manifest) {
+  const resolved = await userStub(c.env, userId).appGetFilePath(fileId);
+  if (!resolved) {
     return c.json({ error: "File not found" }, 404);
   }
+  const { path, mimeType } = resolved;
 
-  if (manifest.chunks.length === 1) {
-    const chunk = manifest.chunks[0];
-    const shardId = c.env.MOSSAIC_SHARD.idFromName(
-      legacyAppPlacement.shardDOName({ ns: "default", tenant: userId }, chunk.shardIndex)
-    );
-    const shardStub = c.env.MOSSAIC_SHARD.get(shardId);
-    const chunkRes = await shardStub.fetch(
-      new Request(`http://internal/chunk/${chunk.hash}`)
-    );
-    if (!chunkRes.ok) {
-      return c.json({ error: "Chunk data not found" }, 404);
-    }
-    return new Response(chunkRes.body, {
+  const vfs = createVFS(c.env, { tenant: userId });
+  try {
+    const bytes = await vfs.readFile(path);
+    return new Response(bytes, {
       headers: {
-        "Content-Type": manifest.mimeType,
-        "Content-Length": chunk.size.toString(),
+        "Content-Type": mimeType,
+        "Content-Length": String(bytes.byteLength),
         "Cache-Control": "public, max-age=86400",
       },
     });
-  }
-
-  // Multi-chunk assembly
-  const chunkBuffers: ArrayBuffer[] = [];
-  for (const chunk of manifest.chunks.sort((a, b) => a.index - b.index)) {
-    const shardId = c.env.MOSSAIC_SHARD.idFromName(
-      legacyAppPlacement.shardDOName({ ns: "default", tenant: userId }, chunk.shardIndex)
-    );
-    const shardStub = c.env.MOSSAIC_SHARD.get(shardId);
-    const chunkRes = await shardStub.fetch(
-      new Request(`http://internal/chunk/${chunk.hash}`)
-    );
-    if (!chunkRes.ok) {
-      return c.json({ error: "Chunk data not found" }, 404);
+  } catch (err) {
+    const code = (err as { code?: string }).code;
+    if (code === "ENOENT") {
+      return c.json({ error: "File not found" }, 404);
     }
-    chunkBuffers.push(await chunkRes.arrayBuffer());
+    throw err;
   }
-
-  const totalSize = chunkBuffers.reduce(
-    (sum, buf) => sum + buf.byteLength,
-    0
-  );
-  const combined = new Uint8Array(totalSize);
-  let offset = 0;
-  for (const buf of chunkBuffers) {
-    combined.set(new Uint8Array(buf), offset);
-    offset += buf.byteLength;
-  }
-
-  return new Response(combined, {
-    headers: {
-      "Content-Type": manifest.mimeType,
-      "Content-Length": totalSize.toString(),
-      "Cache-Control": "public, max-age=86400",
-    },
-  });
 });
 
 export default shared;

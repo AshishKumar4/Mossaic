@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
 
 /**
- * Phase 15 — Step 5 — client-driven compaction of encrypted Yjs files.
+ * Step 5 — client-driven compaction of encrypted Yjs files.
  *
  *   C1.  Manual compactYjs replays decrypted ops, builds a checkpoint,
  *        appends it via CAS, and drops superseded oplog rows.
@@ -45,7 +45,7 @@ function makeKey(byte: number): Uint8Array {
   return a;
 }
 
-describe("Phase 15 — encrypted yjs client-driven compaction", () => {
+describe("encrypted yjs client-driven compaction", () => {
   it("C1 — compactYjs replays + checkpoints + drops oplog rows", async () => {
     const tenant = "p15-c1";
     const cfg: EncryptionConfig = {
@@ -120,7 +120,7 @@ describe("Phase 15 — encrypted yjs client-driven compaction", () => {
     // unless a peer is connected. Local state from the same handle
     // would have been preserved in the doc, but a fresh handle won't
     // see prior content unless it explicitly fetches the oplog.
-    // For Phase 15 the contract is: cold open of a stale encrypted
+    // For the contract is: cold open of a stale encrypted
     // yjs doc starts blank when no peer has the master key. The
     // CHECKPOINT is preserved server-side; the consumer must
     // explicitly read+decrypt it on cold open.

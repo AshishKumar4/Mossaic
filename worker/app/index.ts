@@ -2,9 +2,8 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import type { EnvApp as Env } from "@shared/types";
 import authRoutes from "./routes/auth";
-import uploadRoutes from "./routes/upload";
-import downloadRoutes from "./routes/download";
 import filesRoutes from "./routes/files";
+import indexRoutes from "./routes/index";
 import foldersRoutes from "./routes/folders";
 import analyticsRoutes from "./routes/analytics";
 import galleryRoutes from "./routes/gallery";
@@ -14,12 +13,6 @@ import vfsRoutes from "@core/routes/vfs";
 import vfsPreviewRoutes from "@core/routes/vfs-preview";
 import yjsWsRoutes from "@core/routes/vfs-yjs-ws";
 import multipartRoutes, { chunkDownload } from "@core/routes/multipart-routes";
-// App-pinned multipart route (`/api/upload/multipart/*`).
-// Routes through legacy DO instances (`user:<userId>` /
-// `shard:<userId>:<idx>`) instead of the canonical `vfs:default:*`
-// namespace. SPA passes `multipartBaseOverride: "/api/upload/multipart"`
-// to redirect SDK multipart calls here.
-import appMultipartRoutes from "./routes/multipart";
 
 // UserDO is the App-side subclass that adds the legacy
 // photo-app HTTP routes on top of UserDOCore. Production wrangler
@@ -61,33 +54,8 @@ app.use(
 
 // Mount API routes
 app.route("/api/auth", authRoutes);
-// App-pinned multipart route. Mounted BEFORE the legacy
-// `/api/upload/init|chunk|complete` route so the more-specific path
-// wins. Feature-flagged via `FEATURE_VFS_UPLOAD_MULTIPART`; default
-// ON. Set the flag to "false" via wrangler secret to disable
-// (SPA falls back to legacy single-chunk path).
-app.use("/api/upload/multipart/*", async (c, next) => {
-  const flag = c.env.FEATURE_VFS_UPLOAD_MULTIPART;
-  // Default ON; only "false" / "0" / "off" disables.
-  if (
-    flag !== undefined &&
-    (flag === "false" || flag === "0" || flag === "off")
-  ) {
-    return c.json(
-      {
-        code: "ENOENT",
-        message:
-          "FEATURE_VFS_UPLOAD_MULTIPART is disabled; use legacy /api/upload",
-      },
-      404
-    );
-  }
-  await next();
-});
-app.route("/api/upload/multipart", appMultipartRoutes);
-app.route("/api/upload", uploadRoutes);
-app.route("/api/download", downloadRoutes);
 app.route("/api/files", filesRoutes);
+app.route("/api/index", indexRoutes);
 app.route("/api/folders", foldersRoutes);
 app.route("/api/analytics", analyticsRoutes);
 app.route("/api/gallery", galleryRoutes);

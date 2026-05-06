@@ -7,52 +7,19 @@ import type {
   ShardDistribution,
   GalleryPhoto,
 } from "../../types";
-import type { UserFile, FileManifest, Folder, QuotaInfo } from "@shared/types";
+import type { UserFile, Folder, QuotaInfo } from "@shared/types";
 import { handleSignup, handleLogin, type AuthResult } from "./auth";
-import {
-  createFile,
-  recordChunk,
-  completeFile,
-  getFileManifest,
-  listFiles,
-  deleteFile,
-  getFile,
-} from "./files";
+import { listFiles, deleteFile, getFile } from "./files";
 import { createFolder, listFolders, getFolderPath } from "./folders";
-import { getQuota, checkQuota, updateUsage } from "./quota";
+import { getQuota, updateUsage } from "./quota";
 import { UserDOCore } from "@core/objects/user/user-do-core";
-// multipart upload helpers (App-side variants).
-import {
-  appBeginMultipart as appBeginMultipartImpl,
-  appAbortMultipart as appAbortMultipartImpl,
-  appFinalizeMultipart as appFinalizeMultipartImpl,
-  appGetMultipartStatus as appGetMultipartStatusImpl,
-  appOpenManifest as appOpenManifestImpl,
-  type AppBeginMultipartOpts,
-} from "./multipart";
-import type {
-  MultipartBeginResponse,
-  MultipartFinalizeResponse,
-} from "@shared/multipart";
-
-/**
- * Shape returned by {@link UserDO.appCreateFile}. Mirrors the
- * legacy `/files/create` JSON response so the SPA's
- * `UploadInitResponse` shape is preserved end-to-end.
- */
-export interface AppCreateFileResult {
-  fileId: string;
-  chunkSize: number;
-  chunkCount: number;
-  poolSize: number;
-}
 
 /**
  * Typed projection of a `files` table row. Exposed for callers of
  * {@link UserDO.appGetFile}; matches the snake_case column names of
  * the underlying SQLite schema so the App routes can pass it
- * straight through to legacy wire shapes (e.g. the public share
- * endpoint at `/api/shared/:token/photos`).
+ * straight through to wire shapes that expect the column naming
+ * (e.g. the public share endpoint at `/api/shared/:token/photos`).
  */
 export interface AppFileRow {
   file_id: string;
@@ -82,37 +49,12 @@ export interface AppFileRow {
  * ShardDO) and v2 (SearchDO). The runtime DO namespace is keyed by
  * (script, class_name) so storage on the existing app at
  * mossaic.ashishkumarsingh.com is untouched.
- *
- * ── `_legacyFetch` removal ───────────────────────────────
- *
- * Historically, all app-only operations were dispatched through a
- * hand-rolled JSON router named `_legacyFetch` (193 byte-pinned
- * lines, sha256 `4c6eb84925cd8b34298aa92a5201c6e8074defb4527c3bbb1d2c677f9f2c8e70`).
- * Routes called `stub.fetch("http://internal/files/create", ...)` and
- * parsed the JSON reply.
- *
- * That handler is gone. The typed-RPC methods on this class
- * (`appHandleSignup`, `appCreateFile`, etc.) replace it.
- * App routes call them directly as `stub.appCreateFile(...)`,
- * eliminating one JSON parse + one URL allocation per call and
- * making the surface type-checked end-to-end.
- *
- * The byte-pinned hash is intentionally retired because every caller
- * has been migrated; the unreachable code is removed rather than
- * preserved as dead bytes. Callers that still address the old
- * `http://internal/...` URLs (none exist in this tree) would now
- * receive 404 from `super.fetch(request)`.
- *
- * Production data is unaffected: the typed RPCs hit the same SQLite
- * tables (`auth`, `files`, `file_chunks`, `folders`, `quota`) on the
- * same DO instance via the same helpers.
  */
 export class UserDO extends UserDOCore {
   /**
    * Override Core's `fetch` to surface the WebSocket upgrade path
    * through `super.fetch` (Yjs collab WS). Non-WS HTTP requests fall
-   * through to Core's default 404 — the legacy JSON router that
-   * handled them was retired with the App-on-SDK refactor.
+   * through to Core's default 404.
    */
   override async fetch(request: Request): Promise<Response> {
     return super.fetch(request);
@@ -121,12 +63,9 @@ export class UserDO extends UserDOCore {
   // ── App-only RPCs ────────────────────────────────────────────────
   //
   // All methods below are TYPED RPCs callable from App routes via
-  // `stub.appXxx(...)` over the DO RPC binding. They replace the
-  // legacy `_legacyFetch` JSON router 1:1 in semantics.
-  //
-  // Each method calls `this.ensureInit()` so first-touch on a fresh
-  // DO instance materializes the schema, exactly like the legacy
-  // path did (preserves first-signup behavior on a brand-new user).
+  // `stub.appXxx(...)` over the DO RPC binding. Each calls
+  // `this.ensureInit()` so first-touch on a fresh DO instance
+  // materializes the schema.
 
   /** Create user, hash password, insert quota row. Returns userId+email. */
   async appHandleSignup(email: string, password: string): Promise<AuthResult> {
@@ -134,127 +73,30 @@ export class UserDO extends UserDOCore {
     return handleSignup(this, email, password);
   }
 
+  /**
+   * Initialize the per-tenant data DO with a default quota row.
+   *
+   * Called by `POST /api/auth/signup` immediately after the auth row
+   * lands on the `auth:<email>` DO. Without this, the canonical
+   * `vfs:default:<userId>` data DO has no quota row and analytics +
+   * `appGetQuota` return all-zero defaults forever — gallery still
+   * works but `storage_used` never tracks reality.
+   *
+   * Idempotent (`INSERT OR IGNORE`).
+   */
+  async appInitTenant(userId: string): Promise<void> {
+    this.ensureInit();
+    this.sql.exec(
+      `INSERT OR IGNORE INTO quota (user_id, storage_used, storage_limit, file_count, pool_size)
+       VALUES (?, 0, 107374182400, 0, 32)`,
+      userId
+    );
+  }
+
   /** Verify credentials. Returns userId+email on success; throws on failure. */
   async appHandleLogin(email: string, password: string): Promise<AuthResult> {
     this.ensureInit();
     return handleLogin(this, email, password);
-  }
-
-  /**
-   * Insert a new uploading-state file row. Returns chunk spec + the
-   * user's current pool size for placement. Throws on quota exceeded.
-   */
-  async appCreateFile(
-    userId: string,
-    fileName: string,
-    fileSize: number,
-    mimeType: string,
-    parentId: string | null
-  ): Promise<AppCreateFileResult> {
-    this.ensureInit();
-    if (!checkQuota(this, userId, fileSize)) {
-      throw new Error("Quota exceeded");
-    }
-    return createFile(this, userId, fileName, fileSize, mimeType, parentId);
-  }
-
-  /** Record a successfully-uploaded chunk in `file_chunks`. */
-  async appRecordChunk(
-    fileId: string,
-    chunkIndex: number,
-    chunkHash: string,
-    chunkSize: number,
-    shardIndex: number
-  ): Promise<void> {
-    this.ensureInit();
-    recordChunk(this, fileId, chunkIndex, chunkHash, chunkSize, shardIndex);
-  }
-
-  /**
-   * Flip status='complete' on the file row, stamp file_hash, and bump
-   * the user's quota row by the file size.
-   */
-  async appCompleteFile(
-    fileId: string,
-    fileHash: string,
-    userId: string,
-    fileSize: number
-  ): Promise<void> {
-    this.ensureInit();
-    completeFile(this, fileId, fileHash);
-    updateUsage(this, userId, fileSize, 1);
-  }
-
-  // ── multipart upload RPCs (legacy schema) ──────────────
-  //
-  // Mirror the canonical `vfsBeginMultipart`/`vfsFinalizeMultipart`/
-  // `vfsAbortMultipart`/`vfsGetMultipartStatus`/`vfsOpenManifest`
-  // surface but adapted to the App's legacy `files`/`file_chunks`
-  // schema and `legacyAppPlacement` shard naming. The App-pinned
-  // multipart route at `/api/upload/multipart/*` calls these via the
-  // typed DO RPC binding.
-
-  /** begin a multipart upload session against legacy schema. */
-  async appBeginMultipart(
-    userId: string,
-    path: string,
-    opts: AppBeginMultipartOpts
-  ): Promise<MultipartBeginResponse> {
-    this.ensureInit();
-    return appBeginMultipartImpl(this, userId, path, opts);
-  }
-
-  /** abort a multipart upload session. Idempotent. */
-  async appAbortMultipart(
-    userId: string,
-    uploadId: string
-  ): Promise<{ ok: true }> {
-    this.ensureInit();
-    return appAbortMultipartImpl(this, userId, uploadId);
-  }
-
-  /** finalize a multipart upload — verify + flip to complete. */
-  async appFinalizeMultipart(
-    userId: string,
-    uploadId: string,
-    chunkHashList: readonly string[]
-  ): Promise<MultipartFinalizeResponse> {
-    this.ensureInit();
-    return appFinalizeMultipartImpl(this, userId, uploadId, chunkHashList);
-  }
-
-  /** probe the status of an open multipart session. */
-  async appGetMultipartStatus(
-    userId: string,
-    uploadId: string
-  ): Promise<{
-    landed: number[];
-    total: number;
-    bytesUploaded: number;
-    expiresAtMs: number;
-  }> {
-    this.ensureInit();
-    return appGetMultipartStatusImpl(this, userId, uploadId);
-  }
-
-  /** open a download manifest for a finalized App file. */
-  async appOpenManifest(fileId: string): Promise<{
-    fileId: string;
-    size: number;
-    chunkSize: number;
-    chunkCount: number;
-    chunks: Array<{ index: number; hash: string; size: number }>;
-    inlined: boolean;
-    mimeType: string;
-  }> {
-    this.ensureInit();
-    return appOpenManifestImpl(this, fileId);
-  }
-
-  /** Read the file row + its chunks for download manifest. */
-  async appGetFileManifest(fileId: string): Promise<FileManifest | null> {
-    this.ensureInit();
-    return getFileManifest(this, fileId);
   }
 
   /** Folder contents (files + sub-folders). */
@@ -283,10 +125,117 @@ export class UserDO extends UserDOCore {
   }
 
   /**
-   * Raw file row read (used by the public `/api/shared/...` route
-   * and the upload-complete handler). Returns the snake_case columns
-   * unchanged (the DB rows are passed through with no rename so the
-   * shape matches what the legacy SQL helpers produce).
+   * Resolve an absolute VFS path to its `files` row. The canonical
+   * write path inserts file rows keyed by (user_id, parent_id,
+   * file_name); this is the inverse — used by the `/api/index/file`
+   * SPA callback to translate the just-written path back to a fileId
+   * for the search-index pipeline.
+   */
+  async appResolveFileByPath(
+    userId: string,
+    path: string
+  ): Promise<AppFileRow | null> {
+    this.ensureInit();
+    if (!path.startsWith("/")) return null;
+
+    // Walk segments — descend through `folders` for each non-leaf,
+    // then read the `files` row for the leaf.
+    const segments = path.split("/").filter((s) => s.length > 0);
+    if (segments.length === 0) return null;
+    const leafName = segments[segments.length - 1];
+    const dirSegments = segments.slice(0, -1);
+
+    let parentId: string | null = null;
+    for (const dir of dirSegments) {
+      const folderRow = this.sql
+        .exec(
+          "SELECT folder_id FROM folders WHERE user_id = ? AND IFNULL(parent_id, '') = IFNULL(?, '') AND name = ?",
+          userId,
+          parentId,
+          dir
+        )
+        .toArray()[0] as { folder_id: string } | undefined;
+      if (!folderRow) return null;
+      parentId = folderRow.folder_id;
+    }
+
+    const fileRow = this.sql
+      .exec(
+        "SELECT * FROM files WHERE user_id = ? AND IFNULL(parent_id, '') = IFNULL(?, '') AND file_name = ? AND status != 'deleted'",
+        userId,
+        parentId,
+        leafName
+      )
+      .toArray()[0] as Record<string, unknown> | undefined;
+    if (!fileRow) return null;
+
+    return {
+      file_id: fileRow.file_id as string,
+      user_id: fileRow.user_id as string,
+      parent_id: (fileRow.parent_id as string | null) ?? null,
+      file_name: fileRow.file_name as string,
+      file_size: fileRow.file_size as number,
+      file_hash: (fileRow.file_hash as string) ?? "",
+      mime_type: fileRow.mime_type as string,
+      chunk_size: (fileRow.chunk_size as number) ?? 0,
+      chunk_count: (fileRow.chunk_count as number) ?? 0,
+      pool_size: (fileRow.pool_size as number) ?? 32,
+      status: fileRow.status as string,
+      created_at: fileRow.created_at as number,
+      updated_at: fileRow.updated_at as number,
+      deleted_at: (fileRow.deleted_at as number | null) ?? null,
+    };
+  }
+
+  /**
+   * Reconstruct the absolute VFS path + mimeType for a `files.file_id`
+   * by walking the `parent_id` chain through the `folders` table.
+   * Returns null when the file row is missing or soft-deleted.
+   *
+   * Used by gallery + shared-album routes to translate the App's
+   * fileId-keyed URLs (`GET /api/gallery/image/:fileId`) into the
+   * `path` + `mimeType` that the canonical VFS read APIs need.
+   */
+  async appGetFilePath(
+    fileId: string
+  ): Promise<{ path: string; mimeType: string } | null> {
+    this.ensureInit();
+    const fileRow = this.sql
+      .exec(
+        "SELECT parent_id, file_name, mime_type FROM files WHERE file_id = ? AND status != 'deleted'",
+        fileId
+      )
+      .toArray()[0] as
+      | { parent_id: string | null; file_name: string; mime_type: string }
+      | undefined;
+    if (!fileRow) return null;
+
+    const segments: string[] = [fileRow.file_name];
+    let cursor: string | null = fileRow.parent_id ?? null;
+    // Bound the walk — practical hierarchies stay shallow; the cap
+    // protects against pathological cycles in malformed rows.
+    for (let i = 0; i < 256 && cursor !== null; i++) {
+      const folderRow = this.sql
+        .exec(
+          "SELECT parent_id, name FROM folders WHERE folder_id = ?",
+          cursor
+        )
+        .toArray()[0] as { parent_id: string | null; name: string } | undefined;
+      if (!folderRow) return null; // dangling parent_id
+      segments.unshift(folderRow.name);
+      cursor = folderRow.parent_id ?? null;
+    }
+    return {
+      path: "/" + segments.join("/"),
+      mimeType: fileRow.mime_type ?? "application/octet-stream",
+    };
+  }
+
+  /**
+   * Raw file row read (used by the public `/api/shared/...` route).
+   * Returns the snake_case columns unchanged so callers can pass it
+   * straight through to wire shapes that expect the SQLite column
+   * naming.
    */
   async appGetFile(fileId: string): Promise<AppFileRow | null> {
     this.ensureInit();
@@ -320,15 +269,6 @@ export class UserDO extends UserDOCore {
   ): Promise<Folder> {
     this.ensureInit();
     return createFolder(this, userId, name, parentId);
-  }
-
-  /** Folders sharing a parent. */
-  async appListFolders(
-    userId: string,
-    parentId: string | null
-  ): Promise<Folder[]> {
-    this.ensureInit();
-    return listFolders(this, userId, parentId);
   }
 
   /** Breadcrumb path from root to the given folderId. */
@@ -397,7 +337,7 @@ export class UserDO extends UserDOCore {
     return getQuota(this, userId);
   }
 
-  // ── Internal aggregator (was inline in legacy fetch) ─────────────
+  // ── Internal aggregator ──────────────────────────────────────────
 
   private getUserStats(userId: string): UserStats {
     // Total files and storage

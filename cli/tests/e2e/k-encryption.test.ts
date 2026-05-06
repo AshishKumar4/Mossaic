@@ -1,5 +1,5 @@
 /**
- * E2E K — Phase 15 end-to-end encryption coverage (14 cases).
+ * E2E K — end-to-end encryption coverage (14 cases).
  *
  * These tests exercise the encryption boundary against the live
  * Service-mode worker (https://mossaic-core.ashishkmr472.workers.dev
@@ -197,7 +197,7 @@ async function setYjsMode(
   }
 }
 
-describe.skipIf(!hasSecret())("K — Phase 15 encryption coverage", () => {
+describe.skipIf(!hasSecret())("K — encryption coverage", () => {
   beforeAll(() => requireSecret());
 
   let ctx: TenantCtx;
@@ -327,8 +327,7 @@ describe.skipIf(!hasSecret())("K — Phase 15 encryption coverage", () => {
   });
 
   it("K.5 — convergent mode dedupes: same plaintext → same chunk hashes across paths", async () => {
-    // The SDK encrypts the WHOLE file as a single envelope (Phase 15
-    // §4 — multi-chunk envelope-stream encryption is v15.1). Convergent
+    // The SDK encrypts the WHOLE file as a single envelope. Convergent
     // mode derives the IV deterministically from plaintext+key, so
     // two writes of the same plaintext under the same key/salt
     // produce byte-identical envelopes — the storage layer hashes
@@ -512,7 +511,7 @@ describe.skipIf(!hasSecret())("K — Phase 15 encryption coverage", () => {
 
   it("K.10 — encrypted yjs file is opaque to wire-level Yjs adapter (server returns envelopes; plaintext never leaks)", async () => {
     // Setup: write an encrypted file, then enable yjs-mode on it.
-    // Phase 15's encrypted-yjs path means the SERVER stores the
+    // encrypted-yjs path means the SERVER stores the
     // envelope op log opaquely. The wire-level openYDocOverWs
     // adapter (encryption-unaware) cannot usefully decrypt these,
     // but we CAN still observe:
@@ -597,7 +596,7 @@ describe.skipIf(!hasSecret())("K — Phase 15 encryption coverage", () => {
     // decode. If `swallowedDecodeErrors.length === 0` the server
     // either sent no frames (encrypted-yjs relay broken) OR sent
     // valid plaintext yjs frames (encryption boundary breached).
-    // Either is a Phase 15 violation we want to catch.
+    // Either is a violation we want to catch.
     expect(swallowedDecodeErrors.length).toBeGreaterThan(0);
 
     // Re-stat: encryption stamp is still there post-WS-handshake.
@@ -697,8 +696,7 @@ describe.skipIf(!hasSecret())("K — Phase 15 encryption coverage", () => {
     await httpWriteFile(ctx, "/mode-mismatch.bin", env1, { mode: "convergent" });
 
     // Second write to the SAME path, with a different mode →
-    // server rejects with EBADF (Phase 15 §4.5 — encryption mode is
-    // pinned per path's history). 409 is the EBADF status code in
+    // server rejects with EBADF. 409 is the EBADF status code in
     // worker/core/routes/vfs.ts:143; we additionally assert the
     // response body's `code` field is the exact string "EBADF" to
     // disambiguate from other 409s (EISDIR, EEXIST, EBUSY, ENOTEMPTY).

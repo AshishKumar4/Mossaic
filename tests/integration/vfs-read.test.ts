@@ -2,44 +2,24 @@ import { describe, it, expect } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
 
 /**
- * Phase 2 — Read-side VFS RPC integration tests.
+ * Read-side VFS RPC integration tests.
  *
  * Drives the typed RPC surface (vfsStat / vfsLstat / vfsExists /
  * vfsReadlink / vfsReaddir / vfsReadManyStat / vfsReadFile /
  * vfsOpenManifest / vfsReadChunk) directly through DO RPC. The consumer
  * test fixture pretends to be the SDK: gets a stub via
  * `env.MOSSAIC_USER.get(idFromName(...))` and calls the methods.
- *
- * Phase 4 wires shard naming through `vfsShardDOName(ns, tenant, sub, idx)`,
- * so seed steps that pre-populate ShardDO state must use the same
- * derivation. We hard-code namespace="default" + sub=undefined to match
- * the scope the tests pass to the RPC methods.
  */
 
 import type { UserDO } from "@app/objects/user/user-do";
-import type { ShardDO } from "@core/objects/shard/shard-do";
 import { INLINE_LIMIT } from "@shared/inline";
-import { vfsShardDOName } from "@core/lib/utils";
 
 interface E {
   MOSSAIC_USER: DurableObjectNamespace<UserDO>;
-  MOSSAIC_SHARD: DurableObjectNamespace<ShardDO>;
 }
 const E = env as unknown as E;
 
-async function sha256Hex(data: Uint8Array): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", data);
-  return Array.from(new Uint8Array(digest))
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-}
-
-/**
- * Seed a UserDO via the App's typed `appHandleSignup` RPC. The RPC
- * materializes the auth + quota rows (same `handleSignup` helper the
- * pre-Phase-17 `_legacyFetch` /signup route called) and returns the
- * generated user_id we use as `scope.tenant`.
- */
+/** Seed a UserDO via `appHandleSignup`; returns the generated user_id. */
 async function seedUser(
   stub: DurableObjectStub<UserDO>,
   email: string
@@ -49,20 +29,17 @@ async function seedUser(
 }
 
 describe("vfsStat / vfsLstat / vfsExists", () => {
-  it("stats a file at the root after legacy upload", async () => {
+  it("stats a file at the root after a canonical write", async () => {
     const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-read:stat"));
     const userId = await seedUser(stub, "stat@e.com");
 
-    const { fileId } = await stub.appCreateFile(
-      userId,
-      "stat.txt",
-      5,
-      "text/plain",
-      null
-    );
-    await stub.appCompleteFile(fileId, "0".repeat(64), userId, 5);
-
     const scope = { ns: "default", tenant: userId };
+    await stub.vfsWriteFile(
+      scope,
+      "/stat.txt",
+      new TextEncoder().encode("hello"),
+      { mimeType: "text/plain" }
+    );
     const stat = await stub.vfsStat(scope, "/stat.txt");
     expect(stat.type).toBe("file");
     expect(stat.size).toBe(5);
@@ -143,17 +120,15 @@ describe("vfsReaddir", () => {
     for (const name of ["a", "b"]) {
       await stub.appCreateFolder(userId, name, null);
     }
-    for (const name of ["c.txt", "d.txt"]) {
-      const { fileId } = await stub.appCreateFile(
-        userId,
-        name,
-        1,
-        "text/plain",
-        null
-      );
-      await stub.appCompleteFile(fileId, "0".repeat(64), userId, 1);
-    }
     const scope = { ns: "default", tenant: userId };
+    for (const name of ["c.txt", "d.txt"]) {
+      await stub.vfsWriteFile(
+        scope,
+        `/${name}`,
+        new TextEncoder().encode("x"),
+        { mimeType: "text/plain" }
+      );
+    }
 
     const entries = await stub.vfsReaddir(scope, "/");
     expect(entries).toEqual(["a", "b", "c.txt", "d.txt"]);
@@ -165,15 +140,13 @@ describe("vfsReaddir", () => {
   it("ENOTDIR when path resolves to a file", async () => {
     const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-read:enotdir"));
     const userId = await seedUser(stub, "ntd@e.com");
-    const { fileId } = await stub.appCreateFile(
-      userId,
-      "f.txt",
-      1,
-      "text/plain",
-      null
-    );
-    await stub.appCompleteFile(fileId, "0".repeat(64), userId, 1);
     const scope = { ns: "default", tenant: userId };
+    await stub.vfsWriteFile(
+      scope,
+      "/f.txt",
+      new TextEncoder().encode("x"),
+      { mimeType: "text/plain" }
+    );
     await expect(stub.vfsReaddir(scope, "/f.txt")).rejects.toThrow(/ENOTDIR/);
   });
 });
@@ -183,8 +156,7 @@ describe("vfsReadFile (inline tier + chunked path)", () => {
     const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-read:inline"));
     const userId = await seedUser(stub, "il@e.com");
 
-    // Manually insert an inlined file (Phase 3 will write this via
-    // vfsWriteFile; here we simulate the row a writeFile would produce).
+    // Manually insert an inlined file.
     const payload = new TextEncoder().encode("hello inline tier!");
     expect(payload.byteLength).toBeLessThanOrEqual(INLINE_LIMIT);
 
@@ -225,67 +197,19 @@ describe("vfsReadFile (inline tier + chunked path)", () => {
   it("reads a chunked file by fanning out ShardDO subrequests", async () => {
     const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-read:chunked-user"));
     const userId = await seedUser(stub, "ch@e.com");
-    const shardIdx = 0;
-    const shardDO = E.MOSSAIC_SHARD.get(
-      E.MOSSAIC_SHARD.idFromName(vfsShardDOName("default", userId, undefined, shardIdx))
-    );
 
-    // Two-chunk file. We use the legacy upload protocol since vfsWriteFile
-    // hasn't shipped yet (Phase 3).
-    const part1 = new TextEncoder().encode("chunk-one--");
-    const part2 = new TextEncoder().encode("chunk-two!!");
-    const full = new Uint8Array(part1.byteLength + part2.byteLength);
-    full.set(part1, 0);
-    full.set(part2, part1.byteLength);
-
-    const { fileId } = await stub.appCreateFile(
-      userId,
-      "two.bin",
-      full.byteLength,
-      "application/octet-stream",
-      null
-    );
-
-    // Override chunk_size + chunk_count so reading walks two chunk rows.
-    await runInDurableObject(stub, async (_instance, state) => {
-      state.storage.sql.exec(
-        "UPDATE files SET chunk_size = ?, chunk_count = 2 WHERE file_id = ?",
-        part1.byteLength,
-        fileId
-      );
-    });
-
-    // Upload both chunks via the existing ShardDO protocol.
-    for (let i = 0; i < 2; i++) {
-      const part = i === 0 ? part1 : part2;
-      const hash = await sha256Hex(part);
-      const put = await shardDO.fetch(
-        new Request("http://internal/chunk", {
-          method: "PUT",
-          headers: {
-            "X-Chunk-Hash": hash,
-            "X-File-Id": fileId,
-            "X-Chunk-Index": String(i),
-            "X-User-Id": userId,
-          },
-          body: part,
-        })
-      );
-      expect(put.ok).toBe(true);
-      await stub.appRecordChunk(fileId, i, hash, part.byteLength, shardIdx);
-    }
-    await stub.appCompleteFile(
-      fileId,
-      "0".repeat(64),
-      userId,
-      full.byteLength
-    );
+    // 20KB > INLINE_LIMIT (16KB) → forces the chunked tier so the read
+    // exercises the ShardDO fan-out path.
+    const full = new Uint8Array(20 * 1024);
+    for (let i = 0; i < full.length; i++) full[i] = (i * 31 + 7) & 0xff;
 
     const scope = { ns: "default", tenant: userId };
+    await stub.vfsWriteFile(scope, "/two.bin", full, {
+      mimeType: "application/octet-stream",
+    });
+
     const out = await stub.vfsReadFile(scope, "/two.bin");
-    expect(new TextDecoder().decode(out)).toBe(
-      "chunk-one--chunk-two!!"
-    );
+    expect(new Uint8Array(out)).toEqual(full);
   });
 });
 
@@ -294,18 +218,16 @@ describe("vfsReadManyStat", () => {
     const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-read:many"));
     const userId = await seedUser(stub, "many@e.com");
 
+    const scope = { ns: "default", tenant: userId };
     for (const name of ["a.txt", "b.txt"]) {
-      const { fileId } = await stub.appCreateFile(
-        userId,
-        name,
-        3,
-        "text/plain",
-        null
+      await stub.vfsWriteFile(
+        scope,
+        `/${name}`,
+        new TextEncoder().encode("xxx"),
+        { mimeType: "text/plain" }
       );
-      await stub.appCompleteFile(fileId, "0".repeat(64), userId, 3);
     }
 
-    const scope = { ns: "default", tenant: userId };
     const stats = await stub.vfsReadManyStat(scope, [
       "/a.txt",
       "/missing",
@@ -322,51 +244,29 @@ describe("vfsOpenManifest / vfsReadChunk", () => {
   it("openManifest hides shardIndex; readChunk serves bytes", async () => {
     const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-read:manifest-u"));
     const userId = await seedUser(stub, "mf@e.com");
-    const shardIdx = 0;
-    const shardDO = E.MOSSAIC_SHARD.get(
-      E.MOSSAIC_SHARD.idFromName(vfsShardDOName("default", userId, undefined, shardIdx))
-    );
 
-    const part = new TextEncoder().encode("just-one-chunk");
-    const { fileId } = await stub.appCreateFile(
-      userId,
-      "m.bin",
-      part.byteLength,
-      "application/octet-stream",
-      null
-    );
-    const hash = await sha256Hex(part);
-    await shardDO.fetch(
-      new Request("http://internal/chunk", {
-        method: "PUT",
-        headers: {
-          "X-Chunk-Hash": hash,
-          "X-File-Id": fileId,
-          "X-Chunk-Index": "0",
-          "X-User-Id": userId,
-        },
-        body: part,
-      })
-    );
-    await stub.appRecordChunk(fileId, 0, hash, part.byteLength, shardIdx);
-    await stub.appCompleteFile(
-      fileId,
-      "0".repeat(64),
-      userId,
-      part.byteLength
-    );
+    // 20KB > INLINE_LIMIT (16KB) → chunked tier with at least one chunk.
+    const full = new Uint8Array(20 * 1024);
+    for (let i = 0; i < full.length; i++) full[i] = (i * 17 + 3) & 0xff;
 
     const scope = { ns: "default", tenant: userId };
+    await stub.vfsWriteFile(scope, "/m.bin", full, {
+      mimeType: "application/octet-stream",
+    });
+
     const m = await stub.vfsOpenManifest(scope, "/m.bin");
     expect(m.inlined).toBe(false);
-    expect(m.size).toBe(part.byteLength);
-    expect(m.chunks).toHaveLength(1);
-    expect(m.chunks[0]).toMatchObject({ index: 0, hash, size: part.byteLength });
+    expect(m.size).toBe(full.byteLength);
+    expect(m.chunks.length).toBeGreaterThan(0);
     // shardIndex MUST NOT leak in the public shape.
     expect((m.chunks[0] as Record<string, unknown>).shardIndex).toBeUndefined();
+    expect(typeof m.chunks[0].hash).toBe("string");
+    expect(m.chunks[0].hash.length).toBe(64);
 
     const ck = await stub.vfsReadChunk(scope, "/m.bin", 0);
-    expect(new TextDecoder().decode(ck)).toBe("just-one-chunk");
+    // First chunk = first chunkSize bytes of the original payload.
+    expect(new Uint8Array(ck).slice(0, 16))
+      .toEqual(full.slice(0, 16));
   });
 
   it("openManifest reports inlined=true for inlined files", async () => {
@@ -410,14 +310,18 @@ describe("scope handling", () => {
     const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-read:tenant-iso"));
     const userId = await seedUser(stub, "iso@e.com");
 
-    // Insert a file under tenant=userId, sub=undefined.
-    await stub.appCreateFile(userId, "owned.txt", 1, "text/plain", null);
+    // Write under tenant=userId, sub=undefined.
+    const scopeNoSub = { ns: "default", tenant: userId } as const;
+    await stub.vfsWriteFile(
+      scopeNoSub,
+      "/owned.txt",
+      new TextEncoder().encode("x"),
+      { mimeType: "text/plain" }
+    );
 
     // scope.sub set → user_id becomes "<userId>::<sub>" which has no rows
     const scopeWithSub = { ns: "default", tenant: userId, sub: "alice" };
     expect(await stub.vfsExists(scopeWithSub, "/owned.txt")).toBe(false);
-
-    const scopeNoSub = { ns: "default", tenant: userId };
     expect(await stub.vfsExists(scopeNoSub, "/owned.txt")).toBe(true);
   });
 });

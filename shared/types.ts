@@ -119,8 +119,7 @@ export type ImagesBinding = {
 
 /**
  * Cloudflare Browser Run binding. Reserved for the deferred
- * preview renderers (PDF page-1, video poster, Office). Phase 20
- * wires the binding optionally; renderers requiring it fall through
+ * preview renderers (PDF page-1, video poster, Office). * wires the binding optionally; renderers requiring it fall through
  * to the icon-card when the binding is absent.
  */
 export type BrowserBinding = {
@@ -151,15 +150,6 @@ export interface EnvApp extends EnvCore {
   SEARCH_DO: DurableObjectNamespace;
   ASSETS: Fetcher;
   AI?: Ai;
-  /**
-   * Feature flag for the SPA's `/api/upload/multipart/*` route.
-   * Defaults to ON. Set to "false" via
-   * `wrangler secret put FEATURE_VFS_UPLOAD_MULTIPART false` to
-   * disable the new path during a rollback; the SPA falls back to
-   * the legacy single-chunk `api.uploadInit/uploadChunk/uploadComplete`
-   * path (kept until the legacy-routes cleanup phase).
-   */
-  FEATURE_VFS_UPLOAD_MULTIPART?: string;
 }
 
 /**

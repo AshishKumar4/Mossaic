@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
 
 /**
- * Phase 12 — copyFile.
+ * copyFile.
  *
  * Pinned invariants:
  *   C1. Inline-tier copy: ZERO new shard work. dest.inline_data
@@ -61,7 +61,7 @@ async function chunkRefCount(
   });
 }
 
-describe("Phase 12 — copyFile inline-tier (C1)", () => {
+describe("copyFile inline-tier (C1)", () => {
   it("inline copy produces identical inline_data, zero new chunks", async () => {
     const tenant = "p12-cp-inline";
     const vfs = createVFS(envFor(), { tenant });
@@ -108,7 +108,7 @@ describe("Phase 12 — copyFile inline-tier (C1)", () => {
   });
 });
 
-describe("Phase 12 — copyFile chunked-tier (C2)", () => {
+describe("copyFile chunked-tier (C2)", () => {
   it("chunked copy bumps refcount by 1 per chunk, no new chunks created", async () => {
     const tenant = "p12-cp-chunked";
     const vfs = createVFS(envFor(), { tenant });
@@ -189,7 +189,7 @@ describe("Phase 12 — copyFile chunked-tier (C2)", () => {
   });
 });
 
-describe("Phase 12 — copyFile error paths (C5..C8)", () => {
+describe("copyFile error paths (C5..C8)", () => {
   it("EEXIST when dest exists and overwrite=false", async () => {
     const tenant = "p12-cp-eexist";
     const vfs = createVFS(envFor(), { tenant });
@@ -238,7 +238,7 @@ describe("Phase 12 — copyFile error paths (C5..C8)", () => {
   });
 });
 
-describe("Phase 12 — copyFile yjs-mode src (C4)", () => {
+describe("copyFile yjs-mode src (C4)", () => {
   it("yjs-mode src forks to a plain dest with materialized bytes", async () => {
     const tenant = "p12-cp-yjs";
     const vfs = createVFS(envFor(), { tenant });
@@ -274,7 +274,7 @@ describe("Phase 12 — copyFile yjs-mode src (C4)", () => {
   });
 });
 
-describe("Phase 12 — copyFile concurrent (C9)", () => {
+describe("copyFile concurrent (C9)", () => {
   it("3 parallel copies to distinct dests bump ref_count by 3", async () => {
     const tenant = "p12-cp-concurrent";
     const vfs = createVFS(envFor(), { tenant });
@@ -318,7 +318,7 @@ describe("Phase 12 — copyFile concurrent (C9)", () => {
   });
 });
 
-describe("Phase 12 — copyFile metadata + tags inheritance (C10)", () => {
+describe("copyFile metadata + tags inheritance (C10)", () => {
   it("inherits src metadata + tags by default; explicit opts override", async () => {
     const tenant = "p12-cp-meta";
     const vfs = createVFS(envFor(), { tenant });

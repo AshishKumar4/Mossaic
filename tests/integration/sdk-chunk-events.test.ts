@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { SELF, env } from "cloudflare:test";
 
 /**
- * Phase 17.6 — SDK per-chunk lifecycle event tests.
+ * SDK per-chunk lifecycle event tests.
  *
  *   E1.  `parallelUpload({onChunkEvent})` fires `started` →
  *        `completed` per index. Per-index ordering preserved.
@@ -53,7 +53,7 @@ async function mint(tenant: string): Promise<string> {
   return signVFSToken(TEST_ENV as never, {
     ns: "default",
     tenant,
-    sub: "alice", // sub-tenant → canonical placement (Phase 17.5 resolver)
+    sub: "alice", // sub-tenant → canonical placement
   });
 }
 
@@ -76,7 +76,7 @@ function makeBytes(n: number, seed = 0): Uint8Array {
   return out;
 }
 
-describe("Phase 17.6 — SDK ChunkEvent + ManifestEvent emission", () => {
+describe("SDK ChunkEvent + ManifestEvent emission", () => {
   it("E1 — parallelUpload fires `started` → `completed` per index, per-index ordering preserved", async () => {
     const vfs = await clientFor("sdk-ce-1");
     // Force chunked-tier: chunkSize=128 bytes; 384 bytes → 3 chunks.

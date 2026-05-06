@@ -1,68 +1,47 @@
 /**
  * SPA path/parentId reconciliation helpers.
  *
- * `parallelUpload(client, path, source)` takes a `path`, but the
- * legacy App's UI is `parentId`-based — the photo-library models
- * folders by `parent_id` references and surfaces them via breadcrumb
- * UI. The new App-pinned multipart route accepts `path` as the
- * filename (it's an opaque label for the legacy `files.file_name`
- * column) and `parentId` via the `metadata.parentId` field on the
- * begin request.
+ * `parallelUpload(client, path, source)` and `parallelDownload(client,
+ * path)` take a path. The App's UI is `parentId`-based — folders are
+ * referenced via `parent_id` rows on the legacy `files` table. These
+ * helpers reconcile the two address spaces.
  *
- * **Translation rules.**
- *  - For uploads: `path` = bare fileName; `parentId` is passed via
- *    `opts.metadata.parentId`. The App's `appBeginMultipart`
- *    extracts `parentId` and uses it for the legacy `files`
- *    INSERT.
- *  - For downloads: the SPA's `useDownload` already addresses files
- *    by `fileId` (legacy convention). The App's
- *    `/api/upload/multipart/download-token` route accepts a
- *    `fileId` in the `path` field (with optional leading `/`
- *    tolerated). `pathFromFileId(fileId) = fileId`.
- *
- * **Why the asymmetry?** The legacy schema doesn't have a UNIQUE
- * `(parent, name)` index — files are addressed by `fileId`. The
- * `path` column on the canonical multipart wire shape exists for
- * the canonical SDK path-resolution flow which the legacy App
- * doesn't use. We pass-through to satisfy the wire shape without
- * changing the legacy semantics.
+ * The path emitted is informational at the App layer for now; the
+ * canonical pipeline ignores `parentId` and addresses files by full
+ * path. The App's `/api/index/file` callback resolves the path back to
+ * a `files.file_id` after upload-finalize.
  */
 
 /**
- * Build the multipart upload `path` for a file in the legacy App.
+ * Build the upload `path` for a file in the App.
  *
- * For the App's photo-library, the path is just the filename — the
- * folder hierarchy is encoded in the `parentId` passed via
- * `opts.metadata.parentId`. The App's `appBeginMultipart`
- * destructures both.
+ * For root-level uploads we emit `/<fileName>`. Sub-folder uploads pass
+ * a non-null `parentId`; the SPA UI hands the parentId in opaquely
+ * (the user picked a folder in the breadcrumb). The path is constructed
+ * with a leading slash for cosmetic consistency with canonical
+ * consumers; canonical writes will key the row by (user_id, parent_id,
+ * file_name) regardless.
  *
  * @param parentId The destination folder's id, or `null` for root.
  * @param fileName The file's display name (last path segment).
- * @returns A path suitable for `parallelUpload(client, path, ...)`.
  */
 export function pathFromParentId(
   parentId: string | null,
   fileName: string
 ): string {
-  // The path is informational at the App layer — `appBeginMultipart`
-  // uses parentId from metadata for legacy SQL routing. We construct
-  // a `/`-prefixed path for cosmetic logging consistency with
-  // canonical consumers.
   void parentId;
   return `/${fileName}`;
 }
 
 /**
- * Resolve a fileId to the multipart-route's `path` argument.
+ * Resolve a fileId to the download `path` argument.
  *
- * The App-pinned multipart download-token route accepts a fileId
- * directly (it ignores leading slashes). `pathFromFileId` returns
- * the fileId unchanged so downstream callers don't have to think
- * about the `path` vs `fileId` mismatch.
+ * The canonical multipart download-token route accepts a fileId
+ * directly (it's tolerant of leading slashes). `pathFromFileId`
+ * returns the fileId unchanged so downstream callers don't have to
+ * think about the path-vs-fileId mismatch.
  *
- * @param fileId The legacy `files.file_id` ULID-shaped string.
- * @returns A path suitable for
- *   `parallelDownload(client, path, ...)` against the App route.
+ * @param fileId The `files.file_id` ULID-shaped string.
  */
 export function pathFromFileId(fileId: string): string {
   return fileId;

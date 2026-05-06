@@ -63,14 +63,6 @@ export type {
   AadTag,
 } from "@shared/encryption-types";
 
-// Placement abstraction — same surface as `@mossaic/sdk`. The
-// `legacyAppPlacement` impl is intentionally App-internal and
-// not re-exported here either.
-export {
-  canonicalPlacement,
-  type Placement,
-} from "../../shared/placement";
-
 // Stream handles — used by `createReadStream`/`createWriteStream`
 // callers in HTTP-fallback consumers.
 export type {

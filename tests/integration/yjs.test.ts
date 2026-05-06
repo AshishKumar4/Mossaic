@@ -3,7 +3,7 @@ import { env, runInDurableObject } from "cloudflare:test";
 import * as Y from "yjs";
 
 /**
- * Phase 10 — native Yjs per-file mode.
+ * native Yjs per-file mode.
  *
  * Pinned invariants (these are the targets for the upcoming TSLean
  * formal proofs — keep one assertion per invariant where possible):
@@ -74,7 +74,7 @@ function userStub(tenant: string, sub?: string) {
 // I1. Schema migration is idempotent and creates expected tables.
 // ───────────────────────────────────────────────────────────────────────
 
-describe("Phase 10 — schema migration (I1)", () => {
+describe("schema migration (I1)", () => {
   it("creates yjs_oplog + yjs_meta tables and the mode_yjs column", async () => {
     const tenant = "yjs-schema-1";
     // Trigger ensureInit by issuing one VFS call.
@@ -107,7 +107,7 @@ describe("Phase 10 — schema migration (I1)", () => {
 // I2. Promotion semantics — 0 → 1 OK, 1 → 0 EINVAL.
 // ───────────────────────────────────────────────────────────────────────
 
-describe("Phase 10 — setYjsMode (I2)", () => {
+describe("setYjsMode (I2)", () => {
   it("promotes a regular file 0 → 1 and is idempotent", async () => {
     const tenant = "yjs-promote";
     const vfs = createVFS(envFor(), { tenant });
@@ -156,7 +156,7 @@ describe("Phase 10 — setYjsMode (I2)", () => {
 // they sit unused by readFile after promotion).
 // ───────────────────────────────────────────────────────────────────────
 
-describe("Phase 10 — writeFile/readFile on yjs-mode file (I3, I4)", () => {
+describe("writeFile/readFile on yjs-mode file (I3, I4)", () => {
   it("routes writes through the op log and reads return materialized bytes", async () => {
     const tenant = "yjs-rw";
     const vfs = createVFS(envFor(), { tenant });
@@ -201,7 +201,7 @@ describe("Phase 10 — writeFile/readFile on yjs-mode file (I3, I4)", () => {
 // I5. stat.mode surfaces VFS_MODE_YJS_BIT.
 // ───────────────────────────────────────────────────────────────────────
 
-describe("Phase 10 — stat surfaces yjs bit (I5)", () => {
+describe("stat surfaces yjs bit (I5)", () => {
   it("sets VFS_MODE_YJS_BIT after promotion, and clears it on plain files", async () => {
     const tenant = "yjs-stat-bit";
     const vfs = createVFS(envFor(), { tenant });
@@ -221,7 +221,7 @@ describe("Phase 10 — stat surfaces yjs bit (I5)", () => {
 // shard chunk_refs.
 // ───────────────────────────────────────────────────────────────────────
 
-describe("Phase 10 — unlink purges oplog (I6)", () => {
+describe("unlink purges oplog (I6)", () => {
   it("drops yjs_oplog + yjs_meta rows for the path on hard delete", async () => {
     const tenant = "yjs-unlink-purge";
     const vfs = createVFS(envFor(), { tenant });
@@ -283,7 +283,7 @@ describe("Phase 10 — unlink purges oplog (I6)", () => {
 // load-dependent.
 // ───────────────────────────────────────────────────────────────────────
 
-describe("Phase 10 — compaction (I7)", () => {
+describe("compaction (I7)", () => {
   it("manual compact emits a checkpoint and reaps prior op rows", async () => {
     const tenant = "yjs-compact";
     const vfs = createVFS(envFor(), { tenant });
@@ -315,7 +315,7 @@ describe("Phase 10 — compaction (I7)", () => {
         .exec("SELECT pool_size FROM quota WHERE user_id = ?", userId)
         .toArray()[0] as { pool_size: number } | undefined;
       const poolSize = poolRow ? poolRow.pool_size : 32;
-      // Phase 14: yjsRuntime is now an async lazy accessor —
+      // yjsRuntime is now an async lazy accessor —
       // `getYjsRuntime()` returns Promise<YjsRuntime>.
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const runtime = await (inst as any).getYjsRuntime();
@@ -359,7 +359,7 @@ describe("Phase 10 — compaction (I7)", () => {
 // I8. Tenant isolation across yjs-mode files.
 // ───────────────────────────────────────────────────────────────────────
 
-describe("Phase 10 — tenant isolation (I8)", () => {
+describe("tenant isolation (I8)", () => {
   it("yjs-mode file in tenant A is invisible from tenant B at the same path", async () => {
     const tenantA = "yjs-iso-a";
     const tenantB = "yjs-iso-b";
@@ -394,14 +394,14 @@ describe("Phase 10 — tenant isolation (I8)", () => {
 // to yjs-mode and continue serving reads/writes.
 // ───────────────────────────────────────────────────────────────────────
 
-describe("Phase 10 — igit interop (I9)", () => {
+describe("igit interop (I9)", () => {
   it("a regular file can be promoted in-place; latest bytes survive", async () => {
     const tenant = "yjs-igit-interop";
     const vfs = createVFS(envFor(), { tenant });
     await vfs.writeFile("/README.md", "# initial\n");
     // (We don't run a full igit commit here — that's covered in
     // tests/integration/igit-smoke.test.ts. The interop invariant
-    // we pin in Phase 10 is: chmod-yjs preserves the existing
+    // we pin in is: chmod-yjs preserves the existing
     // bytes even though storage now flows through the op log.)
     await vfs.setYjsMode("/README.md", true);
     // First yjs-mode write replaces the doc state. The PRIOR bytes
@@ -435,7 +435,7 @@ describe("Phase 10 — igit interop (I9)", () => {
 // one's client doc must propagate to the other within a few microtasks.
 // ───────────────────────────────────────────────────────────────────────
 
-describe("Phase 10 — live two-client round-trip (I10)", () => {
+describe("live two-client round-trip (I10)", () => {
   it("propagates client A → server → client B updates", async () => {
     const tenant = "yjs-live-2c";
     const vfs = createVFS(envFor(), { tenant });
@@ -479,7 +479,7 @@ describe("Phase 10 — live two-client round-trip (I10)", () => {
 });
 
 // ───────────────────────────────────────────────────────────────────────
-// Phase 13 — awareness relay (presence / cursors / selections).
+// awareness relay (presence / cursors / selections).
 //
 // Server relays awareness frames (msg tag 3) but NEVER persists them.
 // Two clients on the same path see each other's local state via the
@@ -487,7 +487,7 @@ describe("Phase 10 — live two-client round-trip (I10)", () => {
 // emits a synthetic "removed" frame so survivors observe the departure.
 // ───────────────────────────────────────────────────────────────────────
 
-describe("Phase 13 — Yjs awareness relay (presence)", () => {
+describe("Yjs awareness relay (presence)", () => {
   it("two clients exchange awareness state via the server relay", async () => {
     const tenant = "yjs-aware-2c";
     const vfs = createVFS(envFor(), { tenant });

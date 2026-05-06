@@ -76,6 +76,65 @@ class ApiClient {
     });
   }
 
+  // ── Auth-bridge: VFS token ──────────────────────────────────────
+  //
+  // Exchanges the App session JWT (set via `setToken`) for a
+  // short-TTL VFS Bearer token. The browser caches the token until
+  // 60s before its expiry; subsequent calls return the cached
+  // value. Force-refresh by calling `clearVfsToken()` (e.g. on a
+  // 401 from a canonical /api/vfs/* call).
+  //
+  // The transfer-client (`src/lib/transfer-client.ts`) consumes
+  // this for the canonical multipart pipeline; the App session
+  // JWT continues to authenticate the App's own /api/auth,
+  // /api/gallery, /api/files, /api/folders, /api/analytics,
+  // /api/search, /api/index routes.
+
+  private vfsToken: { token: string; expiresAtMs: number } | null = null;
+  /** Refresh window: re-mint when ≤ 60s remain on the cached token. */
+  private static readonly VFS_TOKEN_REFRESH_MS = 60_000;
+
+  /**
+   * Get a valid VFS Bearer token. Mints on first use; returns the
+   * cached token until ≤ 60s remain on its TTL, then re-mints.
+   *
+   * Throws if the App session JWT is unset (caller must be
+   * authenticated) or if the bridge endpoint returns 503
+   * (JWT_SECRET unset on the worker).
+   */
+  async getVfsToken(): Promise<string> {
+    if (!this.token) {
+      // The auth-bridge endpoint requires an App session JWT. Reject
+      // early with a precise message instead of relying on a 401 from
+      // the server. Callers (e.g. `getTransferClient`) gate transfers
+      // behind the auth context, so this is a programmer-error path.
+      throw new ApiError(
+        "getVfsToken: no App session JWT set. Sign in before calling.",
+        401
+      );
+    }
+    const cached = this.vfsToken;
+    const now = Date.now();
+    if (cached && cached.expiresAtMs - now > ApiClient.VFS_TOKEN_REFRESH_MS) {
+      return cached.token;
+    }
+    const fresh = await this.request<{ token: string; expiresAtMs: number }>(
+      "/auth/vfs-token",
+      { method: "POST" }
+    );
+    this.vfsToken = fresh;
+    return fresh.token;
+  }
+
+  /**
+   * Drop the cached VFS token. Next `getVfsToken()` call re-mints.
+   * Call on logout, on a 401 from canonical /api/vfs/*, or when
+   * rotating session JWT.
+   */
+  clearVfsToken(): void {
+    this.vfsToken = null;
+  }
+
   // Files
   async listFiles(parentId?: string | null): Promise<FileListResponse> {
     const params = parentId ? `?parentId=${parentId}` : "";
@@ -104,24 +163,10 @@ class ApiClient {
     );
   }
 
-  // Upload + Download
-  //
-  // the SPA's chunked transfer pipeline collapsed onto
-  // `@mossaic/sdk` 's `parallelUpload` / `parallelDownload` (see
-  // `src/hooks/use-upload.ts` + `src/hooks/use-download.ts`). The
-  // `uploadInit` / `uploadChunk` / `uploadComplete` / `getManifest` /
-  // `downloadChunk` methods are gone — the SDK drives the
-  // entire transfer through `/api/upload/multipart/*` (App-pinned
-  // bridge) and `/api/download/chunk/*` (legacy chunk download
-  // endpoint, addressed via `chunkFetchBaseOverride`).
-  //
-  // The legacy single-chunk routes on the App
-  // (`/api/upload/init`, `/api/upload/chunk/*`,
-  // `/api/upload/complete/*`, `/api/download/manifest/*`,
-  // `/api/download/chunk/*`) remain mounted on the worker for
-  // back-compat during the rollout window. A follow-up cleanup
-  // (deferred 1–2 weeks post-stability) deletes the unused legacy
-  // upload routes and their typed RPCs.
+  // Upload + download flow through `@mossaic/sdk` 's `parallelUpload`
+  // / `parallelDownload` against canonical `/api/vfs/multipart/*` and
+  // `/api/vfs/readChunk` — see `src/hooks/use-{upload,download}.ts`.
+  // No bespoke upload/download methods on this client.
 
   // Analytics
   async getAnalytics(): Promise<AnalyticsOverview> {
@@ -210,6 +255,19 @@ class ApiClient {
       indexed: { text: number; clip: number };
       providers: { text: string; clip: string };
     }>("/search/reindex", { method: "POST", body: JSON.stringify({}) });
+  }
+
+  /**
+   * Notify the App that a file was just written via canonical
+   * `/api/vfs/multipart/finalize`. The App resolves the path to a
+   * fileId and schedules semantic indexing (text + CLIP). Call from
+   * `useUpload` after `parallelUpload` resolves.
+   */
+  async postIndexFile(path: string): Promise<{ ok: boolean; fileId: string }> {
+    return this.request<{ ok: boolean; fileId: string }>("/index/file", {
+      method: "POST",
+      body: JSON.stringify({ path }),
+    });
   }
 }
 

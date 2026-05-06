@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
 
 /**
- * Phase 2 — Path resolution tests (sdk-impl-plan §10).
+ * Path resolution tests (sdk-impl-plan §10).
  *
  * Verifies:
  *   - normalizePath/dirname/basename/resolveSymlinkTarget pure utils
@@ -91,29 +91,32 @@ describe("resolvePath inside the DO", () => {
   it("resolves files, dirs, missing leaves and ENOTDIR", async () => {
     const stub = userStub("path-walk:basic");
 
-    // Seed via typed RPCs: signup → folder → file. Phase 17 replaced
-    // the legacy `_legacyFetch` JSON router with `appHandleSignup`,
-    // `appCreateFolder`, `appCreateFile`, `appCompleteFile`.
+    // Seed: signup → folder /home → folder /home/work → write
+    // /home/work/notes.txt via canonical vfsWriteFile.
     const { userId } = await stub.appHandleSignup("pw@e.com", "abcd1234");
-
-    // Folder /home
     const home = await stub.appCreateFolder(userId, "home", null);
-
-    // Folder /home/work
     const work = await stub.appCreateFolder(userId, "work", home.folderId);
 
-    // File /home/work/notes.txt — uploading status; mark it complete.
-    const { fileId } = await stub.appCreateFile(
-      userId,
-      "notes.txt",
-      5,
-      "text/plain",
-      work.folderId
+    const scope = { ns: "default", tenant: userId } as const;
+    await stub.vfsWriteFile(
+      scope,
+      "/home/work/notes.txt",
+      new TextEncoder().encode("hello"),
+      { mimeType: "text/plain" }
     );
-    await stub.appCompleteFile(fileId, "0".repeat(64), userId, 5);
 
-    // Now drive resolvePath via runInDurableObject.
-    await runInDurableObject(stub, async (instance) => {
+    // Drive resolvePath via runInDurableObject + capture the fileId
+    // we'll assert against from the row that vfsWriteFile inserted.
+    await runInDurableObject(stub, async (instance, state) => {
+      const fileIdRow = state.storage.sql
+        .exec(
+          "SELECT file_id FROM files WHERE user_id = ? AND file_name = 'notes.txt'",
+          userId
+        )
+        .toArray()[0] as { file_id: string } | undefined;
+      expect(fileIdRow).toBeDefined();
+      const fileId = fileIdRow!.file_id;
+
       const { resolvePath } = await import(
         "@core/objects/user/path-walk"
       );

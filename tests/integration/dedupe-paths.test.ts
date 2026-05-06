@@ -2,9 +2,9 @@ import { describe, it, expect } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
 
 /**
- * Phase 6 — admin.dedupePaths regression test.
+ * admin.dedupePaths regression test.
  *
- * Phase 1's UNIQUE partial index on (user_id, parent_id, file_name)
+ * UNIQUE partial index on (user_id, parent_id, file_name)
  * WHERE status != 'deleted' is created lazily in ensureInit. If a
  * legacy tenant has live duplicates pre-migration, the index
  * creation throws and is swallowed. dedupePaths(userId, scope?) is

@@ -2,14 +2,14 @@ import { describe, it, expect } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
 
 /**
- * Phase 15 — Step 3 — SDK writeFile / readFile encryption round-trip.
+ * Step 3 — SDK writeFile / readFile encryption round-trip.
  *
  *   R1.  writeFile({encrypted: true}) + readFile round-trips a small
  *        plaintext through the inline tier.
  *   R2.  writeFile({encrypted: true}) + readFile round-trips through
  *        the chunked tier (>16KB).
  *   R3.  writeFile without `encrypted` opt + readFile is byte-identical
- *        to Phase 14 behaviour (plaintext bypass).
+ *        to behaviour (plaintext bypass).
  *   R4.  EINVAL when encrypted=true is set without `createVFS` config.
  *   R5.  EACCES when readFile is called on an encrypted file by a VFS
  *        that has no encryption config.
@@ -67,7 +67,7 @@ function pseudoRandom(n: number, seed = 1): Uint8Array {
 
 const enc = (s: string) => new TextEncoder().encode(s);
 
-describe("Phase 15 — SDK writeFile / readFile encryption", () => {
+describe("SDK writeFile / readFile encryption", () => {
   it("R1 — round-trips an inline-tier encrypted payload", async () => {
     const tenant = "p15-r1";
     const cfg: EncryptionConfig = {

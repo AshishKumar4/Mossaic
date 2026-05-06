@@ -2,9 +2,9 @@ import { describe, it, expect } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
 
 /**
- * Phase 7 — server-authoritative pool size.
+ * server-authoritative pool size.
  *
- * The plan §16 Phase 7 invariant: VFS writes derive the
+ * The plan §16 invariant: VFS writes derive the
  * placement-pool-size server-side from `quota.pool_size`. A client
  * cannot override it via header or body. The legacy /api/upload
  * route still honors `X-Pool-Size` for back-compat (different DO
