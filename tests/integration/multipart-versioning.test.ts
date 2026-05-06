@@ -2,48 +2,30 @@ import { describe, it, expect } from "vitest";
 import { SELF, env, runInDurableObject } from "cloudflare:test";
 
 /**
- * Phase 26 — multipart × versioning state-combination
- * (sub-agent adversarial finding; "$1000 bet won").
+ * Phase 27 — multipart × versioning correctness.
  *
- * THE BUG CLASS this file pins against:
+ * Pre-Phase-27, multipart finalize routed unconditionally through
+ * `commitRename`. With versioning ON this caused silent data
+ * destruction: prior versions were hard-deleted via
+ * `hardDeleteFileRow`'s shard fan-out, no `file_versions` row was
+ * inserted, and `head_version_id` stayed NULL. Phase 26's
+ * sub-agent finding pinned the broken behaviour; this file pins the
+ * POST-FIX behaviour.
  *
- * Multipart finalize (`worker/core/objects/user/multipart-upload.ts`)
- * routes through `commitRename` directly. There is no
- * `isVersioningEnabled` check anywhere in the multipart path.
- * Consequence on a versioning-enabled tenant:
+ *   MV1. Multipart finalize on a versioning-ON tenant DOES create a
+ *        `file_versions` row and sets `head_version_id`.
+ *   MV2. Multipart-overwrite of a writeFile-versioned file
+ *        PRESERVES prior history; `listVersions` returns ≥3
+ *        entries (v1, v2, multipart-version).
+ *   MV3. `listVersions` on a multipart-uploaded file under
+ *        versioning-on returns the multipart version itself
+ *        (length ≥ 1, not 0).
+ *   MV4. `restoreVersion` of a pre-multipart version succeeds:
+ *        `vfs.readFile` after restore returns the historical bytes,
+ *        confirming the prior version's chunks were not destroyed.
  *
- *  - the `files` row gets `head_version_id = NULL`,
- *  - NO `file_versions` row is created,
- *  - chunks live in `file_chunks` (not `version_chunks`),
- *  - if a live row exists at `(parent, leaf)`, `commitRename` calls
- *    `hardDeleteFileRow` which deletes the prior row's chunks via
- *    ShardDO fan-out — destroying the prior history entirely.
- *
- * Severity match for the production tombstone bug: a tenant with
- * versioning enabled who uses the SDK's parallel/multipart upload
- * (the default for files >5 MB; CLI/browser large-file flow) loses
- * version history on every multipart overwrite.
- *
- * These tests pin the CURRENT (buggy) behavior so a reader / future
- * fixer can flip the assertions when the worker-side fix lands.
- *
- *   MV1. Multipart finalize on a versioning-ON tenant currently
- *        does NOT populate head_version_id (today: bug pinned).
- *   MV2. Multipart-overwrite of an existing writeFile-versioned
- *        file: prior versions become unreachable via listVersions
- *        because the new files row has 0 file_versions rows
- *        (today: data loss surface, pinned).
- *   MV3. listVersions on a multipart-uploaded file under
- *        versioning ON returns [] (today, pinned).
- *   MV4. copyFile of a multipart-uploaded file on versioning-ON
- *        tenant: succeeds (fix landed) or fails ENOENT (current
- *        bug branch hits NULL head). Either is acceptable; we lock
- *        the observable result so a flip in either direction is
- *        visible.
- *
- * Drives multipart end-to-end via SELF.fetch — the same HTTP wire
- * path the SDK / SPA use. Inspects DO state via runInDurableObject
- * for the SQL-level assertions.
+ * Drives multipart end-to-end via SELF.fetch — same HTTP path the
+ * SDK / SPA use. SQL-level assertions go through runInDurableObject.
  */
 
 import { signVFSToken } from "@core/lib/auth";
@@ -193,9 +175,9 @@ function makePayload(seed: number): Uint8Array {
   return a;
 }
 
-describe("multipart × versioning — current bug-class lock (MV1, MV3)", () => {
-  it("MV1 — multipart finalize on a versioning-ON tenant currently does NOT populate head_version_id (regression pin for sub-agent finding)", async () => {
-    const tenant = "mv-finalize-no-version";
+describe("multipart × versioning — Phase 27 correct semantics (MV1, MV3)", () => {
+  it("MV1 — multipart finalize on a versioning-ON tenant CREATES a file_versions row and sets head_version_id", async () => {
+    const tenant = "mv-finalize-creates-version";
     const stub = userStub(tenant);
     await (
       stub as unknown as {
@@ -209,7 +191,7 @@ describe("multipart × versioning — current bug-class lock (MV1, MV3)", () => 
     const state = await runInDurableObject(stub, async (_inst, s) => {
       const row = s.storage.sql
         .exec(
-          "SELECT file_id, head_version_id FROM files WHERE file_name = 'large.bin'"
+          "SELECT file_id, head_version_id FROM files WHERE file_name = 'large.bin' AND status = 'complete'"
         )
         .toArray()[0] as
         | { file_id: string; head_version_id: string | null }
@@ -222,17 +204,50 @@ describe("multipart × versioning — current bug-class lock (MV1, MV3)", () => 
           )
           .toArray()[0] as { n: number }
       ).n;
-      return { row, versionCount };
+      // Confirm version_chunks were written for the head version.
+      const versionChunkCount = row?.head_version_id
+        ? (
+            s.storage.sql
+              .exec(
+                "SELECT COUNT(*) AS n FROM version_chunks WHERE version_id = ?",
+                row.head_version_id
+              )
+              .toArray()[0] as { n: number }
+          ).n
+        : 0;
+      // shard_ref_id should be the uploadId; we can't easily fetch
+      // the original uploadId from the test, but we can confirm it
+      // is non-NULL for multipart-finalized versions (Phase 27 stamp).
+      const refIdRow = row?.head_version_id
+        ? (s.storage.sql
+            .exec(
+              "SELECT shard_ref_id FROM file_versions WHERE version_id = ?",
+              row.head_version_id
+            )
+            .toArray()[0] as { shard_ref_id: string | null } | undefined)
+        : undefined;
+      return {
+        row,
+        versionCount,
+        versionChunkCount,
+        shardRefId: refIdRow?.shard_ref_id ?? null,
+      };
     });
+
     expect(state.row).toBeTruthy();
-    // Current contract (the bug). When the worker fix lands this
-    // flips to non-NULL + 1.
-    expect(state.row!.head_version_id).toBeNull();
-    expect(state.versionCount).toBe(0);
+    // Phase 27 — head_version_id is set, file_versions row exists.
+    expect(state.row!.head_version_id).not.toBeNull();
+    expect(state.versionCount).toBe(1);
+    // version_chunks rows mirror the multipart chunks.
+    expect(state.versionChunkCount).toBe(2);
+    // shard_ref_id is stamped (non-NULL) for multipart-finalized
+    // versions so dropVersionRows can fan out the right refId.
+    expect(state.shardRefId).not.toBeNull();
+    expect(typeof state.shardRefId).toBe("string");
   });
 
-  it("MV3 — listVersions on a multipart-uploaded file under versioning ON returns [] today; bytes still readable via legacy chunk path", async () => {
-    const tenant = "mv-listversions-empty";
+  it("MV3 — listVersions on a multipart-uploaded file under versioning ON returns 1 entry; bytes readable", async () => {
+    const tenant = "mv-listversions-one";
     const stub = userStub(tenant);
     await (
       stub as unknown as {
@@ -247,16 +262,21 @@ describe("multipart × versioning — current bug-class lock (MV1, MV3)", () => 
       { ns: NS, tenant },
       "/big.bin"
     );
-    expect(versions).toHaveLength(0);
+    // Phase 27 — exactly 1 version row from the multipart finalize.
+    expect(versions).toHaveLength(1);
+    expect(versions[0]!.deleted).toBe(false);
+    expect(versions[0]!.size).toBe(payload.byteLength);
 
     const back = await stub.vfsReadFile({ ns: NS, tenant }, "/big.bin");
     expect(new Uint8Array(back).length).toBe(payload.byteLength);
+    // Bytes round-trip.
+    expect(new Uint8Array(back)).toEqual(payload);
   });
 });
 
-describe("multipart × versioning — overwrite history loss (MV2)", () => {
-  it("MV2 — multipart-overwrite of an existing writeFile-versioned file: listVersions returns 0 entries afterwards (history unreachable)", async () => {
-    const tenant = "mv-overwrite-history";
+describe("multipart × versioning — overwrite preserves history (MV2)", () => {
+  it("MV2 — multipart-overwrite of an existing writeFile-versioned file PRESERVES prior versions", async () => {
+    const tenant = "mv-overwrite-preserves";
     const stub = userStub(tenant);
     await (
       stub as unknown as {
@@ -266,35 +286,40 @@ describe("multipart × versioning — overwrite history loss (MV2)", () => {
 
     const scope = { ns: NS, tenant };
 
-    // 1. Two writeFile passes — these DO insert file_versions rows.
+    // 1. Two writeFile passes — DO insert file_versions rows.
     await stub.vfsWriteFile(scope, "/p.bin", new TextEncoder().encode("v1"));
     await stub.vfsWriteFile(scope, "/p.bin", new TextEncoder().encode("v2"));
     const before = await stub.vfsListVersions(scope, "/p.bin");
     expect(before.length).toBe(2);
 
-    // 2. Multipart-overwrite. commitRename hard-deletes the prior
-    //    files row; the new files row has 0 file_versions rows.
+    // 2. Multipart-overwrite — Phase 27 must preserve prior history.
     const payload = makePayload(0xc3);
     await multipartWrite(tenant, "/p.bin", payload);
 
-    // 3. listVersions on the new path resolves to the new files row
-    //    which has 0 file_versions rows.
+    // 3. Phase 27 — listVersions returns ≥3 (v1, v2, multipart).
     const list = await stub.vfsListVersions(scope, "/p.bin");
-    // Lock the OBSERVABLE TRUTH today: history is unreachable. When
-    // the multipart-finalize-versioning fix lands, this flips to
-    // ≥3 (v1, v2, multipart) and the test should be updated.
-    expect(list).toHaveLength(0);
+    expect(list.length).toBe(3);
+    // Newest-first ordering — multipart is the head.
+    expect(list[0]!.size).toBe(payload.byteLength);
 
-    // The bytes of the multipart upload are readable; the prior
-    // text content is irrecoverable via the public API.
+    // 4. The multipart bytes are the new head.
     const back = await stub.vfsReadFile(scope, "/p.bin");
     expect(back.byteLength).toBe(payload.byteLength);
+
+    // 5. Older versions still readable by versionId.
+    const v1Row = list.find((v) => v.size === 2 /* "v1" / "v2" */);
+    expect(v1Row).toBeTruthy();
+    const olderBytes = await stub.vfsReadFile(scope, "/p.bin", {
+      versionId: v1Row!.versionId,
+    });
+    // It's either "v1" or "v2"; both have length 2.
+    expect(olderBytes.byteLength).toBe(2);
   });
 });
 
-describe("multipart × versioning — copyFile cross-product (MV4)", () => {
-  it("MV4 — copyFile of a multipart-uploaded file on versioning-ON tenant: succeeds (fix) or fails ENOENT (current bug); pin observable result", async () => {
-    const tenant = "mv-copy-cross";
+describe("multipart × versioning — restoreVersion (MV4)", () => {
+  it("MV4 — restoreVersion of a pre-multipart writeFile version succeeds; readFile returns historical bytes", async () => {
+    const tenant = "mv-restore-after-multipart";
     const stub = userStub(tenant);
     await (
       stub as unknown as {
@@ -302,27 +327,32 @@ describe("multipart × versioning — copyFile cross-product (MV4)", () => {
       }
     ).adminSetVersioning(tenant, true);
 
-    const payload = makePayload(0xd4);
-    await multipartWrite(tenant, "/src.bin", payload);
+    const scope = { ns: NS, tenant };
 
-    let result: "ok" | "enoent" | "other" = "other";
-    let observedMessage = "";
-    try {
-      await stub.vfsCopyFile({ ns: NS, tenant }, "/src.bin", "/dst.bin");
-      result = "ok";
-    } catch (e) {
-      const code = (e as { code?: string }).code ?? "";
-      observedMessage = String((e as Error).message ?? "");
-      if (code === "ENOENT" || /ENOENT/.test(observedMessage)) {
-        result = "enoent";
-      }
-    }
-    // Today's truth: ENOENT thrown via VFSError("ENOENT", "copyFile:
-    // source has no head version") at copy-file.ts:511. When the
-    // multipart-finalize-versioning fix lands, this flips to "ok".
-    expect(["ok", "enoent"]).toContain(result);
-    if (result === "enoent") {
-      expect(observedMessage).toMatch(/source has no head version|ENOENT/i);
-    }
+    // 1. writeFile v1 — historical version we'll restore.
+    const v1Bytes = new TextEncoder().encode("history v1 bytes");
+    await stub.vfsWriteFile(scope, "/q.bin", v1Bytes);
+    const afterV1 = await stub.vfsListVersions(scope, "/q.bin");
+    expect(afterV1.length).toBe(1);
+    const v1Id = afterV1[0]!.versionId;
+
+    // 2. Multipart-overwrite — Phase 27 preserves v1.
+    const payload = makePayload(0xd4);
+    await multipartWrite(tenant, "/q.bin", payload);
+
+    const afterMP = await stub.vfsListVersions(scope, "/q.bin");
+    expect(afterMP.length).toBe(2);
+
+    // 3. Restore v1 — chunks of v1 must still be reachable on shards.
+    await stub.vfsRestoreVersion(scope, "/q.bin", v1Id);
+
+    // 4. After restore: head bytes equal the historical v1 bytes.
+    const restored = await stub.vfsReadFile(scope, "/q.bin");
+    expect(new Uint8Array(restored)).toEqual(v1Bytes);
+
+    // 5. listVersions now has 3 entries (v1, multipart, restore-of-v1
+    //    inserted as a new version row pointing at v1's content).
+    const afterRestore = await stub.vfsListVersions(scope, "/q.bin");
+    expect(afterRestore.length).toBe(3);
   });
 });

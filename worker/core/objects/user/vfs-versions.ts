@@ -236,6 +236,17 @@ export function commitVersion(
      * has already been written; this is metadata only.
      */
     encryption?: { mode: "convergent" | "random"; keyId?: string };
+    /**
+     * Phase 27 — multipart × versioning. ShardDO chunk_refs file_id
+     * actually used when chunks were written. Default `null`; the
+     * standard versioned write path uses the synthetic form
+     * `${pathId}#${versionId}` (computed by `dropVersionRows` on
+     * fan-out) and leaves this NULL. Multipart-finalize-under-
+     * versioning sets it to `uploadId` because that's the refId
+     * the chunk PUT route used during upload — see
+     * `vfsFinalizeMultipart`'s versioned branch.
+     */
+    shardRefId?: string;
   }
 ): void {
   const encMode = args.encryption?.mode ?? null;
@@ -244,8 +255,9 @@ export function commitVersion(
     `INSERT INTO file_versions
        (path_id, version_id, user_id, size, mode, mtime_ms, deleted,
         inline_data, chunk_size, chunk_count, file_hash, mime_type,
-        user_visible, label, metadata, encryption_mode, encryption_key_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        user_visible, label, metadata, encryption_mode, encryption_key_id,
+        shard_ref_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     args.pathId,
     args.versionId,
     args.userId,
@@ -262,7 +274,8 @@ export function commitVersion(
     args.label ?? null,
     args.metadata ?? null,
     encMode,
-    encKeyId
+    encKeyId,
+    args.shardRefId ?? null
   );
   // Update head pointer to the new version. Tombstones also become
   // the head — readers find them by mtime_ms and then check deleted.
@@ -566,6 +579,21 @@ export async function dropVersionRows(
       )
       .toArray() as { shard_index: number }[];
 
+    // Phase 27 — read the per-version `shard_ref_id` BEFORE the
+    // delete so multipart-finalized versions can fan out to the
+    // correct chunk_refs key (uploadId, not the synthetic
+    // `${pathId}#${versionId}`). Falls back to the synthetic form
+    // when the column is NULL — matches every legacy and standard
+    // versioned-write row.
+    const refRow = durableObject.sql
+      .exec(
+        "SELECT shard_ref_id FROM file_versions WHERE path_id = ? AND version_id = ?",
+        pathId,
+        versionId
+      )
+      .toArray()[0] as { shard_ref_id: string | null } | undefined;
+    const explicitRefId = refRow?.shard_ref_id ?? null;
+
     // Drop UserDO-side metadata first (mirrors hardDeleteFileRow).
     // version_chunks must go before file_versions because some
     // future GC paths key off file_versions presence.
@@ -600,10 +628,11 @@ export async function dropVersionRows(
       );
     }
 
-    // Dispatch deleteChunks RPC per touched shard. The synthetic
-    // file_id matches what was used at write time so chunk_refs
-    // resolve correctly.
-    const shardFileId = shardRefId(pathId, versionId);
+    // Dispatch deleteChunks RPC per touched shard. Use the explicit
+    // `shard_ref_id` stamped at write time when set (Phase 27
+    // multipart path); else fall back to the synthetic form used by
+    // the standard versioned-write path.
+    const shardFileId = explicitRefId ?? shardRefId(pathId, versionId);
     for (const { shard_index } of shardRows) {
       const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, shard_index);
       const stub = shardNs.get(shardNs.idFromName(shardName));

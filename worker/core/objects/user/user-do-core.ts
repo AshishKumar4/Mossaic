@@ -559,6 +559,32 @@ export class UserDOCore extends DurableObject<Env> {
       // column already exists
     }
 
+    // Phase 27 — multipart × versioning consistency.
+    //
+    // Records the actual ShardDO chunk_refs file_id used at write
+    // time for this version's chunks. The legacy versioned write
+    // path (vfsWriteFileVersioned, restoreVersion, copy-file) uses
+    // the synthetic `${pathId}#${versionId}` form
+    // (`shardRefId(pathId, versionId)` in vfs-versions.ts:179) and
+    // so the column is NULL for those rows — `dropVersionRows`
+    // falls back to the synthetic form.
+    //
+    // Multipart-finalize-under-versioning (Phase 27) writes chunks
+    // to ShardDOs at upload time keyed by `refId = uploadId`. The
+    // `file_versions` row created at finalize stamps
+    // `shard_ref_id = uploadId` so a future `dropVersionRows` calls
+    // ShardDO `deleteChunks(uploadId)` and finds the right
+    // `chunk_refs` rows. Without this column, the canonical fan-out
+    // would key off `${pathId}#${versionId}` and decrement nothing
+    // — leaking chunk bytes forever.
+    try {
+      this.sql.exec(
+        "ALTER TABLE file_versions ADD COLUMN shard_ref_id TEXT"
+      );
+    } catch {
+      // column already exists
+    }
+
     // Per-file encrypted-yjs op-log byte counter. Server-side
     // backpressure (see worker/core/objects/user/yjs.ts) consults this
     // alongside `op_count_since_ckpt` to decide whether to broadcast

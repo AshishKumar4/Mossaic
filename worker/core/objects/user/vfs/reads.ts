@@ -615,11 +615,11 @@ export async function vfsReadFile(
  * placement detail. The companion `vfsReadChunk(path, idx)` is what the
  * caller invokes per chunk, each in a separate consumer invocation.
  */
-export function vfsOpenManifest(
+export async function vfsOpenManifest(
   durableObject: UserDO,
   scope: VFSScope,
   path: string
-): OpenManifestResult {
+): Promise<OpenManifestResult> {
   const userId = userIdFor(scope);
   const r = resolveOrThrow(durableObject, userId, path, /*follow*/ true);
   if (r.kind !== "file") {
@@ -632,10 +632,18 @@ export function vfsOpenManifest(
   // a path whose head has been tombstoned, then issue chunk GETs
   // and stream stale bytes for an "unlinked" file. Same ENOENT
   // semantics as `vfsStat` and `vfsReadFile`.
+  //
+  // Phase 27.5 — also pull `mode_yjs` so we can short-circuit yjs
+  // files. Yjs content lives in `yjs_oplog` + `yjs_checkpoints`,
+  // NOT in `file_chunks` / `version_chunks`. Pre-fix, openManifest
+  // returned a stale legacy manifest (often size=0, chunks=[]) for
+  // yjs files; the SDK then issued chunk GETs and got nothing
+  // (or worse: a stale pre-yjs-toggle chunk).
   const row = durableObject.sql
     .exec(
       `SELECT f.file_id, f.file_size, f.chunk_size, f.chunk_count,
-              f.inline_data, f.head_version_id, fv.deleted AS head_deleted,
+              f.inline_data, f.mode_yjs, f.head_version_id,
+              fv.deleted AS head_deleted,
               fv.size AS head_size, fv.inline_data AS head_inline,
               fv.chunk_size AS head_chunk_size,
               fv.chunk_count AS head_chunk_count
@@ -653,6 +661,7 @@ export function vfsOpenManifest(
         chunk_size: number;
         chunk_count: number;
         inline_data: ArrayBuffer | null;
+        mode_yjs: number;
         head_version_id: string | null;
         head_deleted: number | null;
         head_size: number | null;
@@ -667,6 +676,25 @@ export function vfsOpenManifest(
       "ENOENT",
       `openManifest: head version is a tombstone for ${path}`
     );
+  }
+
+  // Phase 27.5 — yjs-mode short-circuit. Materialize the live Y.Doc
+  // once and report it as inlined. Caller (download-token route)
+  // sees `inlined: true, chunks: []` and serves the bytes out of
+  // band via `vfsReadChunk(path, 0)` (which has the same yjs
+  // short-circuit). This matches `vfsReadFile`'s behavior at
+  // reads.ts:468.
+  if (row.mode_yjs === 1) {
+    const { readYjsAsBytes } = await import("../yjs");
+    const bytes = await readYjsAsBytes(durableObject, scope, r.leafId);
+    return {
+      fileId: row.file_id,
+      size: bytes.byteLength,
+      chunkSize: 0,
+      chunkCount: 0,
+      chunks: [],
+      inlined: true,
+    };
   }
 
   // Versioned tenant path: read manifest from the head version's
@@ -769,9 +797,12 @@ export async function vfsReadChunk(
   // data exposure). For non-tombstoned versioned tenants we also
   // route through `version_chunks` so chunks reflect the head
   // version, matching `readFileVersioned`.
+  //
+  // Phase 27.5 — also pull `mode_yjs` so yjs files materialize from
+  // the live Y.Doc, matching `vfsReadFile` and `vfsOpenManifest`.
   const inlineRow = durableObject.sql
     .exec(
-      `SELECT f.inline_data, f.head_version_id,
+      `SELECT f.inline_data, f.mode_yjs, f.head_version_id,
               fv.deleted AS head_deleted, fv.inline_data AS head_inline
          FROM files f
          LEFT JOIN file_versions fv
@@ -783,6 +814,7 @@ export async function vfsReadChunk(
     .toArray()[0] as
     | {
         inline_data: ArrayBuffer | null;
+        mode_yjs: number;
         head_version_id: string | null;
         head_deleted: number | null;
         head_inline: ArrayBuffer | null;
@@ -794,6 +826,19 @@ export async function vfsReadChunk(
       "ENOENT",
       `readChunk: head version is a tombstone for ${path}`
     );
+  }
+  // Phase 27.5 — yjs-mode: materialize and serve as a single chunk.
+  // Caller's manifest reported `inlined: true, chunks: []`; only
+  // chunkIndex===0 is valid and returns the full materialized bytes.
+  if (inlineRow.mode_yjs === 1) {
+    if (chunkIndex !== 0) {
+      throw new VFSError(
+        "EINVAL",
+        `readChunk: yjs file has no chunk index ${chunkIndex}`
+      );
+    }
+    const { readYjsAsBytes } = await import("../yjs");
+    return readYjsAsBytes(durableObject, scope, r.leafId);
   }
   // Versioned tenant: use head version's inline / chunks.
   if (inlineRow.head_version_id !== null) {

@@ -422,7 +422,57 @@ export async function vfsRename(
     );
   }
   if (dstFile) {
-    // Replace: free the unique-index slot first, then move src in.
+    // Phase 27 — under versioning-on, replace-overwrite must NOT
+    // hard-delete the displaced file's history. The semantics
+    // mirror what `unlink` does on a versioned tenant: the
+    // displaced row's chunks survive, accessible via
+    // `listVersions` + `restoreVersion`. We tombstone the
+    // displaced path instead of hard-deleting it.
+    if (isVersioningEnabled(durableObject, userId)) {
+      // Tombstone the displaced row via commitVersion(deleted=true)
+      // — same shape as `vfsUnlink`'s versioning fork.
+      const { commitVersion } = await import("../vfs-versions");
+      const now = Date.now();
+      const tombId = generateId();
+      commitVersion(durableObject, {
+        pathId: dstFile.file_id,
+        versionId: tombId,
+        userId,
+        size: 0,
+        mode: 0,
+        mtimeMs: now,
+        chunkSize: 0,
+        chunkCount: 0,
+        fileHash: "",
+        mimeType: "application/octet-stream",
+        inlineData: null,
+        deleted: true,
+      });
+      // Free the unique-index slot by renaming the displaced row.
+      // The path the displaced file_id appears at no longer
+      // matches `(dstParent, dstLeaf)`; subsequent listings filter
+      // it via the tombstone-head consistency check (Phase 25). A
+      // suffix keeps it unique per path-tombstone-event.
+      durableObject.sql.exec(
+        "UPDATE files SET file_name = ?, updated_at = ? WHERE file_id = ?",
+        `${dstFile.file_id}.tombstoned-${now}`,
+        now,
+        dstFile.file_id
+      );
+      // Now move src into the freed slot.
+      durableObject.sql.exec(
+        "UPDATE files SET parent_id=?, file_name=?, updated_at=? WHERE file_id=? AND user_id=?",
+        dstParent,
+        dstLeaf,
+        now,
+        srcR.leafId,
+        userId
+      );
+      return;
+    }
+
+    // Versioning OFF — pre-Phase-27 behaviour: hard-delete the
+    // displaced row's chunks via shard fan-out.
     const now = Date.now();
     durableObject.sql.exec(
       "UPDATE files SET status='deleted', deleted_at=?, updated_at=? WHERE file_id=?",
