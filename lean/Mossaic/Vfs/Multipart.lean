@@ -9,12 +9,15 @@ single-ref-drop semantics of the TS supersession (instead of the cruder
 
 Models:
   worker/core/objects/shard/shard-do.ts:286-374  (putChunkMultipart + staging)
-  worker/core/objects/user/multipart-upload.ts (883 LoC):
-    :123  (vfsBeginMultipart)
-    :445  (vfsAbortMultipart)
-    :519  (vfsFinalizeMultipart)
-    :840  (sweepExpiredMultipartSessions)
-  worker/core/routes/multipart-routes.ts        (HTTP routes + token verify)
+  worker/core/objects/user/multipart-upload.ts (1029 LoC):
+    :123       (vfsBeginMultipart)
+    :447       (vfsAbortMultipart)
+    :521       (vfsFinalizeMultipart)
+    :654-768   (Phase 27 versioning split — commitVersion vs commitRename)
+    :731       (commitVersion call site under versioning ON)
+    :876       (sweepExpiredMultipartSessions)
+  worker/core/objects/user/vfs-versions.ts:202   (commitVersion definition)
+  worker/core/routes/multipart-routes.ts         (HTTP routes + token verify)
   worker/core/lib/auth.ts (478 LoC)              (signVFSMultipartToken,
                                                   verifyVFSMultipartToken,
                                                   signVFSDownloadToken)
@@ -48,6 +51,17 @@ What we actually prove:
      arbitrarily preserves the global refcount invariant. Proof: by
      induction on the operation list.
 
+  §4 Phase 27 multipart × versioning split:
+     §4.1 multipart_finalize_under_versioning_creates_version —
+          versioning ON appends a fresh `file_versions` row with
+          `deleted=false`.
+     §4.2 multipart_overwrite_preserves_prior_versions —
+          prior versions for the same path are NOT removed (the
+          load-bearing data-preservation invariant Phase 27 fixes).
+     §4.3 multipart_finalize_under_versioning_off_uses_commitRename —
+          legacy byte-equivalence: with versioning OFF, the versions
+          table is unchanged.
+
 What we explicitly DO NOT prove here (claims that were `True := by trivial`
 in earlier versions are now removed; if you want them, see
 `docs/multipart-security-claims.md` for the literature references):
@@ -80,6 +94,7 @@ NO `axiom`. NO `sorry`. Mathlib v4.29.0.
 
 import Mossaic.Vfs.Common
 import Mossaic.Vfs.Refcount
+import Mossaic.Vfs.Versioning
 
 namespace Mossaic.Vfs.Multipart
 
@@ -243,5 +258,117 @@ theorem multipart_put_changes_state
   unfold step at hcontra
   simp [ShardState.empty, ShardState.appendRef, ShardState.coldInsert,
         ShardState.findChunk] at hcontra
+
+-- ─── §4 Multipart × Versioning (Phase 27) ───────────────────────────────
+--
+-- Phase 27 split `vfsFinalizeMultipart` into two routes:
+--   - versioning OFF: commitRename (pre-existing behaviour, byte-identical
+--     to pre-Phase-27 single-shot writeFile path)
+--   - versioning ON: commitVersion + (optional) commitRename for the
+--     no-prior-row branch. Prior versions / chunks are PRESERVED.
+--
+-- Models:
+--   worker/core/objects/user/multipart-upload.ts:654-768 (versioning split)
+--   worker/core/objects/user/vfs-versions.ts:202 (commitVersion)
+--
+-- We parameterise the model by an abstract VersioningMode + a finalize
+-- transition. The Versioning state machine (`Mossaic.Vfs.Versioning`) is
+-- the source of truth for versions; we lift the multipart finalize as a
+-- macro over `Versioning.Op.insertVersion` (versioning ON) or as a
+-- no-op on the versions table (versioning OFF — commitRename touches
+-- only the `files` row).
+
+/-- Whether versioning is enabled for the tenant. Mirrors
+`isVersioningEnabled(durableObject, userId)` in vfs-versions.ts. -/
+inductive VersioningMode where
+  | off
+  | on
+  deriving DecidableEq, Repr
+
+/-- A Versioning-side state alias. We re-use the existing
+`Versioning.VersionState` to avoid duplicating the model. -/
+abbrev VState := Mossaic.Vfs.Versioning.VersionState
+
+/--
+Multipart finalize as a transition on `VState`:
+  - mode = .off: NO version row inserted (legacy commitRename path).
+    The Versioning state is unchanged.
+  - mode = .on: insert a fresh `Version` row with `deleted = false` —
+    matching `commitVersion(... deleted: false)` in
+    multipart-upload.ts:731.
+
+`pathId` is the stable file_id (per Phase 27, we route through commitVersion
+on the existing live row; or the tmp_id for the no-prior-row branch).
+-/
+def finalizeMultipart
+    (s : VState) (mode : VersioningMode)
+    (pathId : Mossaic.Vfs.Common.PathId) (versionId : String)
+    (mtime : Mossaic.Vfs.Common.TimeMs) : VState :=
+  match mode with
+  | .off => s
+  | .on  => Mossaic.Vfs.Versioning.step s
+              (.insertVersion pathId versionId mtime false)
+
+/-- §4.1 multipart_finalize_under_versioning_creates_version
+Phase 27 main fix: under versioning ON, `vfsFinalizeMultipart` calls
+`commitVersion(... deleted: false)`, which appends a fresh
+`file_versions` row whose `deleted=0`. -/
+theorem multipart_finalize_under_versioning_creates_version
+    (s : VState) (pid : Mossaic.Vfs.Common.PathId) (vid : String)
+    (mtime : Mossaic.Vfs.Common.TimeMs) :
+    (finalizeMultipart s .on pid vid mtime).versions =
+      s.versions ++
+      [(⟨vid, pid, mtime, false⟩ : Mossaic.Vfs.Versioning.Version)] := by
+  unfold finalizeMultipart
+  rfl
+
+/-- §4.2 multipart_overwrite_preserves_prior_versions
+The structural promise of the Phase 27 fix: prior versions are NOT
+removed. After multipart finalize under versioning ON on a path that
+already has versions, every prior version is still in `versions`. -/
+theorem multipart_overwrite_preserves_prior_versions
+    (s : VState) (pid : Mossaic.Vfs.Common.PathId) (vid : String)
+    (mtime : Mossaic.Vfs.Common.TimeMs)
+    (priorV : Mossaic.Vfs.Versioning.Version)
+    (h_prior : priorV ∈ s.versions) :
+    priorV ∈ (finalizeMultipart s .on pid vid mtime).versions := by
+  unfold finalizeMultipart
+  rw [Mossaic.Vfs.Versioning.insertVersion_appends]
+  exact List.mem_append.mpr (Or.inl h_prior)
+
+/-- §4.3 multipart_finalize_under_versioning_off_uses_commitRename
+Pre-Phase-27 byte-equivalence: with versioning OFF, multipart finalize
+does NOT touch the versions table. Modeled as: post-state versions
+list is byte-identical to the pre-state. -/
+theorem multipart_finalize_under_versioning_off_uses_commitRename
+    (s : VState) (pid : Mossaic.Vfs.Common.PathId) (vid : String)
+    (mtime : Mossaic.Vfs.Common.TimeMs) :
+    (finalizeMultipart s .off pid vid mtime).versions = s.versions := by
+  unfold finalizeMultipart
+  rfl
+
+/-- Non-vacuity for §4.1: there exists a state where finalize actually
+APPENDS a row (the versions list strictly grows). -/
+theorem multipart_finalize_versioning_on_appends_nonvacuous :
+    ∃ (s : VState) (pid : Mossaic.Vfs.Common.PathId) (vid : String)
+      (mtime : Mossaic.Vfs.Common.TimeMs),
+      (finalizeMultipart s .on pid vid mtime).versions.length >
+        s.versions.length := by
+  refine ⟨Mossaic.Vfs.Versioning.VersionState.empty, "p1", "v1", 100, ?_⟩
+  decide
+
+/-- Non-vacuity for §4.2: there exists a state with a prior version
+where the finalize-overwrite still preserves it. -/
+theorem multipart_overwrite_preserves_prior_versions_nonvacuous :
+    ∃ (s : VState) (pid : Mossaic.Vfs.Common.PathId) (vid : String)
+      (mtime : Mossaic.Vfs.Common.TimeMs)
+      (priorV : Mossaic.Vfs.Versioning.Version),
+      priorV ∈ s.versions ∧
+      priorV ∈ (finalizeMultipart s .on pid vid mtime).versions := by
+  let v_prior : Mossaic.Vfs.Versioning.Version := ⟨"v0", "p1", 50, false⟩
+  refine ⟨{ versions := [v_prior] }, "p1", "v1", 100, v_prior, ?_, ?_⟩
+  · decide
+  · exact multipart_overwrite_preserves_prior_versions
+      { versions := [v_prior] } "p1" "v1" 100 v_prior (by decide)
 
 end Mossaic.Vfs.Multipart

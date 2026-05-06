@@ -153,15 +153,6 @@ export async function vfsReadPreview(
   const variantKind: Variant = opts.variant ?? "thumb";
   const variantKey = encodeVariantKey(variantKind);
 
-  // Phase 28 Fix 1 — gate cache lookup on the file's current
-  // head_version_id. After a versioned-write that supersedes the
-  // prior head, cached variant rows for the prior version cease to
-  // match (their `version_id` column != current head), forcing a
-  // re-render instead of serving STALE bytes for the new head.
-  // Versioning-OFF / no-head tenants pass `null` and continue to
-  // hit legacy NULL-version rows.
-  const headVersionForCache = fileRow.head_version_id;
-
   // Try primary renderer kind first; fall back to icon-card row
   // (the universal fallback the writer would have stored under
   // EMOSSAIC_UNAVAILABLE conditions). Track which kind we hit so a
@@ -170,8 +161,7 @@ export async function vfsReadPreview(
     durableObject,
     fileId,
     variantKey,
-    primaryRenderer.kind,
-    headVersionForCache
+    primaryRenderer.kind
   );
   let rowRendererKind = primaryRenderer.kind;
   if (row === null) {
@@ -179,8 +169,7 @@ export async function vfsReadPreview(
       durableObject,
       fileId,
       variantKey,
-      "icon-card",
-      headVersionForCache
+      "icon-card"
     );
     if (fallback !== null) {
       row = fallback;
@@ -230,8 +219,7 @@ export async function vfsReadPreview(
     mimeType,
     fileName,
     fileSize,
-    variantKind,
-    headVersionForCache
+    variantKind
   );
   // Resolve the renderer_kind that was actually persisted (could
   // be the icon-card fallback if the primary hit
@@ -240,8 +228,7 @@ export async function vfsReadPreview(
     durableObject,
     fileId,
     variantKey,
-    primaryRenderer.kind,
-    headVersionForCache
+    primaryRenderer.kind
   );
   const persistedKind =
     persistedRow !== null ? primaryRenderer.kind : "icon-card";

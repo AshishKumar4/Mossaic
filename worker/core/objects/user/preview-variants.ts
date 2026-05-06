@@ -62,43 +62,24 @@ export type VariantRow = {
 };
 
 /**
- * Look up an existing variant row by its composite key, gated by
- * the current head_version_id (Phase 28 Fix 1).
- *
- * Returns `null` when:
- *  - no row exists for the (file_id, variant_kind, renderer_kind) triple, OR
- *  - a row exists but its `version_id` doesn't match the caller's
- *    `headVersionId` (file content advanced since the cache write —
- *    the cached bytes are STALE for the current head).
- *
- * Pass `headVersionId = null` to look up legacy / versioning-OFF
- * rows (the `version_id` column is NULL for those). Mismatched
- * rows are NOT deleted here — the caller (vfs/preview.ts) re-renders
- * and the `INSERT OR REPLACE` semantics in `renderAndStoreVariant`
- * supersede the stale row by composite PK on the way back.
+ * Look up an existing variant row by its composite key. Returns
+ * null if absent — the caller should render on-demand and call
+ * `insertVariantRow`.
  */
 export function findVariantRow(
   durableObject: UserDOCore,
   fileId: string,
   variantKind: string,
-  rendererKind: string,
-  headVersionId: string | null
+  rendererKind: string
 ): VariantRow | null {
-  // Match either the exact head version (versioning-on with a head
-  // pointer) OR a legacy NULL-version row (versioning-off / no-head
-  // tenant). The IS NULL clause is necessary because SQL `=` is
-  // false-on-NULL.
   const row = durableObject.sql
     .exec(
       `SELECT chunk_hash, shard_index, mime_type, width, height, byte_size
          FROM file_variants
-        WHERE file_id = ? AND variant_kind = ? AND renderer_kind = ?
-          AND ((version_id IS NULL AND ? IS NULL) OR version_id = ?)`,
+        WHERE file_id = ? AND variant_kind = ? AND renderer_kind = ?`,
       fileId,
       variantKind,
-      rendererKind,
-      headVersionId,
-      headVersionId
+      rendererKind
     )
     .toArray()[0] as
     | {
@@ -140,11 +121,6 @@ export function findVariantRow(
  * @param fileName Display name (icon-card label, code filename).
  * @param fileSize Original byte size (icon-card label, headers).
  * @param variant  Standard or custom variant request.
- * @param headVersionId  Phase 28 Fix 1 — current head_version_id of
- *   the file at render time. Stamped on the persisted variant row
- *   so a future read on a NEW head version cache-misses (forces
- *   re-render against the new bytes). Pass `null` for legacy /
- *   versioning-OFF tenants.
  */
 export async function renderAndStoreVariant(
   durableObject: UserDOCore,
@@ -154,8 +130,7 @@ export async function renderAndStoreVariant(
   mimeType: string,
   fileName: string,
   fileSize: number,
-  variant: Variant,
-  headVersionId: string | null
+  variant: Variant
 ): Promise<{ row: VariantRow; bytes: Uint8Array; result: RenderResult }> {
   const registry = defaultRegistry();
   const renderer = registry.dispatchByMime(mimeType);
@@ -238,17 +213,11 @@ export async function renderAndStoreVariant(
   const rendererKind =
     result.mimeType === "image/webp" ? "image" : renderer.kind;
 
-  // Phase 28 Fix 1 — `INSERT OR REPLACE` (was `OR IGNORE`) so a
-  // re-render on a NEW head version supersedes the stale cache row
-  // by composite PK. The `version_id` column stamps the head
-  // version this variant was rendered FROM — readers in
-  // `findVariantRow` gate on a match. Without OR REPLACE the
-  // version_id update would be a no-op when an old row existed.
   durableObject.sql.exec(
-    `INSERT OR REPLACE INTO file_variants
+    `INSERT OR IGNORE INTO file_variants
        (file_id, variant_kind, renderer_kind, chunk_hash, shard_index,
-        mime_type, width, height, byte_size, created_at, version_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        mime_type, width, height, byte_size, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     fileId,
     variantKey,
     rendererKind,
@@ -258,8 +227,7 @@ export async function renderAndStoreVariant(
     result.width,
     result.height,
     variantBytes.byteLength,
-    Date.now(),
-    headVersionId
+    Date.now()
   );
 
   return {
@@ -311,26 +279,19 @@ export async function preGenerateStandardVariants(
     fileName: string;
     fileSize: number;
     isEncrypted: boolean;
-    /**
-     * Phase 28 Fix 1 — head_version_id at finalize time. Stamped on
-     * each pre-generated variant row so a future write that flips
-     * the head invalidates these variants automatically. NULL for
-     * non-versioning tenants.
-     */
-    headVersionId: string | null;
   }
 ): Promise<void> {
   if (args.fileSize === 0 || args.isEncrypted) return;
 
   for (const variant of PRE_GEN_STANDARD_VARIANTS) {
     try {
-      // `renderAndStoreVariant` is content-addressed: variantHash =
-      // SHA-256 of rendered bytes. Re-running produces no observable
-      // change beyond a wasted render — acceptable on the rare
-      // double-finalize path; on the hot path each variant is fresh.
-      // Post-Phase-28 the cache row is keyed by version, so a
-      // concurrent rerender against the same head is still
-      // idempotent.
+      // `renderAndStoreVariant` is idempotent: chunk bytes are
+      // content-addressed (variantHash = SHA-256 of rendered bytes)
+      // and the `file_variants` insert is `OR IGNORE` keyed by
+      // (file_id, variant_kind, renderer_kind). Re-running produces
+      // no observable change beyond a wasted render — acceptable on
+      // the rare double-finalize path; on the hot path each variant
+      // is fresh.
       //
       // Phase 23 audit Claim 7: gate through `withRenderSlot` so
       // concurrent finalize bursts don't fan out >MAX_CONCURRENT_RENDERS
@@ -347,8 +308,7 @@ export async function preGenerateStandardVariants(
           args.mimeType,
           args.fileName,
           args.fileSize,
-          variant,
-          args.headVersionId
+          variant
         )
       );
     } catch (err) {

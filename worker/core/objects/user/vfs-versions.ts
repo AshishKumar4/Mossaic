@@ -249,51 +249,8 @@ export function commitVersion(
     shardRefId?: string;
   }
 ): void {
-  // Phase 28 Fix 3 — preserve encryption stamp on tombstones.
-  //
-  // Pre-fix: when `vfsUnlink` (and `vfsRename` overwrite +
-  // `vfsRemoveRecursive`) called `commitVersion` with
-  // `deleted: true` and no `args.encryption`, both the new
-  // tombstone row AND `files.encryption_mode/key_id` were stamped
-  // NULL. If the user then `restoreVersion`'d a prior live
-  // (encrypted) version, the restored head would carry the
-  // tombstone's NULL stamp on `files` — readers would treat the
-  // bytes as plaintext and serve garbage to the SDK, which would
-  // skip its decrypt step and surface unintelligible bytes.
-  //
-  // Post-fix: when `args.deleted` is true AND the caller didn't
-  // pass `args.encryption`, inherit the prior live version's
-  // encryption stamp. The tombstone row records the stamp it
-  // shadows so a later `restoreVersion` of THIS tombstone (which
-  // is rejected anyway via vfs-versions.ts:805 "EINVAL — cannot
-  // restore tombstone"), and a future `walkBack` recovery via
-  // `adminReapTombstonedHeads`, both have a faithful trail.
-  let encMode: "convergent" | "random" | null = args.encryption?.mode ?? null;
-  let encKeyId: string | null = args.encryption?.keyId ?? null;
-  if (args.deleted && args.encryption === undefined) {
-    const prior = durableObject.sql
-      .exec(
-        `SELECT encryption_mode, encryption_key_id
-           FROM file_versions
-          WHERE path_id = ? AND deleted = 0
-          ORDER BY mtime_ms DESC
-          LIMIT 1`,
-        args.pathId
-      )
-      .toArray()[0] as
-      | {
-          encryption_mode: string | null;
-          encryption_key_id: string | null;
-        }
-      | undefined;
-    if (prior) {
-      // Cast back to the typed union — the SQL column is TEXT but
-      // `commitVersion` only ever writes "convergent" | "random" | null
-      // (validated upstream at the route + SDK layers).
-      encMode = prior.encryption_mode as "convergent" | "random" | null;
-      encKeyId = prior.encryption_key_id;
-    }
-  }
+  const encMode = args.encryption?.mode ?? null;
+  const encKeyId = args.encryption?.keyId ?? null;
   durableObject.sql.exec(
     `INSERT INTO file_versions
        (path_id, version_id, user_id, size, mode, mtime_ms, deleted,

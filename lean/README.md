@@ -2,7 +2,7 @@
 
 Mathlib4-backed formal verification of Mossaic VFS invariants in Lean 4.
 
-**Status (Phase 24 honest accounting):** zero `sorry`, zero project axioms (the previous `AES_GCM_IND_CPA` axiom — whose conclusion was `True`, making it logically vacuous — has been removed). The only axioms used are Lean's three kernel axioms: `propext`, `Classical.choice`, `Quot.sound`, plus Mathlib's transitive use of them.
+**Status (Phase 30 honest accounting):** **172 theorems**, zero `sorry`, zero project axioms. The only axioms used are Lean's three kernel axioms: `propext`, `Classical.choice`, `Quot.sound`, plus Mathlib's transitive use of them.
 
 ```bash
 cd lean && lake build
@@ -99,7 +99,41 @@ Would require modeling SQLite's UNIQUE INDEX semantics including SAVEPOINT rollb
   - **Removed silent whitelist** in `check-no-sorry.sh` — the whitelist array is now explicitly empty; any future axiom addition fails the gate.
   - **Refreshed citations** for 3 stale-line-range theorems and 5 stale module-LoC headers.
 
-## Theorem totals (Phase 24 post-cleanup)
+## Phase 30 additions
+
+Phase 30 adds Lean theorem coverage for the work that landed in
+Phase 25 (tombstone consistency), Phase 27 (multipart × versioning),
+the Phase 27 follow-ups (rmrf / stream-commit / copy-file history
+preservation), and Phase 27.5 (read-stream version routing). Each
+target is mirrored from the integration test that pinned it.
+
+NEW modules (3):
+
+  - **`Tombstone.lean`** (13 theorems) — Phase 25 tombstone consistency.
+    Proves listFiles excludes tombstoned heads, fileInfo / readPreview /
+    readManyStat all return ENOENT (or null) on a tombstoned head, and
+    "every listed file is statable" (the SPA gallery contract).
+  - **`HistoryPreservation.lean`** (14 theorems) — Phase 27 follow-ups
+    (Fix 5/6/7). Proves rmrf / stream-commit / copyFile under versioning
+    ON each preserve prior versions while appending a new (or tombstone)
+    version row. Composes with `insertVersion_max_ge` to give maxMtime
+    monotonicity for all three paths.
+  - **`StreamRouting.lean`** (12 theorems) — Phase 27.5 read-stream
+    version routing. Proves createReadStream / openManifest / readChunk
+    all route to `version_chunks` (not legacy `file_chunks`) when the
+    head version is non-inline, yjs mode materializes from the live
+    Y.Doc, empty files don't divide-by-zero, and all four read surfaces
+    agree on byte-source.
+
+EXTENDED modules (1):
+
+  - **`Multipart.lean`** (+5 theorems, 5 → 10) — Phase 27 multipart ×
+    versioning split. Proves `vfsFinalizeMultipart` under versioning ON
+    creates a new `file_versions` row via `commitVersion`; under OFF
+    the legacy `commitRename` byte-equivalence holds; prior versions
+    are preserved across overwrite.
+
+## Theorem totals (Phase 30 post-additions)
 
 | Module | Theorems | Notes |
 |---|--:|---|
@@ -109,16 +143,19 @@ Would require modeling SQLite's UNIQUE INDEX semantics including SAVEPOINT rollb
 | `Gc.lean` | 10 | I5 GC safety. |
 | `AtomicWrite.lean` | 11 | I2 linearizability. |
 | `Versioning.lean` | 13 | I4 sortedness + Phase 12 user_visible. |
-| `Encryption.lean` | 1 | refcount-blindness only (was 5 + 1 axiom; 4 + axiom removed). |
-| `Multipart.lean` | 5 | 3 invariance + 1 finer-grained + 1 liveness witness (was 8; 5 vacuous removed, 1 added). |
-| `Quota.lean` | 10 | NEW — pool-growth correctness. |
-| `Preview.lean` | 15 | NEW — file_variants invariants. |
+| `Encryption.lean` | 1 | refcount-blindness only. |
+| `Multipart.lean` | 10 | Phase 24 base + Phase 30 versioning split (§4). |
+| `Quota.lean` | 10 | Pool-growth correctness. |
+| `Preview.lean` | 15 | file_variants invariants. |
+| `Tombstone.lean` | 13 | NEW (Phase 30) — Phase 25 tombstone consistency. |
+| `HistoryPreservation.lean` | 14 | NEW (Phase 30) — Phase 27 Fix 5/6/7. |
+| `StreamRouting.lean` | 12 | NEW (Phase 30) — Phase 27.5 read-stream routing. |
 | `Generated/Placement.lean` | 0 | Documentation. |
 | `Generated/ShardDO.lean` | 3 | Re-exports. |
 | `Generated/UserDO.lean` | 3 | Re-exports. |
-| **Total** | **128** | |
+| **Total** | **172** | (was 128 post-Phase-24; +44 in Phase 30) |
 
-Plus **0 project axioms** (down from 1) and **0 sorrys**.
+Plus **0 project axioms** (unchanged from Phase 24) and **0 sorrys**.
 
 ## Architecture: Mathlib4 + TSLean-inspired modeling
 
@@ -126,7 +163,7 @@ Architecturally inspired by [AshishKumar4/TSLean](https://github.com/AshishKumar
 
 Mathlib4 v4.29.0 lets us prove the numerical refcount equality (`List.countP`-based) and the listVersions sortedness (`List.pairwise_mergeSort`) directly, without recourse to project axioms.
 
-## Layout (post-Phase-24)
+## Layout (post-Phase-30)
 
 ```
 lean/
@@ -134,7 +171,7 @@ lean/
 ├── lakefile.lean                   (Mathlib v4.29.0 dependency)
 ├── lean-toolchain                  (leanprover/lean4:v4.29.0)
 ├── lake-manifest.json              (auto-generated; pinned)
-├── Mossaic.lean                    (root, re-exports all 11 modules)
+├── Mossaic.lean                    (root, re-exports all 14 modules)
 ├── Mossaic/
 │   ├── Vfs/
 │   │   ├── Common.lean             (Hash/PathId/TimeMs aliases, UniqueBy)
@@ -144,9 +181,12 @@ lean/
 │   │   ├── AtomicWrite.lean        (I2, full linearizability)
 │   │   ├── Versioning.lean         (I4, full sortedness via Mathlib)
 │   │   ├── Encryption.lean         (refcount-blindness only — Phase 24 cleanup)
-│   │   ├── Multipart.lean          (idempotence + supersession — Phase 24 cleanup)
-│   │   ├── Quota.lean              (Phase 24 NEW: pool-growth correctness)
-│   │   └── Preview.lean            (Phase 24 NEW: file_variants invariants)
+│   │   ├── Multipart.lean          (idempotence + supersession + Phase 27 versioning split)
+│   │   ├── Quota.lean              (Phase 24: pool-growth correctness)
+│   │   ├── Preview.lean            (Phase 24: file_variants invariants)
+│   │   ├── Tombstone.lean          (Phase 30 NEW: Phase 25 tombstone consistency)
+│   │   ├── HistoryPreservation.lean (Phase 30 NEW: Phase 27 Fix 5/6/7)
+│   │   └── StreamRouting.lean      (Phase 30 NEW: Phase 27.5 read-stream routing)
 │   └── Generated/
 │       ├── ShardDO.lean            (re-exports for shard-do.ts)
 │       ├── UserDO.lean             (re-exports for user-do.ts)

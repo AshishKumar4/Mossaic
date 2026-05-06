@@ -59,27 +59,6 @@ export async function vfsUnlink(
 
   // versioning fork.
   if (isVersioningEnabled(durableObject, userId)) {
-    // Phase 28 Fix 2 — purge yjs DO state inside the versioning
-    // fork too. Pre-fix, the early return at the bottom of this
-    // block bypassed the yjs purge below — a yjs-mode file
-    // unlinked under versioning ON had its head tombstoned (so
-    // list/stat/exists report ENOENT) but the yjs runtime kept
-    // serving live bytes, the op-log kept growing, and active
-    // WebSocket clients kept emitting awareness updates against a
-    // path the user has logically "deleted". The Phase 27
-    // multipart fix made tombstone semantics consistent for byte
-    // reads via the head_deleted gate (Phase 25); this fix closes
-    // the same gap for the yjs runtime + persisted oplog rows.
-    //
-    // We purge BEFORE writing the tombstone so a race with another
-    // unlink that arrives between commitVersion and purgeYjs
-    // can't observe a "tombstoned but still-live yjs document"
-    // state. (DO single-thread serializes this anyway; ordering
-    // pinned for clarity.)
-    if (r.kind === "file" && isYjsMode(durableObject, userId, r.leafId)) {
-      const { purgeYjs } = await import("../yjs");
-      await purgeYjs(durableObject, scope, r.leafId);
-    }
     const tombId = generateId();
     const now = Date.now();
     commitVersion(durableObject, {
