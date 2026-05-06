@@ -48,6 +48,7 @@ import {
 import { hashChunk } from "../../../shared/crypto";
 import { placeChunk } from "../../../shared/placement";
 import { userIdFor } from "../objects/user/vfs/helpers";
+import { edgeCacheLookup, edgeCachePut } from "../lib/edge-cache";
 
 // ── Shared auth middleware (Bearer VFS token) ──────────────────────────
 
@@ -516,12 +517,22 @@ export default mp;
 // Mounted at /api/vfs/chunk/:fileId/:idx as a separate Hono app so
 // the path doesn't conflict with the multipart `:uploadId/chunk/:idx`
 // PUT. Validates a download token (signed via signVFSDownloadToken),
-// resolves the chunk's hash + shard via the existing
-// `vfsReadChunk`-shaped UserDO RPC, then streams the chunk bytes.
+// resolves the chunk's hash + shard via caller-supplied hints, then
+// streams the chunk bytes.
 //
-// Cache hit path: lookup `caches.default` keyed on (fileId, idx) —
-// chunks are content-addressed and immutable per fileId, so a
-// 1-year `Cache-Control: immutable` is safe.
+// Phase 36b \u2014 migrated to the shared `edgeCache*` helpers.
+// Pre-Phase-36b this endpoint had its own inline cache pattern at
+// `chunks.mossaic.local/${fileId}/${idx}`. Now uses the same helper
+// as readPreview / readChunk / openManifest with surfaceTag="chunk"
+// for a single source-of-truth cache convention. Cache key shape:
+//   https://chunk.mossaic.local/<userId>/<fileId>/0/d/<chunkHash>/i<idx>
+//
+// `updatedAt = 0` because the (fileId, hash, idx) triple is
+// structurally immutable: download tokens are bound to a specific
+// file_id; under versioning-ON each historical version has its
+// own file_id (multipart finalize stamps `shard_ref_id =
+// uploadId`), so writes never alter what's already in the
+// cache for a given fileId.
 
 export const chunkDownload = new Hono<{ Bindings: Env }>();
 
@@ -540,7 +551,7 @@ chunkDownload.get("/chunk/:fileId/:idx", async (c) => {
         : undefined);
     if (typeof tokenStr !== "string" || tokenStr.length === 0) {
       return c.json(
-        { code: "EACCES", message: "?token=… or Bearer required" },
+        { code: "EACCES", message: "?token=\u2026 or Bearer required" },
         401
       );
     }
@@ -572,21 +583,6 @@ chunkDownload.get("/chunk/:fileId/:idx", async (c) => {
       return c.json({ code: "EACCES", message: "download token expired" }, 401);
     }
 
-    const cacheKey = new Request(
-      `https://chunks.mossaic.local/${fileId}/${idx}`,
-      { method: "GET" }
-    );
-    const cache = (caches as unknown as { default: Cache }).default;
-    const cached = await cache.match(cacheKey);
-    if (cached) {
-      return cached;
-    }
-
-    // Resolve chunk via UserDO. The vfsReadChunk RPC validates scope
-    // and returns the bytes — not ideal because it streams the bytes
-    // through the UserDO too, but it's the simplest correct path
-    // for v1. A future optimisation can split lookup-and-stream
-    // (manifest cache + shard direct).
     const scope: VFSScope = {
       ns: payload.ns,
       tenant: payload.tn,
@@ -598,77 +594,78 @@ chunkDownload.get("/chunk/:fileId/:idx", async (c) => {
       )
     ) as unknown) as UserDOCore;
 
-    // Look up the manifest to find (hash, sIdx) without paying
-    // the full chunk read through the UserDO. We need a lookup-by-
-    // fileId; reuse `vfsOpenManifest` by resolving fileId → path is
-    // not possible (fileId is the immutable identity, path is
-    // mutable). Instead we ship a small lookup via vfsReadChunk
-    // routed through a path-by-fileId — for v1, take the simpler
-    // route: fall back to scanning the path that owns this fileId.
-    // BUT: the typed UserDO surface doesn't expose a path-by-fileId
-    // lookup. For v1, return a 501 if the lookup is unavailable;
-    // the SDK uses /download-token which already returns the
-    // manifest, so the SDK doesn't need this endpoint to do its own
-    // lookup. The endpoint is therefore most useful when paired with
-    // a manifest the caller already has — we accept ?hash=… and
-    // ?shard=… as authoritative routing hints, defended by the
-    // download token (which ties caller to fileId).
+    // Caller MUST supply ?hash= and ?shard= for the no-DO-touch
+    // path. The contract is: callers obtain them via
+    // /api/vfs/multipart/download-token, which signs the token AND
+    // returns the manifest. Without hints we have no way to look
+    // up the chunk without a UserDO RPC and the cache loses its
+    // value.
     const hashHint = c.req.query("hash");
     const shardHint = c.req.query("shard");
     if (
-      typeof hashHint === "string" &&
-      /^[0-9a-f]{64}$/.test(hashHint) &&
-      typeof shardHint === "string"
+      typeof hashHint !== "string" ||
+      !/^[0-9a-f]{64}$/.test(hashHint) ||
+      typeof shardHint !== "string"
     ) {
-      const sIdx = Number.parseInt(shardHint, 10);
-      if (!Number.isInteger(sIdx) || sIdx < 0) {
-        return c.json(
-          { code: "EINVAL", message: "shard must be a non-negative integer" },
-          400
-        );
-      }
-      const ssub = shardStub(c.env, scope, sIdx);
-      const res = await ssub.fetch(
-        new Request(`http://internal/chunk/${hashHint}`)
-      );
-      if (!res.ok) {
-        return c.json(
-          { code: "ENOENT", message: `chunk not found on shard ${sIdx}` },
-          404
-        );
-      }
-      const buf = await res.arrayBuffer();
-      const response = new Response(buf, {
-        status: 200,
-        headers: {
-          "Content-Type": "application/octet-stream",
-          "Content-Length": String(buf.byteLength),
-          "Cache-Control": "public, max-age=31536000, immutable",
-          ETag: `"${hashHint}"`,
-          "X-Mossaic-Hash": hashHint,
+      void stub;
+      return c.json(
+        {
+          code: "EINVAL",
+          message:
+            "?hash= and ?shard= required (obtain via /api/vfs/multipart/download-token which returns the manifest)",
         },
-      });
-      // Cache asynchronously; respond immediately.
-      c.executionCtx.waitUntil(cache.put(cacheKey, response.clone()));
-      return response;
+        400
+      );
+    }
+    const sIdx = Number.parseInt(shardHint, 10);
+    if (!Number.isInteger(sIdx) || sIdx < 0) {
+      return c.json(
+        { code: "EINVAL", message: "shard must be a non-negative integer" },
+        400
+      );
     }
 
-    // Without hints we have to walk the manifest. Use vfsReadChunk
-    // — the path lookup happens server-side. Pay one UserDO RPC.
-    // This requires the path; we don't have it. Instead, walk via
-    // the manifest fan-out: but we don't have path either. The
-    // contract here is: callers MUST supply ?hash= and ?shard= for
-    // the no-DO-touch path, and SHOULD use /download-token to obtain
-    // them along with the auth token. Without hints, we fail clearly.
-    void stub; // avoid unused
-    return c.json(
-      {
-        code: "EINVAL",
-        message:
-          "?hash= and ?shard= required (obtain via /api/vfs/multipart/download-token which returns the manifest)",
-      },
-      400
+    // Phase 36b \u2014 unified cache key. Per-tenant namespace; chunk
+    // hash + idx as bust-keyed extras. The (fileId, hash, idx)
+    // triple is immutable for a download-token-scoped fileId.
+    const namespace = payload.sub
+      ? `${payload.tn}::${payload.sub}`
+      : payload.tn;
+    const cacheOpts = {
+      surfaceTag: "chunk" as const,
+      namespace,
+      fileId,
+      updatedAt: 0,
+      extraKeyParts: [`d`, hashHint, `i${idx}`],
+      cacheControl: "public, max-age=31536000, immutable",
+      waitUntil: c.executionCtx.waitUntil.bind(c.executionCtx),
+    };
+    const cached = await edgeCacheLookup(cacheOpts);
+    if (cached) return cached;
+
+    const ssub = shardStub(c.env, scope, sIdx);
+    const res = await ssub.fetch(
+      new Request(`http://internal/chunk/${hashHint}`)
     );
+    if (!res.ok) {
+      return c.json(
+        { code: "ENOENT", message: `chunk not found on shard ${sIdx}` },
+        404
+      );
+    }
+    const buf = await res.arrayBuffer();
+    const response = new Response(buf, {
+      status: 200,
+      headers: {
+        "Content-Type": "application/octet-stream",
+        "Content-Length": String(buf.byteLength),
+        "Cache-Control": "public, max-age=31536000, immutable",
+        ETag: `"${hashHint}"`,
+        "X-Mossaic-Hash": hashHint,
+      },
+    });
+    edgeCachePut(cacheOpts, response);
+    return response;
   } catch (err) {
     const r = errToResponse(err);
     return c.json(r.body, r.status as 400);
