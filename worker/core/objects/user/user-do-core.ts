@@ -63,6 +63,29 @@ import {
   setVersioningEnabled,
   type VersionRow,
 } from "./vfs-versions";
+
+/**
+ * P1-7 — hard cap on concurrent Yjs WebSocket clients PER pathId.
+ *
+ * `YjsRuntime.broadcast` does a synchronous loop over connected
+ * sockets, sending the encoded frame to each. The DO single-thread
+ * holds the event loop during the loop; with N clients connected
+ * to one pathId, every frame burns N-1 sync sends. CPU on workerd
+ * cliffs around 20-50 clients per pathId per Cloudflare colo
+ * scheduling.
+ *
+ * 100 is the hard refusal point (BUSY surfaces to the upgrade
+ * caller — they fall back to read-only). 80 is the warning
+ * threshold; we log a `console.warn` so operators can spot
+ * approaching-cap files before the cap fires.
+ *
+ * Per-path, not per-tenant: a tenant with many collaborative
+ * files each at the cap is still fine — the bottleneck is
+ * per-file fan-out, not aggregate connections.
+ */
+const YJS_WS_HARD_CAP = 100;
+const YJS_WS_WARN_THRESHOLD = 80;
+
 export class UserDOCore extends DurableObject<Env> {
   sql: SqlStorage;
   /**
@@ -664,6 +687,26 @@ export class UserDOCore extends DurableObject<Env> {
     } catch {
       // column already exists
     }
+    // P1-8 — index_attempts column for reconciler retry cap.
+    //
+    // Pre-fix `reconcileUnindexedFiles` re-fired `indexFile` on
+    // every alarm tick for any row with `indexed_at IS NULL`. A
+    // permanently-failing file (corrupted source, unsupported
+    // MIME, or any condition the indexer can't handle) would
+    // retry forever, burning CPU + AI binding budget every alarm
+    // and blocking a slot in the bounded `limit=25` reconciler.
+    //
+    // The new column tracks failed attempts; `appListUnindexedFiles`
+    // filters `index_attempts < 5`. After the cap a single
+    // `console.error` fires and the row is left dormant — operator
+    // sees it via Logpush and can manually reconcile.
+    try {
+      this.sql.exec(
+        "ALTER TABLE files ADD COLUMN index_attempts INTEGER NOT NULL DEFAULT 0"
+      );
+    } catch {
+      // column already exists
+    }
     // Sparse index — most files are indexed within seconds of finalize,
     // so the reconciler scan should be fast: the partial index makes
     // `WHERE indexed_at IS NULL` an index-only scan.
@@ -773,6 +816,22 @@ export class UserDOCore extends DurableObject<Env> {
       CREATE INDEX IF NOT EXISTS idx_upload_sessions_user_status
         ON upload_sessions(user_id, status)
     `);
+    // P1-5 — `attempts` counter for poison-row backoff. Pre-fix,
+    // `sweepExpiredMultipartSessions` flipped status to 'aborted'
+    // on the first vfsAbortMultipart failure, hiding the row from
+    // future sweeps; chunks staged on shards stayed refcounted
+    // forever. Now the catch path bumps `attempts` and leaves
+    // status='open' so the next sweep retries; only after
+    // `MULTIPART_MAX_ABORT_ATTEMPTS` does the row flip to a
+    // distinct `'poisoned'` status (NOT 'aborted') for operator
+    // observability via Logpush.
+    try {
+      this.sql.exec(
+        "ALTER TABLE upload_sessions ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0"
+      );
+    } catch {
+      // column already exists
+    }
 
     // ── Universal preview pipeline ───────────────────────────────────────
     //
@@ -1945,23 +2004,42 @@ export class UserDOCore extends DurableObject<Env> {
   }
 
   /**
+   * Synthesize a VFSScope from a userId for the userId-only admin
+   * RPCs (`adminSetVersioning`, `adminGetVersioning`). The App-side
+   * tenant convention is `{ ns: "default", tenant: userId }` —
+   * mirrors the alarm-path scope reconstruction at
+   * `worker/app/objects/user/user-do.ts:79-84` and the App tenant
+   * mapping at `worker/app/routes/auth.ts:155`. Per-tenant rate-
+   * limit accounting under this scope hits the same bucket the
+   * tenant's gated VFS RPCs use.
+   */
+  private adminScopeFor(userId: string): VFSScope {
+    return { ns: "default", tenant: userId };
+  }
+
+  /**
    * Operator-only: toggle versioning for a tenant. Affects only
    * future writes; existing files / versions are unchanged. Pass
    * `userId` directly (matches admin convention; not scope-derived
    * because the caller may not have a token-scoped session).
+   *
+   * P1-6 fix — gated through the standard write path so the per-
+   * tenant rate-limit bucket also bounds admin replay attempts.
+   * Mirrors the prior fix that closed the corresponding gap on
+   * the App-side `app*` surface (`worker/app/objects/user/gate.ts`).
    */
   async adminSetVersioning(
     userId: string,
     enabled: boolean
   ): Promise<{ enabled: boolean }> {
-    this.ensureInit();
+    this.gateVfsWrite(this.adminScopeFor(userId));
     setVersioningEnabled(this, userId, enabled);
     return { enabled };
   }
 
   /** Operator-only: read the versioning flag for a tenant. */
   async adminGetVersioning(userId: string): Promise<{ enabled: boolean }> {
-    this.ensureInit();
+    this.gateVfs(this.adminScopeFor(userId));
     return { enabled: isVersioningEnabled(this, userId) };
   }
 
@@ -1976,12 +2054,14 @@ export class UserDOCore extends DurableObject<Env> {
    * Resolve duplicate (parent_id, name) rows for a user. Returns counts
    * + index status. See worker/objects/user/admin.ts for the algorithm
    * and atomicity properties.
+   *
+   * P1-6 — write-class gate. Dedupe materially mutates rows.
    */
   async adminDedupePaths(
     userId: string,
     scope: VFSScope
   ): Promise<DedupeResult> {
-    this.ensureInit();
+    this.gateVfsWrite(scope);
     return dedupePaths(this, userId, scope);
   }
 
@@ -1996,6 +2076,12 @@ export class UserDOCore extends DurableObject<Env> {
    * — pass `dryRun: false` explicitly to write.
    *
    * Idempotent. Safe to re-run after partial completion.
+   *
+   * P1-6 — write-class gate (mutates `files` rows when not in
+   * dry-run mode). Dry-run still goes through the gate so its
+   * rate-limit accounting matches the non-dry-run path; otherwise
+   * an attacker could bypass the bucket by always passing
+   * `dryRun: true` while still consuming SQL CPU.
    */
   async adminReapTombstonedHeads(
     userId: string,
@@ -2008,7 +2094,7 @@ export class UserDOCore extends DurableObject<Env> {
     samplePathIds: string[];
     dryRun: boolean;
   }> {
-    this.ensureInit();
+    this.gateVfsWrite(scope);
     const { reapTombstonedHeads } = await import("./admin-tombstones");
     return reapTombstonedHeads(this, userId, scope, opts);
   }
@@ -2021,6 +2107,12 @@ export class UserDOCore extends DurableObject<Env> {
    *
    * Best-effort: per-variant failures are logged and swallowed.
    * Skips empty + encrypted files. Idempotent (content-addressed).
+   *
+   * P1-6 — read-class gate. Pre-generates inserts NEW chunk_refs
+   * but does NOT touch the partial-UNIQUE-INDEX-bearing
+   * (parent_id, file_name) slot, so the H6 EBUSY refusal would
+   * spuriously block legitimate pre-gen. Use the read gate
+   * which still enforces per-tenant rate-limit + scope persistence.
    */
   async adminPreGenerateStandardVariants(
     scope: VFSScope,
@@ -2039,7 +2131,7 @@ export class UserDOCore extends DurableObject<Env> {
       headVersionId?: string | null;
     }
   ): Promise<void> {
-    this.ensureInit();
+    this.gateVfs(scope);
     // Resolve head_version_id from `files` when the caller didn't
     // pass it. Pre-generated variants stamp this value so a
     // subsequent write that flips the head invalidates them
@@ -2320,6 +2412,38 @@ export class UserDOCore extends DurableObject<Env> {
       throw new VFSError(
         "ENOENT",
         `openYjsSocket: head version is a tombstone for ${path}`
+      );
+    }
+
+    // P1-7 fix — hard cap on concurrent yjs sockets per path.
+    //
+    // Pre-fix the `broadcast` loop in YjsRuntime fanned out every
+    // Yjs frame to every connected socket synchronously inside the
+    // DO single-thread. With N=100 connected clients on one
+    // pathId, a 10-byte update produces 99 sync `ws.send` calls
+    // per write — DO CPU is bounded, so throughput cliffs at 20-50
+    // collaborators per file in practice. Refusing the upgrade
+    // beyond a hard cap forces clients to fall back to plaintext
+    // polling rather than silently degrading the editing surface
+    // for everyone connected.
+    //
+    // Cap is per-pathId; a tenant with N collaborative files each
+    // at the cap is fine — the bottleneck is per-file fan-out.
+    // ctx.getWebSockets(tag) returns sockets accepted under the
+    // tag (the pathId) including those currently hibernated, so
+    // the count reflects the steady-state population, not just
+    // active-frame senders.
+    const existing = this.ctx.getWebSockets(r.leafId).length;
+    if (existing >= YJS_WS_HARD_CAP) {
+      throw new VFSError(
+        "EBUSY",
+        `openYjsSocket: too many connected clients (${existing}/${YJS_WS_HARD_CAP}) on ${path}`
+      );
+    }
+    if (existing >= YJS_WS_WARN_THRESHOLD) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[mossaic:P1-7] openYjsSocket near cap: ${existing}/${YJS_WS_HARD_CAP} on path=${path} tenant=${scope.tenant}`
       );
     }
 

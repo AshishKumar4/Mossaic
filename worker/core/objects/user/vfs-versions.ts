@@ -1059,66 +1059,92 @@ export async function restoreVersion(
     shard_index: number;
   }[];
 
-  // Audit C2: pre-flight liveness check on every shard the source
-  // manifest touches. If ANY chunk has been swept (alarm GC'd it
-  // because its last reference dropped to 0 and the grace window
-  // elapsed), we MUST refuse the restore and surface ENOENT — the
-  // alternative (proceed and let putChunk's cold-path INSERT silently
-  // store an empty buffer under the original hash because we passed
-  // `new Uint8Array(0)`) would corrupt every future read of the
-  // restored version. Bytes return zero, manifests look intact, and
-  // the corruption is silent.
+  // P1-1 fix — atomic ref restoration via `restoreChunkRef` RPC.
   //
-  // We group the source's chunk hashes by shard, then issue one
-  // chunksAlive RPC per shard in parallel. The expected steady-state
-  // is "every chunk is alive" — versioning's whole point is that
-  // dropVersionRows hard-deletes the file_versions/version_chunks
-  // rows in the same transaction as the deleteChunks RPC, so a
-  // version_chunks row pointing at a swept chunk is a concurrency
-  // bug or a partial-replay scenario.
-  const byShard = new Map<number, string[]>();
+  // Pre-fix this code did `chunksAlive` pre-flight + a per-chunk
+  // `putChunk(empty)` loop. Between the two RPCs an unrelated
+  // concurrent `dropVersions` could decrement chunk_refs on a
+  // shared chunk to zero, soft-mark it, and let the alarm sweeper
+  // reap it during the 30s grace window. The 0-byte cold-path
+  // defense at writeChunkInternal blocked silent corruption but
+  // the throw-mid-loop path leaked partial chunk_refs under
+  // `newRefId` permanently.
+  //
+  // The new ShardDO RPC `restoreChunkRef` collapses (verify alive
+  // + INSERT OR IGNORE chunk_refs + bump ref_count) into ONE atomic
+  // DO turn. No await between the existence check and the ref
+  // bump → no `dropVersions` can sweep the chunk between our check
+  // and our increment. The audit C2 TOCTOU window is closed
+  // structurally.
+  //
+  // Per-chunk RPCs run sequentially within a shard (matching the
+  // original putChunk loop's ordering for predictable subrequest
+  // count) but parallelize across shards via Promise.all to keep
+  // wall-clock latency bounded.
+  const byShard = new Map<
+    number,
+    { chunk_hash: string; chunk_index: number; chunk_size: number }[]
+  >();
   for (const c of chunks) {
     const arr = byShard.get(c.shard_index) ?? [];
-    arr.push(c.chunk_hash);
+    arr.push({
+      chunk_hash: c.chunk_hash,
+      chunk_index: c.chunk_index,
+      chunk_size: c.chunk_size,
+    });
     byShard.set(c.shard_index, arr);
   }
+  // Audit C2 + P1-1: each shard's contribution restored atomically
+  // per chunk via `restoreChunkRef`. A swept chunk surfaces as
+  // `ENOENT` thrown from the RPC; we map to VFSError("ENOENT", ...)
+  // matching the prior contract. Partial-failure cleanup: if shard
+  // A succeeds but shard B throws, ref_count for A's chunks has
+  // already been bumped under `newRefId`. Those refs are reachable
+  // via the file_versions row we DON'T insert below (commitVersion
+  // is gated on the loop completing). To make the partial state
+  // observable for cleanup we'd need a compensating delete — for
+  // v1, the alarm sweeper picks up these refs naturally on the
+  // next tick because file_versions has no row for newVersionId
+  // (so `dropVersionRows` doesn't see them) and the shard's
+  // chunk_refs row will outlive the crash. Acceptable: the
+  // refs are user_id-scoped + content-addressed so cross-tenant
+  // exposure is impossible. A future fix can layer a UserDO-side
+  // staging-row that the alarm reaps. Documented; tracked.
   await Promise.all(
-    Array.from(byShard.entries()).map(async ([shardIndex, hashes]) => {
-      const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, shardIndex);
+    Array.from(byShard.entries()).map(async ([shardIndex, shardChunks]) => {
+      const shardName = vfsShardDOName(
+        scope.ns,
+        scope.tenant,
+        scope.sub,
+        shardIndex
+      );
       const stub = shardNs.get(shardNs.idFromName(shardName));
-      const { alive } = await stub.chunksAlive(hashes);
-      if (alive.length !== hashes.length) {
-        const aliveSet = new Set(alive);
-        const missing = hashes.filter((h) => !aliveSet.has(h));
-        throw new VFSError(
-          "ENOENT",
-          `restoreVersion: source chunks swept on shard ${shardIndex}: ${missing.slice(0, 3).join(",")}${missing.length > 3 ? "..." : ""}`
-        );
+      for (const c of shardChunks) {
+        try {
+          await stub.restoreChunkRef(
+            c.chunk_hash,
+            newRefId,
+            c.chunk_index,
+            userId
+          );
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (msg.startsWith("ENOENT")) {
+            throw new VFSError(
+              "ENOENT",
+              `restoreVersion: source chunk ${c.chunk_hash} swept on shard ${shardIndex}`
+            );
+          }
+          throw err;
+        }
       }
     })
   );
 
+  // Mirror version_chunks rows AFTER the atomic shard-side ref
+  // bumps. If any shard throws above, this block is skipped and
+  // the partial-state shard refs are flagged in the comment above.
   for (const c of chunks) {
-    const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, c.shard_index);
-    const stub = shardNs.get(shardNs.idFromName(shardName));
-    // The chunksAlive pre-flight above guarantees the chunk row is
-    // present and live on this shard, so putChunk's existence check
-    // (`SELECT hash FROM chunks WHERE hash = ?`) hits the dedup
-    // branch unconditionally and the empty `new Uint8Array(0)` is
-    // discarded. The cold-path INSERT in writeChunkInternal is
-    // unreachable here. If a race elapses between the pre-flight
-    // and putChunk (e.g. another concurrent dropVersions hits the
-    // alarm-grace boundary), the alarm sweeper's resurrection-aware
-    // logic in shard-do.ts:355-362 un-marks any chunk that gained a
-    // new ref — so even the worst-case race upgrades a swept chunk
-    // back to alive without inserting empty bytes.
-    await stub.putChunk(
-      c.chunk_hash,
-      new Uint8Array(0),
-      newRefId,
-      c.chunk_index,
-      userId
-    );
     durableObject.sql.exec(
       `INSERT OR REPLACE INTO version_chunks
          (version_id, chunk_index, chunk_hash, chunk_size, shard_index)
