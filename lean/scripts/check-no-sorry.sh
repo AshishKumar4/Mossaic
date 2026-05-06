@@ -18,7 +18,7 @@ cd "$(dirname "$0")/.."
 output=$(lake build 2>&1 || true)
 
 # Filter for files we care about (must-have only).
-must_have_pattern='Mossaic/Vfs/(Common|Tenant|Refcount|Gc|AtomicWrite|Versioning|Encryption)\.lean|Mossaic/Generated/(ShardDO|UserDO|Placement)\.lean'
+must_have_pattern='Mossaic/Vfs/(Common|Tenant|Refcount|Gc|AtomicWrite|Versioning|Encryption|Multipart)\.lean|Mossaic/Generated/(ShardDO|UserDO|Placement)\.lean'
 
 sorry_warnings=$(echo "$output" | grep -E "declaration uses .sorry." | grep -E "$must_have_pattern" || true)
 
