@@ -362,27 +362,20 @@ theorem yjs_mode_materializes_from_doc_not_chunks
   simp [h_yjs]
 
 -- ─── (R6) Consistency across read surfaces ─────────────────────────────
-
-/--
-**(R6) consistency.**
-All four read surfaces (`createReadStream`, `openManifest`, `readChunk`,
-`readFile`) source bytes through `version_chunks` keyed by the same
-`head_version_id` when versioning is ON and the head is non-inline.
-Modeled as: the same routing function produces the same `chunkSource`,
-proving that any per-surface implementation that uses `routeOpenReadStream`
-agrees on the byte-source.
--/
-theorem read_surfaces_agree_on_byte_source
-    (row : FileMetaRow) :
-    let h_create  := routeOpenReadStream row
-    let h_manifest := routeOpenReadStream row
-    let h_chunk   := routeOpenReadStream row
-    h_create.chunkSource = h_manifest.chunkSource ∧
-    h_manifest.chunkSource = h_chunk.chunkSource ∧
-    h_create.size = h_manifest.size ∧
-    h_create.chunkCount = h_manifest.chunkCount := by
-  intros
-  exact ⟨rfl, rfl, rfl, rfl⟩
+--
+-- All four read surfaces (`createReadStream`, `openManifest`,
+-- `readChunk`, `readFile`) source bytes through `version_chunks`
+-- keyed by the same `head_version_id` when versioning is ON and
+-- the head is non-inline. The Phase 30 placeholder
+-- `read_surfaces_agree_on_byte_source` aliased the same routing
+-- function under three different `let`-bound names and proved the
+-- three were equal — vacuous (pattern 2: f(x) = f(x)). Removed in
+-- Phase 51. The non-vacuous content lives in the per-surface
+-- routing theorems above (`createReadStream_*`, `openManifest_*`,
+-- `readChunk_*`) — each proves its specific surface routes to
+-- `versionChunks` with the head's pinned (chunkSize, chunkCount).
+-- The TS-side fact that the four surfaces share `routeOpenReadStream`
+-- is enforced by the worker's module structure, not by Lean.
 
 -- ─── Non-vacuity sanity checks ──────────────────────────────────────────
 

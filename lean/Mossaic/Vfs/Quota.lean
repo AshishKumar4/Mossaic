@@ -183,17 +183,14 @@ level — `recordWriteUsage` operates on `Quota`, not on per-chunk
 records.) This formalises the "old chunks stay" promise in
 `helpers.ts:367-372`.
 -/
-theorem placement_immutability_under_resize
-    (q : Quota) (deltaBytes deltaFiles : Nat)
-    (cp : StoredChunkPlacement) :
-    -- `recordWriteUsage` cannot mutate `cp` — the types are disjoint —
-    -- so the shard index recorded at write time is preserved verbatim.
-    cp.shardIndex = cp.shardIndex ∧
-    cp.poolAtWrite = cp.poolAtWrite := by
-  -- This is a structural truth — cp is a record value not touched by
-  -- `recordWriteUsage q deltaBytes deltaFiles`. We package it as the
-  -- conjunction of two reflexivities to make the property explicit.
-  exact ⟨rfl, rfl⟩
+-- Note: a `placement_immutability_under_resize` theorem
+-- (cp.shardIndex = cp.shardIndex ∧ cp.poolAtWrite = cp.poolAtWrite;
+-- pattern 2 vacuous) was removed in Phase 51. The TS-side fact —
+-- that `recordWriteUsage` writes only to the `quota` row, never to
+-- `file_chunks` — is enforced by SQL schema separation, not by Lean.
+-- The non-vacuous downstream consequence (a stored shardIndex stays
+-- in bounds after pool growth) is `stored_shard_within_resized_pool`
+-- below.
 
 /--
 The recorded shard index for a chunk written at pool size N stays
@@ -495,21 +492,10 @@ theorem inline_overflow_rejected
 -- server-side. Adding a `clientHint : Option Nat` argument (which
 -- would let the client influence placement) would change the type
 -- signature. The Lean type system therefore witnesses authority by
--- construction; no theorem statement could capture more without
--- becoming `f = f`. We instead expose a witness that two different
--- "client-side" placeholder values cannot affect the output, by
--- showing the function does not depend on a hypothetical extra arg.
-
-/-- Witness: the same (poolSize, fullShards) gives the same answer for
-any two distinct hypothetical client-side hints. Because
-`placeChunkSkipFull`'s signature contains no client hint, this is
-trivially true — and that's the point: the client cannot influence
-placement because there is no parameter through which it could. -/
-theorem witness_no_client_hint_in_placement
-    (poolSize : Nat) (fullShards : List Nat)
-    (_clientHintA _clientHintB : Nat) :
-    placeChunkSkipFull poolSize fullShards =
-      placeChunkSkipFull poolSize fullShards := rfl
+-- construction; no `theorem` statement can capture more without
+-- becoming `f = f`. The Phase 43 placeholder
+-- (`witness_no_client_hint_in_placement`) was removed in Phase 51 as
+-- vacuous; the safety claim lives entirely in the function's type.
 
 -- ─── Non-vacuity sanity checks ─────────────────────────────────────────
 

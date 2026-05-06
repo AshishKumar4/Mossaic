@@ -865,14 +865,18 @@ ShardState — no shard transition is implied. -/
 def setMetadata (p : PathState) (m : Option (List Nat)) : PathState :=
   { p with metadata := m }
 
-/-- T7.1: metadata mutation preserves shard `validState`. The
-proof is one line — the mutation does not touch the shard. -/
+/-- T7.1: metadata mutation does not interfere with subsequent shard
+operations. After a metadata write on the path side, applying any
+shard-side `Op` produces the same result as if the metadata write
+had not happened. This is the structural fact behind the Phase 12
+"setMetadata is shard-blind" claim: the shard's `step` function
+takes only `(ShardState, Op)`, never `PathState`, so by parametricity
+in the function's signature, `step` is independent of metadata. -/
 theorem metadata_mutation_preserves_chunk_invariant
     (s : ShardState) (p : PathState) (m : Option (List Nat))
-    (hv : validState s) :
-    validState s ∧ (setMetadata p m).metadata = m := by
-  refine ⟨hv, ?_⟩
-  rfl
+    (op : Op) (hv : validState s) :
+    validState (step s op) ∧ (setMetadata p m).metadata = m := by
+  refine ⟨step_preserves_validState s op hv, rfl⟩
 
 -- ─── Phase 32 Fix C2: restoreChunkRef atomicity ────────────────────────
 --

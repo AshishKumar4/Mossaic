@@ -116,17 +116,14 @@ def edgeCacheKey (opts : CacheOpts) : String :=
   | []     => base
   | parts  => base ++ "/" ++ String.intercalate "/" parts
 
-/--
-**(C2) cache_key_extensional.**
-The cache key is a function of opts. Equal opts produce equal keys
-(structural function congruence). The non-vacuous content lives in
-the witness theorems below, which exhibit two opts that differ only
-in `updatedAt` (resp. `namespace_`) and decide that the resulting
-keys are unequal — establishing that `updatedAt` and `namespace_`
-are part of the key. -/
-theorem cache_key_extensional (opts1 opts2 : CacheOpts)
-    (h : opts1 = opts2) : edgeCacheKey opts1 = edgeCacheKey opts2 := by
-  rw [h]
+-- Note: a `cache_key_extensional` theorem (function congruence: equal
+-- opts ⇒ equal keys) was removed in Phase 51 as vacuous. The
+-- load-bearing claims — that `updatedAt`, `namespace_`,
+-- `extraKeyParts`, and `surfaceTag` are each part of the key —
+-- are pinned by the `decide`-based witness theorems
+-- `witness_distinct_updatedAt`, `witness_namespace_isolation`,
+-- `witness_distinct_headVersion`, and `witness_surface_tag_isolation`
+-- below.
 
 -- ─── (C1) bust_token_completeness ───────────────────────────────────────
 
@@ -263,14 +260,14 @@ Preview module) the head_version_id, so a versioned-on tenant gets
 keys per-version. Combined with C1 (bust on commitVersion) and C2
 (deterministic key derivation), the cache cannot serve a stale variant.
 
-Modeled here as the structural identity: equal `chunk_hash` values
-are observationally equivalent (the operational guarantee is SHA-256
-collision-resistance, axiomatised at the `Hash := String`
-abstraction layer per Common.lean).
+The operational guarantee — that equal `chunk_hash` ⇒ equal bytes —
+is SHA-256 collision-resistance, which lives outside Lean (it's a
+cryptographic assumption, not a Lean theorem). The Phase 30
+placeholder theorem here was `T → T := id` (vacuous; pattern 3) and
+was removed in Phase 51. The actual variant invariance is upheld
+by `Refcount.step_preserves_validState` (chunks-by-hash UniqueBy)
+plus the SHA-256 assumption; we do not formalise the latter in Lean.
 -/
-theorem versioned_variant_chunk_hash_determines_bytes
-    (variantHash₁ variantHash₂ : Hash) :
-    variantHash₁ = variantHash₂ → variantHash₁ = variantHash₂ := id
 
 -- ─── Non-vacuity sanity checks (concrete witnesses via decide) ─────────
 
