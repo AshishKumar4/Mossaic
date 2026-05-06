@@ -53,6 +53,7 @@ import type {
   VFSScope,
   VFSStatRaw,
 } from "@shared/vfs-types";
+import { dedupePaths, type DedupeResult } from "./admin";
 
 export class UserDO extends DurableObject<Env> {
   sql: SqlStorage;
@@ -778,5 +779,26 @@ export class UserDO extends DurableObject<Env> {
   ): Promise<{ stream: WritableStream<Uint8Array>; handle: VFSWriteHandle }> {
     this.ensureInit();
     return vfsCreateWriteStream(this, scope, path, opts);
+  }
+
+  // ── Phase 6: admin tooling ────────────────────────────────────────────
+  //
+  // Operator-only RPC. Not exposed through the legacy /api/* routes
+  // and not surfaced on the SDK's VFS class. Holders of the binding
+  // can call it directly via stub.adminDedupePaths(userId, scope?)
+  // when migrating legacy data that pre-dates the Phase 1 UNIQUE
+  // partial index.
+
+  /**
+   * Resolve legacy duplicate (parent_id, name) rows for a user.
+   * Returns counts + index status. See worker/objects/user/admin.ts
+   * for the algorithm and atomicity properties.
+   */
+  async adminDedupePaths(
+    userId: string,
+    scope: VFSScope | null = null
+  ): Promise<DedupeResult> {
+    this.ensureInit();
+    return dedupePaths(this, userId, scope);
   }
 }

@@ -550,23 +550,25 @@ describe("handle-based write: begin → append → commit", () => {
   });
 
   it("EFBIG when cumulative size exceeds WRITEFILE_MAX", async () => {
+    const { WRITEFILE_MAX } = await import("@shared/inline");
     const tenant = "wh-efbig";
     const stub = userStubFor(tenant);
     const scope = { ns: NS, tenant };
     const handle = await stub.vfsBeginWriteStream(scope, "/big.bin");
 
-    // Real-time pumping of 100 MB through Miniflare RPC is slow and
-    // dominated by the per-chunk 32 MiB serialization cap. We instead
-    // seed the row's file_size to just below WRITEFILE_MAX, then a
-    // single small append must trip the cumulative check.
+    // Real-time pumping a full WRITEFILE_MAX worth of bytes through
+    // Miniflare RPC is slow and dominated by the per-chunk 32 MiB
+    // serialization cap. We instead seed the row's file_size to just
+    // below WRITEFILE_MAX, then a single small append must trip the
+    // cumulative check.
     await runInDurableObject(stub, async (_inst, state) => {
-      // WRITEFILE_MAX = 100 MB; chunk_count must be coherent with
-      // file_size for the next append to be accepted, so we leave
-      // chunk_count at 0 — the next append at index 0 is the first
-      // accepted but is rejected by the size check.
+      // chunk_count must be coherent with file_size for the next
+      // append to be accepted, so we leave chunk_count at 0 — the
+      // next append at index 0 is the first accepted but is rejected
+      // by the size check.
       state.storage.sql.exec(
         "UPDATE files SET file_size = ? WHERE file_id = ?",
-        100 * 1024 * 1024 - 5,
+        WRITEFILE_MAX - 5,
         handle.tmpId
       );
     });
