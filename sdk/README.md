@@ -3,13 +3,50 @@
 Cloudflare-Worker-native VFS over Mossaic. fs/promises-shaped, isomorphic-git compatible, multi-tenant, content-addressed, deduplicating, streaming-aware.
 
 ```
-┌────────────────┐  1 DO RPC   ┌─────────────────┐  N internal   ┌─────────────────┐
-│ Consumer       │ ──────────► │ MOSSAIC_USER DO │ ────────────► │ MOSSAIC_SHARD   │
-│ Worker         │ ◄────────── │ (per-tenant)    │ ◄──────────── │ DO instances    │
-└────────────────┘             └─────────────────┘   chunks      └─────────────────┘
-   1 outbound /                   metadata + manifest             content-addressed
-   VFS call                       per (ns, tenant, sub?)          chunks, refcounted
+                                  Phases 10–12 architecture
+                                  ─────────────────────────
+┌────────────────┐  1 DO RPC      ┌─────────────────────────┐   N internal    ┌─────────────────┐
+│ Consumer       │ ─────────────► │  MOSSAIC_USER  (Core)   │ ──────────────► │ MOSSAIC_SHARD   │
+│ Worker         │ ◄───────────── │  UserDOCore (per-tenant)│ ◄────────────── │ DO instances    │
+│  (createVFS)   │                │                         │   chunk RPCs    │ (per shardIdx)  │
+└──┬─────────────┘                │  ┌───────────────────┐  │                 └─────────────────┘
+   │                              │  │ vfs_meta          │  │                  content-addressed
+   │  WS upgrade                  │  │ files + file_tags │  │                  chunks, refcounted
+   │ (Yjs binary sync)            │  │ file_versions     │  │                  partial unique idx
+   └──── Hibernation API ─────────┤  │ yjs_oplog/yjs_meta│  │                  ⌃ shared by tenants
+                                  │  │ idx_files_*       │  │                    ONLY when same DO
+                                  │  └───────────────────┘  │                    binding (= same
+                                  │  + listFiles cursor     │                    tenant by name)
+                                  │    (HMAC w/ JWT_SECRET) │
+                                  └────────────┬────────────┘
+                                               │ (Phase 11 split)
+                                               │ App: UserDO extends UserDOCore
+                                               │       └─ + _legacyFetch (byte-pinned)
+                                               │       └─ + SearchDO (App-only, not in SDK)
+                                               │ Service-mode: binds UserDOCore directly
+                                               ▼
+                                  ┌──────────────────────────┐
+                                  │ HTTP fallback transport  │
+                                  │ (non-Worker consumers)   │
+                                  │ /api/vfs/*  Bearer VFS-  │
+                                  │ scoped JWT (jose HS256)  │
+                                  └──────────────────────────┘
 ```
+
+The runtime split (Phase 11):
+
+| Mode          | DO bindings                    | Routes mounted                  | Use case |
+|---------------|--------------------------------|---------------------------------|----------|
+| App mode      | `UserDO` (subclass of `UserDOCore`) + `ShardDO` + `SearchDO` | legacy `/api/upload`, `/api/download`, photo-app, `/api/vfs/*` | the existing `mossaic.ashishkumarsingh.com` deployment — the App's `UserDO.fetch` delegates non-WS HTTP to a byte-pinned `_legacyFetch` and forwards WS upgrades to `super.fetch` for Yjs |
+| Service mode  | `UserDOCore` + `ShardDO` (no SearchDO) | `/api/vfs/*` only | a new fresh deployment for SDK consumers — see `deployments/service/wrangler.jsonc` |
+| Library mode  | consumer's own `MOSSAIC_USER` + `MOSSAIC_SHARD` (re-exported `UserDO`/`ShardDO` from `@mossaic/sdk`) | consumer-defined | the recommended path: `import { UserDO, ShardDO, createVFS }` and bind in your own Worker — 1 DO RPC per VFS call, no HTTP hop |
+
+Per-DO-instance state pinned to a `(ns, tenant, sub?)` tuple:
+
+- **VFS metadata**: `files`, `folders`, `file_versions`, `chunk_refs`, `file_tags` (Phase 12), plus indexes `idx_files_parent_mtime`, `idx_files_parent_name`, `idx_files_parent_size`, `idx_file_tags_tag_mtime`.
+- **Yjs (Phase 10)**: `yjs_oplog`, `yjs_meta`. WebSocket transport uses Cloudflare's [Hibernation API](https://developers.cloudflare.com/durable-objects/api/websockets/#hibernation-api) — idle sockets cost $0; per-socket state survives hibernation via `serializeAttachment`.
+- **listFiles cursor (Phase 12)**: opaque base64 payload `{v,ob,d,ov,pid,sig}`. `sig` is HMAC-SHA256 truncated to 128 bits, keyed off `env.JWT_SECRET` (the same Workers secret used for VFS tokens — there is **no** dev fallback string in source). Tampered or wrong-secret cursors throw `EINVAL`.
+- **Tenant boundary**: DO instances are named `vfs:${ns}:${tenant}[:${sub}]`. Different triples → different DO instances → different SQLite databases. Cross-tenant Yjs broadcast and cross-tenant listFiles cursors are structurally impossible (each DO has its own `YjsRuntime` and its own SQLite).
 
 ---
 
@@ -435,6 +472,193 @@ if ((stat.mode & VFS_MODE_YJS_BIT) !== 0) {
 - **isomorphic-git interop**: a tracked file can be promoted in-place. Once promoted, blob hashes change every transaction (the underlying chunks are Yjs updates, not the file content), so don't expect Git-friendly diffs against earlier commits — promote a file when you want CRDT semantics, not on the source you want Git to track.
 - **`yjs` peer dependency**: install in your consumer Worker. Mossaic does NOT bundle it. Tested against `yjs >=13.6.0`.
 - **No awareness yet**: the WebSocket protocol carries sync only in v1. Awareness (cursors, selections, presence) ships in a follow-up minor.
+
+## Phase 12: copy, metadata, tags, indexed listFiles, version marks
+
+Phase 12 extends the surface with five additive primitives. None change Phase 11 byte-equivalence: a tenant that never calls these methods sees no behavior change. All caps are enforced server-side and live in `shared/metadata-caps.ts`.
+
+| Cap | Default | Purpose |
+|---|---|---|
+| `METADATA_MAX_BYTES` | 64 KB | per-file metadata blob (UTF-8 JSON) |
+| `TAGS_MAX_PER_FILE` | 32 | distinct tags per file |
+| `TAG_MAX_LEN` | 128 chars | each tag, charset `[A-Za-z0-9._:/-]` |
+| `TAGS_MAX_PER_LIST_QUERY` | 8 | tags per `listFiles({tags})` query |
+| `LIST_LIMIT_MAX` | 1000 | listFiles page size |
+| `LIST_LIMIT_DEFAULT` | 50 | listFiles default page size |
+
+### `writeFile` extended options (metadata, tags, version)
+
+Every existing `writeFile` call works unchanged. The new opts are additive:
+
+```ts
+await vfs.writeFile("/photos/hike.jpg", bytes, {
+  mode: 0o644,
+  mimeType: "image/jpeg",
+  // metadata: undefined (default) keeps existing.
+  // metadata: null clears.
+  // metadata: {...} REPLACES (deep-validate; ≤ 64 KB).
+  metadata: { camera: "Pixel 8", iso: 200, gps: { lat: 47.6, lng: -122.3 } },
+  // tags: undefined (default) keeps. tags: [] drops all. tags: [...] REPLACES.
+  tags: ["nature", "2026", "hike"],
+  // Per-version flags (ignored on non-versioning tenants).
+  version: { label: "trail-summit", userVisible: true },
+});
+```
+
+### `copyFile(src, dest)` — chunk-refcount-aware, no bytes re-uploaded
+
+Same-tenant copy. Three internal tiers; the SDK picks one based on `src`:
+
+- **Inline tier**: copies `inline_data` bytes in-DO. Zero ShardDO work.
+- **Chunked (versioning OFF)**: per-shard `chunksAlive` preflight, then `putChunk(empty)` under the new `file_id` for every chunk. Each unique chunk hash gets `+1 ref` on the dest shard slot — bytes are never re-transmitted.
+- **Versioned**: same fan-out, plus a new `file_versions` row pointing at the same chunk graph.
+- **Yjs-mode src**: materialises via `readYjsAsBytes`, then `writeFile`s to `dest` as a plain (non-yjs) file.
+
+```ts
+// Inherit src's metadata + tags. Default overwrite=true.
+await vfs.copyFile("/photos/hike.jpg", "/album/2026/hike.jpg");
+
+// Override metadata/tags on the dest. Refuse if dest exists.
+await vfs.copyFile("/photos/hike.jpg", "/album/2026/hike.jpg", {
+  metadata: { album: "2026", source: "/photos/hike.jpg" }, // REPLACES
+  tags: ["album", "2026"],                                  // REPLACES
+  version: { label: "filed", userVisible: true },
+  overwrite: false, // throws EEXIST if dest exists
+});
+```
+
+A formal Lean theorem (`Mossaic.Vfs.Refcount.copyFile_chunks_length_invariant`) proves a `copyFile` never grows the chunk row set — it only bumps `ref_count`. See `lean/Mossaic/Vfs/Refcount.lean`.
+
+### `patchMetadata(path, patch, opts)` — partial-update (deep-merge with null-tombstone)
+
+Surgical metadata edits without rewriting the file. Tags can be added/removed in the same call:
+
+```ts
+// Deep-merge patch. Arrays are REPLACED (not merged).
+await vfs.patchMetadata("/photos/hike.jpg", { iso: 400, gps: { lat: 47.7 } });
+// → metadata is { camera: "Pixel 8", iso: 400, gps: { lat: 47.7, lng: -122.3 } }
+
+// null at any leaf REMOVES that key.
+await vfs.patchMetadata("/photos/hike.jpg", { iso: null });
+
+// Pass null at the root to CLEAR all metadata.
+await vfs.patchMetadata("/photos/hike.jpg", null);
+
+// Tag adds/removes are atomic with the metadata patch.
+await vfs.patchMetadata("/photos/hike.jpg", { reviewed: true }, {
+  addTags:    ["approved"],
+  removeTags: ["pending"],
+});
+```
+
+### `listFiles(opts)` — indexed query + HMAC-signed cursor pagination
+
+Replaces the natural-but-expensive "scan everything in a directory" pattern with an index-driven enumeration over four axes — prefix, tags (AND), metadata exact-match, ordering.
+
+```ts
+// Default: 50 newest files in the tenant, by mtime desc.
+const page1 = await vfs.listFiles();
+
+// Filter to a folder, then tags (AND). Up to 8 tags per query.
+const tagged = await vfs.listFiles({
+  prefix: "/photos/2026/",
+  tags: ["approved", "nature"],
+  limit: 100,
+  orderBy: "mtime",   // 'mtime' (default) | 'name' | 'size'
+  direction: "desc",  // 'desc' default for mtime/size, 'asc' for name
+});
+
+// Pagination via opaque cursor. Each page has a stable boundary
+// `(orderbyValue, file_id)` with strict tie-break on file_id.
+let cursor: string | undefined;
+do {
+  const page = await vfs.listFiles({ tags: ["approved"], cursor, limit: 50 });
+  for (const item of page.items) {
+    item.path;       // absolute path
+    item.pathId;     // stable file_id
+    item.stat;       // VFSStat (omit via includeStat: false)
+    item.tags;       // sorted tag array — always present
+    item.metadata;   // only when includeMetadata: true
+  }
+  cursor = page.cursor; // undefined when end-of-list
+} while (cursor);
+
+// Exact-match metadata filter (post-filtered, not indexed — pair with
+// prefix or tags for index-driven performance).
+await vfs.listFiles({
+  prefix: "/photos/",
+  metadata: { camera: "Pixel 8" },
+  includeMetadata: true,
+});
+```
+
+**Cursor codec.** Each cursor is a base64-url payload `{ v: 1, ob, d, ov, pid, sig }`. `sig` is HMAC-SHA256 (truncated to 128 bits) keyed off `env.JWT_SECRET`. Tampered cursors, cursor-with-different-orderBy, and cursor-with-different-direction all throw `EINVAL` — the next-page query MUST agree with the cursor's encoded shape. There is **no** dev fallback for the secret in source: a deploy without `JWT_SECRET` returns 503 (`VFSConfigError`) on listFiles, exactly like VFS-token verification.
+
+**Index plan.** `listFiles` does NOT let SQLite's planner choose. The driver is selected explicitly:
+
+| Query                         | Index used                    |
+|-------------------------------|-------------------------------|
+| prefix only, mtime ordering   | `idx_files_parent_mtime`       |
+| prefix only, name ordering    | `idx_files_parent_name`        |
+| prefix only, size ordering    | `idx_files_parent_size`        |
+| single tag                    | `idx_file_tags_tag_mtime`      |
+| multiple tags (AND)           | rarest-tag drive + intersect   |
+| metadata only                 | post-filter (no JSON index)    |
+| prefix + tags                 | rarest dimension drives        |
+
+### `markVersion(path, versionId, opts)` — label + user-visible flag
+
+Phase 12 splits versions into **opportunistic** (e.g. Yjs compaction snapshots, `userVisible=0`) and **user-visible** (`writeFile`, `copyFile`, `restoreVersion`, `flush()`, `markVersion`). The flag is **monotonic** — once visible, always visible. `userVisible: false` on `markVersion` is rejected `EINVAL`.
+
+```ts
+const versions = await vfs.listVersions("/notes/today.md");
+// Promote the third-newest (an opportunistic compaction) to user-visible
+// and attach a label.
+await vfs.markVersion("/notes/today.md", versions[2].id, {
+  label: "before-edit",
+  userVisible: true,
+});
+
+// Then surface only user-visible versions to a UI.
+const visible = await vfs.listVersions("/notes/today.md", {
+  userVisibleOnly: true,
+  includeMetadata: true,
+});
+```
+
+### `YDocHandle.flush({ label })` — explicit Yjs checkpoint → user-visible Mossaic version
+
+Yjs compactions normally fire opportunistically (every 50 ops or 60 s) and produce `userVisible=0` checkpoint rows so a heavy collaborative editor doesn't pollute a user's "save history" view. `flush()` is the explicit save:
+
+```ts
+import { openYDoc } from "@mossaic/sdk/yjs";
+
+const handle = await openYDoc(vfs, "/notes/today.md");
+await handle.synced;
+
+handle.doc.getText("content").insert(0, "DRAFT — ");
+
+// Force a compaction NOW; mark its checkpoint user-visible; attach a label.
+const { versionId, checkpointSeq } = await handle.flush({ label: "draft" });
+// versionId === null on tenants without versioning enabled — the compaction
+// still happens; just no Mossaic version row.
+
+await handle.close();
+```
+
+The compaction snapshot captures whatever the live `Y.Doc` holds at the moment of the flush. Local edits made on this handle are streamed to the server via the open WebSocket synchronously inside `doc.transact`, so the compaction always observes them.
+
+### Wire summary (Phase 12)
+
+| Method | Binding RPC | HTTP route |
+|---|---|---|
+| `writeFile` (extended opts) | `vfsWriteFile` | `POST /api/vfs/writeFile` |
+| `copyFile` | `vfsCopyFile` | `POST /api/vfs/copy` (alias `copyFile`) |
+| `patchMetadata` | `vfsPatchMetadata` | `PATCH /api/vfs/metadata` (alias `POST /patchMetadata`) |
+| `listFiles` | `vfsListFiles` | `POST /api/vfs/list` (alias `listFiles`) |
+| `markVersion` | `vfsMarkVersion` | `PUT /api/vfs/version-mark` (alias `POST /markVersion`) |
+| `listVersions` (extended opts: `userVisibleOnly`, `includeMetadata`) | `vfsListVersions` | `POST /api/vfs/listVersions` |
+| `YDocHandle.flush({ label })` | `vfsFlushYjs` | binding-only (Yjs WS upgrade is binding-only too) |
 
 ## Subrequest model
 

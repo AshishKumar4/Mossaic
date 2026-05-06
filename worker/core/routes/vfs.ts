@@ -102,6 +102,17 @@ function userStub(c: { env: Env; var: { scope: VFSScope } }): UserDOCore {
 
 /** Map a thrown error to (status, body) for JSON responses. */
 function errToResponse(err: unknown): { status: number; body: { code: string; message: string } } {
+  // VFSConfigError = JWT_SECRET missing on the deploy. Surface as 503
+  // service-misconfigured (mirrors the auth-middleware path). Caught
+  // here as defense-in-depth: post-auth handlers like listFiles can
+  // also throw VFSConfigError if the cursor secret resolves to empty
+  // (B-1 fix in worker/core/objects/user/list-files.ts).
+  if (err instanceof VFSConfigError) {
+    return {
+      status: 503,
+      body: { code: "EMOSSAIC_UNAVAILABLE", message: err.message },
+    };
+  }
   const e = err as { code?: unknown; message?: unknown };
   const rawMsg = typeof e?.message === "string" ? e.message : String(err);
   // Extract code via the same scan-all-tokens approach as
@@ -526,6 +537,119 @@ vfs.post("/dropVersions", async (c) => {
     return c.json(r.body, r.status as 400);
   }
 });
+
+// ── Phase 12: copyFile, metadata, listFiles, version-mark ──────────────
+
+const copyFileHandler = async (
+  c: import("hono").Context<{ Bindings: Env; Variables: { scope: VFSScope } }>
+) => {
+  try {
+    const body = await c.req.json<{
+      src: string;
+      dest: string;
+      opts?: {
+        metadata?: Record<string, unknown> | null;
+        tags?: readonly string[];
+        version?: { label?: string; userVisible?: boolean };
+        overwrite?: boolean;
+      };
+    }>();
+    if (typeof body.src !== "string" || typeof body.dest !== "string") {
+      return c.json(
+        { code: "EINVAL", message: "body.src and body.dest must be strings" },
+        400
+      );
+    }
+    await userStub(c).vfsCopyFile(c.var.scope, body.src, body.dest, body.opts);
+    return c.json({ ok: true });
+  } catch (err) {
+    const r = errToResponse(err);
+    return c.json(r.body, r.status as 400);
+  }
+};
+vfs.post("/copy", copyFileHandler);
+vfs.post("/copyFile", copyFileHandler);
+
+// PATCH is the RESTful verb for partial-update; we ALSO accept POST
+// so the HttpVFS client (which uses a single POST helper) can call
+// the same handler.
+const patchMetadataHandler = async (
+  c: import("hono").Context<{ Bindings: Env; Variables: { scope: VFSScope } }>
+) => {
+  try {
+    const body = await c.req.json<{
+      path: string;
+      patch: Record<string, unknown> | null;
+      opts?: { addTags?: readonly string[]; removeTags?: readonly string[] };
+    }>();
+    const path = expectPath(body);
+    await userStub(c).vfsPatchMetadata(c.var.scope, path, body.patch, body.opts);
+    return c.json({ ok: true });
+  } catch (err) {
+    const r = errToResponse(err);
+    return c.json(r.body, r.status as 400);
+  }
+};
+vfs.patch("/metadata", patchMetadataHandler);
+vfs.post("/patchMetadata", patchMetadataHandler);
+
+const listFilesHandler = async (
+  c: import("hono").Context<{ Bindings: Env; Variables: { scope: VFSScope } }>
+) => {
+  try {
+    // Use POST for /list so callers can pass complex `metadata`
+    // filter objects without URL-encoding gymnastics. The HTTP
+    // route's JSON body mirrors the typed RPC surface 1:1.
+    const body = await c.req.json<{
+      prefix?: string;
+      tags?: readonly string[];
+      metadata?: Record<string, unknown>;
+      limit?: number;
+      cursor?: string;
+      orderBy?: "mtime" | "name" | "size";
+      direction?: "asc" | "desc";
+      includeStat?: boolean;
+      includeMetadata?: boolean;
+    }>();
+    const r = await userStub(c).vfsListFiles(c.var.scope, body);
+    return c.json(r);
+  } catch (err) {
+    const r = errToResponse(err);
+    return c.json(r.body, r.status as 400);
+  }
+};
+vfs.post("/list", listFilesHandler);
+vfs.post("/listFiles", listFilesHandler);
+
+const markVersionHandler = async (
+  c: import("hono").Context<{ Bindings: Env; Variables: { scope: VFSScope } }>
+) => {
+  try {
+    const body = await c.req.json<{
+      path: string;
+      versionId: string;
+      label?: string;
+      userVisible?: boolean;
+    }>();
+    const path = expectPath(body);
+    if (typeof body.versionId !== "string") {
+      return c.json(
+        { code: "EINVAL", message: "body.versionId must be a string" },
+        400
+      );
+    }
+    await userStub(c).vfsMarkVersion(c.var.scope, path, body.versionId, {
+      label: body.label,
+      userVisible: body.userVisible,
+    });
+    return c.json({ ok: true });
+  } catch (err) {
+    const r = errToResponse(err);
+    return c.json(r.body, r.status as 400);
+  }
+};
+vfs.put("/version-mark", markVersionHandler);
+vfs.post("/markVersion", markVersionHandler);
 
 // Catch-all 404 for unknown /api/vfs/<method> paths. Without this,
 // the parent app's wildcard route would forward to ASSETS (or

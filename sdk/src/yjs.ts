@@ -107,6 +107,25 @@ export interface YDocHandle {
   close(): Promise<void>;
 
   /**
+   * Phase 12: explicit flush — triggers a Yjs compaction on the
+   * server whose checkpoint emits a USER-VISIBLE Mossaic version
+   * row (when versioning is enabled for the tenant). Optionally
+   * attach a human-readable `label` to the version.
+   *
+   * Opportunistic compactions (every 50 ops or 60s) keep producing
+   * `userVisible=0` checkpoints behind the scenes — `flush` is the
+   * way to mark a meaningful save point.
+   *
+   * Returns the new version_id (null if versioning is off for the
+   * tenant — the checkpoint still happens, just without a Mossaic
+   * version row) and the seq number of the checkpoint.
+   */
+  flush(opts?: { label?: string }): Promise<{
+    versionId: string | null;
+    checkpointSeq: number;
+  }>;
+
+  /**
    * Optional: register a callback for the underlying socket close.
    * Useful for reconnection logic. Called at most once per handle.
    */
@@ -266,6 +285,18 @@ export async function openYDoc(
       } catch {
         /* already closing */
       }
+    },
+    async flush(flushOpts?: { label?: string }): Promise<{
+      versionId: string | null;
+      checkpointSeq: number;
+    }> {
+      // Phase 12: call the typed RPC. The compaction snapshot
+      // captures whatever the live Y.Doc currently holds — local
+      // edits made on this handle are streamed to the server via
+      // the open WebSocket BEFORE flush() runs (each Yjs update
+      // is emitted synchronously by `doc.transact`), so the
+      // compaction sees them.
+      return vfs._flushYjs(path, flushOpts);
     },
     onClose(cb) {
       closeCb = cb;

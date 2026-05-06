@@ -206,7 +206,7 @@ export class HttpVFS implements VFSClient {
   async writeFile(
     p: string,
     data: Uint8Array | string,
-    opts?: { mode?: number; mimeType?: string }
+    opts?: import("./vfs").WriteFileOpts
   ): Promise<void> {
     if (typeof data === "string") {
       // String → JSON body. Server decodes via TextEncoder.
@@ -217,6 +217,9 @@ export class HttpVFS implements VFSClient {
           data,
           mode: opts?.mode,
           mimeType: opts?.mimeType,
+          metadata: opts?.metadata,
+          tags: opts?.tags,
+          version: opts?.version,
         },
         "open",
         p,
@@ -379,11 +382,16 @@ export class HttpVFS implements VFSClient {
 
   async listVersions(
     p: string,
-    opts?: { limit?: number }
+    opts?: import("./vfs").ListVersionsOpts
   ): Promise<VersionInfo[]> {
     const res = await this.post(
       "listVersions",
-      { path: p, limit: opts?.limit },
+      {
+        path: p,
+        limit: opts?.limit,
+        userVisibleOnly: opts?.userVisibleOnly,
+        includeMetadata: opts?.includeMetadata,
+      },
       "listVersions",
       p,
       "json"
@@ -419,6 +427,82 @@ export class HttpVFS implements VFSClient {
       "json"
     );
     return (await res.json()) as { dropped: number; kept: number };
+  }
+
+  // ── Phase 12 ──────────────────────────────────────────────────────────
+
+  async patchMetadata(
+    p: string,
+    patch: Record<string, unknown> | null,
+    opts?: import("./vfs").PatchMetadataOpts
+  ): Promise<void> {
+    await this.post(
+      "patchMetadata",
+      { path: p, patch, opts },
+      "open",
+      p,
+      "json"
+    );
+  }
+
+  async copyFile(
+    src: string,
+    dest: string,
+    opts?: import("./vfs").CopyFileOpts
+  ): Promise<void> {
+    await this.post(
+      "copyFile",
+      { src, dest, opts },
+      "open",
+      src,
+      "json"
+    );
+  }
+
+  async listFiles(
+    opts: import("./vfs").ListFilesOpts = {}
+  ): Promise<import("./vfs").ListFilesPage> {
+    const res = await this.post(
+      "listFiles",
+      opts as Record<string, unknown>,
+      "scandir",
+      opts.prefix,
+      "json"
+    );
+    const raw = (await res.json()) as {
+      items: Array<{
+        path: string;
+        pathId: string;
+        stat?: import("@shared/vfs-types").VFSStatRaw;
+        metadata?: Record<string, unknown> | null;
+        tags: string[];
+      }>;
+      cursor?: string;
+    };
+    return {
+      items: raw.items.map((r) => ({
+        path: r.path,
+        pathId: r.pathId,
+        stat: r.stat ? new VFSStat(r.stat) : undefined,
+        metadata: r.metadata,
+        tags: r.tags,
+      })),
+      cursor: raw.cursor,
+    };
+  }
+
+  async markVersion(
+    p: string,
+    versionId: string,
+    opts: import("./vfs").VersionMarkOpts
+  ): Promise<void> {
+    await this.post(
+      "markVersion",
+      { path: p, versionId, label: opts.label, userVisible: opts.userVisible },
+      "open",
+      p,
+      "json"
+    );
   }
 }
 

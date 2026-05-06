@@ -47,7 +47,10 @@
     "@shared/ino": "../../shared/ino.ts",
     "@shared/vfs-paths": "../../shared/vfs-paths.ts",
     "@shared/constants": "../../shared/constants.ts",
-    "@shared/embedding-types": "../../shared/embedding-types.ts"
+    "@shared/embedding-types": "../../shared/embedding-types.ts",
+    "@shared/metadata-caps": "../../shared/metadata-caps.ts",
+    "@shared/metadata-validate": "../../shared/metadata-validate.ts",
+    "@shared/metadata-merge": "../../shared/metadata-merge.ts"
   },
 
   "durable_objects": {

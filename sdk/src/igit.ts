@@ -196,7 +196,7 @@ class BatchedLstatFs implements VFSClient {
   writeFile(
     p: string,
     data: Uint8Array | string,
-    opts?: { mode?: number; mimeType?: string }
+    opts?: Parameters<VFSClient["writeFile"]>[2]
   ) { return this.inner.writeFile(p, data, opts); }
   unlink(p: string) { return this.inner.unlink(p); }
   mkdir(
@@ -233,7 +233,7 @@ class BatchedLstatFs implements VFSClient {
     range?: { start?: number; end?: number }
   ) { return this.inner.pullReadStream(handle, chunkIndex, range); }
   // Phase 9 versioning pass-through.
-  listVersions(p: string, opts?: { limit?: number }) {
+  listVersions(p: string, opts?: Parameters<VFSClient["listVersions"]>[1]) {
     return this.inner.listVersions(p, opts);
   }
   restoreVersion(p: string, sourceVersionId: string) {
@@ -244,6 +244,31 @@ class BatchedLstatFs implements VFSClient {
     policy: Parameters<VFSClient["dropVersions"]>[1]
   ) {
     return this.inner.dropVersions(p, policy);
+  }
+  // Phase 12 pass-throughs.
+  patchMetadata(
+    p: string,
+    patch: Parameters<VFSClient["patchMetadata"]>[1],
+    opts?: Parameters<VFSClient["patchMetadata"]>[2]
+  ) {
+    return this.inner.patchMetadata(p, patch, opts);
+  }
+  copyFile(
+    src: string,
+    dest: string,
+    opts?: Parameters<VFSClient["copyFile"]>[2]
+  ) {
+    return this.inner.copyFile(src, dest, opts);
+  }
+  listFiles(opts?: Parameters<VFSClient["listFiles"]>[0]) {
+    return this.inner.listFiles(opts);
+  }
+  markVersion(
+    p: string,
+    versionId: string,
+    opts: Parameters<VFSClient["markVersion"]>[2]
+  ) {
+    return this.inner.markVersion(p, versionId, opts);
   }
 }
 
