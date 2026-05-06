@@ -10,8 +10,12 @@
     "deploy": "pnpm build && wrangler deploy",
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc -b"
+    "typecheck": "tsc -b",
+    "build:sdk": "pnpm -F @mossaic/sdk build"
   },
+  "workspaces": [
+    "sdk"
+  ],
   "pnpm": {
     "onlyBuiltDependencies": [
       "workerd",

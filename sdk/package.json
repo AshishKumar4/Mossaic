@@ -1,0 +1,43 @@
+{
+  "name": "@mossaic/sdk",
+  "version": "0.1.0",
+  "description": "Cloudflare-Worker-native VFS SDK — fs/promises-shaped, isomorphic-git compatible.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./fs": {
+      "types": "./dist/igit.d.ts",
+      "import": "./dist/igit.js"
+    }
+  },
+  "files": [
+    "dist",
+    "templates",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsup",
+    "build:watch": "tsup --watch",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "peerDependencies": {
+    "isomorphic-git": ">=1.25.0"
+  },
+  "peerDependenciesMeta": {
+    "isomorphic-git": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250224.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.7.0"
+  },
+  "license": "MIT"
+}
