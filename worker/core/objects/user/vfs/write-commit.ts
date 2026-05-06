@@ -91,28 +91,27 @@ export async function hardDeleteFileRow(
   scope: VFSScope,
   fileId: string
 ): Promise<void> {
-  // Phase 32 Fix 5 + Phase 32.5 quota-desync correction \u2014
-  // full byte / file accounting on hard-delete.
+  // Full byte / file accounting on hard-delete.
   //
   // Read `(status, file_size, inline_data)` BEFORE the delete
   // cascade so we can issue ONE negative `recordWriteUsage` call
   // covering all three counters: storage_used, file_count, and
   // (for inline rows) inline_bytes_used.
   //
-  // Pre-Phase-32 behaviour: deletes never decremented anything;
-  // `storage_used` / `file_count` monotonically inflated for any
-  // tenant that ever deleted. The Phase 23 Lean invariant
-  // `pool_size_monotonic` is preserved \u2014 negative storage_used
-  // deltas are clamped at 0 by `recordWriteUsage` (helpers.ts:421)
-  // and the pool-recompute is gated on `newPool > row.pool_size`
-  // so shrink is impossible. Cosmetic counters now reflect reality.
+  // Without symmetric decrements, `storage_used` / `file_count`
+  // would monotonically inflate for any tenant that ever deleted.
+  // The `pool_size_monotonic` invariant is preserved — negative
+  // storage_used deltas are clamped at 0 by `recordWriteUsage`
+  // (helpers.ts:421) and the pool-recompute is gated on
+  // `newPool > row.pool_size` so shrink is impossible. Cosmetic
+  // counters now reflect reality.
   //
   // The `status='uploading'` branch (tmp-row reaper sweeps;
   // multipart-abort) was never accounted as a positive delta in
   // `commitInlineTier` / `commitChunkedTier` / multipart finalize,
   // so we do NOT decrement it. The `'complete'` and `'deleted'`
-  // (post-supersede) statuses both decrement \u2014 see Phase 32.5
-  // BUG #1 fix at the gate below.
+  // (post-supersede) statuses both decrement — see the BUG #1 gate
+  // below.
   const accountingRow = durableObject.sql
     .exec(
       "SELECT status, file_size, inline_data FROM files WHERE file_id = ?",
@@ -153,24 +152,23 @@ export async function hardDeleteFileRow(
   durableObject.sql.exec("DELETE FROM file_tags WHERE path_id = ?", fileId);
   durableObject.sql.exec("DELETE FROM files WHERE file_id = ?", fileId);
 
-  // Phase 32.5 quota-desync + BUG #1 \u2014 single decrement call
-  // covering storage_used, file_count, and inline_bytes_used in
-  // one SQL UPDATE. recordWriteUsage clamps all three at zero
-  // (helpers.ts:421-425) so a partial pre-Phase-32.5 deficit
-  // (some tenants accumulated rmrf/unlink inflation before this
-  // landed) doesn't underflow.
+  // Single decrement call covering storage_used, file_count, and
+  // inline_bytes_used in one SQL UPDATE. recordWriteUsage clamps
+  // all three at zero (helpers.ts:421-425) so a partial historical
+  // deficit (tenants who accumulated rmrf/unlink inflation before
+  // this gate shipped) doesn't underflow.
   //
-  // Phase 32.5 BUG #1 fix \u2014 gate is `status !== 'uploading'`,
-  // NOT `status === 'complete'`. The two callers that drive the
-  // overwrite/rename flow (`commitRename` write-commit.ts:~1145,
-  // `vfsRename` mutations.ts:~530) flip status to `'deleted'`
-  // BEFORE invoking hardDeleteFileRow on the displaced row. Under
-  // the previous `status === 'complete'` gate the inline-bytes
-  // decrement was skipped on every overwrite \u2014 `inline_bytes_used`
-  // monotonically inflated by `file_size` per overwrite cycle, so
-  // INLINE_TIER_CAP fired earlier than 1 GiB.
+  // Gate is `status !== 'uploading'`, NOT `status === 'complete'`.
+  // The two callers that drive the overwrite/rename flow
+  // (`commitRename` write-commit.ts:~1145, `vfsRename`
+  // mutations.ts:~530) flip status to `'deleted'` BEFORE invoking
+  // hardDeleteFileRow on the displaced row. Under a
+  // `status === 'complete'` gate the inline-bytes decrement would
+  // be skipped on every overwrite — `inline_bytes_used` would
+  // monotonically inflate by `file_size` per overwrite cycle, so
+  // INLINE_TIER_CAP would fire earlier than 1 GiB.
   //
-  // What the gate must exclude is the `'uploading'` status \u2014 tmp
+  // What the gate must exclude is the `'uploading'` status — tmp
   // rows reaped by the stale-upload sweeper / multipart-abort were
   // never positive-counted by `commitInlineTier` /
   // `commitChunkedTier` / `vfsFinalizeMultipart` (each of those
@@ -357,10 +355,10 @@ async function vfsWriteFileVersioned(
   // 2a. Inline tier — no shards, no chunk_refs. Just insert the
   //     file_versions row and flip the head pointer.
   //
-  // Phase 32 Fix 5 — same graceful-migration cap as the
-  // non-versioned path. Versioned tenants doing many tiny writes
-  // accumulate `file_versions.inline_data` BLOBs on the UserDO
-  // and hit the same SQLite ceiling. The cap also applies here.
+  // Same graceful-migration cap as the non-versioned path.
+  // Versioned tenants doing many tiny writes accumulate
+  // `file_versions.inline_data` BLOBs on the UserDO and hit the
+  // same SQLite ceiling. The cap also applies here.
   if (data.byteLength <= INLINE_LIMIT) {
     const inlineUsed = (
       durableObject.sql
@@ -371,11 +369,9 @@ async function vfsWriteFileVersioned(
         .toArray()[0] as { used: number } | undefined
     )?.used ?? 0;
     if (inlineUsed + data.byteLength <= INLINE_TIER_CAP) {
-      // Phase 36 \u2014 commitVersion now does its own accounting
-      // via recordWriteUsage (storage_used + file_count +
-      // inline_bytes_used). The duplicate UPDATE that used to
-      // live here is gone; commitVersion is the single
-      // chokepoint.
+      // commitVersion does its own accounting via
+      // recordWriteUsage (storage_used + file_count +
+      // inline_bytes_used) — single chokepoint.
       commitVersion(durableObject, {
         pathId,
         versionId,
@@ -711,7 +707,7 @@ async function commitInlineTier(
     plan.parentId,
     plan.leaf
   );
-  await applyPhase12SideEffects(
+  await applyPostCommitSideEffects(
     durableObject,
     plan.userId,
     tmpId,
@@ -725,9 +721,9 @@ async function commitInlineTier(
   // accounting-only — but it MUST run because the tenant's first
   // write might be inline + push file_count from 0 → 1.
   //
-  // Phase 32 Fix 5 — also bump `quota.inline_bytes_used` so the
-  // inline-tier cap can fire on subsequent writes. The chunked
-  // tier passes 0 for this delta (default).
+  // Also bump `quota.inline_bytes_used` so the inline-tier cap
+  // can fire on subsequent writes. The chunked tier passes 0 for
+  // this delta (default).
   recordWriteUsage(
     durableObject,
     plan.userId,
@@ -763,9 +759,9 @@ async function commitChunkedTier(
   const tmpName = `_vfs_tmp_${tmpId}`;
   let poolSize = poolSizeFor(durableObject, plan.userId);
 
-  // Phase 32 Fix 4 \u2014 load the skip-set once per write batch.
-  // Cold cache (empty Set) = byte-equivalent to pre-Phase-32
-  // placement (deterministic top-1).
+  // Load the skip-set once per write batch. Cold cache (empty
+  // Set) = byte-equivalent to pure-rendezvous deterministic top-1
+  // placement.
   let fullShards = loadFullShards(durableObject);
 
   // If every shard in the pool is full, force a pool-size bump
@@ -896,7 +892,7 @@ async function commitChunkedTier(
     plan.parentId,
     plan.leaf
   );
-  await applyPhase12SideEffects(
+  await applyPostCommitSideEffects(
     durableObject,
     plan.userId,
     tmpId,
@@ -952,7 +948,7 @@ export async function vfsWriteFile(
       poolSizeFor(durableObject, plan.userId),
       data
     );
-    await applyPhase12SideEffects(
+    await applyPostCommitSideEffects(
       durableObject,
       plan.userId,
       yjsRow.file_id,
@@ -992,8 +988,8 @@ export async function vfsWriteFile(
   // (≤ INLINE_LIMIT); the chunked tier fans out to ShardDOs via
   // bounded-concurrency PUTs.
   //
-  // Phase 32 Fix 5 — graceful migration. A tenant approaching the
-  // INLINE_TIER_CAP (1 GiB cumulative inline bytes) spills NEW
+  // Graceful migration. A tenant approaching the INLINE_TIER_CAP
+  // (1 GiB cumulative inline bytes) spills NEW
   // tiny writes to the chunked tier instead of further loading
   // the UserDO's SQLite. Pre-existing inline rows are read
   // identically by `vfsReadFile` (it checks `inline_data IS NOT
@@ -1051,7 +1047,7 @@ export async function vfsWriteFile(
  * The versioned write path bakes these into commitVersion and is
  * NOT routed through here.
  */
-async function applyPhase12SideEffects(
+async function applyPostCommitSideEffects(
   durableObject: UserDO,
   userId: string,
   pathId: string,

@@ -55,12 +55,12 @@ gallery.get("/thumbnail/:fileId", async (c) => {
  * (`"thumb"`); the caller-controlled `cacheSeconds` flows into the
  * response.
  *
- * Phase 36 \u2014 wraps the origin fetch in `edgeCacheServe`. Cache key
- * is `<surfaceTag>/<userId>/<fileId>/<updated_at>`. The
- * `updated_at` token is bumped by every write that mutates this
- * fileId, so a stale cached response is structurally impossible
- * after a write completes. Auth runs FIRST (authMiddleware on the
- * Hono app); the cache lookup is post-auth.
+ * Wraps the origin fetch in `edgeCacheServe`. Cache key is
+ * `<surfaceTag>/<userId>/<fileId>/<updated_at>`. The `updated_at`
+ * token is bumped by every write that mutates this fileId, so a
+ * stale cached response is structurally impossible after a write
+ * completes. Auth runs FIRST (authMiddleware on the Hono app); the
+ * cache lookup is post-auth.
  */
 async function serveImage(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any

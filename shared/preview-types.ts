@@ -121,7 +121,7 @@ export const STANDARD_VARIANT_DIMS: Record<
 };
 
 /**
- * Phase 45 \u2014 result of `vfs.previewInfo(path, opts)` and
+ * Result of `vfs.previewInfo(path, opts)` and
  * `vfs.previewInfoMany(paths, opts)`. Carries the signed URL the
  * browser can fetch directly + metadata an SPA needs to render
  * the IMG element (mimeType, width, height) and to perform
@@ -169,7 +169,7 @@ export type PreviewInfoBatchEntry =
   | { path: string; ok: false; code: string; message: string };
 
 /**
- * Phase 45 \u2014 options for `vfs.previewUrl` / `vfs.previewInfo` /
+ * Options for `vfs.previewUrl` / `vfs.previewInfo` /
  * `vfs.previewInfoMany`. Same shape as `ReadPreviewOpts` plus a
  * `ttlMs` knob for the signed token's lifetime.
  *

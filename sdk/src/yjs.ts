@@ -242,20 +242,17 @@ export async function openYDoc(
     const stat = await vfs.stat(path);
     fileEnc = stat.encryption;
   } catch (err) {
-    // Phase 41 Fix 3 (audit 40C top-4): the previous bare `catch {}`
-    // swallowed every stat error. Rationale was "ENOENT is fine —
-    // openYDoc creates the file via the WS upgrade", but that also
-    // ate transient errors (network blip, EBUSY, EAGAIN, etc.). On
-    // an encrypted-tenant deployment, a transient stat failure
-    // would leave `fileEnc = undefined` and the subsequent code
-    // would open the WebSocket in PLAINTEXT mode against an
-    // ENCRYPTED file — a real correctness defect.
-    //
-    // Fix: only swallow ENOENT (the documented "file doesn't exist
-    // yet" case). Any other error propagates — the consumer sees a
-    // typed error rather than a silently-degraded plaintext
-    // session. Fail-safe-secure: if we can't tell whether the file
-    // is encrypted, refuse to proceed.
+    // Only swallow ENOENT (the documented "file doesn't exist yet"
+    // case — openYDoc creates the file via the WS upgrade). Any
+    // other stat error propagates so the consumer sees a typed
+    // error rather than a silently-degraded plaintext session. A
+    // bare `catch {}` would also eat transient errors (network
+    // blip, EBUSY, EAGAIN, etc.); on an encrypted-tenant deployment
+    // that would leave `fileEnc = undefined` and the subsequent
+    // code would open the WebSocket in PLAINTEXT mode against an
+    // ENCRYPTED file — a real correctness defect. Fail-safe-secure:
+    // if we can't tell whether the file is encrypted, refuse to
+    // proceed.
     if (!(err instanceof ENOENT)) {
       throw err;
     }

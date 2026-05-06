@@ -26,7 +26,7 @@
 export const INLINE_LIMIT = 16 * 1024;
 
 /**
- * Phase 32 Fix 5 — inline-tier graceful migration cap.
+ * Inline-tier graceful migration cap.
  *
  * Per-tenant ceiling on cumulative bytes stored in the inline tier
  * (`files.inline_data` BLOBs). Tracked via

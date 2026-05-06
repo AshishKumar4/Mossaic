@@ -1,21 +1,21 @@
 /**
- * Phase 45 \u2014 signed preview-variant tokens.
+ * Signed preview-variant tokens.
  *
- * Downstream client (Seal) feedback: thumbnail grids hammer Worker
+ * Without these, thumbnail grids hammer the Worker
  * bytes-through-RPC even on cache hit because every grid item
- * issues an authenticated `POST /readPreview` whose response body
- * is the variant bytes. The browser cannot directly cache that
- * response cross-page, and a CDN edge tier sees opaque
+ * would issue an authenticated `POST /readPreview` whose response
+ * body is the variant bytes. The browser cannot directly cache
+ * that response cross-page, and a CDN edge tier sees opaque
  * Authorization-bearing requests it must serialize through the
  * Worker.
  *
- * Phase 45 fixes this with a signed-URL pattern: the Worker mints
- * a per-variant token whose payload encodes (tenantId, fileId,
- * headVersionId, variantKind, rendererKind, format, contentHash,
- * exp). The browser fetches `GET /api/vfs/preview-variant/<token>`
- * directly. Bytes are content-addressed by `contentHash` so the
- * response is `Cache-Control: public, max-age=31536000, immutable`
- * and the CDN edge happily caches across all clients (no Vary).
+ * Signed-URL pattern: the Worker mints a per-variant token whose
+ * payload encodes (tenantId, fileId, headVersionId, variantKind,
+ * rendererKind, format, contentHash, exp). The browser fetches
+ * `GET /api/vfs/preview-variant/<token>` directly. Bytes are
+ * content-addressed by `contentHash` so the response is
+ * `Cache-Control: public, max-age=31536000, immutable` and the
+ * CDN edge happily caches across all clients (no Vary).
  *
  * Why a separate token shape (not reusing VFSDownloadToken):
  *

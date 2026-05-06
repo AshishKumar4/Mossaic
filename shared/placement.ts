@@ -37,22 +37,21 @@ export const POOL_FULL = -1;
 /**
  * Determine which shard index holds a specific chunk.
  *
- * **Phase 32 Fix 4 — cap-aware placement.** The pure-rendezvous
- * winner is checked against `fullShards` (a snapshot of shards
- * at-or-over the soft cap, populated by
- * `worker/core/objects/user/shard-capacity.ts`). If the winner is
- * full, the loop continues at the next-best score until either a
- * non-full shard is found OR every shard in the pool is full
- * (returns `POOL_FULL`). Caller responsibilities:
+ * **Cap-aware placement.** The pure-rendezvous winner is checked
+ * against `fullShards` (a snapshot of shards at-or-over the soft
+ * cap, populated by `worker/core/objects/user/shard-capacity.ts`).
+ * If the winner is full, the loop continues at the next-best score
+ * until either a non-full shard is found OR every shard in the
+ * pool is full (returns `POOL_FULL`). Caller responsibilities:
  *  - When `fullShards` is `undefined` or empty: behaviour is
- *    byte-equivalent to the pre-Phase-32 deterministic top-1
+ *    byte-equivalent to the pure-rendezvous deterministic top-1
  *    winner. ALL existing tests + readers depending on
  *    deterministic placement see the same result.
  *  - When `placeChunk` returns `POOL_FULL`: trigger pool growth
- *    via Phase 23 `recordWriteUsage` (writing one chunk normally
- *    would not advance pool_size by itself; the operator may need
- *    to bump quota.storage_used to force a 5 GiB-boundary cross),
- *    then retry placement with the new poolSize.
+ *    via `recordWriteUsage` (writing one chunk normally would not
+ *    advance pool_size by itself; the operator may need to bump
+ *    quota.storage_used to force a 5 GiB-boundary cross), then
+ *    retry placement with the new poolSize.
  *
  * Reads are UNCHANGED: every chunk's recorded `shard_index` in
  * `file_chunks` / `version_chunks` stays valid forever. A "full"
@@ -70,10 +69,10 @@ export function placeChunk(
   poolSize: number,
   fullShards?: ReadonlySet<number>
 ): number {
-  // Fast path: no skip-set or empty skip-set \u2014 byte-equivalent to
-  // the pre-Phase-32 implementation. The hot write path (every
-  // chunk PUT) takes this branch when the cache is cold or
-  // empty.
+  // Fast path: no skip-set or empty skip-set — byte-equivalent to
+  // the pure-rendezvous deterministic top-1 winner. The hot write
+  // path (every chunk PUT) takes this branch when the cache is
+  // cold or empty.
   if (!fullShards || fullShards.size === 0) {
     let bestShard = 0;
     let bestScore = -1;

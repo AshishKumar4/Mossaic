@@ -60,17 +60,17 @@ export async function vfsUnlink(
 
   // versioning fork.
   if (isVersioningEnabled(durableObject, userId)) {
-    // Phase 28 Fix 2 — purge yjs DO state inside the versioning
-    // fork too. Pre-fix, the early return at the bottom of this
-    // block bypassed the yjs purge below — a yjs-mode file
-    // unlinked under versioning ON had its head tombstoned (so
-    // list/stat/exists report ENOENT) but the yjs runtime kept
-    // serving live bytes, the op-log kept growing, and active
-    // WebSocket clients kept emitting awareness updates against a
-    // path the user has logically "deleted". The Phase 27
-    // multipart fix made tombstone semantics consistent for byte
-    // reads via the head_deleted gate (Phase 25); this fix closes
-    // the same gap for the yjs runtime + persisted oplog rows.
+    // Purge yjs DO state inside the versioning fork too. Without
+    // this, the early return at the bottom of this block would
+    // bypass the yjs purge below — a yjs-mode file unlinked under
+    // versioning ON would have its head tombstoned (so
+    // list/stat/exists report ENOENT) but the yjs runtime would
+    // keep serving live bytes, the op-log would keep growing, and
+    // active WebSocket clients would keep emitting awareness
+    // updates against a path the user has logically "deleted".
+    // Tombstone semantics are consistent for byte reads via the
+    // head_deleted gate; this closes the same gap for the yjs
+    // runtime + persisted oplog rows.
     //
     // We purge BEFORE writing the tombstone so a race with another
     // unlink that arrives between commitVersion and purgeYjs
@@ -127,7 +127,7 @@ export async function vfsUnlink(
 }
 
 /**
- * Phase 25 — `vfs.purge(path)`.
+ * `vfs.purge(path)`.
  *
  * Permanently destroy a path and ALL its history. Three-tier
  * delete model the SDK exposes:
@@ -139,9 +139,8 @@ export async function vfsUnlink(
  *     row + the files row + decrements ShardDO chunk refs for all
  *     versions' chunks. Independent of versioning state. Acts like
  *     a versioning-off `unlink` even when versioning is on.
- *   - `archive(path)`     — RESERVED for Phase 25.1; will hide a
- *     path from listings without destroying data. NOT implemented
- *     yet — TODO doc-only.
+ *   - `archive(path)`     — cosmetic-only hide; reversible via
+ *     `unarchive`. See `archive.ts`.
  *
  * Use `vfs.purge` for compliance-style "right to be forgotten" or
  * to clean up a specific tombstoned-head path. For sweeping a
@@ -472,8 +471,8 @@ export async function vfsRename(
     );
   }
   if (dstFile) {
-    // Phase 27 — under versioning-on, replace-overwrite must NOT
-    // hard-delete the displaced file's history. The semantics
+    // Under versioning-on, replace-overwrite must NOT hard-delete
+    // the displaced file's history. The semantics
     // mirror what `unlink` does on a versioned tenant: the
     // displaced row's chunks survive, accessible via
     // `listVersions` + `restoreVersion`. We tombstone the
@@ -501,8 +500,8 @@ export async function vfsRename(
       // Free the unique-index slot by renaming the displaced row.
       // The path the displaced file_id appears at no longer
       // matches `(dstParent, dstLeaf)`; subsequent listings filter
-      // it via the tombstone-head consistency check (Phase 25). A
-      // suffix keeps it unique per path-tombstone-event.
+      // it via the tombstone-head consistency check. A suffix
+      // keeps it unique per path-tombstone-event.
       durableObject.sql.exec(
         "UPDATE files SET file_name = ?, updated_at = ? WHERE file_id = ?",
         `${dstFile.file_id}.tombstoned-${now}`,
@@ -533,8 +532,8 @@ export async function vfsRename(
       return;
     }
 
-    // Versioning OFF — pre-Phase-27 behaviour: hard-delete the
-    // displaced row's chunks via shard fan-out.
+    // Versioning OFF: hard-delete the displaced row's chunks via
+    // shard fan-out.
     const now = Date.now();
     durableObject.sql.exec(
       "UPDATE files SET status='deleted', deleted_at=?, updated_at=? WHERE file_id=?",
@@ -683,37 +682,32 @@ export async function vfsRemoveRecursive(
   path: string,
   cursor?: string
 ): Promise<{ done: boolean; cursor?: string }> {
-  // Phase 32 Fix 3 + Phase 32.5 Fix 3 — subrequest budget,
-  // branched.
+  // Subrequest budget, branched by versioning state.
   //
-  // Pre-Phase-32: unconditional BATCH_LIMIT = 200; per-file
-  // `hardDeleteFileRow` fanned out up to `poolSize` subrequests
-  // via `deleteChunks` (one RPC per touched shard). Worst case
-  // 200 \xd7 32 = 6400 subrequests per call \u2014 over the Workers
+  // An unconditional BATCH_LIMIT = 200 plus per-file
+  // `hardDeleteFileRow` fanning out up to `poolSize` subrequests
+  // via `deleteChunks` (one RPC per touched shard) gives a worst
+  // case 200 × 32 = 6400 subrequests per call — over the Workers
   // paid cap of 1000.
   //
-  // Phase 32: BATCH_LIMIT lowered to 30 globally + non-versioning
-  // path BATCHES THE SHARD FAN-OUT into one `deleteManyChunks`
-  // RPC per touched shard. Worst case: poolSize subrequests = 32
-  // for the non-versioning path.
+  // Mitigation: the non-versioning path BATCHES the shard fan-out
+  // into one `deleteManyChunks` RPC per touched shard (worst case
+  // poolSize subrequests = 32) and uses BATCH_LIMIT = 30 because
+  // `deleteManyChunks` over poolSize shards is the dominant cost;
+  // raising would push toward the subrequest cap even with batched
+  // fan-out (30 × 32 = 960 < 1000).
   //
-  // Phase 32.5 Fix 3: branch BATCH_LIMIT by versioning state.
-  // The versioning branch tombstones in-place \u2014 NO ShardDO
-  // fan-out, so subrequest cost is 0 per file. Capping at 30 was
-  // a 6.6x slowdown on the path that doesn't need the lower cap
-  // (a versioning-on rmrf of 150k files needed 5000 invocations
-  // at 30; needs 750 at 200).
-  //
-  // Bound on versioning side: BATCH_LIMIT_VERSIONING = 200 keeps
-  // SQL work (UPDATE files SET file_name=..., commitVersion()
-  // tombstone insert) on a single DO turn \u2014 still well below
-  // the 30s wall-clock bound. The non-versioning side stays at
-  // 30 because `deleteManyChunks` over poolSize shards is the
-  // dominant cost; raising would push toward the subrequest cap
-  // even with batched fan-out (30 \xd7 32 = 960 < 1000).
+  // The versioning branch tombstones in-place — NO ShardDO
+  // fan-out, so subrequest cost is 0 per file. Capping at 30
+  // would be a 6.6x slowdown on the path that doesn't need the
+  // lower cap (a versioning-on rmrf of 150k files needs 750
+  // invocations at 200 vs 5000 at 30). BATCH_LIMIT_VERSIONING =
+  // 200 keeps SQL work (UPDATE files SET file_name=...,
+  // commitVersion() tombstone insert) on a single DO turn — still
+  // well below the 30s wall-clock bound.
   const userId = userIdFor(scope);
   const versioning = isVersioningEnabled(durableObject, userId);
-  // Phase 32.5 Fix 3 \u2014 branched limits.
+  // Branched limits.
   const BATCH_LIMIT_VERSIONING = 200;
   const BATCH_LIMIT_NON_VERSIONING = 30;
   const BATCH_LIMIT = versioning
@@ -764,12 +758,11 @@ export async function vfsRemoveRecursive(
     )
     .toArray() as { file_id: string }[];
 
-  // Phase 27 Fix 5 — under versioning ON, recursive remove must
-  // tombstone each file instead of hard-deleting it. The audit
-  // sub-agent found that `hardDeleteFileRow` on a versioning-on
-  // tenant silently destroyed prior version history AND leaked
-  // ShardDO chunk_refs (file_chunks is empty for versioned writes;
-  // chunks live in version_chunks under
+  // Under versioning ON, recursive remove must tombstone each
+  // file instead of hard-deleting it. `hardDeleteFileRow` on a
+  // versioning-on tenant would silently destroy prior version
+  // history AND leak ShardDO chunk_refs (file_chunks is empty for
+  // versioned writes; chunks live in version_chunks under
   // `${pathId}#${versionId}` or `uploadId` — neither reachable
   // from `hardDeleteFileRow`'s `file_chunks`-keyed fan-out). Each
   // tombstoned path's history remains in `file_versions`,
@@ -779,11 +772,11 @@ export async function vfsRemoveRecursive(
   //
   // `versioning` already computed above for BATCH_LIMIT branching.
   if (versioning) {
-    // Versioning branch — tombstone each file. No ShardDO fan-out:
-    // chunks survive in version_chunks for restore. Phase 32.5 Fix 3
-    // raises BATCH_LIMIT to 200 here \u2014 SQL-only work, fan-out is
-    // zero, cost is dominated by the per-file commitVersion +
-    // file_name UPDATE (single-DO-turn).
+    // Versioning branch — tombstone each file. No ShardDO
+    // fan-out: chunks survive in version_chunks for restore.
+    // BATCH_LIMIT is 200 here — SQL-only work, fan-out is zero,
+    // cost is dominated by the per-file commitVersion + file_name
+    // UPDATE (single-DO-turn).
     for (const f of fileRows) {
       const tombId = generateId();
       const now = Date.now();
@@ -801,9 +794,9 @@ export async function vfsRemoveRecursive(
         inlineData: null,
         deleted: true,
       });
-      // Free the unique-index slot \u2014 same shape as `vfsRename`'s
+      // Free the unique-index slot — same shape as `vfsRename`'s
       // versioning-overwrite branch. The path resolution surface
-      // (Phase 25) filters tombstoned-head rows out of listings.
+      // filters tombstoned-head rows out of listings.
       durableObject.sql.exec(
         "UPDATE files SET file_name = ?, updated_at = ? WHERE file_id = ?",
         `${f.file_id}.tombstoned-${now}`,
@@ -812,10 +805,10 @@ export async function vfsRemoveRecursive(
       );
     }
   } else if (fileRows.length > 0) {
-    // Phase 32 Fix 3 \u2014 batch the shard fan-out.
+    // Batch the shard fan-out.
     //
-    // 1. Read each file's accounting tuple BEFORE delete (only
-    //    needed for inline-bytes decrement \u2014 see Fix 5).
+    // 1. Read each file's accounting tuple BEFORE delete (needed
+    //    for inline-bytes decrement).
     // 2. Collect (file_id, shard_index) pairs across all files in
     //    the batch.
     // 3. Drop UserDO-side metadata (file_chunks / file_tags /
@@ -825,11 +818,11 @@ export async function vfsRemoveRecursive(
     const fileIds = fileRows.map((r) => r.file_id);
     const placeholdersFiles = fileIds.map(() => "?").join(",");
 
-    // Per-file accounting \u2014 Phase 32.5 quota-desync correction.
+    // Per-file accounting — quota-desync correction.
     // Read (status, file_size, inline_data) so a single negative
     // recordWriteUsage call covers storage_used, file_count, AND
-    // inline_bytes_used. Pre-fix this branch only decremented
-    // inline bytes; storage_used / file_count drifted upward
+    // inline_bytes_used. Without this, only inline bytes would be
+    // decremented; storage_used / file_count would drift upward
     // every rmrf invocation.
     const accountingRows = durableObject.sql
       .exec(
@@ -873,17 +866,16 @@ export async function vfsRemoveRecursive(
       ...fileIds
     );
 
-    // Phase 32.5 quota-desync correction \u2014 single negative
-    // recordWriteUsage covering storage_used, file_count, and
-    // inline_bytes_used for the entire batch. Gate is
-    // `status !== 'uploading'` (mirrors hardDeleteFileRow's
-    // BUG #1 fix): tmp / multipart-abort rows were never
-    // positive-counted, so they don't decrement. The rmrf
-    // SELECT at line 685 already filters `status != 'deleted'`,
-    // so accountingRows contains only `complete` and `uploading`
-    // \u2014 the gate effectively keeps complete-only here, but
-    // we use the same predicate as hardDeleteFileRow for
-    // consistency / future-proofing.
+    // Quota-desync correction — single negative recordWriteUsage
+    // covering storage_used, file_count, and inline_bytes_used for
+    // the entire batch. Gate is `status !== 'uploading'` (mirrors
+    // hardDeleteFileRow): tmp / multipart-abort rows were never
+    // positive-counted, so they don't decrement. The rmrf SELECT
+    // already filters `status != 'deleted'`, so accountingRows
+    // contains only `complete` and `uploading` — the gate
+    // effectively keeps complete-only here, but we use the same
+    // predicate as hardDeleteFileRow for consistency / future-
+    // proofing.
     let bytesDelta = 0;
     let filesDelta = 0;
     let inlineDelta = 0;

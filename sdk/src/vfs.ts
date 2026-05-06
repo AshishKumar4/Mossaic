@@ -80,7 +80,7 @@ export interface VFSClient {
   ): Promise<void>;
   unlink(p: string): Promise<void>;
   /**
-   * Phase 25 — destructive cleanup.
+   * Destructive cleanup.
    *
    * Drops the file row + every version + decrements ShardDO chunk
    * refs. Independent of versioning state — acts like a
@@ -90,20 +90,20 @@ export interface VFSClient {
    *  - `unlink(path)`  — POSIX-style (versioned tombstone if
    *    versioning is on; hard delete if off).
    *  - `purge(path)`   — wipe all history for one path.
-   *  - `archive(path)` — Phase 29; cosmetic-only hide. Reversible
-   *    via `unarchive`. Read surfaces are unchanged.
+   *  - `archive(path)` — cosmetic-only hide. Reversible via
+   *    `unarchive`. Read surfaces are unchanged.
    */
   purge(p: string): Promise<void>;
   /**
-   * Phase 29 — hide a path from the default `listFiles` /
-   * `fileInfo` results without touching data. Reversible via
-   * `unarchive`. Read surfaces (`stat`, `readFile`, etc.) are NOT
-   * gated — an archived file is fully readable by anyone who
-   * knows the path. Idempotent. Throws `EISDIR` for directories,
-   * `ENOENT` for non-existent paths.
+   * Hide a path from the default `listFiles` / `fileInfo` results
+   * without touching data. Reversible via `unarchive`. Read
+   * surfaces (`stat`, `readFile`, etc.) are NOT gated — an archived
+   * file is fully readable by anyone who knows the path.
+   * Idempotent. Throws `EISDIR` for directories, `ENOENT` for
+   * non-existent paths.
    */
   archive(p: string): Promise<void>;
-  /** Phase 29 — inverse of `archive`. Idempotent. */
+  /** Inverse of `archive`. Idempotent. */
   unarchive(p: string): Promise<void>;
   mkdir(
     p: string,
@@ -182,7 +182,7 @@ export interface VFSClient {
   ): Promise<ReadPreviewResult>;
 
   /**
-   * Phase 45 \u2014 mint a signed preview-variant URL.
+   * Mint a signed preview-variant URL.
    *
    * Returns a string suitable for embedding in an `<img src=...>`
    * tag (or any other browser-direct fetch). The browser fetches
@@ -200,8 +200,8 @@ export interface VFSClient {
   previewUrl(p: string, opts?: PreviewUrlOpts): Promise<string>;
 
   /**
-   * Phase 45 \u2014 mint a signed preview-variant URL + return all
-   * the metadata an SPA needs to render the IMG element
+   * Mint a signed preview-variant URL + return all the metadata
+   * an SPA needs to render the IMG element
    * (mimeType, width, height) and revalidate via ETag.
    *
    * Same auth + lifecycle as `previewUrl`; the additional metadata
@@ -210,7 +210,7 @@ export interface VFSClient {
   previewInfo(p: string, opts?: PreviewUrlOpts): Promise<PreviewInfo>;
 
   /**
-   * Phase 45 \u2014 batched preview-info mint. One RPC per N paths
+   * Batched preview-info mint. One RPC per N paths
    * (max 256 per call). Per-path failures land as
    * `{ ok: false, code, message }` entries; callers can render a
    * placeholder for those without aborting the whole batch.
@@ -246,7 +246,7 @@ export interface VFSClient {
   ): Promise<void>;
 
   /**
-   * Phase 38 — Yjs snapshot read.
+   * Yjs snapshot read.
    *
    * Returns the full `Y.encodeStateAsUpdate(doc)` bytes for a
    * yjs-mode file. Decode with `Y.applyUpdate(localDoc, bytes)`
@@ -268,7 +268,7 @@ export interface VFSClient {
   readYjsSnapshot(p: string): Promise<Uint8Array>;
 
   /**
-   * Phase 38 — Yjs snapshot commit.
+   * Yjs snapshot commit.
    *
    * Encodes the supplied `Y.Doc` via
    * `Y.encodeStateAsUpdate(doc)`, wraps with the
@@ -329,9 +329,9 @@ export interface UserDOClient {
   ): Promise<void>;
   vfsUnlink(scope: VFSScope, path: string): Promise<void>;
   vfsPurge(scope: VFSScope, path: string): Promise<void>;
-  /** Phase 29 — set archived=1 on the path's files row. */
+  /** Set archived=1 on the path's files row. */
   vfsArchive(scope: VFSScope, path: string): Promise<void>;
-  /** Phase 29 — set archived=0 on the path's files row. */
+  /** Set archived=0 on the path's files row. */
   vfsUnarchive(scope: VFSScope, path: string): Promise<void>;
   vfsMkdir(
     scope: VFSScope,
@@ -396,9 +396,9 @@ export interface UserDOClient {
     enabled: boolean
   ): Promise<void>;
   /**
-   * Phase 38 — return `Y.encodeStateAsUpdate(doc)` bytes for a
-   * yjs-mode file so SDK consumers can decode the FULL Y.Doc and
-   * use arbitrary named shared types (Y.XmlFragment, Y.Map, …).
+   * Return `Y.encodeStateAsUpdate(doc)` bytes for a yjs-mode file
+   * so SDK consumers can decode the FULL Y.Doc and use arbitrary
+   * named shared types (Y.XmlFragment, Y.Map, …).
    */
   vfsReadYjsSnapshot(
     scope: VFSScope,
@@ -423,13 +423,13 @@ export interface UserDOClient {
     path: string,
     opts?: ReadPreviewOpts
   ): Promise<ReadPreviewResult>;
-  /** Phase 45 \u2014 mint a signed preview-variant URL. */
+  /** Mint a signed preview-variant URL. */
   vfsMintPreviewToken(
     scope: VFSScope,
     path: string,
     opts?: PreviewUrlOpts
   ): Promise<PreviewInfo>;
-  /** Phase 45 \u2014 batched mint (max 256 paths). */
+  /** Batched mint (max 256 paths). */
   vfsPreviewInfoMany(
     scope: VFSScope,
     paths: string[],
@@ -660,7 +660,8 @@ export interface VersionInfo {
   /**
    * true if this version was created by an explicit
    * user-facing operation (writeFile, restoreVersion, flush()).
-   * False for opportunistic Yjs compactions and pre-Phase-12 rows.
+   * False for opportunistic Yjs compactions and legacy rows that
+   * pre-date the column.
    */
   userVisible?: boolean;
   /** snapshot of files.metadata at this version (when requested). */
@@ -787,8 +788,8 @@ export interface ListFilesOpts {
    */
   includeTombstones?: boolean;
   /**
-   * Phase 29 — default `false`. When `true`, results include
-   * archived rows (`files.archived = 1`). Use to build a "Hidden"
+   * Default `false`. When `true`, results include archived rows
+   * (`files.archived = 1`). Use to build a "Hidden"
    * / "Trash" UI: pass `true` to fetch all rows including
    * archived; combine with the `archived` flag on each item to
    * partition the view.
@@ -807,19 +808,18 @@ export interface FileInfoOpts {
   /** Default false (size pressure). */
   includeMetadata?: boolean;
   /**
-   * Phase 25 — default `false`. When `true`, a path resolving to
-   * a row whose head version is tombstoned still returns the
-   * fileInfo metadata instead of throwing ENOENT. Reserved for
-   * admin/recovery flows; the steady-state SDK consumer must
-   * never set this.
+   * Default `false`. When `true`, a path resolving to a row whose
+   * head version is tombstoned still returns the fileInfo metadata
+   * instead of throwing ENOENT. Reserved for admin/recovery flows;
+   * the steady-state SDK consumer must never set this.
    */
   includeTombstones?: boolean;
   /**
-   * Phase 29 — default `false`. When `true`, an archived path
-   * returns its info instead of throwing ENOENT. Note this is
-   * STRICTER than `stat` / `readFile` (which never gate on
-   * archived) — `fileInfo` is the listing-shape surface, so it
-   * mirrors the `listFiles` exclusion by default.
+   * Default `false`. When `true`, an archived path returns its
+   * info instead of throwing ENOENT. Note this is STRICTER than
+   * `stat` / `readFile` (which never gate on archived) — `fileInfo`
+   * is the listing-shape surface, so it mirrors the `listFiles`
+   * exclusion by default.
    */
   includeArchived?: boolean;
 }
@@ -1683,8 +1683,8 @@ export class VFS implements VFSClient {
   }
 
   /**
-   * Phase 38 — return the FULL `Y.encodeStateAsUpdate(doc)` bytes
-   * for a yjs-mode file. Decode with `Y.applyUpdate(localDoc, bytes)`
+   * Return the FULL `Y.encodeStateAsUpdate(doc)` bytes for a
+   * yjs-mode file. Decode with `Y.applyUpdate(localDoc, bytes)`
    * to recover the entire `Y.Doc` — including all named shared
    * types (`Y.XmlFragment`, `Y.Map`, `Y.Array`, multiple `Y.Text`s).
    *
@@ -1711,8 +1711,8 @@ export class VFS implements VFSClient {
   }
 
   /**
-   * Phase 38 — write the current state of a `Y.Doc` as a
-   * snapshot update. Encodes via `Y.encodeStateAsUpdate(doc)`,
+   * Write the current state of a `Y.Doc` as a snapshot update.
+   * Encodes via `Y.encodeStateAsUpdate(doc)`,
    * wraps with the `YJS_SNAPSHOT_MAGIC` 4-byte prefix, and routes
    * through the standard `writeFile` path. The server detects
    * the magic and applies the bytes via `Y.applyUpdate` —
@@ -1728,7 +1728,7 @@ export class VFS implements VFSClient {
    *  - Seed a path with a Tiptap document built via the editor's
    *    JSON-to-Y.XmlFragment converter.
    *  - Commit a "save point" snapshot under versioning ON
-   *    (Phase 38 + Phase 13 versioning compose: the snapshot
+   *    (snapshot writes compose with versioning: the snapshot
    *    write creates a `file_versions` row with the snapshot
    *    bytes preserved as the version's content).
    *

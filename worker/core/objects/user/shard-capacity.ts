@@ -1,38 +1,32 @@
 /**
- * Shard capacity monitor (Phase 28 Fix 4 — warning-only mode).
+ * Shard capacity monitor.
  *
- * Polls each ShardDO in the user's pool for `bytesStored` and logs
- * a structured warning when any shard's storage exceeds the soft
- * cap (9 GB by convention; the workerd SQLite-backed DO ceiling is
- * around 10 GB and we want operators to see the approach BEFORE
- * writes start failing).
+ * Polls each ShardDO in the user's pool for `bytesStored`, persists
+ * the result into `shard_storage_cache`, and logs a structured
+ * warning when any shard exceeds the soft cap (9 GB by convention;
+ * the workerd SQLite-backed DO ceiling is around 10 GB and
+ * operators need to see the approach BEFORE writes start failing).
  *
- * **Architectural status — DEFERRED to Phase 28.1**: this is the
- * back-pressure precursor. Cap-aware placement (skip full shards in
- * `placeChunk`, fall over to next-best rendezvous score) requires a
- * persistent per-shard capacity cache + alarm-driven refresh +
- * threading the cache through every callsite. That's substantial
- * cross-cutting plumbing; we ship the warning signal first so:
+ * Two consumers of the cache:
  *
- *   1. Operators get visibility into approaching-cap conditions
- *      via Workers logs / Logpush before any user-visible write
- *      failure.
- *   2. Phase 23's pool growth (`recordWriteUsage`) remains the
- *      primary capacity mechanism — pool grows by 1 ShardDO per
- *      5 GB stored, so a tenant approaching the soft cap on any
- *      individual shard is already at sub-cap on the rest of the
- *      pool. The warning is the operator's signal to verify pool
- *      growth is keeping pace.
- *   3. The eventual cap-aware placement (Phase 28.1) can read the
- *      same `bytesStored` telemetry without schema changes — we
- *      just add a cache table + refresh cadence.
+ *   1. Cap-aware placement: `placeChunk` reads the persisted
+ *      `full=1` set via `loadFullShards` and routes new chunk PUTs
+ *      around shards at-or-over the cap. Reads stay routed to the
+ *      original shard (every chunk's `shard_index` is recorded in
+ *      `file_chunks` / `version_chunks` and never moves).
+ *   2. Pool growth (`recordWriteUsage`) is still the primary
+ *      capacity mechanism — pool grows by 1 ShardDO per 5 GB
+ *      stored, so a tenant approaching the soft cap on any
+ *      individual shard is already at sub-cap on the rest. The
+ *      warning is the operator's signal to verify pool growth is
+ *      keeping pace.
  *
  * Invocation: from the UserDO alarm, throttled by a `vfs_meta` row
- * keyed `shard_capacity_last_check`. Default cadence: 1 hour.
+ * keyed `shard_capacity_last_check`. Default cadence: 30 min.
  *
  * Cost: one ShardDO RPC per shard in the pool. For poolSize=32
  * that's 32 fan-out reads — well under the 50/1000 subrequest cap
- * and bounded to one alarm tick per hour.
+ * and bounded to one alarm tick per cadence interval.
  */
 
 import type { UserDOCore } from "./user-do-core";
@@ -47,12 +41,11 @@ const SOFT_CAP_BYTES = 9 * 1024 * 1024 * 1024;
 /**
  * Min interval between capacity polls.
  *
- * Phase 32 Fix 4 \u2014 lowered from 1h \u2192 30 min so the cache
- * tracking shard fullness for `placeChunk`'s skip logic stays
- * fresh. A shard at 8.5 GB is still well below the soft cap on
- * one poll and over it on the next; tighter cadence shrinks the
- * window where a near-full shard receives extra writes that
- * could push it past the runtime SQLite ceiling.
+ * 30 min keeps the cache tracking shard fullness for
+ * `placeChunk`'s skip logic fresh. A shard at 8.5 GB is still well
+ * below the soft cap on one poll and over it on the next; tighter
+ * cadence shrinks the window where a near-full shard receives
+ * extra writes that could push it past the runtime SQLite ceiling.
  */
 const CHECK_INTERVAL_MS = 30 * 60 * 1000;
 
@@ -128,15 +121,14 @@ export async function monitorShardCapacity(
     })
   );
 
-  // Phase 32 Fix 4 \u2014 persist into shard_storage_cache. Reachable
-  // shards have their measured bytes recorded; transient
-  // failures (bytesStored = -1 sentinel from the catch above) are
-  // skipped \u2014 the next poll retries. INSERT OR REPLACE keeps
-  // the row count bounded by poolSize; refreshed_at is updated
-  // every poll so a stale-cache check could cull entries older
-  // than CHECK_INTERVAL_MS \xd7 2 (not implemented this phase \u2014
-  // pool_size shrinking is forbidden, so stale rows are at worst
-  // cosmetic).
+  // Persist into shard_storage_cache. Reachable shards have their
+  // measured bytes recorded; transient failures (bytesStored = -1
+  // sentinel from the catch above) are skipped — the next poll
+  // retries. INSERT OR REPLACE keeps the row count bounded by
+  // poolSize; refreshed_at is updated every poll so a stale-cache
+  // check could cull entries older than CHECK_INTERVAL_MS × 2 (not
+  // implemented — pool_size shrinking is forbidden, so stale rows
+  // are at worst cosmetic).
   for (const s of snapshots) {
     if (s.bytesStored < 0) continue;
     durableObject.sql.exec(
@@ -167,11 +159,11 @@ export async function monitorShardCapacity(
           bytesStored: s.bytesStored,
           softCapBytes: SOFT_CAP_BYTES,
           uniqueChunks: s.uniqueChunks,
-          // Phase 32 Fix 4 \u2014 placement skips this shard. Pool
-          // growth (Phase 23 `recordWriteUsage`) is still the
-          // primary capacity mechanism; this warning surfaces
-          // shards that are at-cap so operators can verify
-          // growth is keeping pace.
+          // Placement skips this shard. Pool growth
+          // (`recordWriteUsage`) is still the primary capacity
+          // mechanism; this warning surfaces shards that are
+          // at-cap so operators can verify growth is keeping
+          // pace.
           phase: "32-cap-aware",
         }
       );
@@ -188,13 +180,12 @@ export async function monitorShardCapacity(
 export const SHARD_SOFT_CAP_BYTES = SOFT_CAP_BYTES;
 
 /**
- * Phase 32 Fix 4 \u2014 read the persisted full-shard set from
- * `shard_storage_cache`. Each caller of `placeChunk` invokes
- * this once per write batch (one SQL query per batch \u2014
- * negligible) and threads the resulting set through every
- * `placeChunk` call in the batch. Cold cache (no rows) returns
- * an empty set, which preserves the deterministic placement
- * fast path in `placeChunk`.
+ * Read the persisted full-shard set from `shard_storage_cache`.
+ * Each caller of `placeChunk` invokes this once per write batch
+ * (one SQL query per batch — negligible) and threads the
+ * resulting set through every `placeChunk` call in the batch.
+ * Cold cache (no rows) returns an empty set, which preserves the
+ * deterministic placement fast path in `placeChunk`.
  */
 export function loadFullShards(
   durableObject: UserDOCore

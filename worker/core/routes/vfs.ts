@@ -505,8 +505,8 @@ vfs.post("/purge", async (c) => {
   }
 });
 
-// Phase 29 — archive / unarchive endpoints. Cosmetic-only hide;
-// reads remain unaffected. Both are idempotent — calling on an
+// Archive / unarchive endpoints. Cosmetic-only hide; reads remain
+// unaffected. Both are idempotent — calling on an
 // already-(un)archived path is a no-op.
 vfs.post("/archive", async (c) => {
   try {
@@ -639,7 +639,7 @@ vfs.post("/setYjsMode", async (c) => {
   }
 });
 
-// Phase 38 — Yjs snapshot read.
+// Yjs snapshot read.
 //
 // Returns `Y.encodeStateAsUpdate(doc)` bytes as `application/octet-stream`
 // so SDK consumers can decode the FULL Y.Doc and use any named shared
@@ -738,7 +738,7 @@ vfs.post("/openManifest", async (c) => {
     const body = await c.req.json<{ path: string }>();
     const path = expectPath(body);
 
-    // Phase 36b \u2014 Workers Cache for manifest JSON.
+    // Workers Cache for manifest JSON.
     //
     // Manifests are tiny (a few KB at most) but a gallery scroll
     // fans out 50+ openManifest + readPreview calls. The cache
@@ -794,12 +794,12 @@ vfs.post("/readChunk", async (c) => {
       );
     }
 
-    // Phase 36b \u2014 Workers Cache for chunk bytes.
+    // Workers Cache for chunk bytes.
     //
     // Chunks are content-addressed by SHA-256 hash so the
     // bytes for a (fileId, chunkIndex, headVersionId) triple are
     // immutable. Use the same per-user namespace pattern as
-    // readPreview / openManifest \u2014 cross-tenant requests will
+    // readPreview / openManifest — cross-tenant requests will
     // miss-and-refill rather than share entries (the chunks
     // themselves dedup at the ShardDO layer; cache duplication
     // is bounded by cache eviction).
@@ -833,12 +833,12 @@ vfs.post("/readChunk", async (c) => {
         // Per-version per-chunk-index immutable. Overwrites
         // create a new headVersionId → different cache key.
         "Cache-Control": "public, max-age=31536000, immutable",
-        // Phase 41 Fix 2 (audit 40B P1): Vary on Authorization so
-        // any intermediary CDN keys cached entries by Bearer token
-        // and never serves a tenant-A response to a tenant-B
-        // request whose URL happens to collide. The cache key
-        // already includes a per-user namespace; Vary is the wire
-        // assertion that downstream caches honour the same axis.
+        // Vary on Authorization so any intermediary CDN keys
+        // cached entries by Bearer token and never serves a
+        // tenant-A response to a tenant-B request whose URL
+        // happens to collide. The cache key already includes a
+        // per-user namespace; Vary is the wire assertion that
+        // downstream caches honour the same axis.
         Vary: "Authorization",
       },
     });

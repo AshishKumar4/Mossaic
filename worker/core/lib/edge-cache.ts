@@ -1,5 +1,5 @@
 /**
- * Workers Cache helper for read-heavy endpoints (Phase 36 + Phase 36b).
+ * Workers Cache helper for read-heavy endpoints.
  *
  * Wraps `caches.default` for surfaces where:
  *   - The response is bytes-with-stable-content-type
@@ -9,16 +9,14 @@
  *     the response. No active purge calls; structural bust via
  *     key-versioning instead.
  *
- * Phase 36 introduced this helper at `worker/app/lib/edge-cache.ts`
- * for three gallery surfaces. Phase 36b moves it to
- * `worker/core/lib/` so the core route layer (vfs-preview,
- * vfs-readChunk, vfs-openManifest) can use it too, and broadens
- * the cache-key shape with `extraKeyParts[]` so a surface can
- * fold in headVersionId + encryption fingerprint + variant
- * descriptor without bloating the type with one field per
- * surface.
+ * Lives in `worker/core/lib/` so the core route layer
+ * (vfs-preview, vfs-readChunk, vfs-openManifest) can use it
+ * alongside the App-mode gallery surfaces. The cache-key shape
+ * supports `extraKeyParts[]` so a surface can fold in
+ * headVersionId + encryption fingerprint + variant descriptor
+ * without bloating the type with one field per surface.
  *
- * Auth safety \u2014 four invariants:
+ * Auth safety — four invariants:
  *   1. `cache.match` runs AFTER caller-supplied auth verification.
  *      A cached response never serves an unauthenticated
  *      request.
@@ -27,13 +25,13 @@
  *      requires breaking SHA-256 / forging a share token.
  *   3. Bust tokens (`updatedAt`, `headVersionId`,
  *      `encryptionFingerprint`) advance on every write that
- *      changes the response bytes \u2014 stale-after-write is
+ *      changes the response bytes — stale-after-write is
  *      structurally impossible.
  *   4. Cached responses keep their original Cache-Control;
  *      intermediaries respect the shorter TTL of either
  *      the response or their own policy.
  *
- * @lean-invariant Mossaic.Vfs.Cache.bust_token_completeness \u2014
+ * @lean-invariant Mossaic.Vfs.Cache.bust_token_completeness —
  * the cache key must include every column any write path can
  * mutate AND that affects the response. See
  * `local/cache-staleness-audit.md` for the per-surface proof.
@@ -45,13 +43,11 @@
  * surfaces with overlapping (fileId, updatedAt) pairs never
  * collide.
  *
- *   - gthumb / gimg \u2014 gallery thumbnail / image (Phase 36).
- *   - simg \u2014 shared album image (Phase 36).
- *   - preview \u2014 vfs.readPreview rendered variant (Phase 36b).
- *   - chunk \u2014 vfs.readChunk + chunk-download endpoint
- *     (Phase 36b; replaces the inline pattern at
- *     multipart-routes.ts:514).
- *   - manifest \u2014 vfs.openManifest JSON (Phase 36b).
+ *   - gthumb / gimg — gallery thumbnail / image.
+ *   - simg — shared album image.
+ *   - preview — vfs.readPreview rendered variant.
+ *   - chunk — vfs.readChunk + chunk-download endpoint.
+ *   - manifest — vfs.openManifest JSON.
  */
 export type EdgeCacheSurfaceTag =
   | "gthumb"
@@ -82,7 +78,7 @@ export interface EdgeCacheOpts {
    */
   updatedAt: number;
   /**
-   * Phase 36b \u2014 free-form additional key components. Folded
+   * Free-form additional key components. Folded
    * into the URL path after `(namespace, fileId, updatedAt)`.
    * Use cases: headVersionId, encryptionFingerprint,
    * variantKind, rendererKind, chunkIndex, format. Each part
@@ -172,12 +168,12 @@ export async function edgeCacheServe(
 }
 
 /**
- * Phase 36b helper: short hex digest of a string. Useful for
- * folding arbitrary opaque inputs (e.g. encryption stamps,
- * variant descriptors with `/` characters) into a URL-safe
- * cache-key part. Synchronous + deterministic; not cryptographic
- * (the cache key isn't a security boundary, just a uniqueness
- * one \u2014 collisions would only confuse caches, not bypass auth).
+ * Short hex digest of a string. Useful for folding arbitrary
+ * opaque inputs (e.g. encryption stamps, variant descriptors
+ * with `/` characters) into a URL-safe cache-key part.
+ * Synchronous + deterministic; not cryptographic (the cache key
+ * isn't a security boundary, just a uniqueness one — collisions
+ * would only confuse caches, not bypass auth).
  *
  * Uses a small fnv1a-style hash over UTF-8 codepoints; 8 hex
  * chars (32 bits) is enough to disambiguate per-tenant

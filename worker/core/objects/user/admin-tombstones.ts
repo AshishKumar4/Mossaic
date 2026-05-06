@@ -1,12 +1,11 @@
 /**
- * Tombstoned-head reaper (Phase 25 — recovery primitive).
+ * Tombstoned-head reaper (recovery primitive).
  *
- * The Phase 25 fix made list/stat consistent for the steady-state
- * (listings filter tombstoned-head rows; the throw at
- * `helpers.ts:245` remains correct, matching `readFile` / `exists` /
- * S3 delete-marker semantics). But tenants whose data already
- * accumulated tombstoned heads BEFORE the fix shipped need an
- * explicit reaper to clean up.
+ * Steady-state list/stat consistency filters tombstoned-head rows;
+ * the throw at `helpers.ts:245` remains correct, matching
+ * `readFile` / `exists` / S3 delete-marker semantics. But tenants
+ * whose data already accumulated tombstoned heads BEFORE the
+ * filter shipped need an explicit reaper to clean up.
  *
  * Two strategies, operator's choice per call:
  *

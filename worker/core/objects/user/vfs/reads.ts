@@ -203,13 +203,14 @@ export function vfsReadManyStat(
       out.push(null);
       continue;
     }
-    // Phase 25 — tombstone-consistency. The per-path catch was
-    // previously scoped to `resolvePath` only; a versioned-tombstone
-    // ENOENT from `statForResolved` (helpers.ts:245) propagated and
-    // killed the whole batch. We now degrade ANY ENOENT (resolution
-    // failure OR tombstoned head) to `null` for that single entry,
-    // preserving the documented "missing path becomes null" contract
-    // at the JSDoc above.
+    // Tombstone-consistency. The per-path catch must cover BOTH
+    // `resolvePath` failures AND `statForResolved`'s versioned-
+    // tombstone ENOENT (helpers.ts:245). Otherwise a single
+    // tombstoned head would propagate ENOENT and kill the whole
+    // batch. We degrade ANY ENOENT (resolution failure OR
+    // tombstoned head) to `null` for that single entry, preserving
+    // the documented "missing path becomes null" contract at the
+    // JSDoc above.
     try {
       out.push(
         statForResolved(
@@ -359,9 +360,9 @@ async function readFileVersioned(
   const env = durableObject.envPublic;
   const out = new Uint8Array(size);
 
-  // Phase 39 B2/B3 — per-shard batched RPC fan-out (mirrors the
-  // Phase-8 read path above). Group chunk-row indices by shard,
-  // issue ONE `getChunksBatch(...)` RPC per shard in parallel.
+  // Per-shard batched RPC fan-out (mirrors the non-versioned read
+  // path above). Group chunk-row indices by shard, issue ONE
+  // `getChunksBatch(...)` RPC per shard in parallel.
   const offsets = new Array<number>(chunkRows.length);
   {
     let acc = 0;
@@ -425,15 +426,15 @@ export async function vfsReadFile(
     throw new VFSError("EINVAL", `readFile: not a regular file: ${path}`);
   }
 
-  // Phase 25 Fix 12 — head-tombstone check BEFORE the yjs
-  // short-circuit. Pre-fix, a yjs-mode file whose head version was
-  // tombstoned (`unlink` under versioning-on) returned live yjs
-  // bytes here while `vfsStat` / `vfsExists` / `vfsListFiles` all
-  // reported the path as gone. Result: list/stat say "no", readFile
-  // says "yes" — a direct cross-surface contradiction. Now an
-  // explicit head-tombstone shortcuts to ENOENT regardless of mode.
-  // (An explicit `opts.versionId` for a non-tombstoned historical
-  // version still works through `readFileVersioned` below.)
+  // Head-tombstone check BEFORE the yjs short-circuit. Without
+  // this, a yjs-mode file whose head version was tombstoned
+  // (`unlink` under versioning-on) would return live yjs bytes
+  // here while `vfsStat` / `vfsExists` / `vfsListFiles` all
+  // reported the path as gone — a direct cross-surface
+  // contradiction. The explicit head-tombstone shortcut to ENOENT
+  // applies regardless of mode. (An explicit `opts.versionId` for
+  // a non-tombstoned historical version still works through
+  // `readFileVersioned` below.)
   const headRow = durableObject.sql
     .exec(
       `SELECT f.head_version_id, fv.deleted AS head_deleted
@@ -539,13 +540,13 @@ export async function vfsReadFile(
   const env = durableObject.envPublic;
   const out = new Uint8Array(row.file_size);
 
-  // Phase 39 B2/B3 — per-shard batched RPC fan-out.
+  // Per-shard batched RPC fan-out.
   //
-  // Previous architecture (H3, 8-way concurrent `stub.fetch` per
-  // chunk) issued ONE RPC per chunk. For a 100-chunk file landing
-  // across 32 shards, that was 100 round trips at ~10–30 ms each.
+  // A naive 8-way concurrent `stub.fetch` per chunk issues ONE RPC
+  // per chunk. For a 100-chunk file landing across 32 shards,
+  // that's 100 round trips at ~10–30 ms each.
   //
-  // New architecture: group chunks by shard_index, issue ONE
+  // Better: group chunks by shard_index, issue ONE
   // `getChunksBatch(hashesOnThatShard)` typed RPC per shard, all
   // dispatched in parallel without intermediate awaits (CF Workers
   // RPC promise pipelining). Round trips drop to O(touched shards),
@@ -634,20 +635,21 @@ export async function vfsOpenManifest(
   if (r.kind !== "file") {
     throw new VFSError("EINVAL", `openManifest: not a regular file: ${path}`);
   }
-  // Phase 25 Fix 10 — tombstone-consistency at the chunked-read
-  // boundary. The download-token path (`/api/vfs/download-token` →
+  // Tombstone-consistency at the chunked-read boundary. The
+  // download-token path (`/api/vfs/download-token` →
   // multipart-routes.ts) drives this RPC; without the head check
   // the SDK could obtain a manifest pointing at legacy chunks for
   // a path whose head has been tombstoned, then issue chunk GETs
   // and stream stale bytes for an "unlinked" file. Same ENOENT
   // semantics as `vfsStat` and `vfsReadFile`.
   //
-  // Phase 27.5 — also pull `mode_yjs` so we can short-circuit yjs
-  // files. Yjs content lives in `yjs_oplog` + `yjs_checkpoints`,
-  // NOT in `file_chunks` / `version_chunks`. Pre-fix, openManifest
-  // returned a stale legacy manifest (often size=0, chunks=[]) for
-  // yjs files; the SDK then issued chunk GETs and got nothing
-  // (or worse: a stale pre-yjs-toggle chunk).
+  // Also pull `mode_yjs` so we can short-circuit yjs files. Yjs
+  // content lives in `yjs_oplog` + `yjs_checkpoints`, NOT in
+  // `file_chunks` / `version_chunks`. Without the short-circuit,
+  // openManifest would return a stale legacy manifest (often
+  // size=0, chunks=[]) for yjs files; the SDK would then issue
+  // chunk GETs and get nothing (or worse: a stale pre-yjs-toggle
+  // chunk).
   const row = durableObject.sql
     .exec(
       `SELECT f.file_id, f.file_size, f.chunk_size, f.chunk_count,
@@ -687,8 +689,8 @@ export async function vfsOpenManifest(
     );
   }
 
-  // Phase 27.5 — yjs-mode short-circuit. Materialize the live Y.Doc
-  // once and report it as inlined. Caller (download-token route)
+  // Yjs-mode short-circuit. Materialize the live Y.Doc once and
+  // report it as inlined. Caller (download-token route)
   // sees `inlined: true, chunks: []` and serves the bytes out of
   // band via `vfsReadChunk(path, 0)` (which has the same yjs
   // short-circuit). This matches `vfsReadFile`'s behavior at
@@ -800,15 +802,15 @@ export async function vfsReadChunk(
   if (r.kind !== "file") {
     throw new VFSError("EINVAL", `readChunk: not a regular file: ${path}`);
   }
-  // Phase 25 Fix 10 — tombstone gate + versioned-byte-source.
-  // Without this, a download-token chunk fetch for a tombstoned-head
-  // path would silently stream legacy `file_chunks` bytes ("unlinked"
-  // data exposure). For non-tombstoned versioned tenants we also
-  // route through `version_chunks` so chunks reflect the head
-  // version, matching `readFileVersioned`.
+  // Tombstone gate + versioned-byte-source. Without this, a
+  // download-token chunk fetch for a tombstoned-head path would
+  // silently stream legacy `file_chunks` bytes ("unlinked" data
+  // exposure). For non-tombstoned versioned tenants we also route
+  // through `version_chunks` so chunks reflect the head version,
+  // matching `readFileVersioned`.
   //
-  // Phase 27.5 — also pull `mode_yjs` so yjs files materialize from
-  // the live Y.Doc, matching `vfsReadFile` and `vfsOpenManifest`.
+  // Also pull `mode_yjs` so yjs files materialize from the live
+  // Y.Doc, matching `vfsReadFile` and `vfsOpenManifest`.
   const inlineRow = durableObject.sql
     .exec(
       `SELECT f.inline_data, f.mode_yjs, f.head_version_id,
@@ -836,8 +838,8 @@ export async function vfsReadChunk(
       `readChunk: head version is a tombstone for ${path}`
     );
   }
-  // Phase 27.5 — yjs-mode: materialize and serve as a single chunk.
-  // Caller's manifest reported `inlined: true, chunks: []`; only
+  // Yjs-mode: materialize and serve as a single chunk. Caller's
+  // manifest reported `inlined: true, chunks: []`; only
   // chunkIndex===0 is valid and returns the full materialized bytes.
   if (inlineRow.mode_yjs === 1) {
     if (chunkIndex !== 0) {
@@ -883,8 +885,8 @@ export async function vfsReadChunk(
       scope.sub,
       verChunkRow.shard_index
     );
-    // Phase 39 B1 — typed `getChunkBytes` RPC instead of HTTP-style
-    // `stub.fetch`. One IPC hop, no Response/arrayBuffer marshalling.
+    // Typed `getChunkBytes` RPC instead of HTTP-style `stub.fetch`.
+    // One IPC hop, no Response/arrayBuffer marshalling.
     const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
     const stub = shardNs.get(shardNs.idFromName(shardName));
     const buf = await stub.getChunkBytes(verChunkRow.chunk_hash);
@@ -923,7 +925,7 @@ export async function vfsReadChunk(
   }
   const env = durableObject.envPublic;
   const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, chunkRow.shard_index);
-  // Phase 39 B1 — typed `getChunkBytes` RPC.
+  // Typed `getChunkBytes` RPC.
   const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
   const stub = shardNs.get(shardNs.idFromName(shardName));
   const buf = await stub.getChunkBytes(chunkRow.chunk_hash);

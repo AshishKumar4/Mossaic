@@ -79,8 +79,8 @@ export async function vfsReadPreview(
   // the entire pipeline; mime_type drives renderer dispatch;
   // file_name + file_size feed the renderer's RenderInput.
   //
-  // Phase 25 — tombstone-consistency. Also pull `head_version_id`
-  // so we can refuse readPreview on a tombstoned-head row, matching
+  // Tombstone-consistency. Also pull `head_version_id` so we can
+  // refuse readPreview on a tombstoned-head row, matching
   // `vfsStat` / `vfsReadFile` semantics (helpers.ts:245,
   // reads.ts:305-311). Without this check, an SPA gallery
   // thumbnail load on an unlinked-under-versioning file would
@@ -131,8 +131,8 @@ export async function vfsReadPreview(
 
   const mimeType = fileRow.mime_type ?? "application/octet-stream";
   const fileName = fileRow.file_name;
-  // Phase 27.5 — when the tenant has versioning enabled, the
-  // truth-of-record for size is the head version row, not
+  // When the tenant has versioning enabled, the truth-of-record
+  // for size is the head version row, not
   // `files.file_size` (which `commitVersion` does NOT keep in sync).
   // Renderers receive `fileSize` and use it for memory budgeting and
   // decode validation; passing 0 (the stale legacy value) trips
@@ -154,8 +154,8 @@ export async function vfsReadPreview(
   const variantKind: Variant = opts.variant ?? "thumb";
   const variantKey = encodeVariantKey(variantKind);
 
-  // Phase 28 Fix 1 — gate cache lookup on the file's current
-  // head_version_id. After a versioned-write that supersedes the
+  // Gate cache lookup on the file's current head_version_id.
+  // After a versioned-write that supersedes the
   // prior head, cached variant rows for the prior version cease to
   // match (their `version_id` column != current head), forcing a
   // re-render instead of serving STALE bytes for the new head.
@@ -167,8 +167,8 @@ export async function vfsReadPreview(
   // EMOSSAIC_UNAVAILABLE-fallback chain the writer might have used:
   //   image/* sources → image-passthrough then icon-card
   //   non-image      → icon-card only
-  // (Phase 39 A3.) Track which kind we hit so a stale-chunk
-  // recovery can target the correct row.
+  // Track which kind we hit so a stale-chunk recovery can target
+  // the correct row.
   let row = findVariantRow(
     durableObject,
     fileId,
@@ -200,7 +200,7 @@ export async function vfsReadPreview(
   if (row !== null) {
     const env = durableObject.envPublic;
     const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, row.shardIndex);
-    // Phase 39 B1 — typed `getChunkBytes` RPC for the variant blob.
+    // Typed `getChunkBytes` RPC for the variant blob.
     const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
     const stub = shardNs.get(shardNs.idFromName(shardName));
     const bytes = await stub.getChunkBytes(row.chunkHash);
@@ -241,8 +241,8 @@ export async function vfsReadPreview(
   );
   // Resolve the renderer_kind that was actually persisted. The
   // EMOSSAIC_UNAVAILABLE branch in renderAndStoreVariant could have
-  // chosen image-passthrough (image/* sources) or icon-card (others)
-  // — Phase 39 A3.
+  // chosen image-passthrough (image/* sources) or icon-card
+  // (others).
   const persistedRow = findVariantRow(
     durableObject,
     fileId,

@@ -390,13 +390,13 @@ export function recordWriteUsage(
   deltaBytes: number,
   deltaFiles: number,
   /**
-   * Phase 32 Fix 5 — inline-tier byte accounting. Positive on
-   * inline-tier writes, negative on inline-tier deletes. Defaults
-   * to 0 so legacy callers (every site outside `commitInlineTier`
-   * and `hardDeleteFileRow` for inline rows) keep their existing
+   * Inline-tier byte accounting. Positive on inline-tier writes,
+   * negative on inline-tier deletes. Defaults to 0 so legacy
+   * callers (every site outside `commitInlineTier` and
+   * `hardDeleteFileRow` for inline rows) keep their existing
    * behaviour. Used to gate the inline tier at `INLINE_TIER_CAP`
-   * (1 GiB) per tenant — beyond which `vfsWriteFile` falls
-   * through to the chunked tier even for ≤ INLINE_LIMIT inputs.
+   * (1 GiB) per tenant — beyond which `vfsWriteFile` falls through
+   * to the chunked tier even for ≤ INLINE_LIMIT inputs.
    */
   deltaInlineBytes: number = 0
 ): void {
@@ -408,13 +408,11 @@ export function recordWriteUsage(
      VALUES (?, 0, 107374182400, 0, 32)`,
     userId
   );
-  // Phase 32 — clamp at zero on negative deltas. Phase 32 Fix 5
-  // accepts negative `deltaInlineBytes` from
-  // `hardDeleteFileRow` for inline-row deletes; full
-  // `storage_used` decrement on every destructive path is
-  // deferred to Phase 32.5 (cosmetic; pool growth is monotonic
-  // by design so the inflation doesn't impact scaling). The
-  // clamp is defensive against any historical drift.
+  // Clamp at zero on negative deltas. `deltaInlineBytes` accepts
+  // negative values from `hardDeleteFileRow` for inline-row
+  // deletes. The clamp is defensive against any historical drift
+  // (pool growth is monotonic by design so any over-count is
+  // cosmetic and doesn't impact scaling).
   durableObject.sql.exec(
     `UPDATE quota
         SET storage_used = MAX(0, storage_used + ?),

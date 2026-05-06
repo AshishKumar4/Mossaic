@@ -1,5 +1,5 @@
 /**
- * Phase 42 \u2014 audit_log infrastructure.
+ * Audit_log infrastructure.
  *
  * Every destructive operation (unlink, purge, archive,
  * unarchive, restoreVersion, dropVersions, admin*, account
@@ -25,13 +25,13 @@
  *
  * Retention: oldest rows are reaped by the alarm sweeper once
  * count exceeds `AUDIT_LOG_MAX_ROWS`. Reaping deletes
- * `(count - target_floor)` rows in one DELETE \u2014 bounded SQL
+ * `(count - target_floor)` rows in one DELETE — bounded SQL
  * cost regardless of how many rows accumulated since the
  * previous sweep.
  *
  * Payload shape: small JSON. Callers stringify their own
  * structured object; the helper takes a string and stores it
- * verbatim. Keep payloads under ~1 KB \u2014 large payloads bloat
+ * verbatim. Keep payloads under ~1 KB — large payloads bloat
  * the DO storage.
  */
 
