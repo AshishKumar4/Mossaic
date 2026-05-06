@@ -1,0 +1,27 @@
+{
+  "name": "mossaic",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-03-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "assets": {
+    "directory": "dist",
+    "not_found_handling": "single-page-application",
+    "binding": "ASSETS",
+    "run_worker_first": true
+  },
+
+  "durable_objects": {
+    "bindings": [
+      { "name": "USER_DO", "class_name": "UserDO" },
+      { "name": "SHARD_DO", "class_name": "ShardDO" }
+    ]
+  },
+
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["UserDO", "ShardDO"]
+    }
+  ]
+}
