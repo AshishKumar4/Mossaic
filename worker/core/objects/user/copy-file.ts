@@ -30,6 +30,7 @@ import type { ShardDO } from "../shard/shard-do";
 import { VFSError, type VFSScope } from "../../../../shared/vfs-types";
 import { generateId, vfsShardDOName } from "../../lib/utils";
 import { commitVersion, isVersioningEnabled, shardRefId } from "./vfs-versions";
+import { findLiveFile } from "./vfs/helpers";
 
 interface CopyOpts {
   metadataEncoded?: Uint8Array | null | undefined;
@@ -332,6 +333,73 @@ async function copyInline(
     inlineData
   );
   await durableObject.scheduleStaleUploadSweep();
+
+  // Phase 27 Fix 7 — under versioning ON, copy must NOT hard-delete
+  // the destination's prior history. The non-versioned source carries
+  // no `head_version_id`, but the destination tenant may have
+  // versioning enabled and the dest path may already be a versioned
+  // file. Route through commitVersion when versioning is ON; the
+  // bytes are inline so we attach them directly to the version row.
+  const versioning = isVersioningEnabled(durableObject, userId);
+  if (versioning) {
+    const liveDst = findLiveFile(durableObject, userId, parentId, leaf);
+    let pathId: string;
+    if (liveDst) {
+      pathId = liveDst.file_id;
+    } else {
+      await opsMod.commitRename(
+        durableObject,
+        userId,
+        scope,
+        tmpId,
+        parentId,
+        leaf
+      );
+      pathId = tmpId;
+    }
+    const versionId = generateId();
+    commitVersion(durableObject, {
+      pathId,
+      versionId,
+      userId,
+      size: srcRow.file_size,
+      mode: srcRow.mode,
+      mtimeMs: now,
+      chunkSize: 0,
+      chunkCount: 0,
+      fileHash: srcRow.file_hash,
+      mimeType: srcRow.mime_type,
+      inlineData,
+      userVisible: opts.versionUserVisible ?? true,
+      label: opts.versionLabel,
+      metadata: opts.metadataEncoded ?? null,
+    });
+    if (liveDst) {
+      // Drop the tmp row WITHOUT chunk fan-out (no chunks were
+      // written to shards for the inline tier).
+      durableObject.sql.exec(
+        "DELETE FROM file_tags WHERE path_id = ?",
+        tmpId
+      );
+      durableObject.sql.exec(
+        "DELETE FROM files WHERE file_id = ?",
+        tmpId
+      );
+    }
+    // Apply commit-time side effects (metadata + tags) to the
+    // path-stable identity.
+    await applyCopySideEffects(
+      durableObject,
+      userId,
+      pathId,
+      opts,
+      now,
+      srcRow.file_id
+    );
+    return;
+  }
+
+  // Versioning OFF — pre-Phase-27 behaviour preserved.
   await opsMod.commitRename(
     durableObject,
     userId,
@@ -520,10 +588,30 @@ async function copyVersioned(
 
   const newVersionId = generateId();
 
+  // Phase 27 Fix 7 — when destination already has a versioned live
+  // row, attach the new version to its `pathId` instead of `tmpId`
+  // so prior history survives the copy.
+  const liveDst = findLiveFile(durableObject, userId, parentId, leaf);
+  let pathId: string;
+  if (liveDst) {
+    pathId = liveDst.file_id;
+  } else {
+    // No prior path — promote the tmp row.
+    await opsMod.commitRename(
+      durableObject,
+      userId,
+      scope,
+      tmpId,
+      parentId,
+      leaf
+    );
+    pathId = tmpId;
+  }
+
   if (srcHead.inlineData) {
     // Inline-tier version: just snapshot the bytes.
     commitVersion(durableObject, {
-      pathId: tmpId,
+      pathId,
       versionId: newVersionId,
       userId,
       size: srcHead.size,
@@ -542,15 +630,19 @@ async function copyVersioned(
       // the same mode so SDK readFile knows to decrypt.
       encryption: srcHead.encryption,
     });
-    await opsMod.commitRename(
-      durableObject,
-      userId,
-      scope,
-      tmpId,
-      parentId,
-      leaf
-    );
-    await applyCopySideEffects(durableObject, userId, tmpId, opts, now, srcRow.file_id);
+    if (liveDst) {
+      // Drop the redundant tmp row WITHOUT chunk fan-out (inline
+      // bytes live in the file_versions row, not on shards).
+      durableObject.sql.exec(
+        "DELETE FROM file_tags WHERE path_id = ?",
+        tmpId
+      );
+      durableObject.sql.exec(
+        "DELETE FROM files WHERE file_id = ?",
+        tmpId
+      );
+    }
+    await applyCopySideEffects(durableObject, userId, pathId, opts, now, srcRow.file_id);
     return;
   }
 
@@ -615,8 +707,14 @@ async function copyVersioned(
     throw err;
   }
 
+  // Phase 27 Fix 7 — chunked copy commits the new version onto the
+  // destination's stable pathId (resolved above). chunk_refs were
+  // filed under `newRefId = shardRefId(tmpId, newVersionId)`; we
+  // stamp that as `shard_ref_id` so a future `dropVersionRows`
+  // fan-out keys ShardDO `deleteChunks` correctly when the version
+  // is reaped.
   commitVersion(durableObject, {
-    pathId: tmpId,
+    pathId,
     versionId: newVersionId,
     userId,
     size: srcHead.size,
@@ -630,18 +728,29 @@ async function copyVersioned(
     userVisible: opts.versionUserVisible ?? true,
     label: opts.versionLabel,
     metadata: opts.metadataEncoded ?? null,
-    // see inline branch above. Chunked copy preserves source mode.
     encryption: srcHead.encryption,
+    shardRefId: newRefId,
   });
-  await opsMod.commitRename(
-    durableObject,
-    userId,
-    scope,
-    tmpId,
-    parentId,
-    leaf
-  );
-  await applyCopySideEffects(durableObject, userId, tmpId, opts, now, srcRow.file_id);
+  if (liveDst) {
+    // Drop the redundant tmp row + its file_chunks (which the new
+    // version doesn't reference — chunks are owned via
+    // version_chunks under newVersionId, refed on shards via
+    // newRefId). Skip the shard fan-out: chunks belong to the new
+    // version.
+    durableObject.sql.exec(
+      "DELETE FROM file_chunks WHERE file_id = ?",
+      tmpId
+    );
+    durableObject.sql.exec(
+      "DELETE FROM file_tags WHERE path_id = ?",
+      tmpId
+    );
+    durableObject.sql.exec(
+      "DELETE FROM files WHERE file_id = ?",
+      tmpId
+    );
+  }
+  await applyCopySideEffects(durableObject, userId, pathId, opts, now, srcRow.file_id);
 }
 
 async function preflightChunksAlive(

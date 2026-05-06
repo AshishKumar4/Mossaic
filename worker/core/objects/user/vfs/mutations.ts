@@ -651,8 +651,49 @@ export async function vfsRemoveRecursive(
     )
     .toArray() as { file_id: string }[];
 
+  // Phase 27 Fix 5 — under versioning ON, recursive remove must
+  // tombstone each file instead of hard-deleting it. The audit
+  // sub-agent found that `hardDeleteFileRow` on a versioning-on
+  // tenant silently destroyed prior version history AND leaked
+  // ShardDO chunk_refs (file_chunks is empty for versioned writes;
+  // chunks live in version_chunks under
+  // `${pathId}#${versionId}` or `uploadId` — neither reachable
+  // from `hardDeleteFileRow`'s `file_chunks`-keyed fan-out). Each
+  // tombstoned path's history remains in `file_versions`,
+  // accessible via `listVersions` + `restoreVersion`. Operators
+  // who want full destruction should use `vfsPurge(path)` or
+  // `adminReapTombstonedHeads`.
+  const versioning = isVersioningEnabled(durableObject, userId);
   for (const f of fileRows) {
-    await hardDeleteFileRow(durableObject, userId, scope, f.file_id);
+    if (versioning) {
+      const tombId = generateId();
+      const now = Date.now();
+      commitVersion(durableObject, {
+        pathId: f.file_id,
+        versionId: tombId,
+        userId,
+        size: 0,
+        mode: 0,
+        mtimeMs: now,
+        chunkSize: 0,
+        chunkCount: 0,
+        fileHash: "",
+        mimeType: "application/octet-stream",
+        inlineData: null,
+        deleted: true,
+      });
+      // Free the unique-index slot — same shape as `vfsRename`'s
+      // versioning-overwrite branch. The path resolution surface
+      // (Phase 25) filters tombstoned-head rows out of listings.
+      durableObject.sql.exec(
+        "UPDATE files SET file_name = ?, updated_at = ? WHERE file_id = ?",
+        `${f.file_id}.tombstoned-${now}`,
+        now,
+        f.file_id
+      );
+    } else {
+      await hardDeleteFileRow(durableObject, userId, scope, f.file_id);
+    }
   }
 
   // If the batch was full, we have more work — caller should loop.
