@@ -13,10 +13,13 @@
     "noEmit": true,
     "declaration": true,
     "declarationMap": false,
+    "verbatimModuleSyntax": true,
+    "erasableSyntaxOnly": true,
+    "customConditions": ["workspace"],
     "types": ["@cloudflare/workers-types"],
     "paths": {
       "@shared/*": ["../shared/*"]
     }
   },
-  "include": ["src", "../shared", "../worker"]
+  "include": ["src", "src/types", "../shared", "../worker/core"]
 }

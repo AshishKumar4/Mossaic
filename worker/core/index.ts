@@ -32,8 +32,9 @@
  */
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import type { Env } from "@shared/types";
+import type { Env } from "../../shared/types";
 import vfsRoutes from "./routes/vfs";
+import yjsWsRoutes from "./routes/vfs-yjs-ws";
 
 export { UserDOCore } from "./objects/user/index";
 export { ShardDO } from "./objects/shard/index";
@@ -48,6 +49,12 @@ app.use(
     allowHeaders: ["Content-Type", "Authorization"],
   })
 );
+
+// Phase 13.5 — public Yjs WebSocket upgrade route. Mounted BEFORE the
+// /api/vfs/* HTTP fallback so the more-specific path wins. Bearer auth
+// (header or Sec-WebSocket-Protocol subprotocol) gates the upgrade;
+// the underlying DO's own /yjs/ws handler does the protocol work.
+app.route("/api/vfs/yjs", yjsWsRoutes);
 
 // Phase 7 HTTP fallback for non-Worker consumers — Bearer VFS token
 // auth, typed UserDOCore RPC under the hood.

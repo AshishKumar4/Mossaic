@@ -97,8 +97,23 @@ export type {
 // the SDK's pure-VFS contract. Consumers who need semantic search
 // should run their own Vectorize index or DO; nothing in the VFS
 // surface (UserDO + ShardDO) depends on SearchDO.
-export { UserDOCore as UserDO } from "../../worker/core/objects/user/index";
-export { ShardDO } from "../../worker/core/objects/shard/index";
+//
+// Phase 14: ALSO re-export under the canonical `MossaicUserDO` /
+// `MossaicShardDO` names. Both pairs reach the same underlying
+// class; new workspace consumers should prefer the canonical
+// names so their wrangler `class_name` strings clearly identify
+// the SDK origin. Existing `UserDO` / `ShardDO` re-exports stay
+// for back-compat — production wrangler at
+// mossaic.ashishkumarsingh.com binds `class_name: "UserDO"` and
+// must not be disturbed.
+export {
+  UserDOCore as UserDO,
+  UserDOCore as MossaicUserDO,
+} from "../../worker/core/objects/user/index";
+export {
+  ShardDO,
+  ShardDO as MossaicShardDO,
+} from "../../worker/core/objects/shard/index";
 
 // VFSScope is the wire shape of the multi-tenant scope; consumers
 // rarely need it directly but isomorphic-git plugins or HTTP fallback

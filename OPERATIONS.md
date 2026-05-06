@@ -280,16 +280,26 @@ Subrequest budget per Mossaic invocation:
 
 - All outstanding VFS-bearer tokens become invalid (401 from `/api/vfs/*`). Clients must re-fetch tokens from the operator.
 - All outstanding **listFiles cursors** become invalid (EINVAL on next page). Clients must restart pagination.
+- All outstanding **`@mossaic/cli` profiles** with the old secret become invalid; operators must re-run `mossaic auth setup --secret <newvalue>` on their workstations.
 - No data loss. No downtime if the new secret is published BEFORE clients refresh tokens.
 
 **Procedure**:
 
-1. Generate the new secret: `openssl rand -base64 48`.
+1. Generate the new secret: `openssl rand -base64 48` (or `node -e "console.log(require('crypto').randomBytes(48).toString('base64url'))"`).
 2. Decide the cutover window. Notify SDK consumers: "tokens issued before <T> will be rejected after <T+grace>."
 3. `wrangler secret put JWT_SECRET <newvalue>`. Wait <60 s for propagation.
-4. (Optional) For a graceful rollover, deploy a 2-secret variant temporarily — Mossaic does NOT support this natively today. The hard cutover is the supported flow.
-5. Re-issue tokens to consumers via `signVFSToken(env, ...)` calls.
-6. Monitor 401 rate; spike + decay over the rollover window is expected.
+4. **Choose scope** carefully:
+   - **Service-mode only** (`-c deployments/service/wrangler.jsonc`): rotates the `mossaic-core` deploy that serves SDK consumers + the CLI. Photo-app users are unaffected.
+   - **App-mode only** (root `wrangler.jsonc`): rotates `mossaic.ashishkumarsingh.com`; **every active photo-app user is logged out** and must re-login. Schedule a maintenance window.
+   - **Both**: required if the same secret is shared across deploys. Run service-mode first, then app-mode within the maintenance window.
+5. (Optional) For a graceful rollover, deploy a 2-secret variant temporarily — Mossaic does NOT support this natively today. The hard cutover is the supported flow.
+6. Re-issue tokens to consumers via `signVFSToken(env, ...)` calls.
+7. Update operator workstations: `mossaic auth setup --secret <newvalue> --tenant <existing> --name <existing>`.
+8. Monitor 401 rate; spike + decay over the rollover window is expected.
+
+**Phase 13.5 rotation history**:
+
+- 2026-04-29 — Service-mode (`mossaic-core`) only. App-mode (`mossaic`) untouched. Reason: deployed the new `/api/vfs/yjs/ws`, `/api/vfs/setYjsMode`, `/api/vfs/flushYjs`, and `/api/vfs/admin/setVersioning` HTTP routes; rotated the secret as part of the test-harness gating. Photo-app users unaffected.
 
 ### 5.5 — Tenant export / import
 

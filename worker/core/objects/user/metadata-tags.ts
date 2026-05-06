@@ -10,7 +10,7 @@
  */
 
 import type { UserDOCore as UserDO } from "./user-do-core";
-import { deepMerge } from "@shared/metadata-merge";
+import { deepMerge } from "../../../../shared/metadata-merge";
 
 /**
  * Read `files.metadata` for a path. Returns the parsed JSON object,

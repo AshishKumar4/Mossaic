@@ -1,2 +1,4 @@
 packages:
   - sdk
+  - cli
+  - tests/integrations/workspace-consumer

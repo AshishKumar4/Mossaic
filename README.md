@@ -6,6 +6,33 @@ Mossaic exposes a Node `fs/promises`-shaped API over a content-addressed, dedupl
 
 Files are split into 1 MB chunks, SHA-256 hashed, distributed across a dynamic pool of Durable Object shards via rendezvous hashing, and transferred in parallel. Identical bytes are stored once per tenant; tenants are isolated by construction; per-file CRDT mode runs over a Hibernation-API WebSocket at $0 idle cost; critical correctness invariants are formally proved in Lean 4 with Mathlib.
 
+```mermaid
+flowchart LR
+    Clients["Clients<br/>React SPA · SDK consumer Worker<br/>@mossaic/cli · HTTP client"]
+
+    subgraph CF["Cloudflare Workers"]
+        Worker["Hono Worker Router<br/>(legacy + /api/vfs/*)"]
+        UserDO["UserDO<br/>(per-tenant: manifests,<br/>versioning, Yjs runtime)"]
+
+        subgraph Shards["ShardDO Pool (n shards)"]
+            S0["ShardDO 0"]
+            S1["ShardDO 1"]
+            S2["ShardDO 2"]
+            Sn["ShardDO n..."]
+        end
+    end
+
+    Clients -- "parallel chunk<br/>upload / download" --> Worker
+    Clients -- "Yjs WebSocket<br/>(live collab)" --> Worker
+    Worker -- "MOSSAIC_USER<br/>RPC + WSS upgrade" --> UserDO
+    UserDO -- "MOSSAIC_SHARD<br/>fan-out via<br/>rendezvous hash" --> S0
+    UserDO --> S1
+    UserDO --> S2
+    UserDO --> Sn
+```
+
+> See **[Detailed architecture](#detailed-architecture)** below for the full Phase 14 surface — Service-mode vs App-mode split, Phase 12 metadata + tags + indexed listFiles, Phase 13 Yjs awareness relay, copyFile chunk-refcount semantics, and the three storage tiers.
+
 ---
 
 ## Two products in one repo
@@ -14,6 +41,7 @@ Files are split into 1 MB chunks, SHA-256 hashed, distributed across a dynamic p
 |---|---|---|
 | **Storage app** | A runnable photo library / file manager — drag-and-drop uploads, justified-grid gallery, lightbox, albums, analytics dashboard. Live at [mossaic.ashishkumarsingh.com](https://mossaic.ashishkumarsingh.com). | `src/` (React SPA) + `worker/` (Hono router + DOs) |
 | **`@mossaic/sdk`** | An npm package any Cloudflare Worker can consume to embed Mossaic as a `fs/promises`-shaped VFS. Multi-tenant scoping, streaming, isomorphic-git compatible, per-file Yjs CRDT mode, typed errors, HTTP fallback for non-Worker consumers. | `sdk/` — see **[`sdk/README.md`](./sdk/README.md)** for the full DX walkthrough |
+| **`@mossaic/cli`** | A Node 20+ CLI (`mossaic` / `mscli`) that drives a deployed Mossaic Service worker over HTTP/WSS. Mints VFS tokens locally, exposes every public SDK method as a verb, supports live Yjs editing over `wss://…/api/vfs/yjs/ws`. | `cli/` — see **[`cli/README.md`](./cli/README.md)** for the full command reference |
 
 Both share the same Durable Object backend (`UserDO`, `ShardDO`, `SearchDO`) and the same chunking / placement primitives in `shared/`.
 
@@ -88,66 +116,34 @@ await handle.close();
 
 ---
 
-## Architecture
+## `@mossaic/cli` — command-line tool against a deployed Mossaic worker
 
-```
-                   ┌─────────────────────────────────────────────────────┐
-                   │  DO instance ID  =  vfs:${ns}:${tenant}[:${sub}]    │
-                   │  (per-tenant scoping; cross-tenant data unreachable)│
-                   └─────────────────────────────────────────────────────┘
+For operations and scripting workflows that don't run inside a Cloudflare Worker, `@mossaic/cli` (binary `mossaic`, alias `mscli`) speaks to a deployed Mossaic Service worker over HTTPS + WSS. It mints VFS-scoped JWTs locally (matching `worker/core/lib/auth.ts:signVFSToken`) using the operator's `JWT_SECRET`, and exposes every public SDK method as a CLI verb.
 
-  Consumer Worker / SPA                  Cloudflare Workers runtime
-  ─────────────────────                  ─────────────────────────────────
-                          DO RPC
-   createVFS(env, opts) ─────────────►  ┌──────────────────────────┐
-   vfs.readFile / writeFile / ...       │         UserDO           │
-   vfs.stat / readdir / unlink          │  (per-tenant)            │
-                                        │                          │
-                                        │  • auth, manifests,      │
-                                        │    folders, quota        │
-                                        │  • file-level versioning │
-                                        │  • inline tier (≤16 KB)  │  ◄── tier 1
-                                        │    stays in UserDO row   │      no fanout
-                                        │  • atomic temp→commit    │
-                                        │  • Yjs runtime (per-file)│
-                                        └────┬───────────┬─────────┘
-                                             │           │
-   Live editor client                        │           │
-   (browser / Worker)                        │           │
-        │                                    │           │
-        │   WebSocket upgrade                │           │  DO RPC: rendezvous-
-        │   (Hibernation API,                │           │  hashed chunk fanout
-        │    $0 idle, binary frames,         │           │
-        │    Yjs sync protocol)              │           ▼
-        └────────────────────────────────►   │  ┌──────────────────────────┐
-                                             │  │  ShardDO pool (n shards) │
-                                             │  │                          │
-                                             │  │  • normal chunks         │  ◄── tier 2
-                                             │  │    (1 MB, content-       │      blob storage
-                                             │  │     addressed, refct'd)  │
-                                             │  │  • Yjs op-log + check-   │  ◄── tier 3
-                                             │  │    point chunks (mode_   │      live CRDT
-                                             │  │     yjs files)           │
-                                             │  │  • 30s-grace alarm GC    │
-                                             │  └──────────────────────────┘
-                                             │
-                                             ▼
-                                     ┌────────────────┐
-                                     │   SearchDO     │  (optional, per-tenant
-                                     │ (per-tenant)   │   semantic-search index)
-                                     └────────────────┘
+```bash
+# 1) Configure the active profile (writes ~/.mossaic/config.json mode 0600).
+mossaic auth setup \
+  --endpoint https://mossaic-core.ashishkmr472.workers.dev \
+  --secret "$JWT_SECRET" \
+  --tenant team-acme
+
+# 2) Verify.
+mossaic auth whoami
+
+# 3) Drive any VFS operation.
+mossaic write /notes.md --text "# hello"
+mossaic cat /notes.md --encoding utf8
+mossaic find --tag draft --json
+mossaic versions ls /notes.md
+
+# 4) Live CRDT editing (Yjs over wss://).
+mossaic yjs init /notes.md
+echo "DRAFT — " | mossaic yjs edit /notes.md --flush --label "morning save"
 ```
 
-Each tenant gets their own **UserDO** (auth, file manifests, folder hierarchy, quota, versioning, Yjs runtime) and a **dynamic pool of ShardDOs** that store the actual chunk data. Chunks are placed deterministically via rendezvous hashing — both client and server can independently compute which shard holds any chunk with zero coordination.
+The CLI is a sibling package at [`cli/`](./cli/) with its own README and its own ≥58 live E2E tests + ≥10 functional execa tests run against the deployed Service worker. See **[`cli/README.md`](./cli/README.md)** for the full command reference.
 
-**Three storage tiers**:
-1. **Inline** (≤16 KB) — the file body lives in the UserDO row itself; no ShardDO fanout, no chunk RPC.
-2. **Normal chunks** — 1 MB content-addressed blobs in ShardDOs, refcounted, deduplicated within the tenant, swept by a 30s-grace alarm GC.
-3. **Yjs op-log + checkpoint chunks** — for files in CRDT mode, every Yjs update is a content-hashed op-log row and periodic compactions emit `Y.Doc` state snapshots. Both reuse the chunk fabric (rendezvous placement, refcount, GC).
-
-**Two transports** out of UserDO:
-- **DO RPC** — `vfs.*` calls dispatch over the `MOSSAIC_USER` binding; one outbound RPC per VFS call regardless of internal chunk fanout.
-- **WebSocket upgrade** — live Yjs sessions speak the standard sync protocol over Cloudflare's [Hibernation API](https://developers.cloudflare.com/durable-objects/api/websockets/#hibernation-api). Idle connections cost **$0** — workerd evicts the DO between frames and rehydrates per message; per-socket state survives via `serializeAttachment`.
+The Service worker exposes a public Yjs WebSocket upgrade route at `/api/vfs/yjs/ws` (Bearer-authenticated, forwards to `UserDOCore._fetchWebSocketUpgrade`). Without that route, Yjs would only be reachable from sibling Workers via `stub.fetch()`.
 
 ---
 
@@ -228,6 +224,88 @@ For the full DX (`chmod` overload, `setYjsMode` on freshly-created files, error 
 - **Albums & sharing** — client-side album management, public shared album links via base64-encoded tokens
 - **Analytics dashboard** — storage quota, file status breakdown, MIME distribution, per-shard chunk/dedup stats, recent uploads
 - **Dark & light themes** — CSS custom property theming with Tailwind v4, persisted to localStorage
+
+---
+
+## Detailed architecture
+
+DO instance IDs derive from `vfs:${ns}:${tenant}[:${sub}]` — distinct triples land on distinct SQLite databases, so cross-tenant data is unreachable by construction.
+
+```mermaid
+flowchart TD
+    %% ───── Consumers ─────
+    subgraph Consumers["Consumers"]
+        direction LR
+        SPA["React SPA<br/>(photo app)"]
+        Worker["SDK consumer Worker<br/>createVFS(env, opts)"]
+        CLI["@mossaic/cli<br/>(mossaic / mscli)"]
+        HTTP["Non-Worker HTTP client<br/>(browser / Node)"]
+    end
+
+    %% ───── Service-mode boundary (App ⊃ Core) ─────
+    subgraph App["App deployment (worker/app/) — superset of Core"]
+        direction TB
+        subgraph Core["Service deployment (worker/core/) — SDK-essential surface"]
+            direction TB
+            CoreRouter["Hono router<br/>Bearer-JWT auth on /api/vfs/*<br/>HTTP fallback + WSS upgrade"]
+            UserDOCore[("UserDOCore (per-tenant)<br/>manifests + inline tier · versioning<br/>metadata + tags + indexed listFiles (P12)<br/>HMAC pagination cursor · Yjs op log<br/>+ awareness relay (P13) · alarm GC")]
+            subgraph ShardPool["ShardDO pool × N (rendezvous-hashed)"]
+                direction LR
+                S0[("ShardDO 0")]
+                S1[("ShardDO 1")]
+                Sn[("ShardDO n…")]
+            end
+        end
+        AppRouter["Legacy /api/upload, /api/download,<br/>/api/auth, /api/files, /api/folders,<br/>/api/gallery, /api/analytics,<br/>/api/search, /api/shared"]
+        SearchDO[("SearchDO (per-tenant)<br/>CLIP + BGE — App only")]
+    end
+
+    %% ───── Edges: HTTP / RPC ─────
+    SPA -- "HTTPS (legacy + /api/vfs)" --> AppRouter
+    Worker -- "in-Worker DO RPC" --> UserDOCore
+    CLI -- "HTTPS Bearer JWT" --> CoreRouter
+    HTTP -- "HTTPS Bearer JWT" --> CoreRouter
+    AppRouter -- "auth, quota, gallery,<br/>analytics" --> UserDOCore
+    AppRouter -- "semantic search" --> SearchDO
+    CoreRouter -- "VFS RPC dispatch" --> UserDOCore
+
+    %% ───── Storage flow ─────
+    UserDOCore -- "rendezvous-hashed<br/>chunk fanout (1 MB,<br/>content-addressed,<br/>refcounted, GC alarm)" --> S0
+    UserDOCore --> S1
+    UserDOCore --> Sn
+    UserDOCore -- "copyFile (P12):<br/>manifest copy +<br/>chunk_refs ref_count++<br/>(zero bytes move)" --> S0
+
+    %% ───── Yjs WebSocket path ─────
+    Browser["Live editor peer<br/>(browser / Worker)"]
+    Browser2["Other peer(s)"]
+    Browser -- "WSS upgrade<br/>(Hibernation API,<br/>$0 idle, binary frames)" --> CoreRouter
+    CoreRouter -- "Yjs sync + awareness<br/>(P13 relay-only)" --> UserDOCore
+    UserDOCore -. "broadcast peer updates<br/>(awareness in-memory,<br/>never persisted)" .-> Browser2
+
+    %% ───── Styling (light + dark GitHub themes) ─────
+    classDef consumer fill:#e5e7eb,stroke:#6b7280,stroke-width:1px,color:#111827;
+    classDef core fill:#dbeafe,stroke:#3b82f6,stroke-width:1px,color:#0c4a6e;
+    classDef app fill:#fef3c7,stroke:#d97706,stroke-width:1px,color:#78350f;
+    classDef shard fill:#dcfce7,stroke:#16a34a,stroke-width:1px,color:#14532d;
+    classDef peer fill:#f3e8ff,stroke:#9333ea,stroke-width:1px,color:#581c87;
+
+    class SPA,Worker,CLI,HTTP consumer;
+    class CoreRouter,UserDOCore core;
+    class AppRouter,SearchDO app;
+    class S0,S1,Sn,ShardPool shard;
+    class Browser,Browser2 peer;
+```
+
+Each tenant gets their own **UserDOCore** (manifests, metadata + tags + indexes, HMAC cursor, versioning, Yjs runtime + awareness relay) and a **dynamic pool of ShardDOs** that store the actual chunk data. Chunks are placed deterministically via rendezvous hashing — both client and server can independently compute which shard holds any chunk with zero coordination. The **Service deployment** ships UserDOCore + ShardDO + the Bearer-JWT-authed `/api/vfs/*` Hono router (HTTP fallback + WSS upgrade); the **App deployment** is a superset that adds the legacy photo-app routes, password auth, and SearchDO (CLIP + BGE semantic index).
+
+**Three storage tiers**:
+1. **Inline** (≤16 KB) — the file body lives in the UserDO row itself; no ShardDO fanout, no chunk RPC.
+2. **Normal chunks** — 1 MB content-addressed blobs in ShardDOs, refcounted, deduplicated within the tenant, swept by a 30s-grace alarm GC.
+3. **Yjs op-log + checkpoint chunks** — for files in CRDT mode, every Yjs update is a content-hashed op-log row and periodic compactions emit `Y.Doc` state snapshots. Both reuse the chunk fabric (rendezvous placement, refcount, GC).
+
+**Two transports** out of UserDO:
+- **DO RPC** — `vfs.*` calls dispatch over the `MOSSAIC_USER` binding; one outbound RPC per VFS call regardless of internal chunk fanout.
+- **WebSocket upgrade** — live Yjs sessions speak the standard sync protocol over Cloudflare's [Hibernation API](https://developers.cloudflare.com/durable-objects/api/websockets/#hibernation-api). Idle connections cost **$0** — workerd evicts the DO between frames and rehydrates per message; per-socket state survives via `serializeAttachment`.
 
 ---
 

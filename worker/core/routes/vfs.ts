@@ -1,10 +1,10 @@
 import { Hono } from "hono";
-import type { Env } from "@shared/types";
+import type { Env } from "../../../shared/types";
 import type { MiddlewareHandler } from "hono";
 import { verifyVFSToken, VFSConfigError } from "../lib/auth";
 import { vfsUserDOName } from "../lib/utils";
 import type { UserDOCore } from "../objects/user/user-do-core";
-import type { VFSScope } from "@shared/vfs-types";
+import type { VFSScope } from "../../../shared/vfs-types";
 
 /**
  * HTTP fallback for non-Worker consumers (browsers, Node servers,
@@ -172,9 +172,19 @@ function expectPath(body: unknown): string {
 
 vfs.post("/readFile", async (c) => {
   try {
-    const body = await c.req.json<{ path: string; encoding?: "utf8" }>();
+    const body = await c.req.json<{
+      path: string;
+      encoding?: "utf8";
+      // Phase 13.5: optional historical-version selector. Pairs with
+      // CLI `cat --version <id>`.
+      versionId?: string;
+    }>();
     const path = expectPath(body);
-    const buf = await userStub(c).vfsReadFile(c.var.scope, path);
+    const buf = await userStub(c).vfsReadFile(
+      c.var.scope,
+      path,
+      body.versionId ? { versionId: body.versionId } : undefined,
+    );
     if (body.encoding === "utf8") {
       return c.json({ data: new TextDecoder().decode(buf) });
     }
@@ -465,6 +475,80 @@ vfs.post("/symlink", async (c) => {
   }
 });
 
+// Phase 13.5 — setYjsMode HTTP endpoint. Required by the @mossaic/cli
+// `yjs init` command. The DO method is binding-only by default; we
+// surface it here so external clients (Node CLI, scripts) can promote
+// a file to yjs-mode without holding a DO stub. Demoting back to plain
+// (`enabled: false`) is rejected at the DO layer with EINVAL — losing
+// CRDT history is never silent.
+vfs.post("/setYjsMode", async (c) => {
+  try {
+    const body = await c.req.json<{ path: string; enabled: boolean }>();
+    const path = expectPath(body);
+    if (typeof body.enabled !== "boolean") {
+      return c.json(
+        { code: "EINVAL", message: "body.enabled must be a boolean" },
+        400
+      );
+    }
+    await userStub(c).vfsSetYjsMode(c.var.scope, path, body.enabled);
+    return c.json({ ok: true });
+  } catch (err) {
+    const r = errToResponse(err);
+    return c.json(r.body, r.status as 400);
+  }
+});
+
+// Phase 13.5 — admin: enable/disable per-tenant versioning. Operator-
+// class RPC; Bearer-gated like the rest of /api/vfs/*. The userId
+// argument is derived from the verified scope (tenant + optional sub),
+// not from the request body — cross-tenant manipulation is impossible.
+vfs.post("/admin/setVersioning", async (c) => {
+  try {
+    const body = await c.req.json<{ enabled: boolean }>();
+    if (typeof body.enabled !== "boolean") {
+      return c.json(
+        { code: "EINVAL", message: "body.enabled must be a boolean" },
+        400
+      );
+    }
+    const userId = c.var.scope.sub
+      ? `${c.var.scope.tenant}::${c.var.scope.sub}`
+      : c.var.scope.tenant;
+    const r = await (
+      userStub(c) as unknown as {
+        adminSetVersioning(uid: string, on: boolean): Promise<{ enabled: boolean }>;
+      }
+    ).adminSetVersioning(userId, body.enabled);
+    return c.json(r);
+  } catch (err) {
+    const r = errToResponse(err);
+    return c.json(r.body, r.status as 400);
+  }
+});
+
+// Phase 13.5 — flushYjs HTTP endpoint. Triggers a Yjs compaction
+// whose checkpoint emits a USER-VISIBLE Mossaic version row (when
+// versioning is enabled). Symmetric with the binding-mode
+// `YDocHandle.flush({ label })` surface.
+vfs.post("/flushYjs", async (c) => {
+  try {
+    const body = await c.req.json<{ path: string; label?: string }>();
+    const path = expectPath(body);
+    const r = await userStub(c).vfsFlushYjs(c.var.scope, path, {
+      label: body.label,
+    });
+    return c.json(r);
+  } catch (err) {
+    const r = errToResponse(err);
+    return c.json(r.body, r.status as 400);
+  }
+});
+
+// Phase 13.5 — patchMetadata HTTP endpoint already exists above (PATCH
+// /metadata + POST /patchMetadata). Kept here as a comment for grep
+// continuity.
+
 vfs.post("/removeRecursive", async (c) => {
   try {
     const body = await c.req.json<{ path: string; cursor?: string }>();
@@ -524,18 +608,31 @@ vfs.post("/readChunk", async (c) => {
 
 vfs.post("/listVersions", async (c) => {
   try {
-    const body = await c.req.json<{ path: string; limit?: number }>();
+    const body = await c.req.json<{
+      path: string;
+      limit?: number;
+      userVisibleOnly?: boolean;
+      includeMetadata?: boolean;
+    }>();
     const path = expectPath(body);
     const rows = await userStub(c).vfsListVersions(c.var.scope, path, {
       limit: body.limit,
+      userVisibleOnly: body.userVisibleOnly,
+      includeMetadata: body.includeMetadata,
     });
-    // Map server VersionRow → public VersionInfo (id field).
+    // Map server VersionRow → public VersionInfo. Phase 12 surfaces
+    // label + userVisible; Phase 13.5 propagates them through the
+    // HTTP fallback so external consumers (CLI, etc.) see the same
+    // shape as binding-mode callers.
     const versions = rows.map((r) => ({
       id: r.versionId,
       mtimeMs: r.mtimeMs,
       size: r.size,
       mode: r.mode,
       deleted: r.deleted,
+      label: r.label,
+      userVisible: r.userVisible,
+      metadata: body.includeMetadata ? r.metadata ?? null : undefined,
     }));
     return c.json({ versions });
   } catch (err) {

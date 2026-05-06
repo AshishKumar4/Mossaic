@@ -60,6 +60,51 @@ pnpm add @mossaic/sdk
 
 The package re-exports the Mossaic Durable Object classes; consumer Workers re-export them in their own entry module so wrangler can discover them at deploy time.
 
+### Workspace (vendored) install — `workspace:*`
+
+For monorepos vendoring the SDK as TypeScript source (no prebuilt `dist/` required), declare the SDK as a workspace dependency and opt into the `workspace` exports condition in your tsconfig:
+
+```jsonc
+// consumer/package.json
+{ "dependencies": { "@mossaic/sdk": "workspace:*" } }
+```
+
+```jsonc
+// consumer/tsconfig.json
+{
+  "compilerOptions": {
+    "moduleResolution": "bundler",     // required for customConditions
+    "customConditions": ["workspace"], // resolves @mossaic/sdk → src/*.ts
+    "types": ["@cloudflare/workers-types"]
+  }
+}
+```
+
+When `customConditions: ["workspace"]` is set, the SDK's `package.json` exports map resolves each subpath to `./src/*.ts` (TS source) instead of `./dist/*.js`. Consumers without the condition fall through to the prebuilt `dist/` artifacts — same behavior as published-on-npm consumers.
+
+Use the canonical `MossaicUserDO` / `MossaicShardDO` names for new workspace consumers (legacy `UserDO` / `ShardDO` re-exports stay for backward compatibility):
+
+```ts
+// consumer/src/index.ts
+import { createVFS, MossaicUserDO, MossaicShardDO, type MossaicEnv } from "@mossaic/sdk";
+export { MossaicUserDO, MossaicShardDO };
+```
+
+```jsonc
+// consumer/wrangler.jsonc
+{
+  "durable_objects": {
+    "bindings": [
+      { "name": "MOSSAIC_USER",  "class_name": "MossaicUserDO" },
+      { "name": "MOSSAIC_SHARD", "class_name": "MossaicShardDO" }
+    ]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["MossaicUserDO", "MossaicShardDO"] }]
+}
+```
+
+Yjs / collab editing is loaded lazily — consumers who don't import from `@mossaic/sdk/yjs` and don't set `mode_yjs = 1` on any file pay zero size cost for `yjs` + `y-protocols`. Both peer deps are optional; install only if your tenants use yjs-mode files.
+
 ---
 
 ## Setup

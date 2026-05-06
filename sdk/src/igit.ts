@@ -111,11 +111,16 @@ class BatchedLstatFs implements VFSClient {
     }>
   > = new Map();
   private timer: ReturnType<typeof setTimeout> | null = null;
+  // Phase 14: explicit fields instead of constructor parameter
+  // properties — `erasableSyntaxOnly` (TS 5.8+) rejects the
+  // shorthand because `private readonly foo: T` in a constructor
+  // signature emits runtime field initializers.
+  private readonly inner: VFS;
+  private readonly windowMs: number;
 
-  constructor(
-    private readonly inner: VFS,
-    private readonly windowMs: number
-  ) {
+  constructor(inner: VFS, windowMs: number) {
+    this.inner = inner;
+    this.windowMs = windowMs;
     this.promises = this;
   }
 
