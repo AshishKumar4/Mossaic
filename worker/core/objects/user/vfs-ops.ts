@@ -44,6 +44,7 @@ export {
 
 export {
   vfsUnlink,
+  vfsPurge,
   vfsMkdir,
   vfsRmdir,
   vfsRename,

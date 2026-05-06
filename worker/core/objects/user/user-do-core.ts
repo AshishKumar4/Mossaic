@@ -2000,6 +2000,35 @@ export class UserDOCore extends DurableObject<Env> {
         `openYjsSocket: file is not in yjs mode: ${path}`
       );
     }
+    // Phase 25 Fix 12 — refuse the WS upgrade for a tombstoned-head
+    // file. Pre-fix, a yjs-mode path that had been `unlink`ed under
+    // versioning-on still accepted incoming WS connections; clients
+    // could read AND WRITE into a path the SDK reported as
+    // gone. Now an explicit head-tombstone shortcuts to ENOENT,
+    // matching `vfsStat` / `vfsReadFile`.
+    const yjsHead = this.sql
+      .exec(
+        `SELECT f.head_version_id, fv.deleted AS head_deleted
+           FROM files f
+           LEFT JOIN file_versions fv
+             ON fv.path_id = f.file_id AND fv.version_id = f.head_version_id
+          WHERE f.file_id = ? AND f.user_id = ?`,
+        r.leafId,
+        userId
+      )
+      .toArray()[0] as
+      | { head_version_id: string | null; head_deleted: number | null }
+      | undefined;
+    if (
+      yjsHead !== undefined &&
+      yjsHead.head_version_id !== null &&
+      yjsHead.head_deleted === 1
+    ) {
+      throw new VFSError(
+        "ENOENT",
+        `openYjsSocket: head version is a tombstone for ${path}`
+      );
+    }
 
     // Look up the per-tenant pool size now so we don't have to
     // re-query on every socket message.
