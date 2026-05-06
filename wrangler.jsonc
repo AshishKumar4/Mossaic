@@ -1,5 +1,11 @@
 // Mossaic Worker config.
 //
+// Default deploy target: **Seal staging** (account_id below).
+// The legacy personal-account deployment at
+// mossaic.ashishkumarsingh.com is no longer the default; if/when
+// it is revived, prefer a `--env personal` block over flipping
+// the top-level `account_id`. See docs/deployment.md.
+//
 // REQUIRED secrets (set via `wrangler secret put`, NEVER committed):
 //   JWT_SECRET — signs auth + VFS tokens. There is no in-source dev
 //                fallback. Workers without this secret will refuse to
@@ -20,13 +26,14 @@
 {
   "name": "mossaic",
   "main": "worker/app/index.ts",
-  "account_id": "f44999d1ddda7012e9a87729eba250f1",
+  "account_id": "f42e5aacc251bd8ca6eadc04fb4ed13c",
   "compatibility_date": "2026-03-01",
   "compatibility_flags": ["nodejs_compat"],
 
-  "routes": [
-    { "pattern": "mossaic.ashishkumarsingh.com", "custom_domain": true }
-  ],
+  // No `routes`. Staging publishes to the default workers.dev
+  // subdomain (mossaic.<staging>.workers.dev). The legacy custom
+  // domain mossaic.ashishkumarsingh.com belongs to the personal
+  // account and is not bound here.
 
   "ai": { "binding": "AI" },
 
