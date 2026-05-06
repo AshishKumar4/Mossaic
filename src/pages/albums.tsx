@@ -17,9 +17,13 @@ import {
 } from "lucide-react";
 import { useAlbums } from "@/hooks/use-albums";
 import { useGallery } from "@/hooks/use-gallery";
+import { useUpload } from "@/hooks/use-upload";
+import { useDropZone } from "@/hooks/use-drop-zone";
 import { useImageLoader } from "@/hooks/use-image-loader";
 import { JustifiedGrid } from "@/components/gallery/justified-grid";
 import { Lightbox } from "@/components/gallery/lightbox";
+import { DropZoneOverlay } from "@/components/upload/drop-zone-overlay";
+import { TransferPanel } from "@/components/upload/transfer-panel";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -257,7 +261,7 @@ function AlbumDetail({
   album: Album;
   onBack: () => void;
 }) {
-  const { photos: allPhotos } = useGallery();
+  const { photos: allPhotos, refresh: refreshGallery } = useGallery();
   const {
     updateAlbum,
     deleteAlbum,
@@ -267,6 +271,32 @@ function AlbumDetail({
     unshareAlbum,
     getShareToken,
   } = useAlbums();
+
+  const {
+    transfers: uploadTransfers,
+    uploadFile,
+    clearTransfer: clearUpload,
+  } = useUpload(refreshGallery);
+
+  const handleFileDrop = useCallback(
+    async (files: File[]) => {
+      const newFileIds: string[] = [];
+      for (const file of files) {
+        const result = await uploadFile(file, null);
+        if (result.failedCount === 0) {
+          newFileIds.push(result.fileId);
+        }
+      }
+      if (newFileIds.length > 0) {
+        addPhotosToAlbum(album.id, newFileIds);
+      }
+    },
+    [uploadFile, addPhotosToAlbum, album.id]
+  );
+
+  const { isDragOver, dropZoneProps } = useDropZone({
+    onDrop: handleFileDrop,
+  });
 
   const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
   const [showAddPhotos, setShowAddPhotos] = useState(false);
@@ -325,7 +355,8 @@ function AlbumDetail({
     : "";
 
   return (
-    <div className="flex h-full flex-col">
+    <div className="relative flex h-full flex-col" {...dropZoneProps}>
+      <DropZoneOverlay visible={isDragOver} />
       {/* Header */}
       <div className="flex flex-col gap-3 border-b border-white/[0.06] px-6 py-4 sm:flex-row sm:items-center sm:justify-between">
         <div className="flex items-center gap-3 min-w-0">
@@ -441,6 +472,18 @@ function AlbumDetail({
           />
         )}
       </AnimatePresence>
+
+      {/* Transfer panel */}
+      <AnimatePresence>
+        {uploadTransfers.size > 0 && (
+          <TransferPanel
+            uploads={uploadTransfers}
+            downloads={new Map()}
+            onClearUpload={clearUpload}
+            onClearDownload={() => {}}
+          />
+        )}
+      </AnimatePresence>
     </div>
   );
 }
@@ -451,6 +494,25 @@ export function AlbumsPage() {
   const albumId = searchParams.get("album");
   const { albums, createAlbum, getAlbum, getShareToken } = useAlbums();
   const [showCreate, setShowCreate] = useState(false);
+
+  const {
+    transfers: uploadTransfers,
+    uploadFile,
+    clearTransfer: clearUpload,
+  } = useUpload();
+
+  const handleFileDrop = useCallback(
+    (files: File[]) => {
+      for (const file of files) {
+        uploadFile(file, null);
+      }
+    },
+    [uploadFile]
+  );
+
+  const { isDragOver, dropZoneProps } = useDropZone({
+    onDrop: handleFileDrop,
+  });
 
   const currentAlbum = albumId ? getAlbum(albumId) : undefined;
 
@@ -477,7 +539,8 @@ export function AlbumsPage() {
   }
 
   return (
-    <div className="flex h-full flex-col">
+    <div className="relative flex h-full flex-col" {...dropZoneProps}>
+      <DropZoneOverlay visible={isDragOver} />
       {/* Header */}
       <div className="flex items-center justify-between border-b border-white/[0.06] px-6 py-4">
         <div>
@@ -559,6 +622,18 @@ export function AlbumsPage() {
         onOpenChange={setShowCreate}
         onCreate={handleCreateAlbum}
       />
+
+      {/* Transfer panel */}
+      <AnimatePresence>
+        {uploadTransfers.size > 0 && (
+          <TransferPanel
+            uploads={uploadTransfers}
+            downloads={new Map()}
+            onClearUpload={clearUpload}
+            onClearDownload={() => {}}
+          />
+        )}
+      </AnimatePresence>
     </div>
   );
 }

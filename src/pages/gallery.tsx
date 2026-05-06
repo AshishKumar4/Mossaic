@@ -13,8 +13,12 @@ import {
   Camera,
 } from "lucide-react";
 import { useGallery } from "@/hooks/use-gallery";
+import { useUpload } from "@/hooks/use-upload";
+import { useDropZone } from "@/hooks/use-drop-zone";
 import { JustifiedGrid } from "@/components/gallery/justified-grid";
 import { Lightbox } from "@/components/gallery/lightbox";
+import { DropZoneOverlay } from "@/components/upload/drop-zone-overlay";
+import { TransferPanel } from "@/components/upload/transfer-panel";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import {
@@ -32,6 +36,26 @@ type SortOrder = "newest" | "oldest";
 export function GalleryPage() {
   const { photos, dateGroups, loading, error, refresh, deletePhoto } =
     useGallery();
+
+  const {
+    transfers: uploadTransfers,
+    uploadFile,
+    clearTransfer: clearUpload,
+  } = useUpload(refresh);
+
+  const handleFileDrop = useCallback(
+    (files: File[]) => {
+      for (const file of files) {
+        uploadFile(file, null);
+      }
+    },
+    [uploadFile]
+  );
+
+  const { isDragOver, dropZoneProps } = useDropZone({
+    onDrop: handleFileDrop,
+  });
+
   const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [selectable, setSelectable] = useState(false);
@@ -169,7 +193,8 @@ export function GalleryPage() {
   const isFilteredEmpty = filteredPhotos.length === 0;
 
   return (
-    <div className="flex h-full flex-col">
+    <div className="relative flex h-full flex-col" {...dropZoneProps}>
+      <DropZoneOverlay visible={isDragOver} />
       {/* Header */}
       <div className="flex flex-col gap-3 border-b border-white/[0.06] px-6 py-4 sm:flex-row sm:items-center sm:justify-between">
         <div className="min-w-0">
@@ -376,6 +401,18 @@ export function GalleryPage() {
             initialIndex={lightboxIndex}
             onClose={() => setLightboxIndex(null)}
             onDelete={handleLightboxDelete}
+          />
+        )}
+      </AnimatePresence>
+
+      {/* Transfer panel */}
+      <AnimatePresence>
+        {uploadTransfers.size > 0 && (
+          <TransferPanel
+            uploads={uploadTransfers}
+            downloads={new Map()}
+            onClearUpload={clearUpload}
+            onClearDownload={() => {}}
           />
         )}
       </AnimatePresence>

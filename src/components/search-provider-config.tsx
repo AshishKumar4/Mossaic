@@ -2,11 +2,11 @@ import { useEffect } from "react";
 import {
   RefreshCw,
   Settings,
-  Database,
-  Cpu,
   CheckCircle2,
   XCircle,
   Loader2,
+  Image,
+  FileText,
 } from "lucide-react";
 import { useSearchProviders } from "@/hooks/use-search";
 import { cn } from "@/lib/utils";
@@ -20,6 +20,7 @@ export function SearchProviderConfig() {
     providers,
     active,
     indexedCount,
+    spaces,
     loading,
     error,
     refresh,
@@ -34,6 +35,9 @@ export function SearchProviderConfig() {
 
   const embeddingProviders = providers.filter((p) => p.type === "embedding");
   const vectorStores = providers.filter((p) => p.type === "vectorStore");
+
+  const clipCount = spaces.find((s) => s.space === "clip")?.count ?? 0;
+  const textCount = spaces.find((s) => s.space === "text")?.count ?? 0;
 
   return (
     <Card>
@@ -57,10 +61,35 @@ export function SearchProviderConfig() {
           <div className="text-center text-sm text-destructive">{error}</div>
         ) : (
           <>
+            {/* Vector Space Stats */}
+            <div>
+              <p className="mb-2 text-xs font-medium text-muted-foreground uppercase tracking-wider">
+                Index Stats
+              </p>
+              <div className="grid grid-cols-2 gap-2">
+                <div className="flex items-center gap-2 rounded-lg bg-white/[0.03] px-3 py-2">
+                  <Image className="h-3.5 w-3.5 text-blue-400" />
+                  <div>
+                    <p className="text-xs font-medium">{clipCount}</p>
+                    <p className="text-[10px] text-muted-foreground">CLIP vectors</p>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 rounded-lg bg-white/[0.03] px-3 py-2">
+                  <FileText className="h-3.5 w-3.5 text-green-400" />
+                  <div>
+                    <p className="text-xs font-medium">{textCount}</p>
+                    <p className="text-[10px] text-muted-foreground">Text vectors</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <Separator />
+
             {/* Embedding Providers */}
             <div>
               <p className="mb-2 text-xs font-medium text-muted-foreground uppercase tracking-wider">
-                Embedding Provider
+                Embedding Providers
               </p>
               <div className="space-y-1.5">
                 {embeddingProviders.map((provider) => (
@@ -70,6 +99,7 @@ export function SearchProviderConfig() {
                     available={provider.available}
                     active={active?.embedding === provider.name}
                     dimensions={provider.dimensions}
+                    space={provider.space}
                     onClick={() => setConfig({ embedding: provider.name })}
                   />
                 ))}
@@ -103,7 +133,7 @@ export function SearchProviderConfig() {
               <div>
                 <p className="text-sm font-medium">Reindex All Files</p>
                 <p className="text-xs text-muted-foreground">
-                  Re-embed all files with the active provider
+                  Re-embed files in both CLIP and text spaces
                 </p>
               </div>
               <Button
@@ -133,12 +163,14 @@ function ProviderRow({
   available,
   active,
   dimensions,
+  space,
   onClick,
 }: {
   name: string;
   available: boolean;
   active: boolean;
   dimensions?: number;
+  space?: string;
   onClick: () => void;
 }) {
   const displayName = formatProviderName(name);
@@ -169,11 +201,18 @@ function ProviderRow({
         )}
         <div>
           <span className="text-sm font-medium">{displayName}</span>
-          {dimensions && (
-            <span className="ml-1.5 text-[10px] text-muted-foreground">
-              {dimensions}d
-            </span>
-          )}
+          <div className="flex items-center gap-1.5">
+            {dimensions && (
+              <span className="text-[10px] text-muted-foreground">
+                {dimensions}d
+              </span>
+            )}
+            {space && (
+              <span className="text-[10px] text-muted-foreground">
+                {space === "clip" ? "visual" : "text"}
+              </span>
+            )}
+          </div>
         </div>
       </div>
       {active && (
@@ -188,6 +227,8 @@ function ProviderRow({
 function formatProviderName(name: string): string {
   const names: Record<string, string> = {
     simple: "Simple (Built-in)",
+    clip: "CLIP (Visual)",
+    "bge-text": "BGE Text",
     "cloudflare-ai": "Cloudflare AI",
     ollama: "Ollama",
     "durable-object": "Durable Object",

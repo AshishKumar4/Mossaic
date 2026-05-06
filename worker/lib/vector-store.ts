@@ -1,10 +1,11 @@
 import type { VectorStore } from "@shared/embedding-types";
+import type { VectorSpace } from "@shared/embedding-types";
 import type { Env } from "@shared/types";
 
 // ── Durable Object Vector Store ──
 // Stores vectors in the SearchDO Durable Object with SQLite.
 // Uses brute-force cosine similarity — fine for <100K vectors.
-// Default store — works without any external Cloudflare bindings.
+// Supports multiple vector spaces (clip, text) via the space parameter.
 
 export class DOVectorStore implements VectorStore {
   name = "durable-object";
@@ -16,12 +17,13 @@ export class DOVectorStore implements VectorStore {
   }
 
   async upsert(
-    vectors: { id: string; values: number[]; metadata?: Record<string, string> }[]
+    vectors: { id: string; values: number[]; metadata?: Record<string, string> }[],
+    space: VectorSpace = "text"
   ): Promise<void> {
     const res = await this.stub.fetch(
       new Request("http://internal/vectors/upsert", {
         method: "POST",
-        body: JSON.stringify({ vectors }),
+        body: JSON.stringify({ vectors, space }),
       })
     );
     if (!res.ok) {
@@ -33,12 +35,13 @@ export class DOVectorStore implements VectorStore {
   async query(
     vector: number[],
     topK = 10,
-    filter?: Record<string, string>
+    filter?: Record<string, string>,
+    space: VectorSpace = "text"
   ): Promise<{ id: string; score: number; metadata?: Record<string, string> }[]> {
     const res = await this.stub.fetch(
       new Request("http://internal/vectors/query", {
         method: "POST",
-        body: JSON.stringify({ vector, topK, filter }),
+        body: JSON.stringify({ vector, topK, filter, space }),
       })
     );
     if (!res.ok) {
@@ -51,11 +54,11 @@ export class DOVectorStore implements VectorStore {
     return data.results;
   }
 
-  async delete(ids: string[]): Promise<void> {
+  async delete(ids: string[], space: VectorSpace = "text"): Promise<void> {
     const res = await this.stub.fetch(
       new Request("http://internal/vectors/delete", {
         method: "POST",
-        body: JSON.stringify({ ids }),
+        body: JSON.stringify({ ids, space }),
       })
     );
     if (!res.ok) {
@@ -67,6 +70,7 @@ export class DOVectorStore implements VectorStore {
 
 // ── Cloudflare Vectorize Store ──
 // Uses Cloudflare Vectorize binding. Requires VECTORIZE_INDEX binding in wrangler config.
+// Note: Vectorize doesn't natively support spaces — we use metadata filtering.
 
 export class CloudflareVectorize implements VectorStore {
   name = "vectorize";
@@ -77,14 +81,15 @@ export class CloudflareVectorize implements VectorStore {
   }
 
   async upsert(
-    vectors: { id: string; values: number[]; metadata?: Record<string, string> }[]
+    vectors: { id: string; values: number[]; metadata?: Record<string, string> }[],
+    space: VectorSpace = "text"
   ): Promise<void> {
     if (!this.index) throw new Error("Vectorize binding not available");
     await this.index.upsert(
       vectors.map((v) => ({
         id: v.id,
         values: v.values,
-        metadata: v.metadata,
+        metadata: { ...v.metadata, _space: space },
       }))
     );
   }
@@ -92,12 +97,13 @@ export class CloudflareVectorize implements VectorStore {
   async query(
     vector: number[],
     topK = 10,
-    filter?: Record<string, string>
+    filter?: Record<string, string>,
+    space: VectorSpace = "text"
   ): Promise<{ id: string; score: number; metadata?: Record<string, string> }[]> {
     if (!this.index) throw new Error("Vectorize binding not available");
     const result = await this.index.query(vector, {
       topK,
-      filter,
+      filter: { ...filter, _space: space },
       returnMetadata: "all",
     });
     return result.matches.map((m) => ({
@@ -107,7 +113,7 @@ export class CloudflareVectorize implements VectorStore {
     }));
   }
 
-  async delete(ids: string[]): Promise<void> {
+  async delete(ids: string[], _space?: VectorSpace): Promise<void> {
     if (!this.index) throw new Error("Vectorize binding not available");
     await this.index.deleteByIds(ids);
   }

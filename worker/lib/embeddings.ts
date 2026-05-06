@@ -1,17 +1,15 @@
-import type { EmbeddingProvider } from "@shared/embedding-types";
+import type { EmbeddingProvider, ImageEmbeddingProvider, VectorSpace } from "@shared/embedding-types";
+import type { Env } from "@shared/types";
 
 // ── Simple Embedding (TF-IDF-like bag-of-words) ──
 // Always available — no external dependencies. Not as good as real embeddings
-// but makes the feature work out of the box.
+// but makes the feature work out of the box. Used as fallback for local dev.
 
 export class SimpleEmbedding implements EmbeddingProvider {
   name = "simple";
   dimensions = 256;
   maxBatchSize = 100;
-
-  // Fixed vocabulary of common words for consistent dimensionality
-  private vocabulary: string[] = [];
-  private vocabIndex = new Map<string, number>();
+  space: VectorSpace = "text";
 
   constructor() {
     // Build a deterministic vocabulary from common file-related terms
@@ -102,28 +100,106 @@ export class SimpleEmbedding implements EmbeddingProvider {
   }
 }
 
-// ── Cloudflare Workers AI Embedding ──
+// ── CLIP Embedding Provider ──
+// Uses @cf/openai/clip-vit-base-patch32 via Workers AI.
+// Text and image inputs map to the same 512-dim vector space,
+// enabling text-to-image search via cosine similarity.
+
+export class CLIPEmbedding implements ImageEmbeddingProvider {
+  name = "clip";
+  dimensions = 512;
+  maxBatchSize = 20;
+  space: VectorSpace = "clip";
+
+  private ai: Ai | null;
+
+  constructor(env: Env) {
+    this.ai = env.AI ?? null;
+  }
+
+  /** Embed text queries into CLIP space (for searching against image vectors) */
+  async embed(texts: string[]): Promise<number[][]> {
+    if (!this.ai) throw new Error("Workers AI binding not available");
+
+    // CLIP model isn't in the standard type definitions — use untyped call
+    const result = await (this.ai as unknown as {
+      run(model: string, input: Record<string, unknown>): Promise<{ data: number[][] }>;
+    }).run("@cf/openai/clip-vit-base-patch32", { text: texts });
+
+    return result.data;
+  }
+
+  /** Embed a raw image into CLIP space (for indexing) */
+  async embedImage(imageBytes: Uint8Array): Promise<number[]> {
+    if (!this.ai) throw new Error("Workers AI binding not available");
+
+    // CLIP model expects image as number[] of raw bytes
+    const result = await (this.ai as unknown as {
+      run(model: string, input: Record<string, unknown>): Promise<{ data: number[][] }>;
+    }).run("@cf/openai/clip-vit-base-patch32", { image: [...imageBytes] });
+
+    return result.data[0];
+  }
+
+  async isAvailable(): Promise<boolean> {
+    return this.ai !== null;
+  }
+}
+
+// ── BGE Text Embedding Provider ──
+// Uses @cf/baai/bge-base-en-v1.5 via Workers AI — 768-dim vectors.
+// Best for document filenames, paths, and extracted text content.
+
+export class BGETextEmbedding implements EmbeddingProvider {
+  name = "bge-text";
+  dimensions = 768;
+  maxBatchSize = 100;
+  space: VectorSpace = "text";
+
+  private ai: Ai | null;
+
+  constructor(env: Env) {
+    this.ai = env.AI ?? null;
+  }
+
+  async embed(texts: string[]): Promise<number[][]> {
+    if (!this.ai) throw new Error("Workers AI binding not available");
+
+    const result = await this.ai.run("@cf/baai/bge-base-en-v1.5", {
+      text: texts,
+    });
+
+    return (result as { data: number[][] }).data;
+  }
+
+  async isAvailable(): Promise<boolean> {
+    return this.ai !== null;
+  }
+}
+
+// ── Legacy Cloudflare AI Embedding (kept for backward compat) ──
 // Uses @cf/baai/bge-base-en-v1.5 via env.AI.run()
 
 export class CloudflareAIEmbedding implements EmbeddingProvider {
   name = "cloudflare-ai";
   dimensions = 768;
   maxBatchSize = 100;
+  space: VectorSpace = "text";
 
-  private ai: { run: (model: string, input: Record<string, unknown>) => Promise<unknown> } | null;
+  private ai: Ai | null;
 
-  constructor(env: Record<string, unknown>) {
-    this.ai = (env.AI as typeof this.ai) ?? null;
+  constructor(env: Env) {
+    this.ai = env.AI ?? null;
   }
 
   async embed(texts: string[]): Promise<number[][]> {
     if (!this.ai) throw new Error("Workers AI binding not available");
 
-    const result = (await this.ai.run("@cf/baai/bge-base-en-v1.5", {
+    const result = await this.ai.run("@cf/baai/bge-base-en-v1.5", {
       text: texts,
-    })) as { data: number[][] };
+    });
 
-    return result.data;
+    return (result as { data: number[][] }).data;
   }
 
   async isAvailable(): Promise<boolean> {
@@ -138,6 +214,7 @@ export class OllamaEmbedding implements EmbeddingProvider {
   name = "ollama";
   dimensions = 768;
   maxBatchSize = 50;
+  space: VectorSpace = "text";
 
   private baseUrl: string;
   private model: string;
@@ -184,13 +261,44 @@ export class OllamaEmbedding implements EmbeddingProvider {
 // ── Provider Registry ──
 
 export function createEmbeddingProviders(
-  env: Record<string, unknown>
+  env: Env
 ): Map<string, EmbeddingProvider> {
   const providers = new Map<string, EmbeddingProvider>();
 
   providers.set("simple", new SimpleEmbedding());
+  providers.set("clip", new CLIPEmbedding(env));
+  providers.set("bge-text", new BGETextEmbedding(env));
   providers.set("cloudflare-ai", new CloudflareAIEmbedding(env));
   providers.set("ollama", new OllamaEmbedding());
 
   return providers;
+}
+
+/**
+ * Get the best available text embedding provider.
+ * Prefers BGE > CloudflareAI > Ollama > Simple (fallback).
+ */
+export async function getBestTextProvider(
+  env: Env
+): Promise<EmbeddingProvider> {
+  const bge = new BGETextEmbedding(env);
+  if (await bge.isAvailable()) return bge;
+
+  const cfai = new CloudflareAIEmbedding(env);
+  if (await cfai.isAvailable()) return cfai;
+
+  // Ollama usually not available in production, but try
+  const ollama = new OllamaEmbedding();
+  if (await ollama.isAvailable()) return ollama;
+
+  return new SimpleEmbedding();
+}
+
+/**
+ * Get the CLIP provider if available, or null.
+ */
+export function getCLIPProvider(env: Env): CLIPEmbedding | null {
+  const clip = new CLIPEmbedding(env);
+  // Synchronous check — AI binding presence
+  return env.AI ? clip : null;
 }
