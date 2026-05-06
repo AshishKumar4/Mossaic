@@ -21,3 +21,10 @@ dist/
 # Large reference files
 kumo-component-registry.json
 kumo-readme.md
+
+# Lean build artifacts
+lean/.lake/
+lean/lake-manifest.json
+
+# Local-only docs (audit reports, planning notes)
+local/
