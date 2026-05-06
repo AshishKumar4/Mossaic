@@ -512,6 +512,60 @@ export class UserDOCore extends DurableObject<Env> {
       // column already exists
     }
 
+    // ── Phase 15: opt-in end-to-end encryption ───────────────────────────
+    //
+    // Two columns on `files` and two on `file_versions` carry the
+    // per-file encryption mode + opaque keyId label. Pre-Phase-15 rows
+    // get NULL by default — the SDK treats NULL as "plaintext" and
+    // returns the bytes verbatim, preserving full backward compatibility.
+    //
+    // The server NEVER decrypts user data. These columns are pure
+    // metadata used to (a) tell the SDK whether to attempt decryption
+    // on read, and (b) reject mixed-mode writes within a path's
+    // history with EBADF.
+    //
+    // No CHECK constraint — consistent with how `mode_yjs` was added
+    // without one. The SDK validates the values it reads.
+    //
+    // No new wrangler migration tag — additive ALTERs are idempotent.
+    try {
+      this.sql.exec("ALTER TABLE files ADD COLUMN encryption_mode TEXT");
+    } catch {
+      // column already exists
+    }
+    try {
+      this.sql.exec("ALTER TABLE files ADD COLUMN encryption_key_id TEXT");
+    } catch {
+      // column already exists
+    }
+    try {
+      this.sql.exec(
+        "ALTER TABLE file_versions ADD COLUMN encryption_mode TEXT"
+      );
+    } catch {
+      // column already exists
+    }
+    try {
+      this.sql.exec(
+        "ALTER TABLE file_versions ADD COLUMN encryption_key_id TEXT"
+      );
+    } catch {
+      // column already exists
+    }
+
+    // Per-file encrypted-yjs op-log byte counter. Server-side
+    // backpressure (see worker/core/objects/user/yjs.ts) consults this
+    // alongside `op_count_since_ckpt` to decide whether to broadcast
+    // the tag-4 compact-please advisory or hard-reject further appends
+    // with EBUSY. Reset to 0 on every checkpoint commit.
+    try {
+      this.sql.exec(
+        "ALTER TABLE yjs_meta ADD COLUMN bytes_since_last_compact INTEGER NOT NULL DEFAULT 0"
+      );
+    } catch {
+      // column already exists
+    }
+
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS file_tags (
         path_id   TEXT NOT NULL,
@@ -961,6 +1015,10 @@ export class UserDOCore extends DurableObject<Env> {
       metadata?: Record<string, unknown> | null;
       tags?: readonly string[];
       version?: { label?: string; userVisible?: boolean };
+      // Phase 15: optional encryption stamp. Server NEVER decrypts —
+      // it just records `encryption_mode` + `encryption_key_id` on the
+      // file row so the SDK knows what to do on read.
+      encryption?: { mode: "convergent" | "random"; keyId?: string };
     }
   ): Promise<void> {
     this.gateVfsWrite(scope);
@@ -1258,6 +1316,160 @@ export class UserDOCore extends DurableObject<Env> {
       versionId: result.versionId ?? null,
       checkpointSeq: result.checkpointSeq,
     };
+  }
+
+  /**
+   * Phase 15 — client-driven compaction for encrypted Yjs files.
+   *
+   * The server CANNOT decrypt the oplog, so the client builds the
+   * checkpoint locally (decrypt all ops → apply → encode state →
+   * encrypt) and submits it via this RPC. CAS-on-`next_seq` ensures
+   * exactly-one-wins between concurrent compactors / writers.
+   *
+   * Throws `EBUSY` on CAS failure — caller retries against the new
+   * tip.
+   */
+  async vfsCompactEncryptedYjs(
+    scope: VFSScope,
+    path: string,
+    checkpointEnvelope: Uint8Array,
+    expectedNextSeq: number
+  ): Promise<{ checkpointSeq: number; opsReaped: number }> {
+    this.gateVfsWrite(scope);
+    const userId = scope.sub
+      ? `${scope.tenant}::${scope.sub}`
+      : scope.tenant;
+    const { resolvePathFollow } = await import("./path-walk");
+    const r = resolvePathFollow(this, userId, path);
+    if (r.kind !== "file") {
+      const { VFSError } = await import("../../../../shared/vfs-types");
+      throw new VFSError(
+        "EINVAL",
+        `compactEncryptedYjs: not a regular file: ${path}`
+      );
+    }
+    const { isYjsMode } = await import("./vfs-ops");
+    if (!isYjsMode(this, userId, r.leafId)) {
+      const { VFSError } = await import("../../../../shared/vfs-types");
+      throw new VFSError(
+        "EINVAL",
+        `compactEncryptedYjs: file is not in yjs mode: ${path}`
+      );
+    }
+    const poolRow = this.sql
+      .exec("SELECT pool_size FROM quota WHERE user_id = ?", userId)
+      .toArray()[0] as { pool_size: number } | undefined;
+    const poolSize = poolRow ? poolRow.pool_size : 32;
+    return await (await this.getYjsRuntime()).compactEncryptedYjs(
+      scope,
+      userId,
+      r.leafId,
+      poolSize,
+      checkpointEnvelope,
+      expectedNextSeq
+    );
+  }
+
+  /**
+   * Phase 15 — read raw oplog rows (envelope bytes) for a yjs-mode
+   * file. Used by the client-side compactor: it fetches all ops
+   * since `last_checkpoint_seq`, decrypts them, and rebuilds the
+   * checkpoint locally.
+   *
+   * Returns rows ordered by seq ASC. Caller may stream-read for
+   * very large oplogs (the server caps at 1000 rows per call —
+   * pagination via `afterSeq` cursor).
+   */
+  async vfsReadYjsOplog(
+    scope: VFSScope,
+    path: string,
+    opts?: { afterSeq?: number; limit?: number }
+  ): Promise<{
+    rows: { seq: number; kind: "op" | "checkpoint"; envelope: Uint8Array }[];
+    nextSeq: number;
+    hasMore: boolean;
+  }> {
+    this.gateVfs(scope);
+    const userId = scope.sub
+      ? `${scope.tenant}::${scope.sub}`
+      : scope.tenant;
+    const { resolvePathFollow } = await import("./path-walk");
+    const r = resolvePathFollow(this, userId, path);
+    if (r.kind !== "file") {
+      const { VFSError } = await import("../../../../shared/vfs-types");
+      throw new VFSError(
+        "EINVAL",
+        `readYjsOplog: not a regular file: ${path}`
+      );
+    }
+    const { isYjsMode } = await import("./vfs-ops");
+    if (!isYjsMode(this, userId, r.leafId)) {
+      const { VFSError } = await import("../../../../shared/vfs-types");
+      throw new VFSError(
+        "EINVAL",
+        `readYjsOplog: file is not in yjs mode: ${path}`
+      );
+    }
+    const limit = Math.min(opts?.limit ?? 1000, 1000);
+    const afterSeq = opts?.afterSeq ?? -1;
+    const oprows = this.sql
+      .exec(
+        `SELECT seq, kind, chunk_hash, shard_index
+           FROM yjs_oplog WHERE path_id = ? AND seq > ?
+          ORDER BY seq ASC LIMIT ?`,
+        r.leafId,
+        afterSeq,
+        limit + 1
+      )
+      .toArray() as {
+      seq: number;
+      kind: string;
+      chunk_hash: string;
+      shard_index: number;
+    }[];
+    const hasMore = oprows.length > limit;
+    if (hasMore) oprows.pop();
+    // Resolve each row to its envelope bytes via the ShardDO.
+    const env = this.envPublic;
+    const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace;
+    const { vfsShardDOName } = await import("../../lib/utils");
+    const rows: {
+      seq: number;
+      kind: "op" | "checkpoint";
+      envelope: Uint8Array;
+    }[] = [];
+    for (const row of oprows) {
+      const shardName = vfsShardDOName(
+        scope.ns,
+        scope.tenant,
+        scope.sub,
+        row.shard_index
+      );
+      const stub = shardNs.get(shardNs.idFromName(shardName));
+      // Read via the HTTP chunk endpoint. The ShardDO's GET /chunk/:hash
+      // route serves the raw bytes (which are envelopes for encrypted
+      // yjs files). No userId / refId needed for read — content-addressed.
+      const resp = await stub.fetch(
+        `http://internal/chunk/${encodeURIComponent(row.chunk_hash)}`,
+        { method: "GET" }
+      );
+      if (!resp.ok) {
+        const { VFSError } = await import("../../../../shared/vfs-types");
+        throw new VFSError(
+          "ENOENT",
+          `readYjsOplog: chunk ${row.chunk_hash} not on shard (status ${resp.status})`
+        );
+      }
+      const bytes = await resp.arrayBuffer();
+      rows.push({
+        seq: row.seq,
+        kind: row.kind as "op" | "checkpoint",
+        envelope: new Uint8Array(bytes),
+      });
+    }
+    const nextSeq =
+      rows.length > 0 ? rows[rows.length - 1]!.seq : afterSeq;
+    return { rows, nextSeq, hasMore };
   }
 
   /**
@@ -1567,9 +1779,21 @@ export class UserDOCore extends DurableObject<Env> {
     try {
       switch (decoded.kind) {
         case "syncStep1": {
-          // Client sent us their state vector; reply with the diff
-          // they need (sync-step-2) AND prompt them with our own
-          // state vector (sync-step-1) for full bidirectional sync.
+          // Phase 15: encrypted yjs files cannot be materialised
+          // server-side (the oplog rows are AES-GCM envelopes the
+          // server cannot decrypt). Send an empty sync_step_2 so the
+          // client unblocks its `await synced` and the doc starts
+          // empty; connected peers will broadcast their updates via
+          // the relay path. For new encrypted yjs files this is
+          // correct (no prior state). For files with prior state, a
+          // peer that has the master key must be connected for
+          // bootstrap — otherwise the doc starts blank.
+          const { isPathEncryptedYjs } = await import("./yjs");
+          if (isPathEncryptedYjs(this, att.pathId)) {
+            ws.send(encodeSyncStep2(new Uint8Array(0)));
+            return;
+          }
+          // Plaintext path — original Phase 13 behaviour.
           const Y = await import("yjs");
           const doc = await (await this.getYjsRuntime()).getDoc(att.scope, att.pathId);
           const diff = Y.encodeStateAsUpdate(doc, decoded.stateVector);

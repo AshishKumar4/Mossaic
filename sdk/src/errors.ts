@@ -27,7 +27,10 @@ export type VFSErrorCode =
   | "EROFS"
   | "ENOTEMPTY"
   | "EAGAIN"
-  | "EMOSSAIC_UNAVAILABLE";
+  | "EMOSSAIC_UNAVAILABLE"
+  // Phase 15 — encryption surface.
+  | "EBADF"
+  | "ENOTSUP";
 
 /**
  * Linux errno integers (libc convention). Matters because some
@@ -47,6 +50,8 @@ const ERRNO: Record<VFSErrorCode, number> = {
   ENOTEMPTY: -39,
   EAGAIN: -11, // POSIX EAGAIN — rate-limit / try-again
   EMOSSAIC_UNAVAILABLE: -111, // ECONNREFUSED-equivalent
+  EBADF: -9, // Phase 15: encryption-mode mismatch on a path's history.
+  ENOTSUP: -95, // Phase 15: chmod-style encrypt-in-place not supported.
 };
 
 const HUMAN: Record<VFSErrorCode, string> = {
@@ -63,6 +68,8 @@ const HUMAN: Record<VFSErrorCode, string> = {
   ENOTEMPTY: "directory not empty",
   EAGAIN: "rate limit exceeded; retry",
   EMOSSAIC_UNAVAILABLE: "Mossaic VFS unavailable",
+  EBADF: "encryption mode does not match path history",
+  ENOTSUP: "operation not supported",
 };
 
 /**
@@ -154,6 +161,16 @@ export class ENOTEMPTY extends VFSFsError {
 export class EAGAIN extends VFSFsError {
   constructor(opts: { syscall?: string; path?: string; message?: string } = {}) {
     super("EAGAIN", opts);
+  }
+}
+export class EBADF extends VFSFsError {
+  constructor(opts: { syscall?: string; path?: string; message?: string } = {}) {
+    super("EBADF", opts);
+  }
+}
+export class ENOTSUP extends VFSFsError {
+  constructor(opts: { syscall?: string; path?: string; message?: string } = {}) {
+    super("ENOTSUP", opts);
   }
 }
 export class MossaicUnavailableError extends VFSFsError {
@@ -308,4 +325,6 @@ const SUBCLASS_PROTO: Partial<Record<VFSErrorCode, object>> = {
   ENOTEMPTY: ENOTEMPTY.prototype,
   EAGAIN: EAGAIN.prototype,
   EMOSSAIC_UNAVAILABLE: MossaicUnavailableError.prototype,
+  EBADF: EBADF.prototype,
+  ENOTSUP: ENOTSUP.prototype,
 };

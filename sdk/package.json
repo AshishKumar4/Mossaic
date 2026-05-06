@@ -26,6 +26,11 @@
       "types": "./dist/http-only.d.ts",
       "import": "./dist/http-only.js"
     },
+    "./encryption": {
+      "workspace": "./src/encryption.ts",
+      "types": "./dist/encryption.d.ts",
+      "import": "./dist/encryption.js"
+    },
     "./package.json": "./package.json"
   },
   "files": [

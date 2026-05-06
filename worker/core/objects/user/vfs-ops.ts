@@ -185,7 +185,8 @@ function statForResolved(
   // file or symlink: same SQL row.
   const row = durableObject.sql
     .exec(
-      `SELECT file_id, file_size, mode, mode_yjs, node_kind, symlink_target, inline_data, updated_at
+      `SELECT file_id, file_size, mode, mode_yjs, node_kind, symlink_target,
+              inline_data, updated_at, encryption_mode, encryption_key_id
          FROM files
         WHERE file_id=? AND user_id=? AND status!='deleted'`,
       r.leafId,
@@ -201,11 +202,31 @@ function statForResolved(
         symlink_target: string | null;
         inline_data: ArrayBuffer | null;
         updated_at: number;
+        encryption_mode: string | null;
+        encryption_key_id: string | null;
       }
     | undefined;
   if (!row) {
     throw new VFSError("ENOENT", "stat: file vanished");
   }
+  // Phase 15: project encryption columns into the SDK-facing shape.
+  // Defined inline so both file-return branches can call it; symlinks
+  // ignore encryption (the target string is plaintext metadata).
+  const projectEnc = ():
+    | { mode: "convergent" | "random"; keyId?: string }
+    | undefined => {
+    if (
+      row.encryption_mode !== "convergent" &&
+      row.encryption_mode !== "random"
+    )
+      return undefined;
+    const enc: { mode: "convergent" | "random"; keyId?: string } = {
+      mode: row.encryption_mode,
+    };
+    if (row.encryption_key_id !== null) enc.keyId = row.encryption_key_id;
+    return enc;
+  };
+
   if (r.kind === "symlink") {
     // Symlink size = byteLength of the target string (POSIX convention).
     const targetLen = new TextEncoder().encode(row.symlink_target ?? "")
@@ -254,7 +275,7 @@ function statForResolved(
         throw new VFSError("ENOENT", "stat: head version is a tombstone");
       }
       const vsize = head.inline_data ? head.inline_data.byteLength : head.size;
-      return {
+      const out: VFSStatRaw = {
         type: "file",
         // Phase 10: surface the yjs-mode bit on stat.mode. The
         // mode_yjs flag lives on the `files` row (not the version
@@ -266,6 +287,13 @@ function statForResolved(
         gid,
         ino: inoFromId(row.file_id),
       };
+      // Phase 15: encryption stamp from the head row on `files`. The
+      // versioned write path keeps `files.encryption_*` in sync with
+      // the head version's columns (see commitVersion), so reading
+      // from `files` here is correct.
+      const enc = projectEnc();
+      if (enc) out.encryption = enc;
+      return out;
     }
   }
 
@@ -276,7 +304,7 @@ function statForResolved(
   const size = row.inline_data
     ? row.inline_data.byteLength
     : row.file_size;
-  return {
+  const out: VFSStatRaw = {
     type: "file",
     // Phase 10: surface the yjs-mode bit on stat.mode (0o4000).
     mode: (row.mode ?? 0o644) | (row.mode_yjs === 1 ? 0o4000 : 0),
@@ -286,6 +314,10 @@ function statForResolved(
     gid,
     ino: inoFromId(row.file_id),
   };
+  // Phase 15: encryption stamp.
+  const enc = projectEnc();
+  if (enc) out.encryption = enc;
+  return out;
 }
 
 /** stat() — follows trailing symlinks, throws ELOOP at SYMLINK_MAX_HOPS. */
@@ -1288,6 +1320,8 @@ async function vfsWriteFileVersioned(
     tags?: readonly string[] | undefined;
     versionUserVisible?: boolean;
     versionLabel?: string;
+    /** Phase 15: encryption stamp for this version. */
+    encryption?: { mode: "convergent" | "random"; keyId?: string };
   } = {}
 ): Promise<void> {
   // 1. Ensure a stable `files` row exists at (parent_id, leaf).
@@ -1374,6 +1408,7 @@ async function vfsWriteFileVersioned(
       userVisible: phase12.versionUserVisible ?? true,
       label: phase12.versionLabel,
       metadata: metadataForVersion,
+      encryption: phase12.encryption,
     });
     if (phase12.tags !== undefined) {
       const { replaceTags } = await import("./metadata-tags");
@@ -1487,6 +1522,7 @@ async function vfsWriteFileVersioned(
     userVisible: phase12.versionUserVisible ?? true,
     label: phase12.versionLabel,
     metadata: metadataForVersion,
+    encryption: phase12.encryption,
   });
   if (phase12.tags !== undefined) {
     const { replaceTags } = await import("./metadata-tags");
@@ -1514,6 +1550,19 @@ export interface VFSWriteFileOpts {
   metadata?: Record<string, unknown> | null;
   tags?: readonly string[];
   version?: { label?: string; userVisible?: boolean };
+  /**
+   * Phase 15: opt-in end-to-end encryption.
+   *
+   * When set, the worker stamps `files.encryption_mode` and
+   * `files.encryption_key_id` (and the corresponding `file_versions`
+   * columns when versioning is on). Mode-history-monotonic: a write
+   * that disagrees with the existing path's mode is rejected EBADF.
+   *
+   * The `data` payload is treated identically to plaintext bytes
+   * regardless of this opt — the SDK has already produced an
+   * envelope-stream by this point. The server NEVER decrypts.
+   */
+  encryption?: { mode: "convergent" | "random"; keyId?: string };
 }
 
 export async function vfsWriteFile(
@@ -1552,6 +1601,22 @@ export async function vfsWriteFile(
   if (opts.version?.label !== undefined) {
     const { validateLabel } = await import("../../../../shared/metadata-validate");
     validateLabel(opts.version.label);
+  }
+
+  // Phase 15: validate encryption opts shape and enforce mode-history
+  // monotonicity. Both checks throw VFSError before any SQL touches
+  // the row, so a rejected write leaves the existing path untouched.
+  if (opts.encryption) {
+    const { validateEncryptionOpts, enforceModeMonotonic } = await import(
+      "./encryption-stamp"
+    );
+    validateEncryptionOpts(opts.encryption);
+    enforceModeMonotonic(durableObject, userId, parentId, leaf, opts.encryption);
+  } else {
+    // Plaintext write: still need to check we're not silently writing
+    // plaintext to an encrypted path.
+    const { enforceModeMonotonic } = await import("./encryption-stamp");
+    enforceModeMonotonic(durableObject, userId, parentId, leaf, undefined);
   }
 
   const mode = opts.mode ?? 0o644;
@@ -1598,13 +1663,15 @@ export async function vfsWriteFile(
       // Phase 12: apply metadata/tags to the yjs-mode file. Version
       // opts are ignored on yjs files — the op log IS the history;
       // explicit checkpoints come from `flush()` (Phase 10/12).
+      // Phase 15: stamp encryption columns if opts.encryption is set.
       await applyPhase12SideEffects(
         durableObject,
         userId,
         existing.file_id,
         metadataEncoded,
         opts.tags,
-        Date.now()
+        Date.now(),
+        opts.encryption
       );
       return;
     }
@@ -1632,6 +1699,7 @@ export async function vfsWriteFile(
         tags: opts.tags,
         versionUserVisible: opts.version?.userVisible ?? true,
         versionLabel: opts.version?.label,
+        encryption: opts.encryption,
       }
     );
   }
@@ -1674,7 +1742,8 @@ export async function vfsWriteFile(
       tmpId,
       metadataEncoded,
       opts.tags,
-      now
+      now,
+      opts.encryption
     );
     return;
   }
@@ -1781,13 +1850,15 @@ export async function vfsWriteFile(
 
   await commitRename(durableObject, userId, scope, tmpId, parentId, leaf);
   // Phase 12: post-commit side effects on the chunked-tier write.
+  // Phase 15: stamp encryption columns when present.
   await applyPhase12SideEffects(
     durableObject,
     userId,
     tmpId,
     metadataEncoded,
     opts.tags,
-    now
+    now,
+    opts.encryption
   );
 }
 
@@ -1814,7 +1885,19 @@ async function applyPhase12SideEffects(
   pathId: string,
   metadataEncoded: Uint8Array | null | undefined,
   tags: readonly string[] | undefined,
-  mtimeMs: number
+  mtimeMs: number,
+  /**
+   * Phase 15: optional encryption stamp. Mode-history-monotonicity
+   * was already enforced at the top of `vfsWriteFile`; this just
+   * applies the column UPDATE to the freshly-committed row.
+   *
+   * - undefined → no change to existing encryption columns. Note
+   *   that for the chunked/inline write paths the freshly-inserted
+   *   row already has NULL columns (defaults), so undefined here is
+   *   correct for plaintext writes.
+   * - { mode, keyId? } → stamp the columns.
+   */
+  encryption?: { mode: "convergent" | "random"; keyId?: string }
 ): Promise<void> {
   if (metadataEncoded !== undefined) {
     durableObject.sql.exec(
@@ -1830,6 +1913,10 @@ async function applyPhase12SideEffects(
   } else {
     const { bumpTagMtimes } = await import("./metadata-tags");
     bumpTagMtimes(durableObject, pathId, mtimeMs);
+  }
+  if (encryption !== undefined) {
+    const { stampFileEncryption } = await import("./encryption-stamp");
+    stampFileEncryption(durableObject, pathId, encryption);
   }
 }
 

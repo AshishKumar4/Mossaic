@@ -20,7 +20,16 @@ import path from "node:path";
  * Output is ESM only (the SDK is for Workers, which is ESM-native).
  */
 export default defineConfig({
-  entry: ["src/index.ts", "src/igit.ts", "src/yjs.ts", "src/http-only.ts"],
+  entry: [
+    "src/index.ts",
+    "src/igit.ts",
+    "src/yjs.ts",
+    "src/http-only.ts",
+    // Phase 15: lazy-load encryption helpers via /encryption subpath.
+    // The main entry's writeFile/readFile use `await import("./encryption")`
+    // — splitting:true keeps that out of the main bundle.
+    "src/encryption.ts",
+  ],
   format: ["esm"],
   dts: true,
   sourcemap: true,

@@ -236,11 +236,16 @@ async function appendUpdate(
 
   // Update meta counters that depend on `kind`. The seq counter is
   // already advanced; this updates checkpoint-tracking only.
+  // Phase 15: also track `bytes_since_last_compact` for the
+  // backpressure check on encrypted yjs files (see
+  // {@link checkEncryptedYjsBackpressure}).
   if (kind === "op") {
     durableObject.sql.exec(
       `UPDATE yjs_meta
-          SET op_count_since_ckpt = op_count_since_ckpt + 1
+          SET op_count_since_ckpt = op_count_since_ckpt + 1,
+              bytes_since_last_compact = bytes_since_last_compact + ?
         WHERE path_id = ?`,
+      bytes.byteLength,
       pathId
     );
   } else {
@@ -248,7 +253,8 @@ async function appendUpdate(
       `UPDATE yjs_meta
           SET last_checkpoint_seq = ?,
               op_count_since_ckpt = 0,
-              last_compact_at = ?
+              last_compact_at = ?,
+              bytes_since_last_compact = 0
         WHERE path_id = ?`,
       seq,
       now,
@@ -257,6 +263,55 @@ async function appendUpdate(
   }
 
   return seq;
+}
+
+// ── Phase 15: backpressure on encrypted yjs op-log ─────────────────────
+
+/** Op-count threshold at which the server broadcasts a compact-please advisory. */
+export const COMPACT_ADVISORY_THRESHOLD = 100;
+/** Op-count hard threshold above which `appendUpdate` rejects with EBUSY. */
+export const COMPACT_HARD_THRESHOLD = 500;
+/** Byte hard threshold (op-log envelopes since last compact). */
+export const COMPACT_LOG_BYTES_HARD_LIMIT = 100 * 1024 * 1024;
+/** Inactivity threshold (since last compact) before the hard ban activates. */
+export const COMPACT_INACTIVITY_BAN_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Phase 15: read `files.encryption_mode` to detect if a yjs-mode file
+ * is encrypted. Used to route the WS message handler between the
+ * plaintext (materialise + apply + broadcast) path and the encrypted
+ * (opaque-relay only) path.
+ *
+ * Returns true iff `encryption_mode IS NOT NULL` for the path's
+ * head row.
+ */
+export function isPathEncryptedYjs(
+  durableObject: { sql: SqlStorage },
+  pathId: string
+): boolean {
+  const row = durableObject.sql
+    .exec(
+      "SELECT encryption_mode FROM files WHERE file_id = ?",
+      pathId
+    )
+    .toArray()[0] as { encryption_mode: string | null } | undefined;
+  return row?.encryption_mode === "convergent" || row?.encryption_mode === "random";
+}
+
+/**
+ * Frame an outbound `compact-please` advisory. Tag-4 frame; payload
+ * is `uint32 BE` of the current op-log seq count.
+ *
+ * The SDK's `openYDoc` handle exposes this via `onCompactNeeded(cb)`.
+ */
+export function encodeCompactPleaseFrame(seqCount: number): Uint8Array {
+  const out = new Uint8Array(5);
+  out[0] = 4; // YJS_COMPACT_PLEASE
+  out[1] = (seqCount >>> 24) & 0xff;
+  out[2] = (seqCount >>> 16) & 0xff;
+  out[3] = (seqCount >>> 8) & 0xff;
+  out[4] = seqCount & 0xff;
+  return out;
 }
 
 /**
@@ -481,6 +536,17 @@ export class YjsRuntime {
     update: Uint8Array,
     fromSocket: WebSocket
   ): Promise<void> {
+    // Phase 15: encrypted awareness — opaque relay only. Server can't
+    // decrypt the frame to extract clientIDs, so the
+    // disconnect-removal bookkeeping isn't possible. The cost is
+    // that survivors won't see a synthetic "removed" frame when a
+    // peer disconnects mid-session — they'll observe staleness
+    // until y-protocols' built-in heartbeat/timeout flushes the
+    // ghosts. Acceptable for v15.
+    if (isPathEncryptedYjs(this.durableObject, pathId)) {
+      this.broadcast(pathId, encodeAwarenessMessage(update), fromSocket);
+      return;
+    }
     // Materialise the doc lazily so the Awareness instance has the
     // right Y.Doc clientID space available.
     const doc = await this.getDoc(scope, pathId);
@@ -550,6 +616,13 @@ export class YjsRuntime {
    * and trigger compaction if thresholds are met.
    *
    * Returns the assigned seq number.
+   *
+   * Phase 15: when the file is encrypted, the `update` bytes are an
+   * AES-GCM envelope produced by the SDK. The server CANNOT decrypt
+   * — it just appends-and-broadcasts. Server-side compaction is
+   * disabled for encrypted yjs (the consumer compacts via
+   * `vfs.compactYjs`). The op-count advisory threshold still fires,
+   * but as a tag-4 frame rather than triggering server-side compact.
    */
   async applyRemoteUpdate(
     scope: VFSScope,
@@ -559,14 +632,36 @@ export class YjsRuntime {
     update: Uint8Array,
     excludeSocket: WebSocket | null
   ): Promise<number> {
-    // Ensure the doc is materialised.
-    const doc = await this.getDoc(scope, pathId);
+    const encrypted = isPathEncryptedYjs(this.durableObject, pathId);
+    if (!encrypted) {
+      // Plaintext path — original Phase 10 behaviour.
+      const doc = await this.getDoc(scope, pathId);
+      Y.applyUpdate(doc, update, "remote");
+      const seq = await appendUpdate(
+        this.durableObject,
+        scope,
+        userId,
+        pathId,
+        poolSize,
+        update,
+        "op"
+      );
+      const cached = this.docs.get(pathId);
+      if (cached) cached.seqApplied = seq;
+      this.broadcast(pathId, encodeUpdateMessage(update), excludeSocket);
+      const meta = getYjsMeta(this.durableObject, pathId);
+      if (
+        shouldCompact(meta.op_count_since_ckpt, meta.last_compact_at, Date.now())
+      ) {
+        // Fire-and-forget; failures don't break the live edit path.
+        void this.compact(scope, userId, pathId, poolSize).catch(() => {
+          /* swallow: compaction is opportunistic */
+        });
+      }
+      return seq;
+    }
 
-    // Apply locally. Origin 'remote' so any observers (none in
-    // current code, but future-proof) can discriminate.
-    Y.applyUpdate(doc, update, "remote");
-
-    // Persist as op row.
+    // ── Encrypted path: opaque relay + persist; no Y.Doc materialisation.
     const seq = await appendUpdate(
       this.durableObject,
       scope,
@@ -576,22 +671,15 @@ export class YjsRuntime {
       update,
       "op"
     );
-
-    const cached = this.docs.get(pathId);
-    if (cached) cached.seqApplied = seq;
-
-    // Broadcast to other sockets on this path.
     this.broadcast(pathId, encodeUpdateMessage(update), excludeSocket);
-
-    // Compaction trigger.
+    // Phase 15 advisory: when the encrypted op-log crosses the soft
+    // threshold, broadcast a tag-4 compact-please frame to ALL
+    // connected sockets (including the originator — the SDK ignores
+    // duplicate advisories until manually re-armed).
     const meta = getYjsMeta(this.durableObject, pathId);
-    if (
-      shouldCompact(meta.op_count_since_ckpt, meta.last_compact_at, Date.now())
-    ) {
-      // Fire-and-forget; failures don't break the live edit path.
-      void this.compact(scope, userId, pathId, poolSize).catch(() => {
-        /* swallow: compaction is opportunistic */
-      });
+    if (meta.op_count_since_ckpt >= COMPACT_ADVISORY_THRESHOLD) {
+      const advisory = encodeCompactPleaseFrame(meta.next_seq);
+      this.broadcast(pathId, advisory, null);
     }
 
     return seq;
@@ -685,6 +773,94 @@ export class YjsRuntime {
       checkpointSeq: ckSeq,
       opsReaped: r.dropped,
       versionId,
+    };
+  }
+
+  /**
+   * Phase 15 — client-driven compaction for encrypted Yjs files.
+   *
+   * The server CANNOT materialise an encrypted doc, so compaction
+   * must be initiated by a client that holds the master key. The
+   * client:
+   *  1. Reads the oplog (envelope bytes per op).
+   *  2. Decrypts each op locally.
+   *  3. Builds a fresh `Y.Doc` and applies the decrypted ops.
+   *  4. Encrypts `Y.encodeStateAsUpdate(doc)` as a single envelope
+   *     (`AAD='yj'`, mode='random' per plan §10 Q10).
+   *  5. Calls this RPC with `{ checkpointEnvelope, expectedNextSeq }`.
+   *
+   * Server validates that `meta.next_seq === expectedNextSeq` (CAS).
+   * If yes, appends the checkpoint at `expectedNextSeq` (bumping
+   * next_seq to `expectedNextSeq + 1`), drops oplog rows with
+   * `seq < expectedNextSeq`, and resets `bytes_since_last_compact`.
+   * If no, throws `EBUSY` so the client can retry against the new
+   * tip.
+   *
+   * Atomicity: single DO RPC method = single DO turn = one SQL
+   * transaction. CAS check + checkpoint append + drop-old-ops +
+   * counters reset all happen serially in this method body without
+   * any await crossing an event-loop boundary AFTER the CAS check
+   * (the only await is the ShardDO putChunk inside appendUpdate,
+   * which uses idempotent `INSERT OR REPLACE` on the chunk row).
+   */
+  async compactEncryptedYjs(
+    scope: VFSScope,
+    userId: string,
+    pathId: string,
+    poolSize: number,
+    checkpointEnvelope: Uint8Array,
+    expectedNextSeq: number
+  ): Promise<{ checkpointSeq: number; opsReaped: number }> {
+    if (!isPathEncryptedYjs(this.durableObject, pathId)) {
+      throw new VFSError(
+        "EINVAL",
+        "compactEncryptedYjs: path is not encrypted-yjs (use vfs.flushYjs for plaintext)"
+      );
+    }
+    // CAS pre-check. We re-check inside the actual SQL UPDATE that
+    // reserves the seq (see appendUpdate's UPSERT) — that is the
+    // load-bearing atomicity boundary. The pre-check here is a
+    // cheap optimization: catches the obvious non-race cases
+    // before we do the (slow) ShardDO putChunk.
+    const meta = getYjsMeta(this.durableObject, pathId);
+    if (meta.next_seq !== expectedNextSeq) {
+      throw new VFSError(
+        "EBUSY",
+        `compaction race: expectedNextSeq=${expectedNextSeq}, current=${meta.next_seq}`
+      );
+    }
+    // Append the checkpoint envelope. After this returns, next_seq
+    // has advanced by 1 atomically.
+    const ckSeq = await appendUpdate(
+      this.durableObject,
+      scope,
+      userId,
+      pathId,
+      poolSize,
+      checkpointEnvelope,
+      "checkpoint"
+    );
+    // Race resolution: if another writer/compactor sneaked in
+    // between our pre-check and our appendUpdate, ckSeq will not
+    // equal expectedNextSeq. In that case we MUST refuse to drop
+    // oplog rows below ckSeq — they belong to the racing writer.
+    // We surface EBUSY and the client retries.
+    if (ckSeq !== expectedNextSeq) {
+      throw new VFSError(
+        "EBUSY",
+        `compaction race: another writer advanced past expectedNextSeq=${expectedNextSeq} (got ckSeq=${ckSeq})`
+      );
+    }
+    // Drop old ops + decrement chunk_refs.
+    const r = await dropOpsBefore(
+      this.durableObject,
+      scope,
+      pathId,
+      ckSeq
+    );
+    return {
+      checkpointSeq: ckSeq,
+      opsReaped: r.dropped,
     };
   }
 

@@ -18,7 +18,7 @@ cd "$(dirname "$0")/.."
 output=$(lake build 2>&1 || true)
 
 # Filter for files we care about (must-have only).
-must_have_pattern='Mossaic/Vfs/(Common|Tenant|Refcount|Gc|AtomicWrite|Versioning)\.lean|Mossaic/Generated/(ShardDO|UserDO|Placement)\.lean'
+must_have_pattern='Mossaic/Vfs/(Common|Tenant|Refcount|Gc|AtomicWrite|Versioning|Encryption)\.lean|Mossaic/Generated/(ShardDO|UserDO|Placement)\.lean'
 
 sorry_warnings=$(echo "$output" | grep -E "declaration uses .sorry." | grep -E "$must_have_pattern" || true)
 
@@ -29,11 +29,42 @@ if [[ -n "$sorry_warnings" ]]; then
 fi
 
 # 2. Project axioms.
-project_axioms=$(grep -rnE '^axiom|^[[:space:]]+axiom' Mossaic/ || true)
-if [[ -n "$project_axioms" ]]; then
-  echo "FAIL: project-level axiom declarations found:"
-  echo "$project_axioms"
-  exit 1
+#
+# Phase 15: a single whitelisted axiom is permitted by name —
+# `AES_GCM_IND_CPA` in `Mossaic/Vfs/Encryption.lean`. This is the
+# standard cryptographic-literature result (NIST SP 800-38D, McGrew
+# & Viega 2004) and matches the F* + miTLS / EverCrypt practice of
+# axiomatising AES-GCM as an AEAD primitive.
+#
+# Any future axiom addition requires updating this whitelist (manual,
+# audited).
+WHITELISTED_AXIOMS=("AES_GCM_IND_CPA")
+
+# Find every axiom declaration in proof files. The project pattern
+# `^axiom <name>` or `^[[:space:]]+axiom <name>`.
+all_axioms_raw=$(grep -rnE '^axiom |^[[:space:]]+axiom ' Mossaic/ || true)
+if [[ -n "$all_axioms_raw" ]]; then
+  unauthorized=""
+  while IFS= read -r line; do
+    # Extract axiom name: format is "<file>:<line>:<indent>axiom NAME ..."
+    name=$(echo "$line" | sed -E 's/.*axiom +([A-Za-z_][A-Za-z0-9_]*).*/\1/')
+    is_whitelisted=0
+    for w in "${WHITELISTED_AXIOMS[@]}"; do
+      if [[ "$name" == "$w" ]]; then
+        is_whitelisted=1
+        break
+      fi
+    done
+    if [[ "$is_whitelisted" -eq 0 ]]; then
+      unauthorized+="$line"$'\n'
+    fi
+  done <<< "$all_axioms_raw"
+  if [[ -n "$unauthorized" ]]; then
+    echo "FAIL: project-level axiom declarations not in whitelist:"
+    echo "$unauthorized"
+    echo "Whitelisted: ${WHITELISTED_AXIOMS[*]}"
+    exit 1
+  fi
 fi
 
 # 3. Confirm `lake build` succeeded.

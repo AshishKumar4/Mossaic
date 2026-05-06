@@ -32,6 +32,13 @@ export interface VFSStatRaw {
   gid: number;
   /** 53-bit safe integer derived deterministically from the row's id (file_id / folder_id). */
   ino: number;
+  /**
+   * Phase 15: per-file encryption stamp. Undefined for plaintext
+   * (default for pre-Phase-15 rows and explicit plaintext writes).
+   * The SDK consults this on readFile to decide whether to attempt
+   * decryption. NULL/undefined → return server bytes verbatim.
+   */
+  encryption?: { mode: "convergent" | "random"; keyId?: string };
 }
 
 /** Public, shard-index-stripped manifest returned by `vfsOpenManifest` for caller-driven multi-invocation reads. */
@@ -80,7 +87,18 @@ export type VFSErrorCode =
   | "ELOOP"
   | "EBUSY"
   | "EINVAL"
-  | "EAGAIN";
+  | "EAGAIN"
+  // Phase 15 — opt-in E2E encryption error surface (per plan §4.6).
+  // - EBADF: writeFile attempted with a different encryption mode than
+  //   the existing path's history, OR plaintext write to an encrypted
+  //   path. Mode-history-monotonic enforcement.
+  // - EACCES: readFile / openYDoc on an encrypted file without
+  //   `encryption` config on the VFS instance.
+  // - ENOTSUP: chmod-style encryption toggle (encrypt/decrypt-in-place)
+  //   not supported in v15.
+  | "EBADF"
+  | "EACCES"
+  | "ENOTSUP";
 
 /**
  * Error class thrown by VFS RPC methods. Workers RPC serializes the

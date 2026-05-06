@@ -340,7 +340,7 @@ async function copyInline(
     parentId,
     leaf
   );
-  await applyCopySideEffects(durableObject, userId, tmpId, opts, now);
+  await applyCopySideEffects(durableObject, userId, tmpId, opts, now, srcRow.file_id);
 }
 
 async function copyChunked(
@@ -453,7 +453,7 @@ async function copyChunked(
     parentId,
     leaf
   );
-  await applyCopySideEffects(durableObject, userId, tmpId, opts, now);
+  await applyCopySideEffects(durableObject, userId, tmpId, opts, now, srcRow.file_id);
 }
 
 async function copyVersioned(
@@ -537,6 +537,10 @@ async function copyVersioned(
       userVisible: opts.versionUserVisible ?? true,
       label: opts.versionLabel,
       metadata: opts.metadataEncoded ?? null,
+      // Phase 15: copy preserves the source's encryption mode + keyId.
+      // The bytes are envelope-stream verbatim; the dest must report
+      // the same mode so SDK readFile knows to decrypt.
+      encryption: srcHead.encryption,
     });
     await opsMod.commitRenameExternal(
       durableObject,
@@ -546,7 +550,7 @@ async function copyVersioned(
       parentId,
       leaf
     );
-    await applyCopySideEffects(durableObject, userId, tmpId, opts, now);
+    await applyCopySideEffects(durableObject, userId, tmpId, opts, now, srcRow.file_id);
     return;
   }
 
@@ -626,6 +630,8 @@ async function copyVersioned(
     userVisible: opts.versionUserVisible ?? true,
     label: opts.versionLabel,
     metadata: opts.metadataEncoded ?? null,
+    // Phase 15: see inline branch above. Chunked copy preserves source mode.
+    encryption: srcHead.encryption,
   });
   await opsMod.commitRenameExternal(
     durableObject,
@@ -635,7 +641,7 @@ async function copyVersioned(
     parentId,
     leaf
   );
-  await applyCopySideEffects(durableObject, userId, tmpId, opts, now);
+  await applyCopySideEffects(durableObject, userId, tmpId, opts, now, srcRow.file_id);
 }
 
 async function preflightChunksAlive(
@@ -678,7 +684,16 @@ async function applyCopySideEffects(
   userId: string,
   pathId: string,
   opts: CopyOpts,
-  mtimeMs: number
+  mtimeMs: number,
+  /**
+   * Phase 15: source `files.file_id`. When set, the destination
+   * inherits the source's `(encryption_mode, encryption_key_id)`
+   * columns via {@link copyEncryptionStamp}. The bytes were already
+   * copied opaquely (envelopes are byte-identical between src and
+   * dst); this just makes the dest's stat surface report the right
+   * mode so the SDK knows to decrypt on read.
+   */
+  srcFileId?: string
 ): Promise<void> {
   const tagsMod = await import("./metadata-tags");
   if (opts.metadataEncoded !== undefined) {
@@ -688,6 +703,10 @@ async function applyCopySideEffects(
     tagsMod.replaceTags(durableObject, userId, pathId, opts.tags);
   } else {
     tagsMod.bumpTagMtimes(durableObject, pathId, mtimeMs);
+  }
+  if (srcFileId !== undefined) {
+    const { copyEncryptionStamp } = await import("./encryption-stamp");
+    copyEncryptionStamp(durableObject, srcFileId, pathId);
   }
 }
 
