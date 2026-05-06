@@ -84,7 +84,11 @@ export async function signJWT(
   return new SignJWT({ sub: payload.userId, email: payload.email })
     .setProtectedHeader({ alg: "HS256" })
     .setIssuedAt()
-    .setExpirationTime(Date.now() + JWT_EXPIRATION_MS)
+    // jose's `setExpirationTime` interprets numeric input as
+    // seconds-since-epoch (per the JWT `exp` claim spec). The previous
+    // call passed milliseconds, producing tokens with `exp` ~year 57000
+    // — i.e. never-expiring sessions. Convert to seconds.
+    .setExpirationTime(Math.floor((Date.now() + JWT_EXPIRATION_MS) / 1000))
     .sign(secret);
 }
 
@@ -190,7 +194,8 @@ export async function signVFSToken(
   return new SignJWT(claims)
     .setProtectedHeader({ alg: "HS256" })
     .setIssuedAt()
-    .setExpirationTime(Date.now() + ttlMs)
+    // Seconds-since-epoch per JWT `exp` claim spec.
+    .setExpirationTime(Math.floor((Date.now() + ttlMs) / 1000))
     .sign(secret);
 }
 

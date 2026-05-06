@@ -85,4 +85,55 @@ describe("JWT_SECRET handling (C1)", () => {
     const verified = await verifyJWT(env, token);
     expect(verified).toEqual({ userId: "u", email: "e@example.com" });
   });
+
+  /**
+   * Regression: jose's `setExpirationTime(input)` interprets numeric
+   * input as seconds-since-epoch. Earlier code passed milliseconds so
+   * tokens carried `exp` ~year 57000 (effectively never-expiring).
+   * Decode the JWT body and assert `exp` is in seconds and within
+   * sane bounds of "now + ~24h" (default JWT_EXPIRATION_MS).
+   */
+  it("signJWT emits `exp` as seconds-since-epoch (not milliseconds)", async () => {
+    const env = makeEnv("a-secret-of-some-length");
+    const beforeS = Math.floor(Date.now() / 1000);
+    const token = await signJWT(env, { userId: "u", email: "e@example.com" });
+    // Decode the body without verifying — we just want the exp claim.
+    const body = JSON.parse(
+      atob(token.split(".")[1]!.replace(/-/g, "+").replace(/_/g, "/"))
+    ) as { exp?: number; iat?: number };
+    expect(typeof body.exp).toBe("number");
+    // Sanity: exp is within ~25 hours of now (default JWT_EXPIRATION_MS = 30d
+    // per env at time of writing — but at minimum > 0 and < year 2200).
+    expect(body.exp!).toBeGreaterThan(beforeS);
+    expect(body.exp!).toBeLessThan(beforeS + 366 * 24 * 60 * 60);
+    expect(body.iat!).toBeGreaterThanOrEqual(beforeS - 1);
+    expect(body.iat!).toBeLessThan(body.exp!);
+  });
+
+  it("signVFSToken emits `exp` as seconds-since-epoch", async () => {
+    const env = makeEnv("a-secret-of-some-length");
+    const beforeS = Math.floor(Date.now() / 1000);
+    const ttlMs = 15 * 60 * 1000;
+    const token = await signVFSToken(
+      env,
+      { ns: "default", tenant: "alice" },
+      ttlMs
+    );
+    const body = JSON.parse(
+      atob(token.split(".")[1]!.replace(/-/g, "+").replace(/_/g, "/"))
+    ) as { exp?: number; iat?: number };
+    expect(typeof body.exp).toBe("number");
+    // 15-min TTL ⇒ exp ≈ iat + 900s. Allow ±5s slop.
+    expect(body.exp!).toBeGreaterThanOrEqual(beforeS + 895);
+    expect(body.exp!).toBeLessThanOrEqual(beforeS + 905);
+  });
+
+  it("verifyVFSToken accepts the seconds-encoded exp from signVFSToken", async () => {
+    const env = makeEnv("a-secret-of-some-length");
+    const token = await signVFSToken(env, { ns: "default", tenant: "alice" });
+    const verified = await verifyVFSToken(env, token);
+    expect(verified).not.toBeNull();
+    expect(verified!.tn).toBe("alice");
+    expect(verified!.ns).toBe("default");
+  });
 });
