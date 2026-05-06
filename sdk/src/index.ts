@@ -100,6 +100,12 @@ export type {
 // Universal preview pipeline — types only; the renderer
 // implementations live in the worker (server-side rendering). SDK
 // consumers call `vfs.readPreview()` and receive `ReadPreviewResult`.
+//
+// Phase 45 \u2014 also export the signed-URL types (`previewUrl` /
+// `previewInfo` / `previewInfoMany`). The new methods return URLs
+// the browser can fetch directly via the
+// `/api/vfs/preview-variant/<token>` route, hitting Workers Cache +
+// CDN edge instead of tunneling bytes through the SDK's RPC.
 export type {
   Variant,
   StandardVariant,
@@ -109,6 +115,9 @@ export type {
   ReadPreviewOpts,
   ReadPreviewResult,
   FileVariant,
+  PreviewInfo,
+  PreviewInfoBatchEntry,
+  PreviewUrlOpts,
 } from "../../shared/preview-types";
 export { STANDARD_VARIANT_DIMS } from "../../shared/preview-types";
 

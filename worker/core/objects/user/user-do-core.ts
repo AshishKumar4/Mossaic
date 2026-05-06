@@ -43,13 +43,28 @@ import type {
   VFSStatRaw,
 } from "../../../../shared/vfs-types";
 import type {
+  PreviewInfo,
+  PreviewInfoBatchEntry,
   ReadPreviewOpts,
   ReadPreviewResult,
+  Variant,
 } from "../../../../shared/preview-types";
 import { VFSError } from "../../../../shared/vfs-types";
 import { vfsShardDOName } from "../../lib/utils";
 import { logError, logInfo } from "../../lib/logger";
+import {
+  signPreviewToken,
+  PREVIEW_TOKEN_DEFAULT_TTL_MS,
+} from "../../lib/preview-token";
 import { dedupePaths, type DedupeResult } from "./admin";
+import {
+  encodeVariantKey,
+  findVariantRow,
+  renderAndStoreVariant,
+} from "./preview-variants";
+import { defaultRegistry } from "../../lib/preview-pipeline";
+import { resolvePath } from "./path-walk";
+import { userIdFor } from "./vfs/helpers";
 import {
   insertAuditLog,
   loadAuditLogMaxRows,
@@ -1499,6 +1514,388 @@ export class UserDOCore extends DurableObject<Env> {
   ): Promise<CacheResolveResult> {
     this.gateVfs(scope);
     return vfsResolveCacheKey(this, scope, path);
+  }
+
+  /**
+   * Phase 45 \u2014 mint a signed preview-variant URL.
+   *
+   * Resolves `path` to a fileId + headVersionId, ensures the
+   * variant cache row exists (rendering on demand if needed),
+   * reads the chunkHash, and signs a JWT that the browser can
+   * present to `GET /api/vfs/preview-variant/<token>`.
+   *
+   * The mint RPC \u2014 not the route handler \u2014 owns the auth
+   * decision: callers prove they can read the path here, and
+   * the resulting token grants a CDN-cacheable URL whose bytes
+   * are content-addressed (immutable per contentHash). Subsequent
+   * fetches for the same content hit Workers Cache + browser
+   * cache without re-authenticating.
+   *
+   * Encrypted files throw `ENOTSUP` (server cannot render
+   * ciphertext; client-side rendering is the path forward).
+   * Tombstoned heads throw `ENOENT` (matches `vfsReadPreview`).
+   *
+   * @param ttlMs \u2014 token TTL clamped to
+   *   [PREVIEW_TOKEN_MIN_TTL_MS, PREVIEW_TOKEN_MAX_TTL_MS] by
+   *   `signPreviewToken`. Default 24h. The browser cache lives
+   *   for the year-long max-age regardless of token TTL.
+   */
+  async vfsMintPreviewToken(
+    scope: VFSScope,
+    path: string,
+    opts: {
+      variant?: Variant;
+      format?: ReadPreviewOpts["format"];
+      renderer?: string;
+      ttlMs?: number;
+    } = {}
+  ): Promise<PreviewInfo> {
+    this.gateVfs(scope);
+    return this.mintPreviewInfo(scope, path, opts);
+  }
+
+  /**
+   * Phase 45 \u2014 read variant bytes by content hash, gated on the
+   * variant cache row matching `(fileId, variantKind, rendererKind,
+   * headVersionId, contentHash)`. Used by the preview-variant
+   * route after `verifyPreviewToken` succeeds: the token claims
+   * the bytes match `contentHash`; this RPC re-verifies the
+   * row still has that hash, then streams bytes from ShardDO.
+   *
+   * Returns null when:
+   *   - The variant row no longer exists (e.g. dropped + not
+   *     re-rendered yet). Route returns 404.
+   *   - The row exists but its `chunk_hash` no longer matches
+   *     the token's `contentHash` (a re-render produced
+   *     different bytes). Route returns 410 Gone (token stale).
+   *   - The chunk has been reaped from the shard. Route
+   *     returns 410.
+   *
+   * NOT auth-gated by the route's `vfsAuth` middleware (the
+   * route validates the HMAC token instead). The DO-level
+   * `gateVfs` is bypassed because the token IS the auth signal;
+   * any caller with a valid token has already proved the mint
+   * RPC verified them.
+   */
+  async vfsReadVariantByHash(
+    scope: VFSScope,
+    fileId: string,
+    variantKind: string,
+    rendererKind: string,
+    headVersionId: string | null,
+    contentHash: string
+  ): Promise<{
+    bytes: Uint8Array;
+    mimeType: string;
+    width: number;
+    height: number;
+  } | null> {
+    this.ensureInit();
+    const row = findVariantRow(
+      this,
+      fileId,
+      variantKind,
+      rendererKind,
+      headVersionId
+    );
+    if (row === null) return null;
+    if (row.chunkHash !== contentHash) return null;
+    const env = this.envPublic;
+    const shardName = vfsShardDOName(
+      scope.ns,
+      scope.tenant,
+      scope.sub,
+      row.shardIndex
+    );
+    const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<
+      import("../shard/shard-do").ShardDO
+    >;
+    const stub = shardNs.get(shardNs.idFromName(shardName));
+    const bytes = await stub.getChunkBytes(row.chunkHash);
+    if (bytes === null) return null;
+    return {
+      bytes,
+      mimeType: row.mimeType,
+      width: row.width,
+      height: row.height,
+    };
+  }
+
+  /**
+   * Phase 45 \u2014 batched preview-info mint. Mirrors the
+   * `/manifests` batched shape: one RPC per N paths instead of N
+   * RPCs. Per-path failures are returned alongside successes so
+   * a single missing file doesn't surface 4xx for the whole
+   * batch.
+   *
+   * Cap at 256 paths per call (matches the manifests batch
+   * cap) so a single request can't exhaust DO turn time.
+   */
+  async vfsPreviewInfoMany(
+    scope: VFSScope,
+    paths: readonly string[],
+    opts: {
+      variant?: Variant;
+      format?: ReadPreviewOpts["format"];
+      renderer?: string;
+      ttlMs?: number;
+    } = {}
+  ): Promise<PreviewInfoBatchEntry[]> {
+    this.gateVfs(scope);
+    if (paths.length === 0) return [];
+    if (paths.length > 256) {
+      throw new VFSError(
+        "EINVAL",
+        `vfsPreviewInfoMany: max 256 paths per call (got ${paths.length})`
+      );
+    }
+    const out: PreviewInfoBatchEntry[] = [];
+    for (const p of paths) {
+      try {
+        const info = await this.mintPreviewInfo(scope, p, opts);
+        out.push({ path: p, ok: true, info });
+      } catch (err) {
+        let code: string = "EBUSY";
+        if (err instanceof VFSError) {
+          code = err.code;
+        } else if (err instanceof Error) {
+          const maybeCoded = err as Error & { code?: unknown };
+          if (typeof maybeCoded.code === "string") {
+            code = maybeCoded.code;
+          }
+        }
+        const message =
+          err instanceof Error ? err.message : String(err);
+        out.push({ path: p, ok: false, code, message });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Phase 45 \u2014 internal mint helper. Resolves the path, ensures
+   * the variant cache row exists, signs the token. Used by both
+   * `vfsMintPreviewToken` and `vfsPreviewInfoMany`.
+   *
+   * Mirrors the auth + routing flow of `vfsReadPreview` so the
+   * mint decision matches the read decision exactly. Where
+   * `vfsReadPreview` returns bytes, this helper returns a
+   * signed URL pointing at the same content.
+   */
+  private async mintPreviewInfo(
+    scope: VFSScope,
+    path: string,
+    opts: {
+      variant?: Variant;
+      format?: ReadPreviewOpts["format"];
+      renderer?: string;
+      ttlMs?: number;
+    }
+  ): Promise<PreviewInfo> {
+    const userId = userIdFor(scope);
+    const r = resolvePath(this, userId, path);
+    if (r.kind === "ENOENT") {
+      throw new VFSError("ENOENT", `previewUrl: no such file: ${path}`);
+    }
+    if (r.kind === "dir") {
+      throw new VFSError("EISDIR", `previewUrl: is a directory: ${path}`);
+    }
+    if (r.kind !== "file") {
+      throw new VFSError(
+        "EINVAL",
+        `previewUrl: not a regular file: ${path}`
+      );
+    }
+    const fileId = r.leafId;
+
+    // Pull file metadata + head_version state. Mirrors the SELECT
+    // in `vfs/preview.ts:90-118` so the mint decision and the
+    // read decision see the same row shape.
+    const fileRow = this.sql
+      .exec(
+        `SELECT f.file_name, f.file_size, f.mime_type, f.encryption_mode,
+                f.head_version_id, fv.deleted AS head_deleted,
+                fv.size AS head_size
+           FROM files f
+           LEFT JOIN file_versions fv
+             ON fv.path_id = f.file_id AND fv.version_id = f.head_version_id
+          WHERE f.file_id = ? AND f.user_id = ? AND f.status != 'deleted'`,
+        fileId,
+        userId
+      )
+      .toArray()[0] as
+      | {
+          file_name: string;
+          file_size: number;
+          mime_type: string | null;
+          encryption_mode: string | null;
+          head_version_id: string | null;
+          head_deleted: number | null;
+          head_size: number | null;
+        }
+      | undefined;
+    if (!fileRow) {
+      throw new VFSError(
+        "ENOENT",
+        `previewUrl: file row missing for ${path}`
+      );
+    }
+    if (fileRow.head_version_id !== null && fileRow.head_deleted === 1) {
+      throw new VFSError(
+        "ENOENT",
+        `previewUrl: head version is a tombstone for ${path}`
+      );
+    }
+    if (fileRow.encryption_mode !== null) {
+      throw new VFSError(
+        "ENOTSUP",
+        "previewUrl: encrypted files require client-side rendering"
+      );
+    }
+
+    const mimeType = fileRow.mime_type ?? "application/octet-stream";
+    const fileName = fileRow.file_name;
+    const fileSize =
+      fileRow.head_version_id !== null
+        ? (fileRow.head_size ?? 0)
+        : fileRow.file_size;
+    const headVersionForCache = fileRow.head_version_id;
+
+    const registry = defaultRegistry();
+    const primaryRenderer = registry.dispatchByMime(mimeType);
+    const variant: Variant = opts.variant ?? "thumb";
+    const variantKey = encodeVariantKey(variant);
+
+    // Try the variant cache. If hit, we know the chunkHash + dims
+    // immediately. Same fallback chain as vfs/preview.ts so a
+    // pre-rendered icon-card or image-passthrough row counts.
+    let row = findVariantRow(
+      this,
+      fileId,
+      variantKey,
+      primaryRenderer.kind,
+      headVersionForCache
+    );
+    let rowRendererKind = primaryRenderer.kind;
+    if (row === null) {
+      const fallbackKinds = mimeType.startsWith("image/")
+        ? ["image-passthrough", "icon-card"]
+        : ["icon-card"];
+      for (const k of fallbackKinds) {
+        const fallback = findVariantRow(
+          this,
+          fileId,
+          variantKey,
+          k,
+          headVersionForCache
+        );
+        if (fallback !== null) {
+          row = fallback;
+          rowRendererKind = k;
+          break;
+        }
+      }
+    }
+
+    // Cache miss \u2014 render + persist + re-lookup.
+    if (row === null) {
+      await renderAndStoreVariant(
+        this,
+        scope,
+        fileId,
+        path,
+        mimeType,
+        fileName,
+        fileSize,
+        variant,
+        headVersionForCache
+      );
+      // Resolve which renderer kind was actually persisted (the
+      // EMOSSAIC_UNAVAILABLE fallback in renderAndStoreVariant
+      // could have chosen image-passthrough or icon-card).
+      const persistedRow = findVariantRow(
+        this,
+        fileId,
+        variantKey,
+        primaryRenderer.kind,
+        headVersionForCache
+      );
+      if (persistedRow !== null) {
+        row = persistedRow;
+        rowRendererKind = primaryRenderer.kind;
+      } else {
+        const fallbackKinds = mimeType.startsWith("image/")
+          ? ["image-passthrough", "icon-card"]
+          : ["icon-card"];
+        for (const k of fallbackKinds) {
+          const fallback = findVariantRow(
+            this,
+            fileId,
+            variantKey,
+            k,
+            headVersionForCache
+          );
+          if (fallback !== null) {
+            row = fallback;
+            rowRendererKind = k;
+            break;
+          }
+        }
+      }
+    }
+
+    if (row === null) {
+      // renderAndStoreVariant should have written exactly one row
+      // (composite PK guards the race); if we still can't find it
+      // here something is structurally wrong. Surface as EBUSY so
+      // the SPA shows a transient failure (and retries) rather
+      // than caching the bad state.
+      throw new VFSError(
+        "EBUSY",
+        `previewUrl: variant row missing after render for ${path}`
+      );
+    }
+
+    // Tenant id mirrors `userIdFor(scope)` shape so the route
+    // can re-derive scope from the verified token's tenantId
+    // claim.
+    const tenantId =
+      scope.sub !== undefined
+        ? `${scope.ns}::${scope.tenant}::${scope.sub}`
+        : `${scope.ns}::${scope.tenant}`;
+    const format =
+      typeof opts.format === "string" && opts.format.length > 0
+        ? opts.format
+        : "auto";
+    const ttlMs = opts.ttlMs ?? PREVIEW_TOKEN_DEFAULT_TTL_MS;
+
+    const { token, expiresAtMs } = await signPreviewToken(
+      this.envPublic,
+      {
+        tenantId,
+        fileId,
+        headVersionId: headVersionForCache,
+        variantKind: variantKey,
+        rendererKind: rowRendererKind,
+        format,
+        contentHash: row.chunkHash,
+      },
+      ttlMs
+    );
+    const cacheControl = "public, max-age=31536000, immutable";
+    return {
+      token,
+      url: `/api/vfs/preview-variant/${token}`,
+      etag: `W/"${row.chunkHash}"`,
+      mimeType: row.mimeType,
+      width: row.width,
+      height: row.height,
+      rendererKind: rowRendererKind,
+      versionId: headVersionForCache,
+      cacheControl,
+      contentHash: row.chunkHash,
+      expiresAtMs,
+    };
   }
 
   // ── VFS RPC surface (write-side) ──────────────────────────────
