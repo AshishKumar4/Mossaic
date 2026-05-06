@@ -862,8 +862,13 @@ export class YjsRuntime {
     pathId: string,
     poolSize: number,
     checkpointEnvelope: Uint8Array,
-    expectedNextSeq: number
-  ): Promise<{ checkpointSeq: number; opsReaped: number }> {
+    expectedNextSeq: number,
+    opts: { userVisible?: boolean; label?: string } = {}
+  ): Promise<{
+    checkpointSeq: number;
+    opsReaped: number;
+    versionId?: string;
+  }> {
     if (!isPathEncryptedYjs(this.durableObject, pathId)) {
       throw new VFSError(
         "EINVAL",
@@ -911,9 +916,87 @@ export class YjsRuntime {
       pathId,
       ckSeq
     );
+
+    // Phase 52 P3 #8 — emit a user-visible version row for
+    // versioning-on tenants when the caller explicitly flushes.
+    //
+    // Pre-Phase-52: this asymmetry between plain (`compact` line
+    // 774-823 emits a version row when `userVisible=true`) and
+    // encrypted-yjs (no version emission) meant `vfs.compactYjs()`
+    // on an encrypted-yjs file silently lost its checkpoint history
+    // from the file's `listVersions` surface. The opt-in
+    // `userVisible` flag mirrors the plain path; opportunistic
+    // server-driven compactions (which can't happen for encrypted
+    // anyway — the server can't decrypt — but symmetric for the
+    // future) skip this.
+    //
+    // The version row's inline_data IS the checkpoint envelope —
+    // an opaque encrypted blob. Restoring this version's bytes via
+    // `restoreVersion` + `readFile` on a yjs-mode file routes
+    // through `writeYjsBytes` which recognises the envelope and
+    // re-applies it to the path's Y.Doc state (Phase 38).
+    let versionId: string | undefined;
+    if (opts.userVisible) {
+      const { isVersioningEnabled, commitVersion } = await import(
+        "./vfs-versions"
+      );
+      if (isVersioningEnabled(this.durableObject, userId)) {
+        const { generateId } = await import("../../lib/utils");
+        versionId = generateId();
+        const now = Date.now();
+        // Mirror the plain-path metadata snapshot.
+        const metaRow = this.durableObject.sql
+          .exec(
+            "SELECT metadata FROM files WHERE file_id = ?",
+            pathId
+          )
+          .toArray()[0] as { metadata: ArrayBuffer | null } | undefined;
+        // Stamp the encryption mode/keyId from the file's row
+        // onto the version. Without this, listVersions on an
+        // encrypted-yjs file would return rows whose
+        // `encryption_mode` IS NULL — confusing for clients
+        // gating decrypt-on-read on that column.
+        const encRow = this.durableObject.sql
+          .exec(
+            "SELECT encryption_mode, encryption_key_id FROM files WHERE file_id = ?",
+            pathId
+          )
+          .toArray()[0] as
+          | { encryption_mode: string | null; encryption_key_id: string | null }
+          | undefined;
+        const enc =
+          encRow && encRow.encryption_mode
+            ? {
+                mode: encRow.encryption_mode as "convergent" | "random",
+                keyId: encRow.encryption_key_id ?? undefined,
+              }
+            : undefined;
+        commitVersion(this.durableObject, {
+          pathId,
+          versionId,
+          userId,
+          size: checkpointEnvelope.byteLength,
+          mode: 0o644,
+          mtimeMs: now,
+          chunkSize: 0,
+          chunkCount: 0,
+          fileHash: "",
+          mimeType: "application/octet-stream",
+          inlineData: checkpointEnvelope,
+          userVisible: true,
+          label: opts.label,
+          metadata: metaRow?.metadata
+            ? new Uint8Array(metaRow.metadata)
+            : null,
+          encryption: enc,
+        });
+      }
+    }
+
     return {
       checkpointSeq: ckSeq,
       opsReaped: r.dropped,
+      versionId,
     };
   }
 
