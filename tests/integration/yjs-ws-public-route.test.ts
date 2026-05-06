@@ -22,6 +22,7 @@ import { signVFSToken } from "@core/lib/auth";
 
 interface E {
   MOSSAIC_USER: DurableObjectNamespace;
+  MOSSAIC_SHARD: DurableObjectNamespace;
   JWT_SECRET?: string;
 }
 const TEST_ENV = env as unknown as E;

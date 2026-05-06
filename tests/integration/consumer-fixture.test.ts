@@ -31,6 +31,7 @@ import handler, {
 
 interface E {
   MOSSAIC_USER: DurableObjectNamespace;
+  MOSSAIC_SHARD: DurableObjectNamespace;
 }
 const E = env as unknown as E;
 
@@ -127,6 +128,7 @@ function makeEnvWithCounter(
       E.MOSSAIC_USER,
       counter
     ) as unknown as ConsumerEnv["MOSSAIC_USER"],
+    MOSSAIC_SHARD: E.MOSSAIC_SHARD as unknown as ConsumerEnv["MOSSAIC_SHARD"],
     TEST_TENANT: tenant,
   };
 }

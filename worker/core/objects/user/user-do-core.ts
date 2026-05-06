@@ -28,6 +28,8 @@ import {
   vfsSymlink,
   vfsUnlink,
   vfsPurge,
+  vfsArchive,
+  vfsUnarchive,
   vfsWriteFile,
   type VFSReadHandle,
   type VFSWriteFileOpts,
@@ -620,6 +622,36 @@ export class UserDOCore extends DurableObject<Env> {
         WHERE indexed_at IS NULL AND status = 'complete'
     `);
 
+    // ── Phase 29 — archive bit (three-tier delete API) ────────────
+    //
+    // `archived = 1` hides a path from the default `listFiles` /
+    // `fileInfo` results without destroying or tombstoning data.
+    // Reads (`stat`, `readFile`, `readPreview`, `createReadStream`,
+    // `openManifest`, `readChunk`, `listVersions`, `restoreVersion`)
+    // are UNCHANGED — an archived file is fully readable by anyone
+    // who knows its path. Only the listing-side filters apply.
+    //
+    // Three-tier delete model after Phase 29:
+    //   - `archive(path)` — cosmetic; reversible via `unarchive`;
+    //                       does NOT touch versions or chunks.
+    //   - `unlink(path)`  — POSIX-style; versioning-on writes a
+    //                       tombstone version (path becomes ENOENT
+    //                       to reads); versioning-off hard-deletes.
+    //   - `purge(path)`   — destructive; drops every version row +
+    //                       decrements ShardDO chunk refs.
+    //
+    // Idempotent ALTER: try/catch swallows "duplicate column name"
+    // when the migration runs on an already-migrated DO. NOT NULL
+    // DEFAULT 0 means existing rows surface as not-archived without
+    // a backfill.
+    try {
+      this.sql.exec(
+        "ALTER TABLE files ADD COLUMN archived INTEGER NOT NULL DEFAULT 0"
+      );
+    } catch {
+      // column already exists
+    }
+
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS file_tags (
         path_id   TEXT NOT NULL,
@@ -748,6 +780,33 @@ export class UserDOCore extends DurableObject<Env> {
       CREATE INDEX IF NOT EXISTS idx_file_variants_file
         ON file_variants(file_id)
     `);
+
+    // Phase 28 Fix 1 — version-aware variant cache.
+    //
+    // Pre-fix, the cache key was `(file_id, variant_kind, renderer_kind)`.
+    // After v2 supersedes v1 on a versioning-on tenant, the cache row
+    // for v1 still matches a thumbnail lookup and the gallery serves
+    // STALE bytes for the file's HEAD until the row is manually
+    // invalidated. The bug surfaces as "I edited the photo but the
+    // thumbnail shows the old image."
+    //
+    // Post-fix: store the head_version_id at render time on the
+    // variant row. The reader (`findVariantRow` in
+    // `worker/core/objects/user/preview-variants.ts`) gates on a match
+    // with the file's CURRENT head_version_id; mismatch → cache miss
+    // → re-render against the new head. Existing (legacy) rows have
+    // version_id IS NULL — they remain valid for the
+    // versioning-OFF / no-head-version case (where head_version_id
+    // is NULL on `files` too). The legacy passthrough is a load-
+    // bearing equivalence: NULL == NULL is the SQL convention we
+    // adopt explicitly (`IS NULL` predicate, not `=`).
+    try {
+      this.sql.exec(
+        "ALTER TABLE file_variants ADD COLUMN version_id TEXT"
+      );
+    } catch {
+      // column already exists
+    }
 
     // ── Audit H6: surface UNIQUE INDEX failure on legacy data ────────────
     //
@@ -1082,6 +1141,30 @@ export class UserDOCore extends DurableObject<Env> {
       // Best-effort.
     }
 
+    // Phase 28 Fix 4 — shard capacity warning poll. Throttled to
+    // once per hour by the helper itself; reads `quota.pool_size`
+    // and fans out a `getStorageBytes` RPC per shard. Logs a
+    // structured warning for each shard that's >softCap (9 GB).
+    // Best-effort: a transient shard failure or missing quota row
+    // is swallowed so capacity monitoring never blocks the
+    // primary alarm work.
+    try {
+      const poolRow = this.sql
+        .exec(
+          "SELECT pool_size FROM quota WHERE user_id = ?",
+          scope.sub !== undefined
+            ? `${scope.tenant}::${scope.sub}`
+            : scope.tenant
+        )
+        .toArray()[0] as { pool_size: number } | undefined;
+      if (poolRow) {
+        const { monitorShardCapacity } = await import("./shard-capacity");
+        await monitorShardCapacity(this, scope, poolRow.pool_size);
+      }
+    } catch {
+      // Best-effort.
+    }
+
     // Reschedule if the batch was capped, otherwise fall through —
     // the next gated VFS call will re-arm via ensureStaleSweepScheduled.
     if (rows.length === 200 || multipartHasMore) {
@@ -1234,6 +1317,24 @@ export class UserDOCore extends DurableObject<Env> {
   async vfsPurge(scope: VFSScope, path: string): Promise<void> {
     this.gateVfsWrite(scope);
     return vfsPurge(this, scope, path);
+  }
+
+  /**
+   * Phase 29 — `archive(path)` / `unarchive(path)`.
+   *
+   * Hide a path from default `listFiles` / `fileInfo` results
+   * without destroying or tombstoning data. Read surfaces (`stat`,
+   * `readFile`, etc.) are unchanged — an archived file is fully
+   * readable by anyone who knows the path.
+   */
+  async vfsArchive(scope: VFSScope, path: string): Promise<void> {
+    this.gateVfsWrite(scope);
+    vfsArchive(this, scope, path);
+  }
+
+  async vfsUnarchive(scope: VFSScope, path: string): Promise<void> {
+    this.gateVfsWrite(scope);
+    vfsUnarchive(this, scope, path);
   }
 
   /** mkdir() — create folder; recursive flag walks intermediates. */
@@ -1879,13 +1980,36 @@ export class UserDOCore extends DurableObject<Env> {
       fileName: string;
       fileSize: number;
       isEncrypted: boolean;
+      /**
+       * Phase 28 Fix 1 — head_version_id at finalize time. Optional
+       * for backward compat with route callers that haven't been
+       * updated; resolved from the `files` row when omitted.
+       */
+      headVersionId?: string | null;
     }
   ): Promise<void> {
     this.ensureInit();
+    // Resolve head_version_id from `files` when the caller didn't
+    // pass it. Pre-generated variants stamp this value so a
+    // subsequent write that flips the head invalidates them
+    // (Phase 28 Fix 1).
+    let headVersionId: string | null = args.headVersionId ?? null;
+    if (args.headVersionId === undefined) {
+      const row = this.sql
+        .exec(
+          "SELECT head_version_id FROM files WHERE file_id = ?",
+          args.fileId
+        )
+        .toArray()[0] as { head_version_id: string | null } | undefined;
+      headVersionId = row?.head_version_id ?? null;
+    }
     const { preGenerateStandardVariants } = await import(
       "./preview-variants"
     );
-    await preGenerateStandardVariants(this, scope, args);
+    await preGenerateStandardVariants(this, scope, {
+      ...args,
+      headVersionId,
+    });
   }
 
   // ── metadata + tags primitives ──────────────────────────────
@@ -1945,6 +2069,8 @@ export class UserDOCore extends DurableObject<Env> {
       direction?: "asc" | "desc";
       includeStat?: boolean;
       includeMetadata?: boolean;
+      includeTombstones?: boolean;
+      includeArchived?: boolean;
     }
   ): Promise<{
     items: import("./list-files").ListFilesItemRaw[];
@@ -1962,6 +2088,7 @@ export class UserDOCore extends DurableObject<Env> {
       includeStat?: boolean;
       includeMetadata?: boolean;
       includeTombstones?: boolean;
+      includeArchived?: boolean;
     }
   ): Promise<import("./list-files").ListFilesItemRaw> {
     this.gateVfs(scope);

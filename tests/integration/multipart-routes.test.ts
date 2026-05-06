@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { SELF, env } from "cloudflare:test";
+import type { UserDO } from "@app/objects/user/user-do";
 
 /**
  * Multipart parallel transfer integration tests.
@@ -24,7 +25,7 @@ import { hashChunk } from "@shared/crypto";
 import { vfsUserDOName } from "@core/lib/utils";
 
 interface E {
-  MOSSAIC_USER: DurableObjectNamespace;
+  MOSSAIC_USER: DurableObjectNamespace<UserDO>;
   JWT_SECRET?: string;
 }
 const TEST_ENV = env as unknown as E;

@@ -16,6 +16,7 @@ import type { UserDO } from "@app/objects/user/user-do";
 
 interface E {
   MOSSAIC_USER: DurableObjectNamespace<UserDO>;
+  MOSSAIC_SHARD: DurableObjectNamespace;
 }
 const E = env as unknown as E;
 

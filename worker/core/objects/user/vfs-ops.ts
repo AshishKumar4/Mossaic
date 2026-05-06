@@ -59,6 +59,8 @@ export {
   isYjsMode,
 } from "./vfs/metadata";
 
+export { vfsArchive, vfsUnarchive } from "./vfs/archive";
+
 export {
   vfsOpenReadStream,
   vfsPullReadStream,

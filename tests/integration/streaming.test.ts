@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
+import type { UserDO } from "@app/objects/user/user-do";
 
 /**
  * Stream + low-level escape-hatch RPC tests.
@@ -24,7 +25,7 @@ import { env, runInDurableObject } from "cloudflare:test";
  * env.MOSSAIC_USER.idFromName(vfsUserDOName(...)) and call the new methods.
  */
 
-import type { UserDOCore as UserDO } from "@core/objects/user/user-do-core";
+
 import type { ShardDO } from "@core/objects/shard/shard-do";
 import { vfsShardDOName, vfsUserDOName } from "@core/lib/utils";
 import { INLINE_LIMIT } from "@shared/inline";

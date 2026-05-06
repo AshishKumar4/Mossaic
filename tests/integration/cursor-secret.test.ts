@@ -1,5 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
+import type { UserDO } from "../../sdk/src/index";
+import type { ListFilesPageResult } from "./helpers";
 import {
   getCursorSecret,
   VFSConfigError,
@@ -98,7 +100,8 @@ describe("cursor codec encode/decode (positive control)", () => {
 });
 
 interface E {
-  MOSSAIC_USER: DurableObjectNamespace;
+  MOSSAIC_USER: DurableObjectNamespace<UserDO>;
+  MOSSAIC_SHARD: DurableObjectNamespace;
 }
 const E = env as unknown as E;
 
@@ -146,7 +149,13 @@ describe("vfsListFiles refuses cursor ops when JWT_SECRET unset (B-1)", () => {
       E.MOSSAIC_USER.idFromName(vfsUserDOName("default", tenant))
     );
     // Default test env DOES set JWT_SECRET, so this should just work.
-    const r = await stub.vfsListFiles({ ns: "default", tenant }, { limit: 5 });
+    // Cast through `ListFilesPageResult` because workers-types'
+    // `Rpc.Result` filter collapses returns containing
+    // `Record<string, unknown>` to `never` (helpers.ts).
+    const r = (await stub.vfsListFiles(
+      { ns: "default", tenant },
+      { limit: 5 }
+    )) as unknown as ListFilesPageResult;
     expect(r.items).toEqual([]);
     expect(r.cursor).toBeUndefined();
   });

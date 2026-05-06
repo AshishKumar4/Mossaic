@@ -11,9 +11,11 @@ import { SELF, env } from "cloudflare:test";
 import { createVFS, createMossaicHttpClient } from "../../sdk/src/index";
 import type { UserDO } from "@app/objects/user/user-do";
 import { signVFSToken } from "@core/lib/auth";
+import type { EnvCore } from "@shared/types";
 
 interface E {
   MOSSAIC_USER: DurableObjectNamespace<UserDO>;
+  MOSSAIC_SHARD: DurableObjectNamespace;
   JWT_SECRET?: string;
 }
 const E = env as unknown as E;
@@ -34,7 +36,7 @@ const selfFetcher: typeof fetch = ((
 describe("SDK readPreview — binding client (createVFS)", () => {
   it("returns SVG bytes via the code renderer for a text file", async () => {
     const vfs = createVFS(E as unknown as Parameters<typeof createVFS>[0], {
-      ns: "default",
+      namespace: "default",
       tenant: "sdk-rp-bind-1",
     });
     await vfs.writeFile(
@@ -52,7 +54,7 @@ describe("SDK readPreview — binding client (createVFS)", () => {
 
   it("second call hits the cache (fromVariantTable=true)", async () => {
     const vfs = createVFS(E as unknown as Parameters<typeof createVFS>[0], {
-      ns: "default",
+      namespace: "default",
       tenant: "sdk-rp-bind-2",
     });
     await vfs.writeFile("/n.txt", "x", { mimeType: "text/plain" });
@@ -65,7 +67,7 @@ describe("SDK readPreview — binding client (createVFS)", () => {
 
   it("propagates ENOENT as VFSFsError subclass", async () => {
     const vfs = createVFS(E as unknown as Parameters<typeof createVFS>[0], {
-      ns: "default",
+      namespace: "default",
       tenant: "sdk-rp-bind-3",
     });
     await expect(
@@ -78,7 +80,7 @@ describe("SDK readPreview — HTTP client (createMossaicHttpClient)", () => {
   it("HTTP client returns the same bytes as the binding client for the same input", async () => {
     const tenant = "sdk-rp-http-1";
     const vfs = createVFS(E as unknown as Parameters<typeof createVFS>[0], {
-      ns: "default",
+      namespace: "default",
       tenant,
     });
     await vfs.writeFile(
@@ -87,7 +89,7 @@ describe("SDK readPreview — HTTP client (createMossaicHttpClient)", () => {
       { mimeType: "text/typescript" }
     );
 
-    const apiKey = await signVFSToken(E, { ns: "default", tenant });
+    const apiKey = await signVFSToken(E as unknown as EnvCore, { ns: "default", tenant });
     const httpVfs = createMossaicHttpClient({
       url: "https://m.test",
       apiKey,
@@ -113,7 +115,7 @@ describe("SDK readPreview — HTTP client (createMossaicHttpClient)", () => {
   it("openManifests batches multiple paths in one HTTP round-trip", async () => {
     const tenant = "sdk-rp-http-2";
     const vfs = createVFS(E as unknown as Parameters<typeof createVFS>[0], {
-      ns: "default",
+      namespace: "default",
       tenant,
     });
     // Two large files (>16 KB inline limit) so they have real manifests.
@@ -128,7 +130,7 @@ describe("SDK readPreview — HTTP client (createMossaicHttpClient)", () => {
       { mimeType: "application/octet-stream" }
     );
 
-    const apiKey = await signVFSToken(E, { ns: "default", tenant });
+    const apiKey = await signVFSToken(E as unknown as EnvCore, { ns: "default", tenant });
     const httpVfs = createMossaicHttpClient({
       url: "https://m.test",
       apiKey,
@@ -151,7 +153,7 @@ describe("SDK readPreview — HTTP client (createMossaicHttpClient)", () => {
 
   it("openManifests on the binding client serializes through DO RPC", async () => {
     const vfs = createVFS(E as unknown as Parameters<typeof createVFS>[0], {
-      ns: "default",
+      namespace: "default",
       tenant: "sdk-rp-bind-4",
     });
     await vfs.writeFile("/x.bin", new Uint8Array(20_000));

@@ -344,6 +344,14 @@ export class HttpVFS implements VFSClient {
     await this.post("purge", { path: p }, "unlink", p, "json");
   }
 
+  async archive(p: string): Promise<void> {
+    await this.post("archive", { path: p }, "chmod", p, "json");
+  }
+
+  async unarchive(p: string): Promise<void> {
+    await this.post("unarchive", { path: p }, "chmod", p, "json");
+  }
+
   async mkdir(
     p: string,
     opts?: { recursive?: boolean; mode?: number }

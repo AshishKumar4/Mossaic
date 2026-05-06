@@ -208,6 +208,8 @@ class BatchedLstatFs implements VFSClient {
   ) { return this.inner.writeFile(p, data, opts); }
   unlink(p: string) { return this.inner.unlink(p); }
   purge(p: string) { return this.inner.purge(p); }
+  archive(p: string) { return this.inner.archive(p); }
+  unarchive(p: string) { return this.inner.unarchive(p); }
   mkdir(
     p: string,
     opts?: { recursive?: boolean; mode?: number }

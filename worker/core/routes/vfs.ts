@@ -500,6 +500,33 @@ vfs.post("/purge", async (c) => {
   }
 });
 
+// Phase 29 — archive / unarchive endpoints. Cosmetic-only hide;
+// reads remain unaffected. Both are idempotent — calling on an
+// already-(un)archived path is a no-op.
+vfs.post("/archive", async (c) => {
+  try {
+    const body = await c.req.json<{ path: string }>();
+    const path = expectPath(body);
+    await userStub(c).vfsArchive(c.var.scope, path);
+    return c.json({ ok: true });
+  } catch (err) {
+    const r = errToResponse(err);
+    return c.json(r.body, r.status as 400);
+  }
+});
+
+vfs.post("/unarchive", async (c) => {
+  try {
+    const body = await c.req.json<{ path: string }>();
+    const path = expectPath(body);
+    await userStub(c).vfsUnarchive(c.var.scope, path);
+    return c.json({ ok: true });
+  } catch (err) {
+    const r = errToResponse(err);
+    return c.json(r.body, r.status as 400);
+  }
+});
+
 vfs.post("/mkdir", async (c) => {
   try {
     const body = await c.req.json<{
