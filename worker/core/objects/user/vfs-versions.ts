@@ -155,6 +155,42 @@ export function isVersioningEnabled(
 }
 
 /**
+ * Cleanup helper for the "tmp row supersedes a live row" path. After
+ * a versioned commit attaches a new version onto an EXISTING pathId
+ * (`liveRow`/`liveDst`), the tmp row that originally hosted the
+ * upload becomes redundant: its bytes already belong to the new
+ * version under the appropriate `shard_ref_id`, and re-attaching its
+ * `files`-row state would shadow the live path.
+ *
+ * Drop the tmp `files` row + its companion `file_chunks` /
+ * `file_tags` rows WITHOUT calling `hardDeleteFileRow` — that helper
+ * dispatches `deleteChunks(tmpId)` to every shard, which would reap
+ * the chunks the just-committed version still references.
+ *
+ * Used by streams.ts (commitWriteStream), multipart-upload.ts
+ * (vfsFinalizeMultipart), and copy-file.ts (copyVersioned). The
+ * `hasChunks` flag distinguishes the chunked tier (delete file_chunks
+ * too) from the inline tier (no chunks were ever inserted).
+ */
+export function dropTmpRowAfterVersionCommit(
+  durableObject: UserDO,
+  tmpId: string,
+  opts: { hasChunks: boolean }
+): void {
+  if (opts.hasChunks) {
+    durableObject.sql.exec(
+      "DELETE FROM file_chunks WHERE file_id = ?",
+      tmpId
+    );
+  }
+  durableObject.sql.exec(
+    "DELETE FROM file_tags WHERE path_id = ?",
+    tmpId
+  );
+  durableObject.sql.exec("DELETE FROM files WHERE file_id = ?", tmpId);
+}
+
+/**
  * Operator helper: toggle versioning for a tenant. Idempotent;
  * affects only future writes (existing files / versions unchanged).
  */

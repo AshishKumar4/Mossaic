@@ -25,7 +25,11 @@ import type {
   Variant,
 } from "../../../../../shared/preview-types";
 import { resolvePath } from "../path-walk";
-import { userIdFor } from "./helpers";
+import {
+  userIdFor,
+  FILE_HEAD_JOIN,
+  assertHeadNotTombstoned,
+} from "./helpers";
 import { vfsShardDOName } from "../../../lib/utils";
 import {
   encodeVariantKey,
@@ -87,14 +91,13 @@ export async function vfsReadPreview(
   // attempt to render bytes that aren't there and 500. The
   // user-visible failure mode is a sea of broken thumbnails until
   // the listing also stops surfacing the tombstoned row.
-  const fileRow = durableObject.sql
+  const fileRowRaw = durableObject.sql
     .exec(
       `SELECT f.file_name, f.file_size, f.mime_type, f.encryption_mode,
               f.head_version_id, fv.deleted AS head_deleted,
               fv.size AS head_size
          FROM files f
-         LEFT JOIN file_versions fv
-           ON fv.path_id = f.file_id AND fv.version_id = f.head_version_id
+         ${FILE_HEAD_JOIN}
         WHERE f.file_id = ? AND f.user_id = ? AND f.status != 'deleted'`,
       fileId,
       userId
@@ -110,18 +113,7 @@ export async function vfsReadPreview(
         head_size: number | null;
       }
     | undefined;
-  if (!fileRow) {
-    throw new VFSError(
-      "ENOENT",
-      `readPreview: file row missing for ${path}`
-    );
-  }
-  if (fileRow.head_version_id !== null && fileRow.head_deleted === 1) {
-    throw new VFSError(
-      "ENOENT",
-      `readPreview: head version is a tombstone for ${path}`
-    );
-  }
+  const fileRow = assertHeadNotTombstoned(fileRowRaw, "readPreview", path);
   if (fileRow.encryption_mode !== null) {
     throw new VFSError(
       "ENOTSUP",

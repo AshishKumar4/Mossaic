@@ -1,5 +1,9 @@
 import { DurableObject } from "cloudflare:workers";
 import type { EnvCore as Env } from "../../../../shared/types";
+import {
+  applyMigrationOnce,
+  ensureMigrationsTable,
+} from "../../lib/migrations";
 
 export class ShardDO extends DurableObject<Env> {
   sql: SqlStorage;
@@ -13,6 +17,8 @@ export class ShardDO extends DurableObject<Env> {
   private ensureInit(): void {
     if (this.initialized) return;
     this.initialized = true;
+
+    ensureMigrationsTable(this.sql);
 
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS chunks (
@@ -44,13 +50,10 @@ export class ShardDO extends DurableObject<Env> {
     // ── VFS GC bookkeeping (sdk-impl-plan §3.2, §8.3) ──────────────────────
     // deleted_at marks chunks pending hard-delete. Set when ref_count first
     // hits 0; the alarm sweeper hard-deletes after a grace
-    // period. NULL = live. Idempotent ALTER guarded by try/catch like
-    // search-do.ts:59-68.
-    try {
-      this.sql.exec("ALTER TABLE chunks ADD COLUMN deleted_at INTEGER");
-    } catch {
-      // column already exists
-    }
+    // period. NULL = live.
+    applyMigrationOnce(this.sql, "chunks_add_deleted_at", () =>
+      this.sql.exec("ALTER TABLE chunks ADD COLUMN deleted_at INTEGER")
+    );
     this.sql.exec(`
       CREATE INDEX IF NOT EXISTS idx_chunks_deleted
         ON chunks(deleted_at)

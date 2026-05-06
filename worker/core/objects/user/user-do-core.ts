@@ -53,6 +53,10 @@ import { VFSError } from "../../../../shared/vfs-types";
 import { vfsShardDOName } from "../../lib/utils";
 import { logError, logInfo } from "../../lib/logger";
 import {
+  applyMigrationOnce,
+  ensureMigrationsTable,
+} from "../../lib/migrations";
+import {
   signPreviewToken,
   PREVIEW_TOKEN_DEFAULT_TTL_MS,
 } from "../../lib/preview-token";
@@ -64,7 +68,11 @@ import {
 } from "./preview-variants";
 import { defaultRegistry } from "../../lib/preview-pipeline";
 import { resolvePath } from "./path-walk";
-import { userIdFor } from "./vfs/helpers";
+import {
+  userIdFor,
+  FILE_HEAD_JOIN,
+  assertHeadNotTombstoned,
+} from "./vfs/helpers";
 import {
   insertAuditLog,
   loadAuditLogMaxRows,
@@ -166,6 +174,8 @@ export class UserDOCore extends DurableObject<Env> {
     if (this.initialized) return;
     this.initialized = true;
 
+    ensureMigrationsTable(this.sql);
+
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS auth (
         user_id       TEXT PRIMARY KEY,
@@ -227,11 +237,14 @@ export class UserDOCore extends DurableObject<Env> {
       )
     `);
 
-    // ── VFS schema migrations (sdk-impl-plan §3.1) ─────────────────────────
-    // Each ALTER is idempotent via try/catch: SQLite throws "duplicate
-    // column name" if the column already exists. The pattern matches
-    // search-do.ts:59-68. CREATE TABLE/INDEX IF NOT EXISTS is naturally
-    // idempotent.
+    // ── VFS schema migrations ────────────────────────────────────────
+    // Migrations are recorded by stable name in `meta_schema`.
+    // `applyMigrationOnce` runs the body only the first time it sees
+    // a name; on existing instances whose columns already exist (from
+    // the prior idempotent-ALTER pattern) the helper catches the
+    // SQLite "duplicate column name" error and records the name as
+    // applied — so the bridge from try/catch-ALTER to registry is
+    // safe without a backfill pass.
     //
     // Backward compatibility: existing rows get default mode, NULL inline
     // data, node_kind='file'. The legacy app's reads keep working because
@@ -239,37 +252,27 @@ export class UserDOCore extends DurableObject<Env> {
     // continues to fall through to file_chunks when inline_data IS NULL.
 
     // file mode (POSIX), inline tier, symlink kind
-    try {
-      this.sql.exec(
-        "ALTER TABLE files ADD COLUMN mode INTEGER NOT NULL DEFAULT 420"
-      ); // 0o644
-    } catch {
-      // column already exists
-    }
-    try {
-      this.sql.exec("ALTER TABLE files ADD COLUMN inline_data BLOB");
-    } catch {
-      // column already exists
-    }
-    try {
-      this.sql.exec("ALTER TABLE files ADD COLUMN symlink_target TEXT");
-    } catch {
-      // column already exists
-    }
-    try {
+    applyMigrationOnce(this.sql, "files_add_mode", () =>
+      // 0o644
+      this.sql.exec("ALTER TABLE files ADD COLUMN mode INTEGER NOT NULL DEFAULT 420")
+    );
+    applyMigrationOnce(this.sql, "files_add_inline_data", () =>
+      this.sql.exec("ALTER TABLE files ADD COLUMN inline_data BLOB")
+    );
+    applyMigrationOnce(this.sql, "files_add_symlink_target", () =>
+      this.sql.exec("ALTER TABLE files ADD COLUMN symlink_target TEXT")
+    );
+    applyMigrationOnce(this.sql, "files_add_node_kind", () =>
       this.sql.exec(
         "ALTER TABLE files ADD COLUMN node_kind TEXT NOT NULL DEFAULT 'file'"
-      );
-    } catch {
-      // column already exists
-    }
-    try {
+      )
+    );
+    applyMigrationOnce(this.sql, "folders_add_mode", () =>
+      // 0o755
       this.sql.exec(
         "ALTER TABLE folders ADD COLUMN mode INTEGER NOT NULL DEFAULT 493"
-      ); // 0o755
-    } catch {
-      // column already exists
-    }
+      )
+    );
     // folders.revision: monotonically-increasing per-folder counter
     // bumped by every mutation that changes that folder's
     // direct children (or the folder's own name/parent slot for
@@ -282,13 +285,11 @@ export class UserDOCore extends DurableObject<Env> {
     // `UPDATE folders SET revision = revision + 1 WHERE folder_id = ?`,
     // so the first bump moves any pre-migration row from 0 → 1.
     // Idempotent ALTER (try/catch on duplicate-column).
-    try {
+    applyMigrationOnce(this.sql, "folders_add_revision", () =>
       this.sql.exec(
         "ALTER TABLE folders ADD COLUMN revision INTEGER NOT NULL DEFAULT 0"
-      );
-    } catch {
-      // column already exists
-    }
+      )
+    );
     // Root-folder revision counter.
     //
     // The root has no `folders` row (it's implicit: parent_id=NULL is
@@ -350,30 +351,18 @@ export class UserDOCore extends DurableObject<Env> {
     // bucket survives cold starts. Defaults: 100 ops/sec refill, 200
     // burst capacity. Operators can override per-tenant via direct
     // SQL or admin tooling. NULL columns inherit defaults at runtime.
-    try {
-      this.sql.exec(
-        "ALTER TABLE quota ADD COLUMN rate_limit_per_sec INTEGER"
-      );
-    } catch {
-      // column already exists
-    }
-    try {
-      this.sql.exec(
-        "ALTER TABLE quota ADD COLUMN rate_limit_burst INTEGER"
-      );
-    } catch {
-      // column already exists
-    }
-    try {
-      this.sql.exec("ALTER TABLE quota ADD COLUMN rl_tokens REAL");
-    } catch {
-      // column already exists
-    }
-    try {
-      this.sql.exec("ALTER TABLE quota ADD COLUMN rl_updated_at INTEGER");
-    } catch {
-      // column already exists
-    }
+    applyMigrationOnce(this.sql, "quota_add_rate_limit_per_sec", () =>
+      this.sql.exec("ALTER TABLE quota ADD COLUMN rate_limit_per_sec INTEGER")
+    );
+    applyMigrationOnce(this.sql, "quota_add_rate_limit_burst", () =>
+      this.sql.exec("ALTER TABLE quota ADD COLUMN rate_limit_burst INTEGER")
+    );
+    applyMigrationOnce(this.sql, "quota_add_rl_tokens", () =>
+      this.sql.exec("ALTER TABLE quota ADD COLUMN rl_tokens REAL")
+    );
+    applyMigrationOnce(this.sql, "quota_add_rl_updated_at", () =>
+      this.sql.exec("ALTER TABLE quota ADD COLUMN rl_updated_at INTEGER")
+    );
 
     // ── per-tenant versioning toggle (S3-style, opt-in) ─────────
     // versioning_enabled: NULL/0 = disabled (byte-equivalent
@@ -381,13 +370,11 @@ export class UserDOCore extends DurableObject<Env> {
     // row, readFile resolves the head version, and historical
     // readFile(path, {version: id}) becomes available. The default is
     // off; tenants opt-in via setTenantVersioning().
-    try {
+    applyMigrationOnce(this.sql, "quota_add_versioning_enabled", () =>
       this.sql.exec(
         "ALTER TABLE quota ADD COLUMN versioning_enabled INTEGER NOT NULL DEFAULT 0"
-      );
-    } catch {
-      // column already exists
-    }
+      )
+    );
 
     // Inline-tier graceful migration.
     //
@@ -408,13 +395,11 @@ export class UserDOCore extends DurableObject<Env> {
     // forward-going writes. That is correct behaviour: a tenant
     // already over the cap on legacy data continues to use inline
     // for the rows that already exist; new writes spill to chunked.
-    try {
+    applyMigrationOnce(this.sql, "quota_add_inline_bytes_used", () =>
       this.sql.exec(
         "ALTER TABLE quota ADD COLUMN inline_bytes_used INTEGER NOT NULL DEFAULT 0"
-      );
-    } catch {
-      // column already exists
-    }
+      )
+    );
 
     // ── file_versions table ─────────────────────────────────────
     // S3-style versioning. Each row is one historical snapshot of a
@@ -491,13 +476,9 @@ export class UserDOCore extends DurableObject<Env> {
     // `files` row is just a stable identity for the path; the actual
     // head version lives in file_versions. Legacy / versioning-OFF
     // tenants leave this NULL and continue using files' own columns.
-    try {
-      this.sql.exec(
-        "ALTER TABLE files ADD COLUMN head_version_id TEXT"
-      );
-    } catch {
-      // column already exists
-    }
+    applyMigrationOnce(this.sql, "files_add_head_version_id", () =>
+      this.sql.exec("ALTER TABLE files ADD COLUMN head_version_id TEXT")
+    );
 
     // ── Yjs per-file mode ──────────────────────────────────────
     //
@@ -512,13 +493,11 @@ export class UserDOCore extends DurableObject<Env> {
     // Set on per-file granularity, not per-tenant — a single
     // tenant can mix yjs-mode files with plain files freely.
     // Default 0 ⇒ no behavior change for any existing file.
-    try {
+    applyMigrationOnce(this.sql, "files_add_mode_yjs", () =>
       this.sql.exec(
         "ALTER TABLE files ADD COLUMN mode_yjs INTEGER NOT NULL DEFAULT 0"
-      );
-    } catch {
-      // column already exists
-    }
+      )
+    );
 
     // yjs_oplog: append-only log of Yjs binary updates per file.
     // Each row is one update + a monotonic seq number per path_id
@@ -632,28 +611,20 @@ export class UserDOCore extends DurableObject<Env> {
     // vfs-ops (validators throw VFSError("EINVAL", ...) before any
     // SQL touches the row).
 
-    try {
-      this.sql.exec("ALTER TABLE files ADD COLUMN metadata BLOB");
-    } catch {
-      // column already exists
-    }
-    try {
+    applyMigrationOnce(this.sql, "files_add_metadata", () =>
+      this.sql.exec("ALTER TABLE files ADD COLUMN metadata BLOB")
+    );
+    applyMigrationOnce(this.sql, "file_versions_add_user_visible", () =>
       this.sql.exec(
         "ALTER TABLE file_versions ADD COLUMN user_visible INTEGER NOT NULL DEFAULT 0"
-      );
-    } catch {
-      // column already exists
-    }
-    try {
-      this.sql.exec("ALTER TABLE file_versions ADD COLUMN label TEXT");
-    } catch {
-      // column already exists
-    }
-    try {
-      this.sql.exec("ALTER TABLE file_versions ADD COLUMN metadata BLOB");
-    } catch {
-      // column already exists
-    }
+      )
+    );
+    applyMigrationOnce(this.sql, "file_versions_add_label", () =>
+      this.sql.exec("ALTER TABLE file_versions ADD COLUMN label TEXT")
+    );
+    applyMigrationOnce(this.sql, "file_versions_add_metadata", () =>
+      this.sql.exec("ALTER TABLE file_versions ADD COLUMN metadata BLOB")
+    );
 
     // ── opt-in end-to-end encryption ───────────────────────────
     //
@@ -671,30 +642,22 @@ export class UserDOCore extends DurableObject<Env> {
     // without one. The SDK validates the values it reads.
     //
     // No new wrangler migration tag — additive ALTERs are idempotent.
-    try {
-      this.sql.exec("ALTER TABLE files ADD COLUMN encryption_mode TEXT");
-    } catch {
-      // column already exists
-    }
-    try {
-      this.sql.exec("ALTER TABLE files ADD COLUMN encryption_key_id TEXT");
-    } catch {
-      // column already exists
-    }
-    try {
+    applyMigrationOnce(this.sql, "files_add_encryption_mode", () =>
+      this.sql.exec("ALTER TABLE files ADD COLUMN encryption_mode TEXT")
+    );
+    applyMigrationOnce(this.sql, "files_add_encryption_key_id", () =>
+      this.sql.exec("ALTER TABLE files ADD COLUMN encryption_key_id TEXT")
+    );
+    applyMigrationOnce(this.sql, "file_versions_add_encryption_mode", () =>
       this.sql.exec(
         "ALTER TABLE file_versions ADD COLUMN encryption_mode TEXT"
-      );
-    } catch {
-      // column already exists
-    }
-    try {
+      )
+    );
+    applyMigrationOnce(this.sql, "file_versions_add_encryption_key_id", () =>
       this.sql.exec(
         "ALTER TABLE file_versions ADD COLUMN encryption_key_id TEXT"
-      );
-    } catch {
-      // column already exists
-    }
+      )
+    );
 
     // Multipart × versioning consistency.
     //
@@ -714,26 +677,22 @@ export class UserDOCore extends DurableObject<Env> {
     // `chunk_refs` rows. Without this column, the canonical fan-out
     // would key off `${pathId}#${versionId}` and decrement nothing
     // — leaking chunk bytes forever.
-    try {
+    applyMigrationOnce(this.sql, "file_versions_add_shard_ref_id", () =>
       this.sql.exec(
         "ALTER TABLE file_versions ADD COLUMN shard_ref_id TEXT"
-      );
-    } catch {
-      // column already exists
-    }
+      )
+    );
 
     // Per-file encrypted-yjs op-log byte counter. Server-side
     // backpressure (see worker/core/objects/user/yjs.ts) consults this
     // alongside `op_count_since_ckpt` to decide whether to broadcast
     // the tag-4 compact-please advisory or hard-reject further appends
     // with EBUSY. Reset to 0 on every checkpoint commit.
-    try {
+    applyMigrationOnce(this.sql, "yjs_meta_add_bytes_since_last_compact", () =>
       this.sql.exec(
         "ALTER TABLE yjs_meta ADD COLUMN bytes_since_last_compact INTEGER NOT NULL DEFAULT 0"
-      );
-    } catch {
-      // column already exists
-    }
+      )
+    );
 
     // indexed_at marks files that have been search-indexed
     // (text+CLIP via `indexFile` in worker/app/routes/search.ts).
@@ -743,11 +702,9 @@ export class UserDOCore extends DurableObject<Env> {
     // `multipart/finalize` and `POST /api/index/file` the file
     // would land in canonical VFS but never indexed → silent search
     // miss for the lifetime of the file.
-    try {
-      this.sql.exec("ALTER TABLE files ADD COLUMN indexed_at INTEGER");
-    } catch {
-      // column already exists
-    }
+    applyMigrationOnce(this.sql, "files_add_indexed_at", () =>
+      this.sql.exec("ALTER TABLE files ADD COLUMN indexed_at INTEGER")
+    );
     // P1-8 — index_attempts column for reconciler retry cap.
     //
     // Pre-fix `reconcileUnindexedFiles` re-fired `indexFile` on
@@ -761,13 +718,11 @@ export class UserDOCore extends DurableObject<Env> {
     // filters `index_attempts < 5`. After the cap a single
     // `console.error` fires and the row is left dormant — operator
     // sees it via Logpush and can manually reconcile.
-    try {
+    applyMigrationOnce(this.sql, "files_add_index_attempts", () =>
       this.sql.exec(
         "ALTER TABLE files ADD COLUMN index_attempts INTEGER NOT NULL DEFAULT 0"
-      );
-    } catch {
-      // column already exists
-    }
+      )
+    );
     // Sparse index — most files are indexed within seconds of finalize,
     // so the reconciler scan should be fast: the partial index makes
     // `WHERE indexed_at IS NULL` an index-only scan.
@@ -799,13 +754,11 @@ export class UserDOCore extends DurableObject<Env> {
     // when the migration runs on an already-migrated DO. NOT NULL
     // DEFAULT 0 means existing rows surface as not-archived without
     // a backfill.
-    try {
+    applyMigrationOnce(this.sql, "files_add_archived", () =>
       this.sql.exec(
         "ALTER TABLE files ADD COLUMN archived INTEGER NOT NULL DEFAULT 0"
-      );
-    } catch {
-      // column already exists
-    }
+      )
+    );
 
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS file_tags (
@@ -886,13 +839,11 @@ export class UserDOCore extends DurableObject<Env> {
     // `MULTIPART_MAX_ABORT_ATTEMPTS` does the row flip to a
     // distinct `'poisoned'` status (NOT 'aborted') for operator
     // observability via Logpush.
-    try {
+    applyMigrationOnce(this.sql, "upload_sessions_add_attempts", () =>
       this.sql.exec(
         "ALTER TABLE upload_sessions ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0"
-      );
-    } catch {
-      // column already exists
-    }
+      )
+    );
 
     // ── Universal preview pipeline ───────────────────────────────────────
     //
@@ -973,13 +924,11 @@ export class UserDOCore extends DurableObject<Env> {
     // passthrough is a load-bearing equivalence: NULL == NULL is
     // the SQL convention we adopt explicitly (`IS NULL` predicate,
     // not `=`).
-    try {
+    applyMigrationOnce(this.sql, "file_variants_add_version_id", () =>
       this.sql.exec(
         "ALTER TABLE file_variants ADD COLUMN version_id TEXT"
-      );
-    } catch {
-      // column already exists
-    }
+      )
+    );
 
     // ── audit_log table ──────────────────────────────────────────
     //
@@ -1750,14 +1699,13 @@ export class UserDOCore extends DurableObject<Env> {
     // Pull file metadata + head_version state. Mirrors the SELECT
     // in `vfs/preview.ts:90-118` so the mint decision and the
     // read decision see the same row shape.
-    const fileRow = this.sql
+    const fileRowRaw = this.sql
       .exec(
         `SELECT f.file_name, f.file_size, f.mime_type, f.encryption_mode,
                 f.head_version_id, fv.deleted AS head_deleted,
                 fv.size AS head_size
            FROM files f
-           LEFT JOIN file_versions fv
-             ON fv.path_id = f.file_id AND fv.version_id = f.head_version_id
+           ${FILE_HEAD_JOIN}
           WHERE f.file_id = ? AND f.user_id = ? AND f.status != 'deleted'`,
         fileId,
         userId
@@ -1773,18 +1721,7 @@ export class UserDOCore extends DurableObject<Env> {
           head_size: number | null;
         }
       | undefined;
-    if (!fileRow) {
-      throw new VFSError(
-        "ENOENT",
-        `previewUrl: file row missing for ${path}`
-      );
-    }
-    if (fileRow.head_version_id !== null && fileRow.head_deleted === 1) {
-      throw new VFSError(
-        "ENOENT",
-        `previewUrl: head version is a tombstone for ${path}`
-      );
-    }
+    const fileRow = assertHeadNotTombstoned(fileRowRaw, "previewUrl", path);
     if (fileRow.encryption_mode !== null) {
       throw new VFSError(
         "ENOTSUP",
@@ -3037,8 +2974,7 @@ export class UserDOCore extends DurableObject<Env> {
       .exec(
         `SELECT f.head_version_id, fv.deleted AS head_deleted
            FROM files f
-           LEFT JOIN file_versions fv
-             ON fv.path_id = f.file_id AND fv.version_id = f.head_version_id
+           ${FILE_HEAD_JOIN}
           WHERE f.file_id = ? AND f.user_id = ?`,
         r.leafId,
         userId
@@ -3046,6 +2982,9 @@ export class UserDOCore extends DurableObject<Env> {
       .toArray()[0] as
       | { head_version_id: string | null; head_deleted: number | null }
       | undefined;
+    // Tolerant of a missing `files` row (a fully-purged file is
+    // already gone — that's not a tombstone case). Only error
+    // when the row exists AND its head is tombstoned.
     if (
       yjsHead !== undefined &&
       yjsHead.head_version_id !== null &&

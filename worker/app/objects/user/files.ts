@@ -1,5 +1,6 @@
 import type { UserDO } from "./user-do";
 import type { UserFile } from "@shared/types";
+import { FILE_HEAD_JOIN } from "@core/objects/user/vfs/helpers";
 
 /**
  * List files in a folder.
@@ -24,8 +25,7 @@ export function listFiles(
         .exec(
           `SELECT f.*
              FROM files f
-             LEFT JOIN file_versions fv
-               ON fv.path_id = f.file_id AND fv.version_id = f.head_version_id
+             ${FILE_HEAD_JOIN}
             WHERE f.user_id = ? AND f.parent_id = ?
               AND f.status != 'deleted'
               AND ${tombstoneFilter}
@@ -38,8 +38,7 @@ export function listFiles(
         .exec(
           `SELECT f.*
              FROM files f
-             LEFT JOIN file_versions fv
-               ON fv.path_id = f.file_id AND fv.version_id = f.head_version_id
+             ${FILE_HEAD_JOIN}
             WHERE f.user_id = ? AND f.parent_id IS NULL
               AND f.status != 'deleted'
               AND ${tombstoneFilter}
@@ -99,8 +98,7 @@ export function getFile(
     .exec(
       `SELECT f.*
          FROM files f
-         LEFT JOIN file_versions fv
-           ON fv.path_id = f.file_id AND fv.version_id = f.head_version_id
+         ${FILE_HEAD_JOIN}
         WHERE f.file_id = ?
           AND (f.head_version_id IS NULL OR fv.deleted IS NULL OR fv.deleted = 0)`,
       fileId

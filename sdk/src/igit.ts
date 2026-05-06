@@ -233,6 +233,22 @@ class BatchedLstatFs implements VFSClient {
     p: string,
     opts?: WriteFileOpts
   ) { return this.inner.createWriteStreamWithHandle(p, opts); }
+  beginMultipartUpload(
+    p: string,
+    opts: Parameters<VFSClient["beginMultipartUpload"]>[1]
+  ) { return this.inner.beginMultipartUpload(p, opts); }
+  putMultipartChunk(
+    handle: Parameters<VFSClient["putMultipartChunk"]>[0],
+    index: number,
+    chunk: Parameters<VFSClient["putMultipartChunk"]>[2]
+  ) { return this.inner.putMultipartChunk(handle, index, chunk); }
+  finalizeMultipartUpload(
+    handle: Parameters<VFSClient["finalizeMultipartUpload"]>[0],
+    chunkHashList: readonly string[]
+  ) { return this.inner.finalizeMultipartUpload(handle, chunkHashList); }
+  abortMultipartUpload(
+    handle: Parameters<VFSClient["abortMultipartUpload"]>[0]
+  ) { return this.inner.abortMultipartUpload(handle); }
   openManifest(p: string) { return this.inner.openManifest(p); }
   openManifests(paths: string[]) { return this.inner.openManifests(paths); }
   readPreview(p: string, opts?: Parameters<VFSClient["readPreview"]>[1]) {

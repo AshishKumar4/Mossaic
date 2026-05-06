@@ -40,11 +40,8 @@ export const AIMD_MIN_CWND = 2;
 /** Slow-start threshold */
 export const AIMD_SSTHRESH = 32;
 
-/** JWT expiration: 30 days */
+/** JWT / session expiration: 30 days */
 export const JWT_EXPIRATION_MS = 30 * 24 * 60 * 60 * 1000;
-
-/** Session expiration: 30 days */
-export const SESSION_EXPIRATION_MS = 30 * 24 * 60 * 60 * 1000;
 
 /** Max retries for chunk operations */
 export const MAX_RETRIES = 3;

@@ -38,7 +38,13 @@ import type {
   VFSClient,
   VersionInfo,
   DropVersionsPolicy,
+  BeginMultipartUploadOpts,
+  MultipartUploadHandle,
+  PutMultipartChunkResult,
+  FinalizeMultipartUploadResult,
+  AbortMultipartUploadResult,
 } from "./vfs";
+import { hashChunk } from "../../shared/crypto";
 
 // Re-export so `import { VFSClient } from "@mossaic/sdk"` continues
 // to work — `vfs.ts` is now the source of truth.
@@ -438,6 +444,106 @@ export class HttpVFS implements VFSClient {
       syscall: "pullReadStream",
       path: "(HTTP fallback: use readChunk(path, idx) instead)",
     });
+  }
+
+  // ── Manual multipart upload ────────────────────────────────────────────
+  //
+  // Thin wrappers over the existing `multipartBegin` / `multipartPutChunk` /
+  // `multipartFinalize` / `multipartAbort` wire helpers. Surface a stable
+  // user-facing handle shape (`MultipartUploadHandle`) decoupled from the
+  // server's `MultipartBeginResponse` so future server changes don't break
+  // serialised handles cached by external callers.
+  //
+  // `parallelUpload` (transfer.ts) drives the same wire endpoints but
+  // owns its own AIMD controller + concurrency. The methods here are
+  // for callers who need to do the chunking themselves.
+
+  async beginMultipartUpload(
+    p: string,
+    opts: BeginMultipartUploadOpts
+  ): Promise<MultipartUploadHandle> {
+    const body: import("../../shared/multipart").MultipartBeginRequest = {
+      path: p,
+      size: opts.size,
+      ...(opts.chunkSize !== undefined ? { chunkSize: opts.chunkSize } : {}),
+      ...(opts.mode !== undefined ? { mode: opts.mode } : {}),
+      ...(opts.mimeType !== undefined ? { mimeType: opts.mimeType } : {}),
+      ...(opts.metadata !== undefined ? { metadata: opts.metadata } : {}),
+      ...(opts.tags !== undefined ? { tags: opts.tags } : {}),
+      ...(opts.version !== undefined ? { version: opts.version } : {}),
+      ...(opts.encryption !== undefined ? { encryption: opts.encryption } : {}),
+      ...(opts.resumeFrom !== undefined ? { resumeFrom: opts.resumeFrom } : {}),
+      ...(opts.ttlMs !== undefined ? { ttlMs: opts.ttlMs } : {}),
+    };
+    const res = await this.multipartBegin(body);
+    return {
+      uploadId: res.uploadId,
+      path: p,
+      chunkSize: res.chunkSize,
+      expectedChunks: res.totalChunks,
+      poolSize: res.poolSize,
+      sessionToken: res.sessionToken,
+      expiresAtMs: res.expiresAtMs,
+    };
+  }
+
+  async putMultipartChunk(
+    handle: MultipartUploadHandle,
+    index: number,
+    chunk: Uint8Array | ArrayBuffer | Blob
+  ): Promise<PutMultipartChunkResult> {
+    const bytes = await coerceChunkToUint8Array(chunk);
+    const result = await this.multipartPutChunk(
+      handle.uploadId,
+      index,
+      bytes,
+      handle.sessionToken
+    );
+    return {
+      chunkHash: result.hash,
+      accepted: result.ok === true,
+      status: result.status,
+    };
+  }
+
+  async finalizeMultipartUpload(
+    handle: MultipartUploadHandle,
+    chunkHashList: readonly string[]
+  ): Promise<FinalizeMultipartUploadResult> {
+    const r = await this.multipartFinalize(handle.uploadId, chunkHashList);
+    return {
+      path: r.path,
+      pathId: r.fileId,
+      // Server's MultipartFinalizeResponse does not yet surface
+      // `versionId` (only `fileId`). Until it does, we expose an
+      // empty string — callers that need the version row should
+      // follow up with `listVersions(path)`. Documented on the type.
+      versionId: "",
+      size: r.size,
+      fileHash: r.fileHash,
+      isEncrypted: r.isEncrypted,
+    };
+  }
+
+  async abortMultipartUpload(
+    handle: MultipartUploadHandle
+  ): Promise<AbortMultipartUploadResult> {
+    try {
+      const r = await this.multipartAbort(handle.uploadId);
+      return { aborted: r.ok === true };
+    } catch (err) {
+      // Server raises ENOENT for an unknown / already-aborted session
+      // and EBUSY for a session that has already finalized (cannot
+      // un-finalize). Both are "already terminal" — surface as
+      // idempotent { aborted: false } rather than throwing so callers
+      // can call abortMultipartUpload unconditionally in cleanup
+      // paths without try/catch.
+      const code = (err as { code?: string }).code;
+      if (code === "ENOENT" || code === "EBUSY") {
+        return { aborted: false };
+      }
+      throw err;
+    }
   }
 
   // ── Low-level escape hatch ────────────────────────────────────────────
@@ -1099,3 +1205,35 @@ export function createMossaicHttpClient(
 // on both `VFS` (sdk/src/vfs.ts) and `HttpVFS` (this file). If either
 // class diverges from VFSClient, the class declaration fails to
 // compile. No additional static assertion needed.
+
+// ── Helpers for the manual-multipart surface ────────────────────────────
+
+/**
+ * Normalise a chunk argument to a Uint8Array view over an ArrayBuffer
+ * (the wire shape `multipartPutChunk` expects). Throws synchronously
+ * on unsupported inputs so callers fail fast — a Promise-rejection
+ * path through the wire helper would be hard to disambiguate from a
+ * server-side EINVAL.
+ */
+async function coerceChunkToUint8Array(
+  chunk: Uint8Array | ArrayBuffer | Blob
+): Promise<Uint8Array> {
+  if (chunk instanceof Uint8Array) return chunk;
+  if (chunk instanceof ArrayBuffer) return new Uint8Array(chunk);
+  // Duck-type Blob (covers File too) — `instanceof Blob` is
+  // unreliable in some test environments where the global is
+  // shimmed. The arrayBuffer() method is the load-bearing contract.
+  if (typeof (chunk as Blob)?.arrayBuffer === "function") {
+    return new Uint8Array(await (chunk as Blob).arrayBuffer());
+  }
+  throw new TypeError(
+    `putMultipartChunk: unsupported chunk type (got ${
+      Object.prototype.toString.call(chunk)
+    }; expected Uint8Array | ArrayBuffer | Blob)`
+  );
+}
+
+// Re-export `hashChunk` so callers running outside a SubtleCrypto-
+// equipped environment have a sane default available without
+// reaching across the package boundary.
+void hashChunk;

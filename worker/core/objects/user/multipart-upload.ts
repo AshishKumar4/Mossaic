@@ -58,7 +58,11 @@ import {
   findLiveFile,
   bumpFolderRevision,
 } from "./vfs-ops";
-import { commitVersion, isVersioningEnabled } from "./vfs-versions";
+import {
+  commitVersion,
+  dropTmpRowAfterVersionCommit,
+  isVersioningEnabled,
+} from "./vfs-versions";
 import {
   validateLabel,
   validateMetadata,
@@ -772,18 +776,9 @@ export async function vfsFinalizeMultipart(
     // dispatch `deleteChunks(uploadId)` to every shard and reap the
     // chunks the version we just committed depends on.
     if (liveRow) {
-      durableObject.sql.exec(
-        "DELETE FROM file_chunks WHERE file_id = ?",
-        uploadId
-      );
-      durableObject.sql.exec(
-        "DELETE FROM file_tags WHERE path_id = ?",
-        uploadId
-      );
-      durableObject.sql.exec(
-        "DELETE FROM files WHERE file_id = ?",
-        uploadId
-      );
+      dropTmpRowAfterVersionCommit(durableObject, uploadId, {
+        hasChunks: true,
+      });
     }
     // (no-prior-row case: commitRename already promoted the tmp row,
     //  and the file_chunks / metadata / tags it carried are intact;

@@ -51,9 +51,9 @@
  *   forgery attempt that swaps payload between token shapes.
  */
 
-import { SignJWT, jwtVerify } from "jose";
+import { jwtVerify } from "jose";
 import type { EnvCore as Env } from "../../../shared/types";
-import { VFSConfigError } from "./auth";
+import { VFSConfigError, signScopedJwt } from "./auth";
 
 /**
  * Scope sentinel embedded in the JWT payload. Verifiers reject
@@ -246,11 +246,7 @@ export async function signPreviewToken(
     format: payload.format,
     contentHash: payload.contentHash,
   };
-  const token = await new SignJWT(claims)
-    .setProtectedHeader({ alg: "HS256" })
-    .setIssuedAt()
-    .setExpirationTime(Math.floor(expiresAtMs / 1000))
-    .sign(secret);
+  const token = await signScopedJwt(secret, claims, expiresAtMs);
   return { token, expiresAtMs };
 }
 
