@@ -917,14 +917,14 @@ export class YjsRuntime {
       ckSeq
     );
 
-    // Phase 52 P3 #8 — emit a user-visible version row for
-    // versioning-on tenants when the caller explicitly flushes.
+    // Emit a user-visible version row for versioning-on tenants
+    // when the caller explicitly flushes.
     //
-    // Pre-Phase-52: this asymmetry between plain (`compact` line
-    // 774-823 emits a version row when `userVisible=true`) and
-    // encrypted-yjs (no version emission) meant `vfs.compactYjs()`
-    // on an encrypted-yjs file silently lost its checkpoint history
-    // from the file's `listVersions` surface. The opt-in
+    // Without this, the encrypted-yjs path would have an asymmetry
+    // with the plain-yjs `compact` (lines 774-823, which DO emit a
+    // version row when `userVisible=true`) — `vfs.compactYjs()` on
+    // an encrypted-yjs file would silently lose its checkpoint
+    // history from the file's `listVersions` surface. The opt-in
     // `userVisible` flag mirrors the plain path; opportunistic
     // server-driven compactions (which can't happen for encrypted
     // anyway — the server can't decrypt — but symmetric for the
@@ -934,7 +934,7 @@ export class YjsRuntime {
     // an opaque encrypted blob. Restoring this version's bytes via
     // `restoreVersion` + `readFile` on a yjs-mode file routes
     // through `writeYjsBytes` which recognises the envelope and
-    // re-applies it to the path's Y.Doc state (Phase 38).
+    // re-applies it to the path's Y.Doc state.
     let versionId: string | undefined;
     if (opts.userVisible) {
       const { isVersioningEnabled, commitVersion } = await import(

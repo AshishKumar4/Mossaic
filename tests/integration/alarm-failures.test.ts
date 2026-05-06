@@ -72,25 +72,34 @@ describe("Phase 42 \u2014 alarm-failures counter", () => {
     expect(n).toBe(5);
   });
 
-  it("AF3 \u2014 alarm() runs cleanly on a clean tenant; counter stays 0", async () => {
-    const tenant = "af3-clean";
-    const stub = E.MOSSAIC_USER.get(
-      E.MOSSAIC_USER.idFromName(vfsUserDOName(NS, tenant))
-    );
-    const scope = { ns: NS, tenant };
-    // Persist scope so alarm() finds it.
-    await stub.vfsWriteFile(scope, "/seed.bin", new Uint8Array(8).fill(1));
-    // Trigger alarm directly (the public path is via the
-    // ensureStaleSweepScheduled trigger; in tests we call the
-    // method directly).
-    await runInDurableObject(stub, async (inst) => {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const alarm = (inst as any).alarm;
-      if (typeof alarm === "function") {
-        await alarm.call(inst);
-      }
-    });
-    const n = await readAlarmFailures(stub);
-    expect(n).toBe(0);
-  });
+  it(
+    "AF3 \u2014 alarm() runs cleanly on a clean tenant; counter stays 0",
+    async () => {
+      const tenant = "af3-clean";
+      const stub = E.MOSSAIC_USER.get(
+        E.MOSSAIC_USER.idFromName(vfsUserDOName(NS, tenant))
+      );
+      const scope = { ns: NS, tenant };
+      // Persist scope so alarm() finds it.
+      await stub.vfsWriteFile(scope, "/seed.bin", new Uint8Array(8).fill(1));
+      // Trigger alarm directly (the public path is via the
+      // ensureStaleSweepScheduled trigger; in tests we call the
+      // method directly).
+      await runInDurableObject(stub, async (inst) => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const alarm = (inst as any).alarm;
+        if (typeof alarm === "function") {
+          await alarm.call(inst);
+        }
+      });
+      const n = await readAlarmFailures(stub);
+      expect(n).toBe(0);
+    },
+    // 20s test timeout. The alarm() path fans out a `getStorageBytes`
+    // RPC to every shard in the tenant's pool (32 by default) for the
+    // shard-capacity poll. Under suite load that's well over the 15s
+    // global default; 20s gives headroom without masking a real
+    // hang. Same precedent as `rmrf-budget.test.ts:106`.
+    20000
+  );
 });

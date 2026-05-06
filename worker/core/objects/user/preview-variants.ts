@@ -162,7 +162,7 @@ export async function renderAndStoreVariant(
   const registry = defaultRegistry();
   let renderer = registry.dispatchByMime(mimeType);
 
-  // Phase 52 P3 #6 — defensive size cap.
+  // Defensive size cap.
   //
   // The renderers (image-resize, image-passthrough, code-svg,
   // waveform, video-poster, icon-card) all buffer the source bytes
