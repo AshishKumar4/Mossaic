@@ -906,7 +906,20 @@ export async function vfsCommitWriteStream(
     return;
   }
 
-  // Versioning OFF — pre-Phase-27 behaviour preserved.
+  // Versioning OFF \u2014 pre-Phase-27 behaviour preserved.
+  //
+  // Phase 36 \u2014 record bytes against quota AFTER commitRename
+  // succeeds. Pre-fix this path NEVER called recordWriteUsage,
+  // so any tenant who ever used createWriteStream had their
+  // storage_used and file_count silently understated. The
+  // versioning branch above goes through commitVersion which
+  // self-accounts (Phase 36); this is the symmetric increment
+  // for the non-versioning branch.
+  //
+  // Read file_size from the now-promoted row. commitRename
+  // either inserted a fresh path or superseded a prior live one;
+  // in both cases the row at handle.tmpId now has the final
+  // file_size (set by the chunk-append loop's UPDATE).
   await commitRename(
     durableObject,
     userId,
@@ -915,6 +928,16 @@ export async function vfsCommitWriteStream(
     handle.parentId,
     handle.leaf
   );
+  const sizeRow = durableObject.sql
+    .exec(
+      "SELECT file_size FROM files WHERE file_id = ?",
+      handle.tmpId
+    )
+    .toArray()[0] as { file_size: number } | undefined;
+  if (sizeRow) {
+    const { recordWriteUsage } = await import("./helpers");
+    recordWriteUsage(durableObject, userId, sizeRow.file_size, 1);
+  }
 }
 
 /**
