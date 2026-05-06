@@ -12,6 +12,7 @@ import {
   BookImage,
   ChevronsUpDown,
   Settings,
+  Search,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useTheme } from "@/lib/theme";

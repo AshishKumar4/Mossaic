@@ -1,5 +1,12 @@
-/** 1 MB — fixed chunk size for all files > 1 MB */
+/**
+ * 1 MB — default/fallback chunk size.
+ * Adaptive chunk sizing (see shared/chunking.ts) now selects the actual
+ * chunk size based on file size, but this constant is kept as a fallback.
+ */
 export const CHUNK_SIZE = 1_048_576;
+
+/** Alias for CHUNK_SIZE — preferred name in new code */
+export const DEFAULT_CHUNK_SIZE = CHUNK_SIZE;
 
 /** Base shard pool size for new users */
 export const BASE_POOL_SIZE = 32;
@@ -8,7 +15,7 @@ export const BASE_POOL_SIZE = 32;
 export const BYTES_PER_SHARD = 5 * 1024 * 1024 * 1024; // 5 GB
 
 /**
- * No per-file size limit. Files are chunked into 1 MB pieces distributed
+ * No per-file size limit. Files are adaptively chunked and distributed
  * across unlimited ShardDOs (each up to 10 GB). The real constraint is
  * the user's storage quota (DEFAULT_STORAGE_LIMIT).
  */
@@ -19,17 +26,19 @@ export const DEFAULT_STORAGE_LIMIT = 100 * 1024 * 1024 * 1024;
 /** SQLite BLOB size limit */
 export const MAX_BLOB_SIZE = 2 * 1024 * 1024; // 2 MB
 
-/** Max parallel upload connections */
-export const MAX_UPLOAD_CONCURRENCY = 50;
+// -- AIMD Congestion Control Defaults --
 
-/** Initial upload concurrency */
-export const INITIAL_UPLOAD_CONCURRENCY = 20;
+/** Initial congestion window (concurrent requests) */
+export const AIMD_INITIAL_CWND = 4;
 
-/** Min upload concurrency */
-export const MIN_UPLOAD_CONCURRENCY = 4;
+/** Maximum congestion window */
+export const AIMD_MAX_CWND = 64;
 
-/** Max parallel download connections */
-export const MAX_DOWNLOAD_CONCURRENCY = 50;
+/** Minimum congestion window */
+export const AIMD_MIN_CWND = 2;
+
+/** Slow-start threshold */
+export const AIMD_SSTHRESH = 32;
 
 /** JWT expiration: 30 days */
 export const JWT_EXPIRATION_MS = 30 * 24 * 60 * 60 * 1000;

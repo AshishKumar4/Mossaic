@@ -3,6 +3,7 @@ import type { Env } from "@shared/types";
 import { authMiddleware } from "../lib/auth";
 import { shardDOName, userDOName } from "../lib/utils";
 import { placeChunk } from "@shared/placement";
+import { indexFile } from "./search";
 
 const upload = new Hono<{
   Bindings: Env;
@@ -137,7 +138,11 @@ upload.post("/complete/:fileId", async (c) => {
   if (!fileRes.ok) {
     return c.json({ error: "File not found" }, 404);
   }
-  const file = (await fileRes.json()) as { file_size: number };
+  const file = (await fileRes.json()) as {
+    file_size: number;
+    file_name: string;
+    mime_type: string;
+  };
 
   // Complete the file
   const res = await userStub.fetch(
@@ -156,6 +161,11 @@ upload.post("/complete/:fileId", async (c) => {
     const err = (await res.json()) as { error: string };
     return c.json({ error: err.error }, 500);
   }
+
+  // Index file for semantic search (fire-and-forget, non-blocking)
+  c.executionCtx.waitUntil(
+    indexFile(c.env, userId, fileId, file.file_name, file.mime_type, file.file_size)
+  );
 
   return c.json({ ok: true, fileId }, 201);
 });

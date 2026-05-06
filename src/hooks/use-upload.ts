@@ -1,24 +1,23 @@
 import { useState, useCallback, useRef } from "react";
-import { api, ApiError } from "@/lib/api";
+import { api } from "@/lib/api";
 import { hashChunk, computeFileHash } from "@shared/crypto";
-import { CHUNK_SIZE, MAX_RETRIES, RETRY_BASE_DELAY } from "@shared/constants";
+import { MAX_RETRIES, RETRY_BASE_DELAY } from "@shared/constants";
+import { AIMDController } from "@shared/aimd";
 import { addTransferStats } from "@/lib/transfer-stats";
-import type { TransferProgress, ChunkProgress, ChunkStatus, CompletedTransferStats } from "@shared/types";
-
-interface UploadJob {
-  file: File;
-  fileId: string;
-  chunkCount: number;
-  chunkSize: number;
-  poolSize: number;
-  parentId: string | null;
-}
+import type {
+  TransferProgress,
+  ChunkProgress,
+  ChunkStatus,
+  CompletedTransferStats,
+} from "@shared/types";
 
 export function useUpload(onComplete?: () => void) {
   const [transfers, setTransfers] = useState<Map<string, TransferProgress>>(
     new Map()
   );
-  const [completedStats, setCompletedStats] = useState<CompletedTransferStats[]>([]);
+  const [completedStats, setCompletedStats] = useState<
+    CompletedTransferStats[]
+  >([]);
   const activeRef = useRef(false);
 
   const updateTransfer = useCallback(
@@ -37,7 +36,7 @@ export function useUpload(onComplete?: () => void) {
 
   const uploadFile = useCallback(
     async (file: File, parentId: string | null = null) => {
-      // Initialize
+      // Initialize — server computes adaptive chunk size
       const initRes = await api.uploadInit({
         fileName: file.name,
         fileSize: file.size,
@@ -47,6 +46,7 @@ export function useUpload(onComplete?: () => void) {
 
       const { fileId, chunkSize, chunkCount, poolSize } = initRes;
 
+      // Build initial chunk progress array
       const chunks: ChunkProgress[] = Array.from(
         { length: chunkCount },
         (_, i) => ({
@@ -54,12 +54,11 @@ export function useUpload(onComplete?: () => void) {
           status: "pending" as ChunkStatus,
           bytesTransferred: 0,
           size:
-            i === chunkCount - 1
-              ? file.size - i * chunkSize
-              : chunkSize,
+            i === chunkCount - 1 ? file.size - i * chunkSize : chunkSize,
         })
       );
 
+      const startedAt = Date.now();
       const progress: TransferProgress = {
         fileId,
         fileName: file.name,
@@ -73,113 +72,217 @@ export function useUpload(onComplete?: () => void) {
         throughputBps: 0,
         estimatedRemainingMs: 0,
         chunks,
-        startedAt: Date.now(),
+        startedAt,
       };
 
       setTransfers((prev) => new Map(prev).set(fileId, progress));
 
-      // Upload chunks with concurrency
-      const concurrency = Math.min(6, chunkCount);
+      // -- AIMD-controlled upload --
+      const controller = new AIMDController();
       const chunkHashes: string[] = new Array(chunkCount);
+      const chunkDone: boolean[] = new Array(chunkCount).fill(false);
       let nextChunk = 0;
       let completedCount = 0;
       let failedCount = 0;
       let totalBytes = 0;
       let peakBps = 0;
+      let activeWorkers = 0;
+      let endgameActive = false;
 
-      const uploadChunk = async (): Promise<void> => {
-        while (nextChunk < chunkCount) {
-          const idx = nextChunk++;
-          const start = idx * chunkSize;
-          const end = Math.min(start + chunkSize, file.size);
-          const blob = file.slice(start, end);
-          const buffer = await blob.arrayBuffer();
-          const data = new Uint8Array(buffer);
-          const hash = await hashChunk(data);
-          chunkHashes[idx] = hash;
+      /**
+       * Process a single chunk index: hash, upload with retry, update progress.
+       * Returns true if the chunk was successfully uploaded.
+       */
+      const processChunk = async (idx: number): Promise<boolean> => {
+        // Skip if already completed (possible in endgame mode)
+        if (chunkDone[idx]) return true;
+
+        const start = idx * chunkSize;
+        const end = Math.min(start + chunkSize, file.size);
+        const blob = file.slice(start, end);
+        const buffer = await blob.arrayBuffer();
+        const data = new Uint8Array(buffer);
+        const hash = await hashChunk(data);
+        chunkHashes[idx] = hash;
+
+        updateTransfer(fileId, (p) => {
+          const c = [...p.chunks];
+          c[idx] = { ...c[idx], status: "uploading" };
+          return {
+            ...p,
+            chunks: c,
+            activeConcurrency: p.activeConcurrency + 1,
+          };
+        });
+
+        let success = false;
+        for (let attempt = 0; attempt < MAX_RETRIES && !success; attempt++) {
+          // Another worker may have completed this chunk (endgame)
+          if (chunkDone[idx]) {
+            updateTransfer(fileId, (p) => ({
+              ...p,
+              activeConcurrency: Math.max(0, p.activeConcurrency - 1),
+            }));
+            return true;
+          }
+
+          const t0 = performance.now();
+          try {
+            await api.uploadChunk(fileId, idx, buffer, hash, poolSize);
+            const rtt = performance.now() - t0;
+            controller.onSuccess(rtt);
+            success = true;
+          } catch {
+            const rtt = performance.now() - t0;
+            controller.onFailure();
+            if (attempt < MAX_RETRIES - 1) {
+              // Backoff using AIMD-informed RTO, capped by exponential backoff
+              const backoff = Math.min(
+                RETRY_BASE_DELAY * Math.pow(2, attempt),
+                controller.getRTO()
+              );
+              await new Promise((r) => setTimeout(r, backoff));
+            }
+          }
+        }
+
+        if (success && !chunkDone[idx]) {
+          chunkDone[idx] = true;
+          completedCount++;
+          totalBytes += data.byteLength;
+          const elapsed = Date.now() - startedAt;
+          const bps = elapsed > 0 ? (totalBytes / elapsed) * 1000 : 0;
+          const remaining =
+            bps > 0 ? ((file.size - totalBytes) / bps) * 1000 : 0;
+          if (bps > peakBps) peakBps = bps;
 
           updateTransfer(fileId, (p) => {
             const c = [...p.chunks];
-            c[idx] = { ...c[idx], status: "uploading" };
+            c[idx] = {
+              ...c[idx],
+              status: "complete",
+              bytesTransferred: data.byteLength,
+            };
             return {
               ...p,
               chunks: c,
-              activeConcurrency: p.activeConcurrency + 1,
+              completedChunks: completedCount,
+              bytesTransferred: totalBytes,
+              activeConcurrency: Math.max(0, p.activeConcurrency - 1),
+              throughputBps: bps,
+              peakThroughputBps: peakBps,
+              estimatedRemainingMs: remaining,
             };
           });
-
-          let success = false;
-          for (let attempt = 0; attempt < MAX_RETRIES && !success; attempt++) {
-            try {
-              await api.uploadChunk(fileId, idx, buffer, hash, poolSize);
-              success = true;
-            } catch {
-              if (attempt < MAX_RETRIES - 1) {
-                await new Promise((r) =>
-                  setTimeout(r, RETRY_BASE_DELAY * Math.pow(2, attempt))
-                );
-              }
-            }
-          }
-
-          if (success) {
-            completedCount++;
-            totalBytes += data.byteLength;
-            const elapsed = Date.now() - progress.startedAt;
-            const bps = elapsed > 0 ? (totalBytes / elapsed) * 1000 : 0;
-            const remaining =
-              bps > 0 ? ((file.size - totalBytes) / bps) * 1000 : 0;
-
-            if (bps > peakBps) peakBps = bps;
-
-            updateTransfer(fileId, (p) => {
-              const c = [...p.chunks];
-              c[idx] = {
-                ...c[idx],
-                status: "complete",
-                bytesTransferred: data.byteLength,
-              };
-              return {
-                ...p,
-                chunks: c,
-                completedChunks: completedCount,
-                bytesTransferred: totalBytes,
-                activeConcurrency: Math.max(0, p.activeConcurrency - 1),
-                throughputBps: bps,
-                peakThroughputBps: peakBps,
-                estimatedRemainingMs: remaining,
-              };
-            });
-          } else {
-            failedCount++;
-            updateTransfer(fileId, (p) => {
-              const c = [...p.chunks];
-              c[idx] = { ...c[idx], status: "failed" };
-              return {
-                ...p,
-                chunks: c,
-                failedChunks: failedCount,
-                activeConcurrency: Math.max(0, p.activeConcurrency - 1),
-              };
-            });
-          }
+          return true;
+        } else if (chunkDone[idx]) {
+          // Completed by another worker (endgame duplicate)
+          updateTransfer(fileId, (p) => ({
+            ...p,
+            activeConcurrency: Math.max(0, p.activeConcurrency - 1),
+          }));
+          return true;
+        } else {
+          failedCount++;
+          updateTransfer(fileId, (p) => {
+            const c = [...p.chunks];
+            c[idx] = { ...c[idx], status: "failed" };
+            return {
+              ...p,
+              chunks: c,
+              failedChunks: failedCount,
+              activeConcurrency: Math.max(0, p.activeConcurrency - 1),
+            };
+          });
+          return false;
         }
       };
 
-      // Run workers
-      const workers = Array.from({ length: concurrency }, () => uploadChunk());
-      await Promise.all(workers);
+      /**
+       * Dynamic worker: pulls chunks from the queue, adjusts to AIMD window.
+       * When endgame mode activates, workers also duplicate remaining chunks.
+       */
+      const worker = async (): Promise<void> => {
+        activeWorkers++;
+        try {
+          while (nextChunk < chunkCount || endgameActive) {
+            // Normal mode: grab next chunk from queue
+            if (nextChunk < chunkCount) {
+              const idx = nextChunk++;
+              await processChunk(idx);
+            } else if (endgameActive) {
+              // Endgame: find any incomplete chunks and send duplicate requests
+              const remaining = chunkDone
+                .map((done, i) => (done ? -1 : i))
+                .filter((i) => i >= 0);
+              if (remaining.length === 0) break;
+              // Pick a random remaining chunk to avoid thundering herd
+              const idx =
+                remaining[Math.floor(Math.random() * remaining.length)];
+              await processChunk(idx);
+            } else {
+              break;
+            }
 
+            // Check if all done
+            if (completedCount + failedCount >= chunkCount) break;
+          }
+        } finally {
+          activeWorkers--;
+        }
+      };
+
+      // Start initial workers up to AIMD window
+      const initialConcurrency = Math.min(
+        controller.getMaxConcurrency(),
+        chunkCount
+      );
+      const workerPromises: Promise<void>[] = [];
+
+      for (let i = 0; i < initialConcurrency; i++) {
+        workerPromises.push(worker());
+      }
+
+      // Spawn additional workers as AIMD window grows
+      const scaleInterval = setInterval(() => {
+        if (completedCount + failedCount >= chunkCount) {
+          clearInterval(scaleInterval);
+          return;
+        }
+
+        const target = Math.min(
+          controller.getMaxConcurrency(),
+          chunkCount - completedCount - failedCount
+        );
+
+        // Activate endgame mode: >90% done AND total > 10 chunks
+        if (
+          !endgameActive &&
+          chunkCount > 10 &&
+          completedCount > chunkCount * 0.9
+        ) {
+          endgameActive = true;
+        }
+
+        // Spawn more workers if needed
+        while (activeWorkers < target) {
+          workerPromises.push(worker());
+        }
+      }, 100);
+
+      await Promise.all(workerPromises);
+      clearInterval(scaleInterval);
+
+      // -- Finalize --
       if (failedCount === 0) {
-        // Complete the upload
         const fileHash = await computeFileHash(chunkHashes);
         await api.uploadComplete(fileId, fileHash);
 
         const completedAt = Date.now();
-        const durationMs = completedAt - progress.startedAt;
-        const avgBps = durationMs > 0 ? (file.size / durationMs) * 1000 : 0;
+        const durationMs = completedAt - startedAt;
+        const avgBps =
+          durationMs > 0 ? (file.size / durationMs) * 1000 : 0;
 
-        // Record final speed stats
         updateTransfer(fileId, (p) => ({
           ...p,
           completedAt,

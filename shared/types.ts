@@ -265,6 +265,7 @@ export interface SharedAlbumPhotosResponse {
 export interface Env {
   USER_DO: DurableObjectNamespace;
   SHARD_DO: DurableObjectNamespace;
+  SEARCH_DO: DurableObjectNamespace;
   ASSETS: Fetcher;
   JWT_SECRET?: string;
 }
