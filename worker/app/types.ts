@@ -80,6 +80,15 @@ export interface TransferProgress {
   completedAt?: number;
   peakThroughputBps?: number;
   averageThroughputBps?: number;
+  /**
+   * Set when the entire transfer terminates with an unrecoverable error
+   * (e.g. auth bridge mint failed, server returned 4xx/5xx, network
+   * dropped during finalize). The UI shows this as a terminal "failed"
+   * state with a clear-button affordance and a user-visible message.
+   */
+  failedAt?: number;
+  /** Human-readable error message attached when `failedAt` is set. */
+  error?: string;
 }
 
 export interface CompletedTransferStats {
