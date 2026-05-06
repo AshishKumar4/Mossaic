@@ -70,6 +70,14 @@ export type { VFSScope } from "../../shared/vfs-types";
 // Token issuance helpers (operator-side; needs JWT_SECRET in env).
 export { issueVFSToken, verifyVFSToken, type VFSTokenPayload } from "./auth";
 
+// HTTP fallback for non-Worker consumers (Phase 7).
+export {
+  createMossaicHttpClient,
+  HttpVFS,
+  type CreateMossaicHttpClientOptions,
+  type VFSClient,
+} from "./http";
+
 import { VFS, type CreateVFSOptions, type MossaicEnv } from "./vfs";
 
 /**

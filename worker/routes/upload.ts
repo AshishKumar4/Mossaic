@@ -62,13 +62,23 @@ upload.put("/chunk/:fileId/:chunkIndex", async (c) => {
   const fileId = c.req.param("fileId");
   const chunkIndex = parseInt(c.req.param("chunkIndex"));
   const chunkHash = c.req.header("X-Chunk-Hash") || "";
+  // Phase 7 NOTE: this legacy route honors the client-supplied
+  // `X-Pool-Size` header for back-compat with existing user-facing app
+  // clients that read the pool size from `init` and echo it back. The
+  // server's true pool_size is in `quota.pool_size` and is the source
+  // of truth for the new VFS write path (vfs-ops.ts:poolSizeFor —
+  // server-authoritative). If a misbehaving legacy client sends a
+  // wrong value here, only THIS request's chunk placement is affected;
+  // future writes by the same user re-derive from the server-side
+  // quota row. The new VFS path (worker/objects/user/vfs-ops.ts) does
+  // NOT read this header and cannot be subverted.
   const poolSize = parseInt(c.req.header("X-Pool-Size") || "32");
 
   if (!chunkHash) {
     return c.json({ error: "X-Chunk-Hash header is required" }, 400);
   }
 
-  // Determine shard placement
+  // Determine shard placement (legacy app shard naming)
   const shardIndex = placeChunk(userId, fileId, chunkIndex, poolSize);
   const doName = shardDOName(userId, shardIndex);
 

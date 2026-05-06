@@ -10,6 +10,7 @@ import analyticsRoutes from "./routes/analytics";
 import galleryRoutes from "./routes/gallery";
 import sharedRoutes from "./routes/shared";
 import searchRoutes from "./routes/search";
+import vfsRoutes from "./routes/vfs";
 
 export { UserDO } from "./objects/user/index";
 export { ShardDO } from "./objects/shard/index";
@@ -46,6 +47,11 @@ app.route("/api/analytics", analyticsRoutes);
 app.route("/api/gallery", galleryRoutes);
 app.route("/api/shared", sharedRoutes);
 app.route("/api/search", searchRoutes);
+// Phase 7: HTTP fallback for non-Worker consumers of the @mossaic/sdk.
+// Auth via Bearer VFS token (signVFSToken / verifyVFSToken). Routes
+// translate HTTP → typed UserDO RPC. The legacy app's /api/* surface
+// above is unaffected.
+app.route("/api/vfs", vfsRoutes);
 
 // Health check
 app.get("/api/health", (c) => c.json({ status: "ok", timestamp: Date.now() }));

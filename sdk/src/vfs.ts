@@ -35,6 +35,76 @@ import type {
 } from "../../shared/vfs-types";
 
 /**
+ * Public consumer-facing VFS contract. Both the binding `VFS` class
+ * and the HTTP fallback `HttpVFS` (sdk/src/http.ts) implement this
+ * interface — the `implements VFSClient` clause on each class
+ * forces both to honour the same surface, so a future divergence is
+ * caught at compile time rather than at integration time.
+ *
+ * Methods mirror Node's `fs/promises` shape with Mossaic-specific
+ * additions (readManyStat, removeRecursive, openManifest, readChunk,
+ * stream-handle primitives). `vfs.promises === vfs` (the
+ * isomorphic-git contract) is honoured by both implementations.
+ */
+export interface VFSClient {
+  readonly promises: VFSClient;
+
+  // Reads
+  readFile(p: string): Promise<Uint8Array>;
+  readFile(p: string, opts: { encoding: "utf8" }): Promise<string>;
+  readdir(p: string): Promise<string[]>;
+  stat(p: string): Promise<VFSStat>;
+  lstat(p: string): Promise<VFSStat>;
+  exists(p: string): Promise<boolean>;
+  readlink(p: string): Promise<string>;
+  readManyStat(paths: string[]): Promise<(VFSStat | null)[]>;
+
+  // Writes
+  writeFile(
+    p: string,
+    data: Uint8Array | string,
+    opts?: { mode?: number; mimeType?: string }
+  ): Promise<void>;
+  unlink(p: string): Promise<void>;
+  mkdir(
+    p: string,
+    opts?: { recursive?: boolean; mode?: number }
+  ): Promise<void>;
+  rmdir(p: string): Promise<void>;
+  removeRecursive(p: string): Promise<void>;
+  symlink(target: string, p: string): Promise<void>;
+  chmod(p: string, mode: number): Promise<void>;
+  rename(src: string, dst: string): Promise<void>;
+
+  // Streams (HTTP fallback throws EINVAL for these in v1)
+  createReadStream(
+    p: string,
+    opts?: ReadStreamOptions
+  ): Promise<ReadableStream<Uint8Array>>;
+  createWriteStream(
+    p: string,
+    opts?: { mode?: number; mimeType?: string }
+  ): Promise<WritableStream<Uint8Array>>;
+  createWriteStreamWithHandle(
+    p: string,
+    opts?: { mode?: number; mimeType?: string }
+  ): Promise<{
+    stream: WritableStream<Uint8Array>;
+    handle: WriteHandle;
+  }>;
+
+  // Low-level escape hatch
+  openManifest(p: string): Promise<OpenManifestResult>;
+  readChunk(p: string, chunkIndex: number): Promise<Uint8Array>;
+  openReadStream(p: string): Promise<ReadHandle>;
+  pullReadStream(
+    handle: ReadHandle,
+    chunkIndex: number,
+    range?: { start?: number; end?: number }
+  ): Promise<Uint8Array>;
+}
+
+/**
  * Subset of the production UserDO RPC surface the SDK uses. Declared
  * structurally so the SDK does NOT take a runtime dep on the worker
  * source — callers pass a typed `DurableObjectNamespace<UserDOClient>`
@@ -154,8 +224,14 @@ import { vfsUserDOName } from "../../worker/lib/utils";
  * `VFSFsError` subclasses with Node-fs-like `code` / `errno` /
  * `syscall` / `path`.
  */
-export class VFS {
-  /** Self-reference so `vfs.promises === vfs` (isomorphic-git wants `.promises`). */
+export class VFS implements VFSClient {
+  /**
+   * Self-reference so `vfs.promises === vfs` (isomorphic-git reads
+   * `.promises`). Typed as `VFS` (a subtype of `VFSClient`) so the
+   * binding client and the HTTP fallback (HttpVFS) both satisfy the
+   * shared `VFSClient` interface; `implements VFSClient` ensures
+   * any future surface change is caught at compile time.
+   */
   readonly promises: VFS;
 
   constructor(
