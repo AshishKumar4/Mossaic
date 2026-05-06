@@ -270,6 +270,44 @@ export class UserDOCore extends DurableObject<Env> {
     } catch {
       // column already exists
     }
+    // Phase 46 — folders.revision: monotonically-increasing per-folder
+    // counter bumped by every mutation that changes that folder's
+    // direct children (or the folder's own name/parent slot for
+    // rename of the folder itself). Returned by `vfsListChildren`
+    // so consumers (Seal etc.) can use it as an ETag — when revision
+    // is unchanged across two reads, the directory contents are
+    // guaranteed identical.
+    //
+    // Default 0 on existing rows; `bumpFolderRevision` does
+    // `UPDATE folders SET revision = revision + 1 WHERE folder_id = ?`,
+    // so the first bump moves any pre-migration row from 0 → 1.
+    // Idempotent ALTER (try/catch on duplicate-column).
+    try {
+      this.sql.exec(
+        "ALTER TABLE folders ADD COLUMN revision INTEGER NOT NULL DEFAULT 0"
+      );
+    } catch {
+      // column already exists
+    }
+    // Phase 46 — root-folder revision counter.
+    //
+    // The root has no `folders` row (it's implicit: parent_id=NULL is
+    // the root). To track its mutation revision we use a dedicated
+    // single-row table keyed by `user_id`; the row is materialised
+    // lazily by `bumpFolderRevision` on first root-level mutation.
+    //
+    // Rejected alternative: a synthetic `__root__` folder row inside
+    // `folders` itself. That leaked into `vfsReaddir`'s `SELECT FROM
+    // folders WHERE parent_id IS NULL`, surfacing as an empty-string
+    // entry on every directory listing. This dedicated table avoids
+    // the leak entirely without exclusion-clauses scattered across
+    // every read site.
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS root_folder_revision (
+        user_id  TEXT PRIMARY KEY,
+        revision INTEGER NOT NULL DEFAULT 0
+      )
+    `);
 
     // POSIX uniqueness via partial indexes (SQLite cannot ALTER TABLE ADD
     // UNIQUE on existing tables). Scoped to non-deleted rows so prior
@@ -2776,6 +2814,7 @@ export class UserDOCore extends DurableObject<Env> {
       includeMetadata?: boolean;
       includeTombstones?: boolean;
       includeArchived?: boolean;
+      includeContentHash?: boolean;
     }
   ): Promise<{
     items: import("./list-files").ListFilesItemRaw[];
@@ -2794,11 +2833,39 @@ export class UserDOCore extends DurableObject<Env> {
       includeMetadata?: boolean;
       includeTombstones?: boolean;
       includeArchived?: boolean;
+      includeContentHash?: boolean;
     }
   ): Promise<import("./list-files").ListFilesItemRaw> {
     this.gateVfs(scope);
     const { vfsFileInfo } = await import("./list-files");
     return vfsFileInfo(this, scope, path, opts);
+  }
+
+  /**
+   * Phase 46 — batched directory listing. Returns folder revision +
+   * a single page of merged folder/file/symlink entries with stat /
+   * metadata / contentHash hydrated in one round-trip. Replaces the
+   * SDK's pre-Phase-46 readdir + lstat × N loop. See
+   * `list-files.ts:vfsListChildren` for the merge / cursor semantics.
+   */
+  async vfsListChildren(
+    scope: VFSScope,
+    opts: {
+      path: string;
+      orderBy?: "mtime" | "name" | "size";
+      direction?: "asc" | "desc";
+      limit?: number;
+      cursor?: string;
+      includeStat?: boolean;
+      includeMetadata?: boolean;
+      includeContentHash?: boolean;
+      includeTombstones?: boolean;
+      includeArchived?: boolean;
+    }
+  ): Promise<import("./list-files").ListChildrenResult> {
+    this.gateVfs(scope);
+    const { vfsListChildren } = await import("./list-files");
+    return vfsListChildren(this, scope, opts);
   }
 
   // ── yjs-mode primitives ─────────────────────────────────────

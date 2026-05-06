@@ -21,6 +21,7 @@ import {
 } from "../../../../../shared/metadata-validate";
 import { replaceTags } from "../metadata-tags";
 import {
+  bumpFolderRevision,
   folderExists,
   poolSizeFor,
   resolveOrThrow,
@@ -903,6 +904,14 @@ export async function vfsCommitWriteStream(
         "DELETE FROM files WHERE file_id = ?",
         handle.tmpId
       );
+    }
+    // Phase 46 — versioned stream-commit either added a fresh path
+    // (commitRename branch above bumped via the new commitRename
+    // hook) OR advanced the head version of an existing path. The
+    // latter case is invisible to commitRename's bump because it
+    // didn't fire — explicit bump here covers it.
+    if (liveRow) {
+      bumpFolderRevision(durableObject, userId, handle.parentId);
     }
     return;
   }

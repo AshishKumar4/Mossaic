@@ -492,3 +492,99 @@ export function folderExists(
     .toArray()[0] as { folder_id: string } | undefined;
   return r !== undefined;
 }
+
+/**
+ * Phase 46 — bump the per-folder revision counter.
+ *
+ * Used by `vfsListChildren` consumers (Seal etc.) as a cheap ETag
+ * for directory contents: when the returned revision is unchanged
+ * between two reads, the contents are guaranteed identical.
+ *
+ * Bumped on every mutation that changes the direct-children set
+ * for `folderId` OR the folder row's own (parent_id, name) slot.
+ * `null` represents the synthetic root folder; we bump the
+ * "user_root" sentinel row stored as a `folders` row with
+ * folder_id='__root__' for that case (created lazily here so
+ * tenants pre-dating Phase 46 don't need a one-shot migration).
+ *
+ * Mutations that bump (caller's responsibility — bumpFolderRevision
+ * does NOT discover the parent itself):
+ *   - vfsMkdir: bump parent of the newly-created folder.
+ *   - vfsRmdir: bump the removed folder's parent.
+ *   - vfsCreateFolder (legacy app path): same as vfsMkdir.
+ *   - write-commit (vfsWriteFile / vfsWriteFileVersioned /
+ *     stream commit / multipart finalize): bump the file's parent.
+ *   - vfsUnlink / vfsPurge: bump the removed file's parent.
+ *   - vfsRename: bump SRC parent + DST parent (two bumps; src
+ *     parent loses, dst parent gains; both observers see the
+ *     directory change).
+ *   - vfsRemoveRecursive: bump every folder in the deleted tree
+ *     (cheap — they're already collected for the SQL DELETE).
+ *   - vfsArchive / vfsUnarchive: bump parent (visibility flips).
+ *   - vfsRestoreVersion: when materialising a tombstoned head
+ *     (path goes back from ENOENT to live), bump parent.
+ *   - vfsCopyFile: bump dst parent (src is unchanged).
+ *   - vfsSymlink: bump parent of the new symlink.
+ *
+ * Idempotent w.r.t. concurrent callers because the DO runs single-
+ * threaded; the SQL UPDATE is atomic and `revision = revision + 1`
+ * cannot lose updates inside one DO turn.
+ *
+ * Strict-monotonic guarantee: the returned revision is the new
+ * value AFTER the bump. Two consecutive bumps produce two
+ * consecutive integers; no skips, no duplicates.
+ */
+export function bumpFolderRevision(
+  durableObject: UserDO,
+  userId: string,
+  folderId: string | null
+): void {
+  if (folderId === null) {
+    // Root revision lives in `root_folder_revision` (dedicated table)
+    // — NOT in `folders`. A synthetic root row inside `folders` would
+    // leak into `vfsReaddir` (which scans `WHERE parent_id IS NULL`).
+    durableObject.sql.exec(
+      `INSERT INTO root_folder_revision (user_id, revision) VALUES (?, 1)
+         ON CONFLICT(user_id) DO UPDATE SET revision = revision + 1`,
+      userId
+    );
+    return;
+  }
+  durableObject.sql.exec(
+    "UPDATE folders SET revision = revision + 1, updated_at = ? WHERE folder_id = ? AND user_id = ?",
+    Date.now(),
+    folderId,
+    userId
+  );
+}
+
+/**
+ * Phase 46 — read the current revision counter for a folder.
+ * Returns 0 for the root sentinel before its first bump (the row
+ * may not yet exist) and for any folder_id that doesn't resolve.
+ *
+ * The `__root__` synthetic row pattern matches `bumpFolderRevision`.
+ */
+export function readFolderRevision(
+  durableObject: UserDO,
+  userId: string,
+  folderId: string | null
+): number {
+  if (folderId === null) {
+    const r = durableObject.sql
+      .exec(
+        "SELECT revision FROM root_folder_revision WHERE user_id = ?",
+        userId
+      )
+      .toArray()[0] as { revision: number } | undefined;
+    return r?.revision ?? 0;
+  }
+  const r = durableObject.sql
+    .exec(
+      "SELECT revision FROM folders WHERE folder_id = ? AND user_id = ?",
+      folderId,
+      userId
+    )
+    .toArray()[0] as { revision: number } | undefined;
+  return r?.revision ?? 0;
+}
