@@ -285,6 +285,15 @@ class BatchedLstatFs implements VFSClient {
   ) {
     return this.inner.markVersion(p, versionId, opts);
   }
+  readYjsSnapshot(p: string) {
+    return this.inner.readYjsSnapshot(p);
+  }
+  commitYjsSnapshot(
+    p: string,
+    doc: Parameters<VFSClient["commitYjsSnapshot"]>[1]
+  ) {
+    return this.inner.commitYjsSnapshot(p, doc);
+  }
 }
 
 /** ENOENT factory for missing-path entries returned from readManyStat. */
