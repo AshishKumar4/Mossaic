@@ -630,11 +630,39 @@ export async function dropVersionRows(
       userId
     );
   } else {
-    // Reset the head pointer to the (still extant) newest version.
+    // Reset the head pointer to the (still extant) newest LIVE
+    // version.
+    //
+    // Phase 25 — tombstone-consistency. Pre-fix the query was
+    // `ORDER BY mtime_ms DESC LIMIT 1` with no `WHERE deleted = 0`
+    // filter. If retention dropped every live version while a
+    // tombstone survived (e.g. operator dropped older live versions
+    // newer than a retention cutoff that also captured a tombstone
+    // in between), the head would be repointed at a tombstone —
+    // making subsequent stat() throw the systemic "head version is
+    // a tombstone" error.
+    //
+    // Now we prefer the newest non-tombstoned version. Two outcomes:
+    //   A. A live version exists → head moves to it; stat() works.
+    //   B. Only tombstones survive → head goes to NULL; stat() falls
+    //      through helpers.ts:225 to the non-versioned branch using
+    //      the denormalized `files` columns (which were updated by
+    //      the original write). Listings filter the row by the new
+    //      tombstone consistency invariant when the most recent
+    //      tombstone is the apparent head — `LEFT JOIN
+    //      file_versions ON head_version_id` returns NULL columns
+    //      and the row is INCLUDED. To keep listings semantically
+    //      consistent we'd want to also drop the `files` row when
+    //      only tombstones remain, but the user has explicitly kept
+    //      these tombstone rows by NOT including them in the drop
+    //      set — they want history preserved. Setting head to NULL
+    //      preserves that history while making stat() succeed
+    //      (returning the denormalized stat as a "no current
+    //      version" placeholder).
     const headRow = durableObject.sql
       .exec(
         `SELECT version_id FROM file_versions
-          WHERE path_id = ?
+          WHERE path_id = ? AND deleted = 0
           ORDER BY mtime_ms DESC
           LIMIT 1`,
         pathId
@@ -644,6 +672,14 @@ export async function dropVersionRows(
       durableObject.sql.exec(
         "UPDATE files SET head_version_id = ?, updated_at = ? WHERE file_id = ?",
         headRow.version_id,
+        Date.now(),
+        pathId
+      );
+    } else {
+      // Only tombstones remain. Clear head_version_id so stat()
+      // takes the non-versioned branch instead of throwing.
+      durableObject.sql.exec(
+        "UPDATE files SET head_version_id = NULL, updated_at = ? WHERE file_id = ?",
         Date.now(),
         pathId
       );

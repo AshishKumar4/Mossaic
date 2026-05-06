@@ -3,23 +3,47 @@ import type { UserFile } from "@shared/types";
 
 /**
  * List files in a folder.
+ *
+ * Phase 25 — tombstone-consistency: rows whose `head_version_id`
+ * points at a `deleted=1` `file_versions` row are EXCLUDED. This
+ * matches the canonical `vfsListFiles` default. The user-visible
+ * App listing surface (`/api/files`) must not surface unlinked-
+ * under-versioning paths because every consumer would then call
+ * `vfsStat` on them and hit the "head version is a tombstone" throw
+ * at `helpers.ts:245`.
  */
 export function listFiles(
   durableObject: UserDO,
   userId: string,
   parentId: string | null
 ): UserFile[] {
+  const tombstoneFilter =
+    "(f.head_version_id IS NULL OR fv.deleted IS NULL OR fv.deleted = 0)";
   const rows = parentId
     ? durableObject.sql
         .exec(
-          "SELECT * FROM files WHERE user_id = ? AND parent_id = ? AND status != 'deleted' ORDER BY created_at DESC",
+          `SELECT f.*
+             FROM files f
+             LEFT JOIN file_versions fv
+               ON fv.path_id = f.file_id AND fv.version_id = f.head_version_id
+            WHERE f.user_id = ? AND f.parent_id = ?
+              AND f.status != 'deleted'
+              AND ${tombstoneFilter}
+            ORDER BY f.created_at DESC`,
           userId,
           parentId
         )
         .toArray()
     : durableObject.sql
         .exec(
-          "SELECT * FROM files WHERE user_id = ? AND parent_id IS NULL AND status != 'deleted' ORDER BY created_at DESC",
+          `SELECT f.*
+             FROM files f
+             LEFT JOIN file_versions fv
+               ON fv.path_id = f.file_id AND fv.version_id = f.head_version_id
+            WHERE f.user_id = ? AND f.parent_id IS NULL
+              AND f.status != 'deleted'
+              AND ${tombstoneFilter}
+            ORDER BY f.created_at DESC`,
           userId
         )
         .toArray();
@@ -59,13 +83,28 @@ export function deleteFile(durableObject: UserDO, fileId: string): boolean {
 
 /**
  * Get file record by ID.
+ *
+ * Phase 25 — tombstone-consistency: returns `null` when the head
+ * version is tombstoned, so all downstream consumers
+ * (`appGetFile`, public-share routes, gallery image fetch) return
+ * a clean 404 instead of throwing the "head version is a tombstone"
+ * error from a downstream byte read. Admin/recovery surfaces that
+ * need to see tombstones can read `files` directly via SQL.
  */
 export function getFile(
   durableObject: UserDO,
   fileId: string
 ): Record<string, unknown> | null {
   const rows = durableObject.sql
-    .exec("SELECT * FROM files WHERE file_id = ?", fileId)
+    .exec(
+      `SELECT f.*
+         FROM files f
+         LEFT JOIN file_versions fv
+           ON fv.path_id = f.file_id AND fv.version_id = f.head_version_id
+        WHERE f.file_id = ?
+          AND (f.head_version_id IS NULL OR fv.deleted IS NULL OR fv.deleted = 0)`,
+      fileId
+    )
     .toArray();
   return rows.length > 0 ? (rows[0] as Record<string, unknown>) : null;
 }

@@ -202,14 +202,29 @@ export function vfsReadManyStat(
       out.push(null);
       continue;
     }
-    out.push(
-      statForResolved(
-        durableObject,
-        userId,
-        scope,
-        r as Extract<ResolveResult, { leafId: string }>
-      )
-    );
+    // Phase 25 — tombstone-consistency. The per-path catch was
+    // previously scoped to `resolvePath` only; a versioned-tombstone
+    // ENOENT from `statForResolved` (helpers.ts:245) propagated and
+    // killed the whole batch. We now degrade ANY ENOENT (resolution
+    // failure OR tombstoned head) to `null` for that single entry,
+    // preserving the documented "missing path becomes null" contract
+    // at the JSDoc above.
+    try {
+      out.push(
+        statForResolved(
+          durableObject,
+          userId,
+          scope,
+          r as Extract<ResolveResult, { leafId: string }>
+        )
+      );
+    } catch (err) {
+      if (err instanceof VFSError && err.code === "ENOENT") {
+        out.push(null);
+        continue;
+      }
+      throw err;
+    }
   }
   return out;
 }

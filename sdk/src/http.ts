@@ -340,6 +340,10 @@ export class HttpVFS implements VFSClient {
     await this.post("unlink", { path: p }, "unlink", p, "json");
   }
 
+  async purge(p: string): Promise<void> {
+    await this.post("purge", { path: p }, "unlink", p, "json");
+  }
+
   async mkdir(
     p: string,
     opts?: { recursive?: boolean; mode?: number }

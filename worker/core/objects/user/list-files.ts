@@ -58,11 +58,34 @@ interface ListFilesOpts {
   direction?: Direction;
   includeStat?: boolean;
   includeMetadata?: boolean;
+  /**
+   * Phase 25 — tombstone-consistency.
+   *
+   * Default `false`: rows whose `files.head_version_id` points at a
+   * `file_versions` row with `deleted=1` are EXCLUDED from results.
+   * This is the user-visible default: a path that has been
+   * unlinked under versioning-on (which leaves the `files` row
+   * resolvable but the head version tombstoned) must NOT appear in
+   * listings; otherwise the SDK's list→stat loop blows up at
+   * `helpers.ts:245` for every result.
+   *
+   * Set to `true` only for admin / recovery surfaces that need to
+   * see tombstoned heads (e.g. `adminReapTombstonedHeads` audit).
+   * The CLI / SPA / typical SDK consumer should never pass this.
+   */
+  includeTombstones?: boolean;
 }
 
 export interface FileInfoOpts {
   includeStat?: boolean;
   includeMetadata?: boolean;
+  /**
+   * Phase 25 — same semantics as `ListFilesOpts.includeTombstones`.
+   * Default `false`: a path resolving to a row whose head version
+   * is tombstoned throws ENOENT, matching `vfsStat`. Set to `true`
+   * for admin/recovery surfaces.
+   */
+  includeTombstones?: boolean;
 }
 
 const FILE_NODE_KIND = "file";
@@ -79,6 +102,7 @@ export async function vfsListFiles(
   const limit = clampLimit(opts.limit);
   const includeStat = opts.includeStat !== false;
   const includeMetadata = opts.includeMetadata === true;
+  const includeTombstones = opts.includeTombstones === true;
 
   if (opts.tags && opts.tags.length > TAGS_MAX_PER_LIST_QUERY) {
     throw new VFSError(
@@ -120,7 +144,8 @@ export async function vfsListFiles(
       orderBy,
       direction,
       cursor,
-      limit
+      limit,
+      includeTombstones
     );
   } else {
     // "prefix" or "none" — both use the files index.
@@ -132,7 +157,8 @@ export async function vfsListFiles(
       direction,
       cursor,
       limit,
-      opts.tags
+      opts.tags,
+      includeTombstones
     );
   }
 
@@ -150,7 +176,8 @@ export async function vfsListFiles(
       scope,
       c.pathId,
       includeStat,
-      includeMetadata
+      includeMetadata,
+      includeTombstones
     );
     if (item) items.push(item);
   }
@@ -200,7 +227,11 @@ export async function vfsFileInfo(
     scope,
     resolved.leafId,
     opts.includeStat !== false,
-    opts.includeMetadata === true
+    opts.includeMetadata === true,
+    // fileInfo is a strict-stat surface by default: a tombstoned
+    // head IS ENOENT, matching `vfsStat`/`vfsReadFile`. Admin /
+    // recovery callers can opt in via `includeTombstones: true`.
+    opts.includeTombstones === true
   );
   if (!item) throw new VFSError("ENOENT", `fileInfo: path not found: ${path}`);
   return item;
@@ -254,35 +285,47 @@ function listByFiles(
   direction: Direction,
   cursor: CursorPayload | null,
   limit: number,
-  tagsFilter: readonly string[] | undefined
+  tagsFilter: readonly string[] | undefined,
+  includeTombstones: boolean
 ): { pathId: string; orderValue: number | string }[] {
   // Choose the SQL ordering column.
   const orderCol =
     orderBy === "mtime"
-      ? "updated_at"
+      ? "f.updated_at"
       : orderBy === "name"
-        ? "file_name"
-        : "file_size";
+        ? "f.file_name"
+        : "f.file_size";
   const dirSql = direction === "asc" ? "ASC" : "DESC";
   const tieBreak = direction === "asc" ? ">" : ">"; // Always strict-greater on file_id for tie-break stability.
 
   // WHERE clauses.
   const where: string[] = [
-    "user_id = ?",
-    "status = 'complete'",
-    "node_kind = ?",
+    "f.user_id = ?",
+    "f.status = 'complete'",
+    "f.node_kind = ?",
   ];
   const args: (string | number)[] = [userId, FILE_NODE_KIND];
   if (parentId !== undefined) {
-    where.push("IFNULL(parent_id,'') = IFNULL(?,'')");
+    where.push("IFNULL(f.parent_id,'') = IFNULL(?,'')");
     args.push(parentId ?? "");
+  }
+  // Phase 25 — tombstone-consistency. LEFT JOIN to file_versions on
+  // the head pointer; require either no head (non-versioned tenants
+  // have head_version_id IS NULL) or a non-tombstoned head. The
+  // partial-NULL match is preserved by the LEFT JOIN — when
+  // head_version_id IS NULL the join returns NULL columns and the
+  // `fv.deleted IS NULL` predicate accepts it.
+  if (!includeTombstones) {
+    where.push(
+      "(f.head_version_id IS NULL OR fv.deleted IS NULL OR fv.deleted = 0)"
+    );
   }
   if (cursor) {
     // Seek bound: (orderCol < ov) OR (orderCol = ov AND file_id > pid)
     // for direction=desc; flip for asc.
     const cmp = direction === "desc" ? "<" : ">";
     where.push(
-      `(${orderCol} ${cmp} ? OR (${orderCol} = ? AND file_id ${tieBreak} ?))`
+      `(${orderCol} ${cmp} ? OR (${orderCol} = ? AND f.file_id ${tieBreak} ?))`
     );
     args.push(
       cursor.ov as number | string,
@@ -296,10 +339,12 @@ function listByFiles(
   args.push(sqlLimit);
 
   const sql = `
-    SELECT file_id, ${orderCol} AS ov
-      FROM files
+    SELECT f.file_id AS file_id, ${orderCol} AS ov
+      FROM files f
+      LEFT JOIN file_versions fv
+        ON fv.path_id = f.file_id AND fv.version_id = f.head_version_id
      WHERE ${where.join(" AND ")}
-     ORDER BY ${orderCol} ${dirSql}, file_id ASC
+     ORDER BY ${orderCol} ${dirSql}, f.file_id ASC
      LIMIT ?
   `;
   const rows = durableObject.sql
@@ -329,7 +374,8 @@ function listByTags(
   orderBy: OrderBy,
   direction: Direction,
   cursor: CursorPayload | null,
-  limit: number
+  limit: number,
+  includeTombstones: boolean
 ): { pathId: string; orderValue: number | string }[] {
   // Single-tag fast path.
   if (tags.length === 1) {
@@ -341,7 +387,8 @@ function listByTags(
       orderBy,
       direction,
       cursor,
-      limit
+      limit,
+      includeTombstones
     );
   }
   // Multi-tag intersect: drive from the rarest tag.
@@ -370,7 +417,8 @@ function listByTags(
     orderBy,
     direction,
     cursor,
-    limit * 4 // over-fetch; intersect may drop rows.
+    limit * 4, // over-fetch; intersect may drop rows.
+    includeTombstones
   );
   const filtered = driverPairs.filter((p) =>
     hasAllTags(durableObject, p.pathId, otherTags)
@@ -386,7 +434,8 @@ function listSingleTag(
   orderBy: OrderBy,
   direction: Direction,
   cursor: CursorPayload | null,
-  limit: number
+  limit: number,
+  includeTombstones: boolean
 ): { pathId: string; orderValue: number | string }[] {
   // The file_tags index covers (tag, mtime_ms DESC, path_id). For
   // orderBy 'mtime' we use it directly. For 'name' or 'size' we
@@ -415,6 +464,19 @@ function listSingleTag(
       );
       args.push(parentId ?? "");
     }
+    // Phase 25 — tombstone filter on the path_id's head version.
+    if (!includeTombstones) {
+      where.push(
+        `NOT EXISTS (
+           SELECT 1 FROM files f
+             JOIN file_versions fv
+               ON fv.path_id = f.file_id
+              AND fv.version_id = f.head_version_id
+            WHERE f.file_id = t.path_id
+              AND fv.deleted = 1
+         )`
+      );
+    }
     args.push(limit);
     const sql = `
       SELECT t.path_id AS pid, t.mtime_ms AS ov
@@ -441,6 +503,11 @@ function listSingleTag(
     where.push("IFNULL(f.parent_id,'') = IFNULL(?,'')");
     args.push(parentId ?? "");
   }
+  if (!includeTombstones) {
+    where.push(
+      "(f.head_version_id IS NULL OR fv.deleted IS NULL OR fv.deleted = 0)"
+    );
+  }
   if (cursor) {
     const cmp = direction === "desc" ? "<" : ">";
     where.push(
@@ -457,6 +524,8 @@ function listSingleTag(
     SELECT f.file_id AS pid, ${orderCol} AS ov
       FROM file_tags t
       JOIN files f ON f.file_id = t.path_id
+      LEFT JOIN file_versions fv
+        ON fv.path_id = f.file_id AND fv.version_id = f.head_version_id
      WHERE ${where.join(" AND ")}
      ORDER BY ${orderCol} ${dirSql}, f.file_id ASC
      LIMIT ?
@@ -553,12 +622,13 @@ function hydrateItem(
   scope: VFSScope,
   pathId: string,
   includeStat: boolean,
-  includeMetadata: boolean
+  includeMetadata: boolean,
+  includeTombstones: boolean
 ): ListFilesItemRaw | null {
   const f = durableObject.sql
     .exec(
       `SELECT file_id, file_name, parent_id, file_size, updated_at, mode,
-              metadata, mode_yjs
+              metadata, mode_yjs, head_version_id
          FROM files
         WHERE file_id = ? AND user_id = ? AND status = 'complete'`,
       pathId,
@@ -574,9 +644,50 @@ function hydrateItem(
         mode: number;
         metadata: ArrayBuffer | null;
         mode_yjs: number;
+        head_version_id: string | null;
       }
     | undefined;
   if (!f) return null;
+
+  // Phase 25 — tombstone-consistency. When the file row carries a
+  // versioned head pointer, follow it; if the head is tombstoned we
+  // skip this row (default) so the result is stat-able, mirroring
+  // `statForResolved` (helpers.ts:244). We also use the head
+  // version's `size` and `mtime_ms` so the surfaced stat matches
+  // what `vfsStat` would return — closing the previous "approximate
+  // for versioned tenants" gap.
+  let headSize = f.file_size;
+  let headMtime = f.updated_at;
+  if (f.head_version_id !== null) {
+    const head = durableObject.sql
+      .exec(
+        `SELECT size, mtime_ms, deleted, inline_data
+           FROM file_versions
+          WHERE path_id = ? AND version_id = ?`,
+        f.file_id,
+        f.head_version_id
+      )
+      .toArray()[0] as
+      | {
+          size: number;
+          mtime_ms: number;
+          deleted: number;
+          inline_data: ArrayBuffer | null;
+        }
+      | undefined;
+    if (head) {
+      if (head.deleted === 1 && !includeTombstones) {
+        return null;
+      }
+      headSize = head.inline_data
+        ? head.inline_data.byteLength
+        : head.size;
+      headMtime = head.mtime_ms;
+    }
+    // If the version row is missing (orphan head), fall through to
+    // the denormalized files columns — same fallback as
+    // `statForResolved`.
+  }
 
   const path = absolutePath(durableObject, userId, f.parent_id, f.file_name);
   const tags = (
@@ -595,17 +706,16 @@ function hydrateItem(
   };
 
   if (includeStat) {
-    // Build a minimal VFSStatRaw. Mirrors statForResolved's file branch
-    // closely; we don't follow versioning here (head-version size
-    // already lives on file_versions, not files, but for listFiles we
-    // use the file's denormalized fields which match for non-versioned
-    // tenants and approximate for versioned ones — listFiles is not
-    // a strict-stat surface).
+    // Build a VFSStatRaw aligned with `statForResolved`'s file
+    // branch. Source of truth for size/mtime is the head version
+    // row when present, falling back to the denormalized `files`
+    // columns. mode_yjs is invariant across versions of the same
+    // path (lives on `files`), so we still read it from the row.
     out.stat = {
       type: "file",
       mode: (f.mode ?? 0o644) | (f.mode_yjs === 1 ? 0o4000 : 0),
-      size: f.file_size,
-      mtimeMs: f.updated_at,
+      size: headSize,
+      mtimeMs: headMtime,
       uid: uidFromTenant(scope.tenant),
       gid: gidFromTenant(scope.tenant),
       ino: inoFromId(pathId),

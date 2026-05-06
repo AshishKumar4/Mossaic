@@ -205,9 +205,22 @@ export class UserDO extends UserDOCore {
       parentId = folderRow.folder_id;
     }
 
+    // Phase 25 — tombstone-consistency. The index callback resolves
+    // a path → fileId then re-fires `indexFile`, which reads bytes.
+    // If the head version is tombstoned the read would throw; just
+    // return null here so the index POST 404s instead of triggering
+    // a downstream byte-read that explodes.
     const fileRow = this.sql
       .exec(
-        "SELECT * FROM files WHERE user_id = ? AND IFNULL(parent_id, '') = IFNULL(?, '') AND file_name = ? AND status != 'deleted'",
+        `SELECT f.*
+           FROM files f
+           LEFT JOIN file_versions fv
+             ON fv.path_id = f.file_id AND fv.version_id = f.head_version_id
+          WHERE f.user_id = ?
+            AND IFNULL(f.parent_id, '') = IFNULL(?, '')
+            AND f.file_name = ?
+            AND f.status != 'deleted'
+            AND (f.head_version_id IS NULL OR fv.deleted IS NULL OR fv.deleted = 0)`,
         userId,
         parentId,
         leafName
@@ -246,9 +259,20 @@ export class UserDO extends UserDOCore {
     fileId: string
   ): Promise<{ path: string; mimeType: string } | null> {
     this.ensureInit();
+    // Phase 25 — tombstone-consistency. Gallery/shared-album routes
+    // call this then immediately read bytes via canonical VFS. A
+    // tombstoned head would 404 with the wrong error class
+    // (downstream "head version is a tombstone" instead of "no such
+    // file"); returning null here gives the route a clean 404 path.
     const fileRow = this.sql
       .exec(
-        "SELECT parent_id, file_name, mime_type FROM files WHERE file_id = ? AND status != 'deleted'",
+        `SELECT f.parent_id, f.file_name, f.mime_type
+           FROM files f
+           LEFT JOIN file_versions fv
+             ON fv.path_id = f.file_id AND fv.version_id = f.head_version_id
+          WHERE f.file_id = ?
+            AND f.status != 'deleted'
+            AND (f.head_version_id IS NULL OR fv.deleted IS NULL OR fv.deleted = 0)`,
         fileId
       )
       .toArray()[0] as
@@ -327,12 +351,25 @@ export class UserDO extends UserDOCore {
    * All files for a user, regardless of folder. Used by the search
    * reindex pipeline. `status='deleted'` rows are excluded; the
    * caller filters further on `status === 'complete'` if needed.
+   *
+   * Phase 25 — tombstone-consistency: rows whose `head_version_id`
+   * points at a `deleted=1` `file_versions` row are EXCLUDED so
+   * downstream consumers (e.g. `indexFile`) don't try to read bytes
+   * for an unlinked path. Mirrors the canonical `vfsListFiles`
+   * default (`includeTombstones=false`).
    */
   async appListAllFiles(userId: string): Promise<UserFile[]> {
     this.ensureInit();
     const rows = this.sql
       .exec(
-        "SELECT * FROM files WHERE user_id = ? AND status != 'deleted' ORDER BY created_at DESC",
+        `SELECT f.*
+           FROM files f
+           LEFT JOIN file_versions fv
+             ON fv.path_id = f.file_id AND fv.version_id = f.head_version_id
+          WHERE f.user_id = ?
+            AND f.status != 'deleted'
+            AND (f.head_version_id IS NULL OR fv.deleted IS NULL OR fv.deleted = 0)
+          ORDER BY f.created_at DESC`,
         userId
       )
       .toArray();
@@ -350,12 +387,28 @@ export class UserDO extends UserDOCore {
     }));
   }
 
-  /** All complete image files across all folders, newest first. */
+  /**
+   * All complete image files across all folders, newest first.
+   *
+   * Phase 25 — tombstone-consistency: same filter as `appListAllFiles`.
+   * The gallery surface absolutely cannot show unlinked-under-versioning
+   * photos: those photos' chunks are still referenced (versioning
+   * preserves history) but the user has expressed intent to hide them.
+   */
   async appGetGalleryPhotos(userId: string): Promise<GalleryPhoto[]> {
     this.ensureInit();
     const rows = this.sql
       .exec(
-        "SELECT file_id, file_name, file_size, mime_type, parent_id, created_at, updated_at FROM files WHERE user_id = ? AND status = 'complete' AND mime_type LIKE 'image/%' ORDER BY created_at DESC",
+        `SELECT f.file_id, f.file_name, f.file_size, f.mime_type,
+                f.parent_id, f.created_at, f.updated_at
+           FROM files f
+           LEFT JOIN file_versions fv
+             ON fv.path_id = f.file_id AND fv.version_id = f.head_version_id
+          WHERE f.user_id = ?
+            AND f.status = 'complete'
+            AND f.mime_type LIKE 'image/%'
+            AND (f.head_version_id IS NULL OR fv.deleted IS NULL OR fv.deleted = 0)
+          ORDER BY f.created_at DESC`,
         userId
       )
       .toArray();
@@ -429,15 +482,25 @@ export class UserDO extends UserDOCore {
     }>
   > {
     this.ensureInit();
+    // Phase 25 — tombstone-consistency. Skip files whose head version
+    // is tombstoned: re-firing `indexFile` on them would attempt a
+    // byte read that throws "head version is a tombstone" downstream.
+    // The file's previously-indexed embeddings remain in the vector
+    // store keyed by file_id (acceptable: an unlinked file
+    // shouldn't surface in search anyway, and the next live write
+    // would re-fire indexing under a fresh fileId).
     const rows = this.sql
       .exec(
-        `SELECT file_id, file_name, mime_type, file_size
-         FROM files
-         WHERE user_id = ?
-           AND status = 'complete'
-           AND indexed_at IS NULL
-         ORDER BY created_at ASC
-         LIMIT ?`,
+        `SELECT f.file_id, f.file_name, f.mime_type, f.file_size
+           FROM files f
+           LEFT JOIN file_versions fv
+             ON fv.path_id = f.file_id AND fv.version_id = f.head_version_id
+          WHERE f.user_id = ?
+            AND f.status = 'complete'
+            AND f.indexed_at IS NULL
+            AND (f.head_version_id IS NULL OR fv.deleted IS NULL OR fv.deleted = 0)
+          ORDER BY f.created_at ASC
+          LIMIT ?`,
         userId,
         Math.min(Math.max(1, limit), 100)
       )
