@@ -214,6 +214,54 @@ const stats = await vfs.readManyStat(["/a", "/b", "/c", "/missing"]);
 
 This is **one** outbound DO RPC regardless of how many paths you batch.
 
+### `listChildren` &mdash; one-RPC enumeration of a folder's direct children
+
+Where `readdir` returns names only and `listFiles` is for indexed
+queries across the entire tenant, `listChildren` answers the
+SPA-shaped question "what's directly inside this folder right now?"
+in a single DO RPC with full `stat` / metadata / tags / contentHash
+hydration:
+
+```ts
+const page = await vfs.listChildren("/photos/2026", {
+  orderBy: "mtime",
+  direction: "desc",
+  limit: 50,
+  includeStat: true,           // default true
+  includeMetadata: false,      // default false
+  includeContentHash: false,   // default false (adds SHA-256 to file entries)
+});
+
+page.revision;                  // monotonic per-folder counter
+for (const entry of page.entries) {
+  // Discriminated union by `kind`:
+  if (entry.kind === "folder") {
+    entry.path; entry.name; entry.stat?.size;
+  } else if (entry.kind === "file") {
+    entry.path; entry.tags; entry.metadata; entry.contentHash;
+  } else if (entry.kind === "symlink") {
+    entry.path; entry.target;   // resolved symlink destination
+  }
+}
+
+if (page.cursor) {
+  const more = await vfs.listChildren("/photos/2026", { cursor: page.cursor });
+}
+```
+
+The `revision` field is the **per-folder mutation counter** &mdash;
+strictly monotonic within a single tenant DO. Use it as a
+client-side ETag: when `revision` is unchanged across two reads,
+the directory contents are guaranteed identical and you can skip
+diffing `entries`. The counter bumps on every direct-child
+mutation (`writeFile`, `rename`, `unlink`, `mkdir`, `rmdir`,
+nested-tree changes do not bump the parent).
+
+Pass `includeContentHash: true` only when you need it (one extra
+SQL probe per file entry); leaving it off is the cheaper default.
+The same `includeContentHash` knob also exists on `listFiles`
+since both surfaces share the underlying hydration path.
+
 ---
 
 ## Streaming for large files
@@ -227,8 +275,16 @@ for await (const chunk of stream) {
   // process chunk
 }
 
-// Range reads
+// Range reads (SDK-level: byte slice across one or more chunks)
 const range = await vfs.createReadStream("/big.bin", { start: 1024, end: 2048 });
+
+// HTTP-level Range support (server-side, for media seek):
+//   GET /api/gallery/image/:fileId
+//   GET /api/shared/:token/image/:fileId
+// These honor `Range: bytes=N-M` with 206 + `Content-Range` +
+// `Accept-Ranges: bytes`. Out-of-bounds → 416. The browser's
+// native <video> / <audio> element handles seek-bar scrubbing
+// without any SDK code.
 
 // Write: WritableStream<Uint8Array>
 const out = await vfs.createWriteStream("/big.bin");
@@ -333,7 +389,61 @@ Every SDK consumer (SPA, CLI, third-party Worker) hits the same surface; there i
 
 ## Universal preview pipeline
 
-`vfs.readPreview()` returns rendered preview bytes for any file the VFS holds — image, code, audio, video, or anything else. Variants are content-addressed, refcount-shared, and immutable-cached.
+Mossaic exposes preview bytes through two complementary surfaces:
+
+1. **`vfs.previewUrl` / `vfs.previewInfo` / `vfs.previewInfoMany`** &mdash; mint a signed URL the browser fetches **directly** via `GET /api/vfs/preview-variant/<token>`. Bytes are content-addressed; the response carries `Cache-Control: public, max-age=31536000, immutable` (no `Vary: Authorization`) so a CDN edge tier caches across all clients. Subsequent loads bypass the SDK and the Worker entirely &mdash; this is the right shape for thumbnail grids, gallery views, and embedded `<img>` tags.
+
+2. **`vfs.readPreview`** &mdash; returns rendered bytes inline through the typed RPC. The right shape when the consumer is going to process the bytes server-side (image manipulation, hashing, re-encoding) rather than ship them to a browser.
+
+Variants are content-addressed, refcount-shared, and immutable-cached regardless of which surface you use. Five built-in renderers dispatch by MIME: `image` (Cloudflare Images), `code-svg` (text/source), `waveform-svg` (audio), `video-poster` (video), `icon-card` (universal fallback). Encrypted files throw `ENOTSUP` &mdash; server cannot render ciphertext.
+
+### Direct-URL caching (the SPA shape)
+
+```ts
+// Mint one signed URL.
+const url = await vfs.previewUrl("/photos/sunset.jpg", { variant: "thumb" });
+// "/api/vfs/preview-variant/eyJhbGciOi…"
+
+// Or get the URL plus the metadata bundle in one mint:
+const info = await vfs.previewInfo("/photos/sunset.jpg", { variant: "thumb" });
+// {
+//   token, url,
+//   etag: "W/\"<contentHash>\"",
+//   mimeType: "image/webp", width: 256, height: 256,
+//   rendererKind: "image",
+//   versionId: "01J...",            // null on legacy / versioning-OFF tenants
+//   cacheControl: "public, max-age=31536000, immutable",
+//   contentHash: "abcd...",
+//   expiresAtMs: 1735776000000,     // token TTL; cached BYTES live a year
+// }
+```
+
+For multi-image grids, batch the mint:
+
+```ts
+const results = await vfs.previewInfoMany(
+  ["/a.jpg", "/b.jpg", "/missing.jpg"],
+  { variant: "thumb" },
+);
+// [
+//   { path: "/a.jpg", ok: true, info: { url, etag, ... } },
+//   { path: "/b.jpg", ok: true, info: { url, etag, ... } },
+//   { path: "/missing.jpg", ok: false, code: "ENOENT", message: "..." },
+// ]
+```
+
+A 50-photo gallery becomes **one mint RPC + 50 direct browser fetches** against the CDN-cached route, instead of 50 RPCs that each tunnel bytes through the Worker.
+
+Token security:
+
+- HMAC-signed (HS256) with `JWT_SECRET`; multi-secret rotation aware (tokens minted under the old secret remain valid through a `JWT_SECRET_PREVIOUS` rotation window).
+- Scope-bound (`scope: "vfs-pv"`): VFS / multipart / download / share tokens replayed at the preview-variant route are rejected.
+- Default TTL 24h; clamped to `[60s, 30d]`. Pass `ttlMs` on `opts` to tune within that range.
+- Stale-after-write impossible: a write changes the file's `headVersionId`, which mints a fresh `contentHash`, which is a different URL.
+
+The token references the variant's pre-rendered bytes; if those have been re-rendered since mint (the variant cache row's `chunk_hash` no longer matches the token's `contentHash`), the route returns 410 Gone &mdash; the SPA's normal recovery is to re-mint.
+
+### Inline reads (the bytes-through-RPC shape)
 
 ```ts
 const preview = await vfs.readPreview("/photos/sunset.jpg", { variant: "thumb" });
@@ -347,9 +457,7 @@ const preview = await vfs.readPreview("/photos/sunset.jpg", { variant: "thumb" }
 // }
 ```
 
-Standard variants: `"thumb"` (256² cover), `"medium"` (768² contain), `"lightbox"` (1920² contain). Custom variants accept `{width, height?, fit?}` and cache under a stable encoded key.
-
-Five built-in renderers dispatch by MIME: `image` (Cloudflare Images), `code-svg` (text/source), `waveform-svg` (audio), `video-poster` (video, (future)), `icon-card` (universal fallback). Encrypted files throw `ENOTSUP` — server cannot render ciphertext.
+Standard variants: `"thumb"` (256&sup2; cover), `"medium"` (768&sup2; contain), `"lightbox"` (1920&sup2; contain). Custom variants accept `{width, height?, fit?}` and cache under a stable encoded key.
 
 Batched manifests for galleries:
 
@@ -720,7 +828,7 @@ await migrateEncrypt(vfs, "/path/to/file");        // single file (atomic per fi
 //   $ mossaic encrypt --prefix=/photos/ --mode=convergent
 ```
 
-Mossaic NEVER auto-encrypts. Pre-Phase-15 files remain plaintext until the consumer opts in.
+Mossaic NEVER auto-encrypts. Existing plaintext files remain plaintext until the consumer opts in.
 
 ### Limits & known gotchas
 
@@ -1145,19 +1253,22 @@ The SDK does not currently expose these as runtime options on `createVFS`; they'
 
 ## Testing locally
 
-The SDK ships with:
+The repo ships ~929 tests covering every public surface. Highlights:
 
-- `tests/integration/igit-smoke.test.ts` — full isomorphic-git round-trip
-- `tests/integration/consumer-fixture.test.ts` — pins the 1-subrequest-per-VFS-call architectural promise
-- `tests/integration/efbig.test.ts` — size-cap enforcement
-- `tests/integration/dedupe-paths.test.ts` — admin tooling
-- `tests/integration/worker-smoke.test.ts` — production regression gate (boots the actual Hono app)
-- `tests/integration/streaming.test.ts` — read/write streams, byte-range, handle-based primitives
-- `tests/integration/tenant-isolation.test.ts` — cross-tenant impossibility
-- `tests/integration/readmany-stat.test.ts` — git-status-style batched lstat
-- ... plus path-walk, ino, refcount, migration, app-smoke, vfs-read, vfs-write
+- `tests/integration/igit-smoke.test.ts` &mdash; full isomorphic-git round-trip
+- `tests/integration/consumer-fixture.test.ts` &mdash; pins the 1-subrequest-per-VFS-call architectural promise
+- `tests/integration/preview-variant-route.test.ts` &mdash; signed-URL preview lifecycle (mint, verify, cache, revoke, stale-token 410)
+- `tests/integration/list-children.test.ts` &mdash; folder-revision ETag + discriminated-union entries
+- `tests/integration/range-support.test.ts` &mdash; HTTP Range 206 + `Content-Range` + 416 out-of-bounds
+- `tests/integration/audit-log.test.ts` &mdash; one row per destructive op + retention sweep
+- `tests/integration/edge-cache.test.ts` &mdash; cache-bust completeness across every cached surface
+- `tests/integration/streaming.test.ts` &mdash; read/write streams, byte-range, handle-based primitives
+- `tests/integration/tenant-isolation.test.ts` &mdash; cross-tenant impossibility
+- `tests/integration/readmany-stat.test.ts` &mdash; git-status-style batched lstat
+- `tests/integration/versioning-accounting.test.ts` &mdash; storage_used/file_count/inline_bytes_used balance
+- ...plus path-walk, ino, refcount, migration, app-smoke, multipart, encryption, yjs
 
-Run `pnpm test` at the repo root.
+Run `pnpm test` at the repo root. `pnpm ci:check` runs typecheck + DTS-strict SDK build + the no-Phase-tag lint gate.
 
 ---
 
