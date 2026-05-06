@@ -3,7 +3,7 @@ import type { ShardDO } from "../shard/shard-do";
 import { VFSError, type VFSScope } from "../../../../shared/vfs-types";
 import { generateId, vfsShardDOName } from "../../lib/utils";
 import { placeChunk } from "../../../../shared/placement";
-import { userIdFor } from "./vfs/helpers";
+import { recordWriteUsage, userIdFor } from "./vfs/helpers";
 import { resolvePath } from "./path-walk";
 
 /**
@@ -249,6 +249,47 @@ export function commitVersion(
     shardRefId?: string;
   }
 ): void {
+  // Phase 36 \u2014 single chokepoint for versioned accounting.
+  //
+  // Read the prior head's state BEFORE the INSERT so we can
+  // compute (deltaBytes, deltaFiles, deltaInline) for one
+  // recordWriteUsage call at the end. This consolidates the
+  // accounting that previously had to live (or be missing) at
+  // every commitVersion caller \u2014 13 call sites across 6 files.
+  //
+  // Semantics (versioning-on file-count + storage):
+  //   - file_count counts LIVE PATHS (paths with a non-tombstone
+  //     head). Adding a new live version keeps the path live;
+  //     adding a tombstone makes the path no longer-live.
+  //   - storage_used counts BYTES of live-version content. Each
+  //     non-tombstone version commit adds args.size; the older
+  //     versions remain (and their bytes are already counted).
+  //     dropVersionRows reaps the bytes on retention sweeps.
+  //   - inline_bytes_used counts CUMULATIVE inline-tier bytes;
+  //     non-tombstone inline commits add args.inlineData.byteLength.
+  //
+  // The yjs compaction path (yjs.ts:739) calls with
+  // userVisible=true on user-flush events, so it accounts as a
+  // normal inline write. Opportunistic compactions
+  // (userVisible=false) skip commitVersion entirely.
+  const headRowForAccounting = durableObject.sql
+    .exec(
+      `SELECT v.size AS prev_size, v.deleted AS prev_deleted
+         FROM files f
+         LEFT JOIN file_versions v
+           ON v.path_id = f.file_id AND v.version_id = f.head_version_id
+        WHERE f.file_id = ?`,
+      args.pathId
+    )
+    .toArray()[0] as
+    | { prev_size: number | null; prev_deleted: number | null }
+    | undefined;
+  const prevWasLive =
+    !!headRowForAccounting &&
+    headRowForAccounting.prev_size !== null &&
+    headRowForAccounting.prev_deleted === 0;
+  const nowIsLive = !args.deleted;
+
   // Phase 28 Fix 3 — preserve encryption stamp on tombstones.
   //
   // Pre-fix: when `vfsUnlink` (and `vfsRename` overwrite +
@@ -337,6 +378,36 @@ export function commitVersion(
     encKeyId,
     args.pathId
   );
+
+  // Phase 36 \u2014 single recordWriteUsage call covering all three
+  // counters. Negative deltas are clamped at zero by the
+  // helper's MAX(0, ...) clamp; pool growth is monotonic via
+  // newPool > row.pool_size guard. See helpers.ts:421-453.
+  //
+  // deltaFiles transitions:
+  //   prev=live  + now=live      \u2192 0 (path stayed live)
+  //   prev=live  + now=tombstone \u2192 -1 (path exited live)
+  //   prev=dead  + now=live      \u2192 +1 (path entered live)
+  //   prev=dead  + now=tombstone \u2192 0 (still no live path)
+  // (\"dead\" = no head OR tombstoned head OR no row.)
+  //
+  // deltaBytes / deltaInline are zero on tombstone inserts \u2014 the
+  // older versions still occupy bytes; dropVersionRows is the
+  // path that frees them.
+  const deltaFiles =
+    (nowIsLive ? 1 : 0) - (prevWasLive ? 1 : 0);
+  const deltaBytes = nowIsLive ? args.size : 0;
+  const deltaInline =
+    nowIsLive && args.inlineData ? args.inlineData.byteLength : 0;
+  if (deltaBytes !== 0 || deltaFiles !== 0 || deltaInline !== 0) {
+    recordWriteUsage(
+      durableObject,
+      args.userId,
+      deltaBytes,
+      deltaFiles,
+      deltaInline
+    );
+  }
 }
 
 /**
@@ -603,21 +674,38 @@ export async function dropVersionRows(
   const env = durableObject.envPublic;
   const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
 
-  // Phase 32.5 BUG #2 fix \u2014 accumulate inline-tier bytes across
-  // versions so we can issue ONE negative `recordWriteUsage` call
-  // at the end. `vfsWriteFileVersioned` inline branch
-  // (write-commit.ts:364-370) increments `quota.inline_bytes_used`
-  // on every versioned inline write; pre-fix `dropVersionRows`
-  // never decremented, so versioning-on tenants with inline
-  // history monotonically inflated the counter and INLINE_TIER_CAP
-  // (1 GiB) fired earlier than spec.
-  //
-  // Read inline_data BEFORE the file_versions DELETE (line 648
-  // below). Tombstones (`deleted=1` with NULL inline_data) and
-  // chunked-tier versions contribute 0. Accumulating across the
-  // whole batch keeps subrequest cost flat \u2014 one decrement RPC
-  // regardless of how many inline versions get reaped.
+  // Phase 36 \u2014 dropVersionRows owns ALL three counters'
+  // negative deltas for versioning-on tenants. Pre-fix, only
+  // inline_bytes_used was decremented (Phase 32.5 BUG #2);
+  // storage_used and file_count drifted upward forever. The
+  // versioning-on write path increments via commitVersion (Phase 36
+  // change); dropVersionRows is the symmetric decrement. Bytes
+  // are accumulated across non-tombstone versions; the file_count
+  // delta fires when the `files` row gets dropped at the end
+  // (path goes ENOENT) AND the path was previously live.
+  let bytesReaped = 0;
   let inlineBytesReaped = 0;
+
+  // Snapshot whether the path is currently LIVE (head is
+  // non-tombstone) BEFORE we start dropping. If the `files` row
+  // ends up dropped at the end (liveCount === 0), the path
+  // exits the live-set and we owe a -1 file_count delta. If the
+  // path was already tombstoned, file_count was already
+  // decremented by the commitVersion(deleted=true) that produced
+  // the tombstone \u2014 don't double-decrement.
+  const wasLiveAtStart = (() => {
+    const r = durableObject.sql
+      .exec(
+        `SELECT v.deleted AS d
+           FROM files f
+           LEFT JOIN file_versions v
+             ON v.path_id = f.file_id AND v.version_id = f.head_version_id
+          WHERE f.file_id = ?`,
+        pathId
+      )
+      .toArray()[0] as { d: number | null } | undefined;
+    return !!r && r.d === 0;
+  })();
 
   let reaped = 0;
   for (const versionId of versionIds) {
@@ -638,35 +726,40 @@ export async function dropVersionRows(
       )
       .toArray() as { shard_index: number }[];
 
-    // Phase 27 — read the per-version `shard_ref_id` BEFORE the
+    // Phase 27 \u2014 read the per-version `shard_ref_id` BEFORE the
     // delete so multipart-finalized versions can fan out to the
     // correct chunk_refs key (uploadId, not the synthetic
     // `${pathId}#${versionId}`). Falls back to the synthetic form
-    // when the column is NULL — matches every legacy and standard
+    // when the column is NULL \u2014 matches every legacy and standard
     // versioned-write row.
     //
-    // Phase 32.5 BUG #2 \u2014 also read inline_data + deleted in the
-    // same SELECT so we can accumulate inline-tier bytes for the
-    // post-loop decrement. Tombstones (`deleted=1`) skip the
-    // accumulation even if `inline_data` is non-NULL (defensive
-    // \u2014 commitVersion shouldn't write inline_data on a
-    // tombstone, but the gate makes the invariant explicit).
+    // Phase 32.5 BUG #2 + Phase 36 \u2014 also read size, inline_data,
+    // and deleted so we can accumulate the byte deltas for the
+    // post-loop recordWriteUsage call. Tombstones (`deleted=1`)
+    // contribute 0 (their bytes were never positive-counted by
+    // commitVersion). Live (`deleted=0`) versions contribute
+    // `+size` for storage_used and (if inline) `+inline_data.byteLength`
+    // for inline_bytes_used.
     const refRow = durableObject.sql
       .exec(
-        "SELECT shard_ref_id, inline_data, deleted FROM file_versions WHERE path_id = ? AND version_id = ?",
+        "SELECT shard_ref_id, size, inline_data, deleted FROM file_versions WHERE path_id = ? AND version_id = ?",
         pathId,
         versionId
       )
       .toArray()[0] as
       | {
           shard_ref_id: string | null;
+          size: number;
           inline_data: ArrayBuffer | null;
           deleted: number;
         }
       | undefined;
     const explicitRefId = refRow?.shard_ref_id ?? null;
-    if (refRow && refRow.deleted === 0 && refRow.inline_data) {
-      inlineBytesReaped += refRow.inline_data.byteLength;
+    if (refRow && refRow.deleted === 0) {
+      bytesReaped += refRow.size;
+      if (refRow.inline_data) {
+        inlineBytesReaped += refRow.inline_data.byteLength;
+      }
     }
 
     // Drop UserDO-side metadata first (mirrors hardDeleteFileRow).
@@ -716,25 +809,18 @@ export async function dropVersionRows(
     reaped++;
   }
 
-  // Phase 32.5 BUG #2 fix \u2014 single decrement for the whole batch.
-  // Lazy import to keep this module free of cross-module cycles
-  // when bundled. Skipped when inlineBytesReaped is 0 (chunked-tier
-  // versions and tombstones contribute nothing) so the SQL UPDATE
-  // is only issued when there's real work.
+  // Phase 36 \u2014 single recordWriteUsage call covering all three
+  // counters for the whole batch. Pre-Phase-36 only inline_bytes_used
+  // was decremented (Phase 32.5 BUG #2); storage_used + file_count
+  // drifted forever for versioning tenants. Now symmetric with
+  // commitVersion.
   //
-  // Plain storage_used / file_count decrement on dropped versions
-  // is intentionally OUT of scope for Phase 32.5 \u2014 see Phase 32.6
-  // in docs/scaling-roadmap.md. Inline-bytes accounting is the
-  // load-bearing invariant (cap depends on it); plain quota is
-  // cosmetic.
-  if (inlineBytesReaped > 0) {
-    const { recordWriteUsage } = await import("./vfs/helpers");
-    recordWriteUsage(durableObject, userId, 0, 0, -inlineBytesReaped);
-  }
-
-  // After dropping, if no live version remains AND no tombstone
-  // either, also drop the empty `files` row so the path becomes
-  // ENOENT cleanly.
+  // file_count delta: -1 IFF the path was LIVE at the start of
+  // the drop AND the `files` row gets dropped below (liveCount === 0
+  // \u2014 the path goes ENOENT). If the path was already tombstoned
+  // when drop started, file_count was already decremented by the
+  // commitVersion(deleted=true) that wrote the tombstone \u2014 we
+  // must not double-decrement here.
   const liveCount = (
     durableObject.sql
       .exec(
@@ -743,7 +829,27 @@ export async function dropVersionRows(
       )
       .toArray()[0] as { n: number }
   ).n;
-  if (liveCount === 0) {
+  const willDropFilesRow = liveCount === 0;
+  const filesRowDelta = willDropFilesRow && wasLiveAtStart ? -1 : 0;
+
+  if (
+    bytesReaped > 0 ||
+    inlineBytesReaped > 0 ||
+    filesRowDelta !== 0
+  ) {
+    recordWriteUsage(
+      durableObject,
+      userId,
+      -bytesReaped,
+      filesRowDelta,
+      -inlineBytesReaped
+    );
+  }
+
+  // After dropping, if no live version remains AND no tombstone
+  // either, also drop the empty `files` row so the path becomes
+  // ENOENT cleanly.
+  if (willDropFilesRow) {
     durableObject.sql.exec(
       "DELETE FROM files WHERE file_id = ? AND user_id = ?",
       pathId,
