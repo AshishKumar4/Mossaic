@@ -1,4 +1,4 @@
-// Phase 19 — barrel re-export. The implementation moved to
+// barrel re-export. The implementation moved to
 // `vfs/{helpers,reads,write-commit,mutations,metadata,streams}.ts`.
 // External callers (user-do-core.ts, multipart-upload.ts,
 // copy-file.ts) continue to import from this path; the barrel
@@ -69,3 +69,5 @@ export {
   type VFSReadHandle,
   type VFSWriteHandle,
 } from "./vfs/streams";
+
+export { vfsReadPreview } from "./vfs/preview";

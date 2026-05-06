@@ -1,6 +1,6 @@
 import { useMemo, useRef, useEffect, useState } from "react";
 import type { GalleryPhoto } from "@app/types";
-import { PhotoThumbnail } from "./photo-thumbnail";
+import { LazyPhotoThumbnail } from "./lazy-photo-thumbnail";
 
 interface JustifiedGridProps {
   photos: GalleryPhoto[];
@@ -156,7 +156,7 @@ export function JustifiedGrid({
             height: item.height,
           }}
         >
-          <PhotoThumbnail
+          <LazyPhotoThumbnail
             fileId={item.photo.fileId}
             fileName={item.photo.fileName}
             width={item.width}

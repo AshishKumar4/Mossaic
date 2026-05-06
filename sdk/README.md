@@ -23,7 +23,7 @@ Cloudflare-Worker-native VFS over Mossaic. fs/promises-shaped, isomorphic-git co
                                   └────────────┬────────────┘
                                                │ (App vs Core split)
                                                │ App: UserDO extends UserDOCore
-                                               │       └─ + _legacyFetch (byte-pinned)
+                                               │       └─ + appXxx typed RPCs (legacy photo-app)
                                                │       └─ + SearchDO (App-only, not in SDK)
                                                │ Service-mode: binds UserDOCore directly
                                                ▼
@@ -39,7 +39,7 @@ The runtime split:
 
 | Mode          | DO bindings                    | Routes mounted                  | Use case |
 |---------------|--------------------------------|---------------------------------|----------|
-| App mode      | `UserDO` (subclass of `UserDOCore`) + `ShardDO` + `SearchDO` | legacy `/api/upload`, `/api/download`, photo-app, `/api/vfs/*` | the existing `mossaic.ashishkumarsingh.com` deployment — the App's `UserDO.fetch` delegates non-WS HTTP to a byte-pinned `_legacyFetch` and forwards WS upgrades to `super.fetch` for Yjs |
+| App mode      | `UserDO` (subclass of `UserDOCore`) + `ShardDO` + `SearchDO` | legacy `/api/upload`, `/api/download`, photo-app, `/api/vfs/*` | the existing `mossaic.ashishkumarsingh.com` deployment — App routes call typed `stub.appXxx(...)` RPCs on the UserDO subclass; WS upgrades fall through to `super.fetch` for Yjs |
 | Service mode  | `UserDOCore` + `ShardDO` (no SearchDO) | `/api/vfs/*` only | a new fresh deployment for SDK consumers — see `deployments/service/wrangler.jsonc` |
 | Library mode  | consumer's own `MOSSAIC_USER` + `MOSSAIC_SHARD` (re-exported `UserDO`/`ShardDO` from `@mossaic/sdk`) | consumer-defined | the recommended path: `import { UserDO, ShardDO, createVFS }` and bind in your own Worker — 1 DO RPC per VFS call, no HTTP hop |
 
@@ -259,6 +259,120 @@ const chunk1 = await vfs.readChunk("/huge.tar", 1);
 ```
 
 Note: `chunks[].shardIndex` is intentionally hidden — it's an internal placement detail, not a stable identifier.
+
+### Parallel multipart transfer
+
+For high-throughput uploads/downloads, use the `parallelUpload` / `parallelDownload` engine. It drives R2/S3-style multipart sessions with adaptive concurrency (1 → 64 lanes) and endgame mode for tail-latency reduction.
+
+```ts
+import {
+  parallelUpload,
+  parallelDownload,
+  type ChunkEvent,
+  type ManifestEvent,
+  type TransferProgressEvent,
+} from "@mossaic/sdk/http";
+import { createMossaicHttpClient } from "@mossaic/sdk/http";
+
+const client = createMossaicHttpClient({
+  url: "https://api.example.com",
+  apiKey: token,
+});
+
+// Upload — `file` can be Uint8Array or Blob.
+const result = await parallelUpload(client, "/photo.jpg", file, {
+  mimeType: "image/jpeg",
+  metadata: { tags: ["sunset", "beach"] },
+  onProgress: (e: TransferProgressEvent) => {
+    console.log(`${e.uploaded}/${e.total} bytes, ${e.currentParallelism} lanes`);
+  },
+  onChunkEvent: (e: ChunkEvent) => {
+    // e.state ∈ {"started", "completed", "failed", "retrying"}
+    // e.index is the chunk index
+    // e.hash + e.bytesAccepted on `completed`
+  },
+});
+console.log(`uploaded ${result.size} bytes; fileId = ${result.fileId}`);
+
+// Download — returns Uint8Array.
+const bytes = await parallelDownload(client, "/photo.jpg", {
+  onManifest: (m: ManifestEvent) => {
+    // Fired once before any chunk fetch.
+    // m = { fileId, mimeType, size, chunkCount, chunks }
+  },
+  onChunkEvent: (e: ChunkEvent) => {
+    // Same shape as upload.
+  },
+});
+```
+
+#### Per-chunk events
+
+`onChunkEvent` fires for every chunk's lifecycle:
+- `started` — chunk pulled from queue, hashing begins.
+- `completed` — server accepted the chunk; `e.hash` and `e.bytesAccepted` are populated.
+- `failed` — terminal failure after `MAX_RETRIES`; `e.error` populated.
+- `retrying` — transient failure; `e.attempt` (1-indexed) populated.
+
+**Per-index ordering**: `started → (retrying)* → (completed | failed)`. **Cross-index ordering**: non-deterministic (concurrent lanes).
+
+#### Manifest event (download only)
+
+`onManifest` fires exactly once after the download token returns, before any `onChunkEvent`. Use it to seed per-chunk UI state and capture `mimeType` for `Blob` construction.
+
+#### `multipartBaseOverride` / `chunkFetchBaseOverride`
+
+Advanced consumers (e.g. a custom App on top of Mossaic) can route SDK multipart calls to a different endpoint base:
+
+```ts
+const client = createMossaicHttpClient({
+  url: "https://app.example.com",
+  apiKey: appJWT,                         // App-issued JWT, not VFS token
+  multipartBaseOverride: "/api/upload/multipart",  // App-pinned multipart bridge
+  chunkFetchBaseOverride: "/api/download",         // App's chunk download endpoint
+});
+```
+
+When set, SDK multipart calls land at:
+- `${url}${multipartBaseOverride}/begin`
+- `${url}${multipartBaseOverride}/${uploadId}/chunk/${idx}`
+- `${url}${multipartBaseOverride}/finalize`
+- `${url}${multipartBaseOverride}/abort`
+- `${url}${multipartBaseOverride}/${uploadId}/status`
+- `${url}${multipartBaseOverride}/download-token`
+
+And `fetchChunkByHash` switches from the canonical `POST /api/vfs/readChunk` to a `GET ${chunkFetchBaseOverride}/chunk/${fileId}/${idx}` request. The Mossaic photo-library SPA uses both overrides to route through legacy DO instances; see `OPERATIONS.md` §6.8 for the full architecture.
+
+---
+
+## Universal preview pipeline
+
+`vfs.readPreview()` returns rendered preview bytes for any file the VFS holds — image, code, audio, video, or anything else. Variants are content-addressed, refcount-shared, and immutable-cached.
+
+```ts
+const preview = await vfs.readPreview("/photos/sunset.jpg", { variant: "thumb" });
+// {
+//   bytes: Uint8Array,                // image/webp or image/svg+xml
+//   mimeType: "image/webp",
+//   width: 256, height: 256,
+//   sourceMimeType: "image/jpeg",
+//   rendererKind: "image",
+//   fromVariantTable: false,          // true on cache hit
+// }
+```
+
+Standard variants: `"thumb"` (256² cover), `"medium"` (768² contain), `"lightbox"` (1920² contain). Custom variants accept `{width, height?, fit?}` and cache under a stable encoded key.
+
+Five built-in renderers dispatch by MIME: `image` (Cloudflare Images), `code-svg` (text/source), `waveform-svg` (audio), `video-poster` (video, Phase 20.1+), `icon-card` (universal fallback). Encrypted files throw `ENOTSUP` — server cannot render ciphertext.
+
+Batched manifests for galleries:
+
+```ts
+const results = await vfs.openManifests(["/a.jpg", "/b.jpg", "/c.jpg"]);
+// One round-trip; per-path errors come back as { ok: false, code, message }.
+```
+
+Full reference: [`docs/previews.md`](../docs/previews.md).
 
 ---
 

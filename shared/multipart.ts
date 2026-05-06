@@ -148,6 +148,12 @@ export interface DownloadTokenResponse {
     chunkCount: number;
     chunks: Array<{ index: number; hash: string; size: number }>;
     inlined: boolean;
+    /**
+     * Surfaced for SPA Blob construction. Optional so the canonical
+     * route stays backward-compatible; the App-pinned route always
+     * populates it from the legacy `files.mime_type` column.
+     */
+    mimeType?: string;
   };
 }
 

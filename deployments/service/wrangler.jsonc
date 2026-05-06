@@ -49,6 +49,13 @@
     ]
   },
 
+  // Universal preview pipeline. Service-mode SDK consumers get the
+  // same renderer surface as App-mode: image resizing via IMAGES;
+  // BROWSER reserved for Phase 20.1 deferred renderers (the
+  // binding is optional — its absence falls through to icon-card).
+  "images": { "binding": "IMAGES" },
+  "browser": { "binding": "BROWSER" },
+
   "migrations": [
     {
       "tag": "v1",

@@ -15,7 +15,7 @@ const shared = new Hono<{ Bindings: Env }>();
  *
  * Token format: base64(JSON({ userId, fileIds, albumName }))
  *
- * Phase 17: typed RPC `appGetFile` replaces the legacy fetch
+ * typed RPC `appGetFile` replaces the legacy fetch
  * indirection for each file metadata read.
  */
 shared.get("/:token/photos", async (c) => {
@@ -63,7 +63,7 @@ shared.get("/:token/photos", async (c) => {
  * GET /api/shared/:token/image/:fileId
  * Public image serving for shared albums.
  *
- * Phase 17: typed RPC `appGetFileManifest`. ShardDO addressing stays
+ * typed RPC `appGetFileManifest`. ShardDO addressing stays
  * on legacy naming.
  */
 shared.get("/:token/image/:fileId", async (c) => {

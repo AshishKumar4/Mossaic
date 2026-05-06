@@ -2,10 +2,10 @@
 Mossaic.Vfs.Encryption — Phase 15: opt-in end-to-end encryption.
 
 Models:
-  shared/encryption-types.ts          (envelope shape, mode discriminator)
-  shared/encryption.ts                (pack/unpack, derivation, AES-GCM)
-  worker/objects/user/encryption-stamp.ts (column stamping, mode-monotonic)
-  worker/objects/user/yjs.ts          (encrypted-yjs opaque relay)
+  shared/encryption-types.ts                       (envelope shape, mode discriminator)
+  shared/encryption.ts (763 LoC)                   (pack/unpack, derivation, AES-GCM, AES-KW)
+  worker/core/objects/user/encryption-stamp.ts (262 LoC) (column stamping, mode-monotonic)
+  worker/core/objects/user/yjs.ts (1160 LoC)       (encrypted-yjs opaque relay)
 
 Audit reference:
   /workspace/Mossaic/local/phase-15-plan.md §3 (envelope), §6 (yjs),

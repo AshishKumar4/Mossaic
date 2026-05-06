@@ -47,7 +47,7 @@ export {
   type VersionMarkOpts,
 } from "./vfs";
 
-// Phase 17.5 — placement abstraction. `canonicalPlacement` is the
+// placement abstraction. `canonicalPlacement` is the
 // default (used by `createVFS()` consumers); `legacyAppPlacement` is
 // App-internal and intentionally NOT re-exported. Advanced consumers
 // can implement the `Placement` interface directly for custom DO
@@ -105,6 +105,21 @@ export type {
   ReadHandle,
   WriteHandle,
 } from "./streams";
+
+// Universal preview pipeline — types only; the renderer
+// implementations live in the worker (server-side rendering). SDK
+// consumers call `vfs.readPreview()` and receive `ReadPreviewResult`.
+export type {
+  Variant,
+  StandardVariant,
+  CustomVariant,
+  FitMode,
+  PreviewFormat,
+  ReadPreviewOpts,
+  ReadPreviewResult,
+  FileVariant,
+} from "../../shared/preview-types";
+export { STANDARD_VARIANT_DIMS } from "../../shared/preview-types";
 
 // Re-export the DO classes so consumer Workers can re-export them in
 // their own entry module — wrangler resolves DO bindings via the
@@ -175,6 +190,8 @@ export {
   type ParallelUploadOpts,
   type ParallelDownloadOpts,
   type ProgressEvent as TransferProgressEvent,
+  type ChunkEvent,
+  type ManifestEvent,
   type MossaicHttpClient,
 } from "./transfer";
 

@@ -3,10 +3,10 @@ Mossaic.Vfs.Versioning — I4: Versioning monotonicity & sortedness.
 Mathlib-backed, NO AXIOM, NO SORRY.
 
 Models:
-  worker/objects/user/vfs-versions.ts:166-200 (insertVersion: new mtime)
-  worker/objects/user/vfs-versions.ts:288-330 (listVersions ORDER BY DESC)
-  worker/objects/user/vfs-versions.ts:533-560 (restoreVersion)
-  worker/objects/user/user-do.ts:298-313     (file_versions schema)
+  worker/core/objects/user/vfs-versions.ts:48-130   (placeChunkForVersion)
+  worker/core/objects/user/vfs-versions.ts:372-500  (listVersions ORDER BY DESC)
+  worker/core/objects/user/vfs-versions.ts:733-887  (restoreVersion)
+  worker/core/objects/user/user-do-core.ts          (file_versions schema in ensureInit)
 
 Audit reference:
   /workspace/local/audit-report.md §I4.

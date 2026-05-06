@@ -11,8 +11,15 @@ import galleryRoutes from "./routes/gallery";
 import sharedRoutes from "./routes/shared";
 import searchRoutes from "./routes/search";
 import vfsRoutes from "@core/routes/vfs";
+import vfsPreviewRoutes from "@core/routes/vfs-preview";
 import yjsWsRoutes from "@core/routes/vfs-yjs-ws";
 import multipartRoutes, { chunkDownload } from "@core/routes/multipart-routes";
+// App-pinned multipart route (`/api/upload/multipart/*`).
+// Routes through legacy DO instances (`user:<userId>` /
+// `shard:<userId>:<idx>`) instead of the canonical `vfs:default:*`
+// namespace. SPA passes `multipartBaseOverride: "/api/upload/multipart"`
+// to redirect SDK multipart calls here.
+import appMultipartRoutes from "./routes/multipart";
 
 // UserDO is the App-side subclass that adds the legacy
 // photo-app HTTP routes on top of UserDOCore. Production wrangler
@@ -54,6 +61,30 @@ app.use(
 
 // Mount API routes
 app.route("/api/auth", authRoutes);
+// App-pinned multipart route. Mounted BEFORE the legacy
+// `/api/upload/init|chunk|complete` route so the more-specific path
+// wins. Feature-flagged via `FEATURE_VFS_UPLOAD_MULTIPART`; default
+// ON. Set the flag to "false" via wrangler secret to disable
+// (SPA falls back to legacy single-chunk path).
+app.use("/api/upload/multipart/*", async (c, next) => {
+  const flag = c.env.FEATURE_VFS_UPLOAD_MULTIPART;
+  // Default ON; only "false" / "0" / "off" disables.
+  if (
+    flag !== undefined &&
+    (flag === "false" || flag === "0" || flag === "off")
+  ) {
+    return c.json(
+      {
+        code: "ENOENT",
+        message:
+          "FEATURE_VFS_UPLOAD_MULTIPART is disabled; use legacy /api/upload",
+      },
+      404
+    );
+  }
+  await next();
+});
+app.route("/api/upload/multipart", appMultipartRoutes);
 app.route("/api/upload", uploadRoutes);
 app.route("/api/download", downloadRoutes);
 app.route("/api/files", filesRoutes);
@@ -73,6 +104,10 @@ app.route("/api/vfs/multipart", multipartRoutes);
 // cacheable per-chunk download endpoint at
 // /api/vfs/chunk/:fileId/:idx — token-auth, immutable cache.
 app.route("/api/vfs", chunkDownload);
+// preview pipeline + batched manifests. Mounted BEFORE the
+// general /api/vfs fallback so the specific paths
+// `/readPreview` and `/manifests` take precedence.
+app.route("/api/vfs", vfsPreviewRoutes);
 // HTTP fallback for non-Worker consumers of the @mossaic/sdk.
 // Auth via Bearer VFS token (signVFSToken / verifyVFSToken). Routes
 // translate HTTP → typed UserDO RPC. The legacy app's /api/* surface

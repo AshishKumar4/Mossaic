@@ -15,7 +15,7 @@ gallery.use("*", authMiddleware());
  * GET /api/gallery/photos
  * List all image files across all folders, sorted by date descending.
  *
- * Phase 17: typed RPC `appGetGalleryPhotos`.
+ * typed RPC `appGetGalleryPhotos`.
  */
 gallery.get("/photos", async (c) => {
   const userId = c.get("userId");
@@ -28,12 +28,12 @@ gallery.get("/photos", async (c) => {
  * Serve a full image by reassembling all chunks. Streams the response
  * for single-chunk images; concatenates for multi-chunk.
  *
- * Phase 17: typed RPC `appGetFileManifest` replaces the legacy fetch
+ * typed RPC `appGetFileManifest` replaces the legacy fetch
  * indirection. ShardDO addressing stays on the legacy
  * `shard:userId:idx` namespace.
  *
  * Future: replace the multi-chunk concat with `vfs.createReadStream`
- * once ShardDO data is migrated (Phase 17.5 / §5.9). For now the
+ * once ShardDO data is migrated (/ §5.9). For now the
  * legacy concat preserves byte-equality with the existing live
  * deploy.
  */

@@ -17,6 +17,7 @@ import {
   vfsPullReadStream,
   vfsReadChunk,
   vfsReadFile,
+  vfsReadPreview,
   vfsReadlink,
   vfsReadManyStat,
   vfsReaddir,
@@ -36,6 +37,10 @@ import type {
   VFSScope,
   VFSStatRaw,
 } from "../../../../shared/vfs-types";
+import type {
+  ReadPreviewOpts,
+  ReadPreviewResult,
+} from "../../../../shared/preview-types";
 import { VFSError } from "../../../../shared/vfs-types";
 import { dedupePaths, type DedupeResult } from "./admin";
 // type-only import. The YjsRuntime class is loaded
@@ -636,6 +641,49 @@ export class UserDOCore extends DurableObject<Env> {
         ON upload_sessions(user_id, status)
     `);
 
+    // ── Universal preview pipeline ───────────────────────────────────────
+    //
+    // `file_variants` records pre-generated and on-demand-cached preview
+    // bytes (thumb / medium / lightbox + custom dimensions). Variant
+    // bytes live on a ShardDO under the same `chunks` / `chunk_refs`
+    // refcount machinery as primary file chunks; this row maps
+    // (file_id, variant_kind, renderer_kind) → (chunk_hash, shard_index).
+    //
+    // - Composite PK lets the same file carry multiple renderer
+    //   strategies (e.g. a video could have both a "video-poster" thumb
+    //   AND a "waveform" medium).
+    // - `chunk_hash` is content-addressed (SHA-256 of variant bytes) so
+    //   identical inputs across users dedupe to one physical chunk.
+    // - `ON DELETE CASCADE` removes variant rows when the parent
+    //   `files` row is hard-deleted; chunk_refs cleanup is dispatched
+    //   by `vfsUnlink` (see worker/core/objects/user/vfs/write-commit.ts).
+    //
+    // Idempotent CREATE TABLE; no migration tag.
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS file_variants (
+        file_id        TEXT NOT NULL,
+        variant_kind   TEXT NOT NULL,
+        renderer_kind  TEXT NOT NULL,
+        chunk_hash     TEXT NOT NULL,
+        shard_index    INTEGER NOT NULL,
+        mime_type      TEXT NOT NULL,
+        width          INTEGER NOT NULL,
+        height         INTEGER NOT NULL,
+        byte_size      INTEGER NOT NULL,
+        created_at     INTEGER NOT NULL,
+        PRIMARY KEY (file_id, variant_kind, renderer_kind),
+        FOREIGN KEY (file_id) REFERENCES files(file_id) ON DELETE CASCADE
+      )
+    `);
+    this.sql.exec(`
+      CREATE INDEX IF NOT EXISTS idx_file_variants_hash
+        ON file_variants(chunk_hash)
+    `);
+    this.sql.exec(`
+      CREATE INDEX IF NOT EXISTS idx_file_variants_file
+        ON file_variants(file_id)
+    `);
+
     // ── Audit H6: surface UNIQUE INDEX failure on legacy data ────────────
     //
     // The previous code swallowed the throw silently when the file
@@ -1046,6 +1094,25 @@ export class UserDOCore extends DurableObject<Env> {
   ): Promise<Uint8Array> {
     this.gateVfs(scope);
     return vfsReadChunk(this, scope, path, chunkIndex);
+  }
+
+  /**
+   * readPreview() — universal preview pipeline entry. Resolves
+   * the file at `path`, dispatches the registered renderer for
+   * its MIME, and returns variant bytes inline. Variant rows are
+   * cached in `file_variants`; subsequent calls for the same
+   * (file, variant) hit the cache.
+   *
+   * Encrypted files throw `ENOTSUP` — server cannot render
+   * ciphertext. Custom variants render every call (no cache row).
+   */
+  async vfsReadPreview(
+    scope: VFSScope,
+    path: string,
+    opts: ReadPreviewOpts = {}
+  ): Promise<ReadPreviewResult> {
+    this.gateVfs(scope);
+    return vfsReadPreview(this, scope, path, opts);
   }
 
   // ── VFS RPC surface (write-side) ──────────────────────────────

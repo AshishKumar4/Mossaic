@@ -43,10 +43,55 @@ export {
   EROFS,
   ENOTEMPTY,
   EAGAIN,
+  // encryption-surface error classes — same surface as `@mossaic/sdk`.
+  EBADF,
+  ENOTSUP,
   MossaicUnavailableError,
   isLikelyUnavailable,
   type VFSErrorCode,
 } from "./errors";
+
+// Encryption types — same surface as `@mossaic/sdk`. Pure type
+// re-exports; the runtime helpers (`encryptChunk` / `decryptChunk`)
+// live on the `@mossaic/sdk/encryption` lazy chunk to keep the main
+// bundle free of WebCrypto envelope code for consumers who don't
+// need it.
+export type {
+  EncryptionConfig,
+  EncryptionMode,
+  FileEncryption,
+  AadTag,
+} from "@shared/encryption-types";
+
+// Placement abstraction — same surface as `@mossaic/sdk`. The
+// `legacyAppPlacement` impl is intentionally App-internal and
+// not re-exported here either.
+export {
+  canonicalPlacement,
+  type Placement,
+} from "../../shared/placement";
+
+// Stream handles — used by `createReadStream`/`createWriteStream`
+// callers in HTTP-fallback consumers.
+export type {
+  ReadStreamOptions,
+  ReadHandle,
+  WriteHandle,
+} from "./streams";
+
+// Universal preview pipeline — type re-exports; the HTTP client's
+// `readPreview()` returns `ReadPreviewResult`.
+export type {
+  Variant,
+  StandardVariant,
+  CustomVariant,
+  FitMode,
+  PreviewFormat,
+  ReadPreviewOpts,
+  ReadPreviewResult,
+  FileVariant,
+} from "../../shared/preview-types";
+export { STANDARD_VARIANT_DIMS } from "../../shared/preview-types";
 
 export type {
   WriteFileOpts,
@@ -97,6 +142,8 @@ export {
   type ParallelUploadOpts,
   type ParallelDownloadOpts,
   type ProgressEvent as TransferProgressEvent,
+  type ChunkEvent,
+  type ManifestEvent,
   type MossaicHttpClient,
 } from "./transfer";
 

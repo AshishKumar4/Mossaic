@@ -29,7 +29,7 @@ async function mintJWT(
  * POST /api/auth/signup
  * Create a new user account.
  *
- * Phase 17: replaced direct DO `stub.fetch("http://internal/signup")`
+ * replaced direct DO `stub.fetch("http://internal/signup")`
  * with a typed RPC call to `UserDO.appHandleSignup`.
  */
 auth.post("/signup", async (c) => {
@@ -73,7 +73,7 @@ auth.post("/signup", async (c) => {
  * POST /api/auth/login
  * Authenticate and get a JWT.
  *
- * Phase 17: replaced direct DO fetch with `UserDO.appHandleLogin`.
+ * replaced direct DO fetch with `UserDO.appHandleLogin`.
  */
 auth.post("/login", async (c) => {
   const { email, password } = await c.req.json<{

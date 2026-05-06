@@ -206,7 +206,7 @@ search.post("/config", async (c) => {
 search.post("/reindex", async (c) => {
   const userId = c.get("userId");
 
-  // Phase 17: typed RPC `appListAllFiles` replaces a stale legacy
+  // typed RPC `appListAllFiles` replaces a stale legacy
   // GET against `/files/list` (which never matched the POST-only
   // handler in the old `_legacyFetch` router and silently 404'd).
   const allFiles = await userStub(c.env, userId).appListAllFiles(userId);

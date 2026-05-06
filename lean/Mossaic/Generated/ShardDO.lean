@@ -2,8 +2,8 @@
 Mossaic.Generated.ShardDO — thin wrapper module for the ShardDO TS file.
 
 This file does not contain any new theorems. Its purpose is to provide a
-single Lean module whose name shadows the TS file `worker/objects/shard/
-shard-do.ts`, with `theorem` names that match the `@lean-invariant`
+single Lean module whose name shadows the TS file `worker/core/objects/
+shard/shard-do.ts`, with `theorem` names that match the `@lean-invariant`
 annotations in the TS source. This makes drift detection mechanical:
 
     rg "@lean-invariant Mossaic\.Generated\.ShardDO\.\w+" worker/
@@ -11,7 +11,7 @@ annotations in the TS source. This makes drift detection mechanical:
 should yield only theorem names that exist in this file (verified by
 `lean/scripts/check-xrefs.sh`).
 
-Modeled file: worker/objects/shard/shard-do.ts (489 LoC).
+Modeled file: worker/core/objects/shard/shard-do.ts (777 LoC).
 -/
 
 import Mossaic.Vfs.Refcount
@@ -21,8 +21,8 @@ namespace Mossaic.Generated.ShardDO
 
 /-- Re-export: the chunk-uniqueness + ref-uniqueness + ref→chunk-existence
 invariant proved at `Mossaic.Vfs.Refcount.step_preserves_validState`.
-The TS function `writeChunkInternal` (shard-do.ts:180-258) and
-`removeFileRefs` (shard-do.ts:324-365) collectively realize the `step`
+The TS functions `writeChunkInternal` and `removeFileRefs` (in
+`worker/core/objects/shard/shard-do.ts`) collectively realize the `step`
 function whose invariance we proved. -/
 theorem chunk_invariant_preserved :
     ∀ (s : Mossaic.Vfs.Refcount.ShardState) (op : Mossaic.Vfs.Refcount.Op),
@@ -30,7 +30,8 @@ theorem chunk_invariant_preserved :
       Mossaic.Vfs.Refcount.validState (Mossaic.Vfs.Refcount.step s op) :=
   Mossaic.Vfs.Refcount.step_preserves_validState
 
-/-- Re-export: GC safety. Mirrors the alarm sweeper at shard-do.ts:390-430. -/
+/-- Re-export: GC safety. Mirrors the alarm sweeper in
+`worker/core/objects/shard/shard-do.ts`. -/
 theorem alarm_safe :
     ∀ (s : Mossaic.Vfs.Refcount.ShardState) (now : Mossaic.Vfs.Common.TimeMs),
       Mossaic.Vfs.Refcount.validState s →

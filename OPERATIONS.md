@@ -16,7 +16,7 @@ Keep this open during deploys. Search-by-symptom: the runbooks at the bottom are
 | **UserDO / UserDOCore** | One DO instance per `(ns, tenant, sub?)` tuple. Holds VFS metadata + Yjs op log + listFiles indexes. |
 | **ShardDO** | Pool of DO instances (default 32, grows with stored bytes). Holds content-addressed chunks. |
 | **JWT_SECRET** | Workers secret. Required. Used for both VFS-token HS256 signing AND listFiles cursor HMAC. **No dev fallback in source** — a deploy without this secret returns 503 on every VFS-token verify and every listFiles cursor op (encode or decode). |
-| **byte-pin** | The legacy `_legacyFetch` body in `worker/app/objects/user/user-do.ts:70..263` is hashed at sha256 `4c6eb84925cd8b34298aa92a5201c6e8074defb4527c3bbb1d2c677f9f2c8e70`. Any deploy that changes this hash silently changes the legacy contract. |
+| **App-on-SDK** | App-mode `UserDO` (`worker/app/objects/user/user-do.ts`) is a typed-RPC subclass of `UserDOCore`. The legacy `_legacyFetch` JSON router was retired; routes call `stub.appXxx(...)` directly. Contract is now enforced by the integration suite (`tests/integration/multipart-routes.test.ts`, `tests/integration/app-smoke.test.ts`, and the App e2e endpoints) — there is no byte-pin gate any more. |
 
 ---
 
@@ -28,11 +28,12 @@ Run **all** of these from `/workspace/Mossaic` (or your local clone). Every box 
 
 - [ ] **Working tree clean**: `git status` reports no modifications, no untracked files.
 - [ ] **On the deploy branch**: `git rev-parse --abbrev-ref HEAD` is `main` (or the documented release branch).
-- [ ] **Legacy fetch byte-pin holds**:
-      ```
-      awk 'NR>=70 && NR<=263' worker/app/objects/user/user-do.ts | sha256sum
-      ```
-      MUST return `4c6eb84925cd8b34298aa92a5201c6e8074defb4527c3bbb1d2c677f9f2c8e70`. If different, **abort deploy** — the legacy app contract has drifted.
+- [ ] **App-mode contract intact**: the typed-RPC App surface
+      (`worker/app/objects/user/user-do.ts:appXxx` methods) is exercised end-to-end by the
+      integration suite. `pnpm test tests/integration/app-smoke.test.ts` and
+      `pnpm test tests/integration/multipart-routes.test.ts` MUST pass — these
+      pin the legacy photo-app HTTP wire shape that the SPA still depends on.
+      If either fails, **abort deploy** — the App contract has drifted.
 
 ### 1.2 Build + tests + proofs (all green, no skips)
 
@@ -563,6 +564,84 @@ mode preserves cross-file dedup on encrypted uploads (see plan
   it expires; clients re-mint via `beginUpload({ resumeFrom })`
   with the same `uploadId` to recover. Fresh tokens; existing
   `landed[]` chunks re-used.
+
+## 6.8 SPA on SDK transfer engine
+
+The SPA at `mossaic.ashishkumarsingh.com` was migrated from a
+hand-rolled chunked transfer engine (~395 LoC of AIMD/processChunk/
+worker/scaleInterval/endgame across `src/hooks/use-upload.ts` +
+`src/hooks/use-download.ts` + `src/lib/api.ts`) onto
+`@mossaic/sdk` 's `parallelUpload` / `parallelDownload`. Audit S1 #4
+closed.
+
+### 6.8.1 Wire surface
+
+The SPA constructs an `HttpVFS` via
+`src/lib/transfer-client.ts:getTransferClient()` configured with:
+
+- `multipartBaseOverride: "/api/upload/multipart"` — routes SDK
+  multipart calls to the App-pinned bridge.
+- `chunkFetchBaseOverride: "/api/download"` — routes cacheable chunk
+  GETs to the App's existing legacy chunk download endpoint.
+- `apiKey: api.getToken()` — the App's JWT (App's `authMiddleware`
+  validates this, NOT a VFS Bearer token).
+
+Endpoint inventory:
+
+| Direction | SDK call | HTTP route | Backed by |
+|---|---|---|---|
+| Upload begin | `multipartBegin` | `POST /api/upload/multipart/begin` | `UserDO.appBeginMultipart` |
+| Upload chunk PUT | `multipartPutChunk` | `PUT /api/upload/multipart/:uploadId/chunk/:idx` | `ShardDO.putChunkMultipart` (legacy `shard:<userId>:<idx>`) |
+| Upload finalize | `multipartFinalize` | `POST /api/upload/multipart/finalize` | `UserDO.appFinalizeMultipart` |
+| Upload abort | `multipartAbort` | `POST /api/upload/multipart/abort` | `UserDO.appAbortMultipart` |
+| Upload status | `multipartStatus` | `GET /api/upload/multipart/:uploadId/status` | `UserDO.appGetMultipartStatus` |
+| Download manifest | `multipartDownloadToken` | `POST /api/upload/multipart/download-token` | `UserDO.appOpenManifest` |
+| Download chunk | `fetchChunkByHash` | `GET /api/download/chunk/:fileId/:idx` | App's existing legacy download route |
+
+### 6.8.2 Feature flag — rollback procedure
+
+`FEATURE_VFS_UPLOAD_MULTIPART` (App env binding). Default ON
+(undefined or any value other than `"false"`/`"0"`/`"off"` enables).
+
+To roll back:
+
+```bash
+wrangler secret put FEATURE_VFS_UPLOAD_MULTIPART  # value: false
+```
+
+The `/api/upload/multipart/*` route returns 404 ENOENT when the
+flag is off. The SPA does NOT auto-fall-back in v1 — uploads will
+fail with a typed network error from `parallelUpload`. To restore
+the legacy single-chunk path during rollback, also revert
+`src/hooks/use-upload.ts` to call `api.uploadInit/uploadChunk/uploadComplete`
+(the legacy methods on `api.ts` are deferred-deletion, scheduled
+for the legacy-routes cleanup phase).
+
+### 6.8.3 Score-template invariance — production data integrity
+
+The new App-pinned multipart route uses `legacyAppPlacement.placeChunk`
+which keys the rendezvous score on `shard:${userId}:${idx}` —
+IDENTICAL to the legacy single-chunk
+upload route's score. **Every existing photo's chunk addressing is
+preserved.** Migration-safety integration test
+`tests/integration/spa-roundtrip-live.test.ts:S2` verifies the
+invariant: bytes uploaded via the new path are byte-equal when
+read back via the legacy `/api/download/chunk/*` endpoint.
+
+### 6.8.4 Per-chunk progress UI
+
+The SDK extensions `onChunkEvent` + `onManifest` drive the SPA's
+per-chunk status grid. Every chunk
+emits `started → completed` (or `→ failed`) events; the SPA hooks
+map these to `ChunkProgress` state flips. Across chunks, ordering
+is non-deterministic (concurrent lanes); per-index ordering is
+preserved.
+
+`onProgress` (10 Hz throttled) drives aggregate counters:
+`bytesTransferred`, `throughputBps`, `activeConcurrency`. The SPA
+displays the AIMD scaling visible on the active-concurrency
+counter — when the SDK's adaptive engine scales up from 4 → 8 →
+12 → … 64 lanes, the SPA UI animates the count.
 
 ## 7. Sign-off (per-deploy)
 

@@ -6,8 +6,9 @@ import type { VFSScope } from "./vfs-types";
  *
  * **Legacy template.** Used by the App's photo-library routes
  * (`worker/app/routes/*.ts`) and embedded in the rendezvous-score
- * key for ALL placements (legacy AND canonical) — see §1.4 of the
- * Phase 17.5 plan for why score-string compatibility is forever-pinned.
+ * key for ALL placements (legacy AND canonical). The score-string
+ * template is forever-pinned: changing it orphans every existing
+ * chunk.
  */
 export function shardDOName(userId: string, shardIndex: number): string {
   return `shard:${userId}:${shardIndex}`;
@@ -36,8 +37,8 @@ function placementScore(
  * FULLY DETERMINISTIC: depends only on (userId, fileId, chunkIndex, poolSize).
  * No network calls. No state lookups.
  *
- * **Score-template invariance (Phase 17.5 §1.4):** the score key uses
- * the legacy `shard:${userId}:${idx}` template regardless of whether
+ * **Score-template invariance:** the score key uses the legacy
+ * `shard:${userId}:${idx}` template regardless of whether
  * the eventual DO instance name is legacy or canonical. This decouples
  * the score from the name — both placement implementations end up
  * routing to the same shard *index*, while building different
@@ -90,7 +91,7 @@ export function computePoolSize(storageUsedBytes: number): number {
   return BASE_POOL + additional;
 }
 
-// ── Phase 17.5: Placement abstraction ────────────────────────────────────
+// ── Placement abstraction ────────────────────────────────────
 //
 // The `Placement` interface lets two name templates coexist for the
 // rollout window. Production data lives under the legacy
@@ -98,8 +99,8 @@ export function computePoolSize(storageUsedBytes: number): number {
 // consumers use `vfs:${ns}:${tenant}[:${sub}][:s${idx}]`.
 //
 // Both placement implementations share the SAME `placeChunk` rendezvous
-// score (see §1.4 of the Phase 17.5 plan) — the integer they return
-// MUST be identical for the same `(fileId, chunkIndex, poolSize)` and
+// score — the integer they return MUST be identical for the same
+// `(fileId, chunkIndex, poolSize)` and
 // the same `userId` derivation from scope. Only the resulting DO
 // *instance name* differs.
 //
@@ -115,7 +116,7 @@ export function computePoolSize(storageUsedBytes: number): number {
  *
  * MUST be deterministic. MUST keep the score-string template stable
  * across implementations to preserve every existing chunk's
- * addressability (Phase 17.5 §1.4).
+ * addressability.
  */
 export interface Placement {
   /**

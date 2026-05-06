@@ -33,6 +33,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import type { EnvCore as Env } from "../../shared/types";
 import vfsRoutes from "./routes/vfs";
+import vfsPreviewRoutes from "./routes/vfs-preview";
 import yjsWsRoutes from "./routes/vfs-yjs-ws";
 import multipartRoutes, { chunkDownload } from "./routes/multipart-routes";
 
@@ -67,6 +68,11 @@ app.route("/api/vfs/multipart", multipartRoutes);
 // Bearer required if the token is presented; download tokens are
 // scope-bound). Cache-Control: immutable for hash-addressed bytes.
 app.route("/api/vfs", chunkDownload);
+
+// preview pipeline + batched manifests. Specific paths under
+// /api/vfs (`/readPreview`, `/manifests`); mounted BEFORE the
+// general /api/vfs fallback so they take precedence.
+app.route("/api/vfs", vfsPreviewRoutes);
 
 // HTTP fallback for non-Worker consumers — Bearer VFS token
 // auth, typed UserDOCore RPC under the hood.

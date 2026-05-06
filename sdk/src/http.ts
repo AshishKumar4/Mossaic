@@ -26,6 +26,10 @@
 import { VFSStat } from "./stats";
 import { mapServerError, MossaicUnavailableError, EINVAL } from "./errors";
 import type { OpenManifestResult, VFSStatRaw } from "../../shared/vfs-types";
+import type {
+  ReadPreviewOpts,
+  ReadPreviewResult,
+} from "../../shared/preview-types";
 import type { ReadHandle, WriteHandle } from "./streams";
 import type {
   VFSClient,
@@ -44,6 +48,37 @@ export interface CreateMossaicHttpClientOptions {
   apiKey: string;
   /** Optional: a fetch implementation. Defaults to globalThis.fetch. Useful for tests. */
   fetcher?: typeof fetch;
+  /**
+   * Override the multipart endpoint base path.
+   *
+   * Default: `"/api/vfs/multipart"` (canonical SDK consumers).
+   *
+   * The photo-library SPA passes `"/api/upload/multipart"` to route
+   * multipart calls through the App-pinned bridge that targets
+   * legacy DO instances (`user:<userId>` / `shard:<userId>:<idx>`)
+   * instead of the canonical `vfs:default:<tenant>` namespace.
+   *
+   * The override applies to every multipart route:
+   *  - `${url}${multipartBaseOverride}/begin`
+   *  - `${url}${multipartBaseOverride}/${uploadId}/chunk/${idx}`
+   *  - `${url}${multipartBaseOverride}/finalize`
+   *  - `${url}${multipartBaseOverride}/abort`
+   *  - `${url}${multipartBaseOverride}/${uploadId}/status`
+   *  - `${url}${multipartBaseOverride}/download-token`
+   *
+   * Should NOT include a trailing slash.
+   */
+  multipartBaseOverride?: string;
+  /**
+   * Override the cacheable per-chunk endpoint base.
+   *
+   * Default: `"/api/vfs/chunk"` (canonical). The App's photo-library
+   * SPA passes `"/api/download/chunk"` (or similar) to address its
+   * legacy chunk download path.
+   *
+   * Applies to: `${url}${chunkFetchBaseOverride}/${fileId}/${idx}?...`.
+   */
+  chunkFetchBaseOverride?: string;
 }
 
 /**
@@ -60,6 +95,17 @@ export class HttpVFS implements VFSClient {
   private readonly fetcher: typeof fetch;
   private readonly base: string;
   private readonly apiKey: string;
+  /**
+   * Multipart route base. Defaults to `/api/vfs/multipart`.
+   * Set via `multipartBaseOverride` for the SPA's `/api/upload/multipart`
+   * App-pinned bridge.
+   */
+  private readonly multipartBase: string;
+  /**
+   * Cacheable chunk route base. Defaults to `/api/vfs/chunk`.
+   * Set via `chunkFetchBaseOverride` for the SPA's legacy download path.
+   */
+  private readonly chunkFetchBase: string;
 
   constructor(opts: CreateMossaicHttpClientOptions) {
     if (!opts || typeof opts.url !== "string" || opts.url.length === 0) {
@@ -78,6 +124,16 @@ export class HttpVFS implements VFSClient {
     this.base = opts.url.replace(/\/$/, "");
     this.apiKey = opts.apiKey;
     this.fetcher = opts.fetcher ?? fetch;
+    // Optional multipart and chunk-fetch route overrides. Defaults
+    // preserve canonical SDK consumer behavior byte-for-byte.
+    this.multipartBase =
+      opts.multipartBaseOverride !== undefined
+        ? opts.multipartBaseOverride.replace(/\/$/, "")
+        : "/api/vfs/multipart";
+    this.chunkFetchBase =
+      opts.chunkFetchBaseOverride !== undefined
+        ? opts.chunkFetchBaseOverride.replace(/\/$/, "")
+        : "/api/vfs/chunk";
     this.promises = this;
   }
 
@@ -396,6 +452,94 @@ export class HttpVFS implements VFSClient {
     return body.manifest;
   }
 
+  /**
+   * Batched manifest fetch via the dedicated `/api/vfs/manifests`
+   * route. One round-trip for N paths; per-path errors come back
+   * as `{ ok: false, code, message }` rather than throwing.
+   */
+  async openManifests(
+    paths: string[]
+  ): Promise<
+    (
+      | { ok: true; manifest: OpenManifestResult }
+      | { ok: false; code: string; message: string }
+    )[]
+  > {
+    const res = await this.post(
+      "manifests",
+      { paths },
+      "open",
+      undefined,
+      "json"
+    );
+    const body = (await res.json()) as {
+      manifests: (
+        | { ok: true; manifest: OpenManifestResult }
+        | { ok: false; code: string; message: string }
+      )[];
+    };
+    return body.manifests;
+  }
+
+  async readPreview(
+    p: string,
+    opts?: ReadPreviewOpts
+  ): Promise<ReadPreviewResult> {
+    const url = `${this.base}/api/vfs/readPreview`;
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${this.apiKey}`,
+      "Content-Type": "application/json",
+    };
+    const payload = JSON.stringify({
+      path: p,
+      variant: opts?.variant ?? "thumb",
+      format: opts?.format,
+      renderer: opts?.renderer,
+    });
+    let res: Response;
+    try {
+      res = await this.fetcher(url, {
+        method: "POST",
+        headers,
+        body: payload,
+      });
+    } catch (err) {
+      throw new MossaicUnavailableError({
+        message: `HTTP fetch to ${url} failed: ${(err as Error).message}`,
+      });
+    }
+    if (!res.ok) {
+      let pj: { code?: string; message?: string };
+      try {
+        pj = (await res.json()) as { code?: string; message?: string };
+      } catch {
+        pj = { message: `HTTP ${res.status} ${res.statusText}` };
+      }
+      const synthetic = Object.assign(
+        new Error(pj.message ?? `HTTP ${res.status}`),
+        { code: pj.code }
+      );
+      throw mapServerError(synthetic, { syscall: "open", path: p });
+    }
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const mimeType = res.headers.get("Content-Type") ?? "application/octet-stream";
+    const rendererKind = res.headers.get("X-Mossaic-Renderer") ?? "icon-card";
+    const cacheHdr = res.headers.get("X-Mossaic-Variant-Cache") ?? "miss";
+    const sourceMime =
+      res.headers.get("X-Mossaic-Source-Mime") ?? "application/octet-stream";
+    const widthHdr = res.headers.get("X-Mossaic-Width");
+    const heightHdr = res.headers.get("X-Mossaic-Height");
+    return {
+      bytes,
+      mimeType,
+      width: widthHdr === null ? 0 : parseInt(widthHdr, 10),
+      height: heightHdr === null ? 0 : parseInt(heightHdr, 10),
+      sourceMimeType: sourceMime,
+      rendererKind,
+      fromVariantTable: cacheHdr === "hit",
+    };
+  }
+
   async readChunk(p: string, chunkIndex: number): Promise<Uint8Array> {
     const res = await this.post(
       "readChunk",
@@ -550,7 +694,7 @@ export class HttpVFS implements VFSClient {
     body: import("../../shared/multipart").MultipartBeginRequest,
     signal?: AbortSignal
   ): Promise<import("../../shared/multipart").MultipartBeginResponse> {
-    const url = `${this.base}/api/vfs/multipart/begin`;
+    const url = `${this.base}${this.multipartBase}/begin`;
     const res = await this.fetcher(url, {
       method: "POST",
       headers: {
@@ -573,7 +717,7 @@ export class HttpVFS implements VFSClient {
     sessionToken: string,
     signal?: AbortSignal
   ): Promise<import("../../shared/multipart").MultipartPutChunkResponse> {
-    const url = `${this.base}/api/vfs/multipart/${encodeURIComponent(uploadId)}/chunk/${idx}`;
+    const url = `${this.base}${this.multipartBase}/${encodeURIComponent(uploadId)}/chunk/${idx}`;
     const res = await this.fetcher(url, {
       method: "PUT",
       headers: {
@@ -595,7 +739,7 @@ export class HttpVFS implements VFSClient {
     uploadId: string,
     chunkHashList: readonly string[]
   ): Promise<import("../../shared/multipart").MultipartFinalizeResponse> {
-    const url = `${this.base}/api/vfs/multipart/finalize`;
+    const url = `${this.base}${this.multipartBase}/finalize`;
     const res = await this.fetcher(url, {
       method: "POST",
       headers: {
@@ -613,7 +757,7 @@ export class HttpVFS implements VFSClient {
   async multipartAbort(
     uploadId: string
   ): Promise<{ ok: true }> {
-    const url = `${this.base}/api/vfs/multipart/abort`;
+    const url = `${this.base}${this.multipartBase}/abort`;
     const res = await this.fetcher(url, {
       method: "POST",
       headers: {
@@ -632,7 +776,7 @@ export class HttpVFS implements VFSClient {
     uploadId: string,
     sessionToken: string
   ): Promise<import("../../shared/multipart").MultipartStatusResponse> {
-    const url = `${this.base}/api/vfs/multipart/${encodeURIComponent(uploadId)}/status`;
+    const url = `${this.base}${this.multipartBase}/${encodeURIComponent(uploadId)}/status`;
     const res = await this.fetcher(url, {
       method: "GET",
       headers: {
@@ -650,7 +794,7 @@ export class HttpVFS implements VFSClient {
     p: string,
     ttlMs?: number
   ): Promise<import("../../shared/multipart").DownloadTokenResponse> {
-    const url = `${this.base}/api/vfs/multipart/download-token`;
+    const url = `${this.base}${this.multipartBase}/download-token`;
     const body: { path: string; ttlMs?: number } = { path: p };
     if (ttlMs !== undefined) body.ttlMs = ttlMs;
     const res = await this.fetcher(url, {
@@ -669,12 +813,18 @@ export class HttpVFS implements VFSClient {
 
   /**
    * Cacheable per-chunk GET. The download token is the value from
-   * `multipartDownloadToken`. The caller MUST pass the file's `path`
-   * — this method internally hits `/api/vfs/readChunk` which is
-   * keyed by path, not fileId. The token's `fileId` is also passed
-   * through for forward-compat with a future
-   * `/api/vfs/readChunkByFileId` endpoint that will let us drop the
-   * `path` round-trip; until then `path` is required.
+   * `multipartDownloadToken`.
+   *
+   * Two modes:
+   *  1. **Canonical / default** (no `chunkFetchBaseOverride`): falls
+   *     back to `POST /api/vfs/readChunk` keyed by `path` — same as
+   *     pre-Phase-17.6 behavior. Bearer auth via `this.apiKey`.
+   *  2. **App-pinned** (with `chunkFetchBaseOverride: "/api/download"`):
+   *     issues `GET ${chunkFetchBase}/chunk/:fileId/:idx`. Bearer auth
+   *     via `this.apiKey` (App JWT). The `download token` and `hash`
+   *     are passed as query params for cacheable / verifiable use.
+   *
+   * The caller MUST pass the file's `path` for mode 1.
    */
   async fetchChunkByHash(
     fileId: string,
@@ -684,6 +834,25 @@ export class HttpVFS implements VFSClient {
     path: string,
     signal?: AbortSignal
   ): Promise<Uint8Array> {
+    // when a chunk-fetch override is set, prefer the
+    // cacheable GET endpoint. Otherwise fall back to the canonical
+    // POST /api/vfs/readChunk path that pre-existed.
+    if (this.chunkFetchBase !== "/api/vfs/chunk") {
+      const url = `${this.base}${this.chunkFetchBase}/chunk/${encodeURIComponent(fileId)}/${idx}`;
+      const res = await this.fetcher(url, {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${this.apiKey}`,
+        },
+        signal,
+      });
+      if (!res.ok) {
+        await this.throwHttp(res, "open", path);
+      }
+      void hash;
+      void token;
+      return new Uint8Array(await res.arrayBuffer());
+    }
     void hash; // read path doesn't need to verify here — caller does post-fetch verification
     void fileId; // forward-compat: a typed /readChunkByFileId endpoint will use this
     void token; // bearer auth on /readChunk uses this.apiKey; download token is for the future endpoint

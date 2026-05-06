@@ -33,6 +33,10 @@ import type {
   VFSScope,
   VFSStatRaw,
 } from "../../shared/vfs-types";
+import type {
+  ReadPreviewOpts,
+  ReadPreviewResult,
+} from "../../shared/preview-types";
 
 /**
  * Public consumer-facing VFS contract. Both the binding `VFS` class
@@ -110,6 +114,20 @@ export interface VFSClient {
 
   // Low-level escape hatch
   openManifest(p: string): Promise<OpenManifestResult>;
+  /**
+   * Batched manifest fetch. Returns one result per input path; misses
+   * surface as `{ ok: false, code, message }` rather than throwing,
+   * so a single bad path doesn't tank a gallery render. Max 256
+   * paths per call (server-enforced).
+   */
+  openManifests(
+    paths: string[]
+  ): Promise<
+    (
+      | { ok: true; manifest: OpenManifestResult }
+      | { ok: false; code: string; message: string }
+    )[]
+  >;
   readChunk(p: string, chunkIndex: number): Promise<Uint8Array>;
   openReadStream(p: string): Promise<ReadHandle>;
   pullReadStream(
@@ -117,6 +135,21 @@ export interface VFSClient {
     chunkIndex: number,
     range?: { start?: number; end?: number }
   ): Promise<Uint8Array>;
+
+  /**
+   * Universal preview pipeline. Returns rendered preview bytes
+   * (image/* or image/svg+xml depending on the renderer dispatched
+   * for the file's MIME). Variant rows are cached server-side and
+   * content-addressed; identical inputs across users dedupe.
+   *
+   * Encrypted files throw `ENOTSUP` — server cannot render
+   * ciphertext. Custom variants (`{width, height?, fit?}`) cache
+   * under a stable encoded key.
+   */
+  readPreview(
+    p: string,
+    opts?: ReadPreviewOpts
+  ): Promise<ReadPreviewResult>;
 
   // file-level versioning (only meaningful when the tenant
   // has versioning enabled; the binding client surfaces these methods
@@ -242,6 +275,11 @@ export interface UserDOClient {
     scope: VFSScope,
     path: string
   ): Promise<OpenManifestResult>;
+  vfsReadPreview(
+    scope: VFSScope,
+    path: string,
+    opts?: ReadPreviewOpts
+  ): Promise<ReadPreviewResult>;
   vfsReadChunk(
     scope: VFSScope,
     path: string,
@@ -446,7 +484,7 @@ export interface CreateVFSOptions {
     keyId?: string;
   };
   /**
-   * Phase 17.5 — pluggable placement strategy.
+   * pluggable placement strategy.
    *
    * Decides which DO instance names the SDK addresses. Default:
    * `canonicalPlacement` (`vfs:${ns}:${tenant}[:${sub}][:s${idx}]`).
@@ -460,7 +498,7 @@ export interface CreateVFSOptions {
    * **Score-template invariance.** Both built-in placements
    * (`canonicalPlacement`, `legacyAppPlacement`) keep the same
    * rendezvous-score function; only the resulting *DO instance
-   * name* differs. See `shared/placement.ts` and Phase 17.5 §1.4.
+   * name* differs. See `shared/placement.ts` and §1.4.
    */
   placement?: import("../../shared/placement").Placement;
 }
@@ -756,7 +794,7 @@ export class VFS implements VFSClient {
   // `createVFS`.
 
   protected user(): UserDOClient {
-    // Phase 17.5: route through the placement abstraction. Default
+    // route through the placement abstraction. Default
     // (`canonicalPlacement`) produces the same `vfs:${ns}:${tenant}`
     // name as before; consumers that pass `opts.placement` (e.g.
     // `legacyAppPlacement` via `createAppVFS`) get their custom
@@ -1251,6 +1289,53 @@ export class VFS implements VFSClient {
   async openManifest(p: string): Promise<OpenManifestResult> {
     try {
       return await this.user().vfsOpenManifest(this.scope(), p);
+    } catch (err) {
+      throw mapServerError(err, { path: p, syscall: "open" });
+    }
+  }
+
+  /**
+   * Batched manifest fetch. Implemented as a serial loop in the
+   * binding client because a single DO is single-threaded —
+   * Promise.all here would not parallelize. The HTTP client uses
+   * the dedicated `/api/vfs/manifests` route to amortize the
+   * network hop.
+   */
+  async openManifests(
+    paths: string[]
+  ): Promise<
+    (
+      | { ok: true; manifest: OpenManifestResult }
+      | { ok: false; code: string; message: string }
+    )[]
+  > {
+    const stub = this.user();
+    const results: (
+      | { ok: true; manifest: OpenManifestResult }
+      | { ok: false; code: string; message: string }
+    )[] = [];
+    for (const p of paths) {
+      try {
+        const m = await stub.vfsOpenManifest(this.scope(), p);
+        results.push({ ok: true, manifest: m });
+      } catch (err) {
+        const mapped = mapServerError(err, { path: p, syscall: "open" });
+        results.push({
+          ok: false,
+          code: (mapped as { code?: string }).code ?? "EINTERNAL",
+          message: mapped.message,
+        });
+      }
+    }
+    return results;
+  }
+
+  async readPreview(
+    p: string,
+    opts?: ReadPreviewOpts
+  ): Promise<ReadPreviewResult> {
+    try {
+      return await this.user().vfsReadPreview(this.scope(), p, opts ?? {});
     } catch (err) {
       throw mapServerError(err, { path: p, syscall: "open" });
     }

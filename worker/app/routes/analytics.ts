@@ -17,7 +17,7 @@ analytics.use("*", authMiddleware());
  * Returns aggregated analytics: user stats + per-shard breakdown +
  * totals.
  *
- * Phase 17: typed RPCs `appGetUserStats` + `appGetQuota` replace the
+ * typed RPCs `appGetUserStats` + `appGetQuota` replace the
  * legacy fetch indirection. ShardDO `/stats` is still HTTP because
  * ShardDO doesn't expose a typed RPC for stats.
  */

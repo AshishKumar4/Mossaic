@@ -14,7 +14,7 @@ files.use("*", authMiddleware());
  * GET /api/files
  * List files and folders in root or a specific folder.
  *
- * Phase 17: typed RPC `appListFiles` replaces the legacy fetch
+ * typed RPC `appListFiles` replaces the legacy fetch
  * indirection. Wire shape (`{files, folders}`) is preserved 1:1.
  */
 files.get("/", async (c) => {
@@ -29,7 +29,7 @@ files.get("/", async (c) => {
  * DELETE /api/files/:fileId
  * Soft-delete a file and decrement the user's quota.
  *
- * Phase 17: typed RPC `appDeleteFile` (atomic delete + quota update
+ * typed RPC `appDeleteFile` (atomic delete + quota update
  * on the DO side, no extra round-trips).
  */
 files.delete("/:fileId", async (c) => {
