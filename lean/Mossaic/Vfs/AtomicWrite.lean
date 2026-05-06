@@ -3,9 +3,9 @@ Mossaic.Vfs.AtomicWrite — I2: Atomic-write commit linearizability.
 Mathlib-backed, NO AXIOM, NO SORRY.
 
 Models:
-  worker/core/objects/user/vfs/write-commit.ts:821-947 (commitRename)
-  worker/core/objects/user/vfs/helpers.ts:357-393     (findLiveFile, status='complete')
-  worker/core/objects/user/vfs/reads.ts                (readFile chunk loop)
+  worker/core/objects/user/vfs/write-commit.ts:895-... (commitRename)
+  worker/core/objects/user/vfs/helpers.ts:423-459     (findLiveFile, status='complete')
+  worker/core/objects/user/vfs/reads.ts:396-...        (vfsReadFile chunk loop)
   worker/core/objects/user/user-do-core.ts             (UNIQUE INDEX serialization, ensureInit schema migration)
 
 Audit reference:

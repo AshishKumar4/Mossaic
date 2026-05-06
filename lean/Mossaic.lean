@@ -8,6 +8,8 @@ import Mossaic.Vfs.AtomicWrite
 import Mossaic.Vfs.Versioning
 import Mossaic.Vfs.Encryption
 import Mossaic.Vfs.Multipart
+import Mossaic.Vfs.Quota
+import Mossaic.Vfs.Preview
 import Mossaic.Generated.ShardDO
 import Mossaic.Generated.UserDO
 import Mossaic.Generated.Placement

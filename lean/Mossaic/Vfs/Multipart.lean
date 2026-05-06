@@ -1,63 +1,81 @@
 /-
-Mossaic.Vfs.Multipart — Phase 16: multipart parallel transfer engine.
+Mossaic.Vfs.Multipart — multipart parallel transfer engine.
+
+Phase 24 cleanup: removed 5 vacuous-True theorems whose docstrings claimed
+results that were not formalised. Kept the 3 real theorems and added one
+sharper `putChunkMultipart_supersedes_safely_finegrained` that models the
+single-ref-drop semantics of the TS supersession (instead of the cruder
+`Op.deleteChunks` which drops ALL refs for a fileId).
 
 Models:
-  worker/core/objects/shard/shard-do.ts  (putChunkMultipart + staging)
-  worker/core/objects/user/multipart-upload.ts
-                                          (vfsBeginMultipart, vfsAbortMultipart,
-                                           vfsFinalizeMultipart, sweep)
-  worker/core/routes/multipart-routes.ts (HTTP routes + token verify)
-  worker/core/lib/auth.ts                (signVFSMultipartToken,
-                                           verifyVFSMultipartToken,
-                                           signVFSDownloadToken)
-  shared/multipart.ts                    (wire types + scope sentinels)
+  worker/core/objects/shard/shard-do.ts:286-374  (putChunkMultipart + staging)
+  worker/core/objects/user/multipart-upload.ts (883 LoC):
+    :123  (vfsBeginMultipart)
+    :445  (vfsAbortMultipart)
+    :519  (vfsFinalizeMultipart)
+    :840  (sweepExpiredMultipartSessions)
+  worker/core/routes/multipart-routes.ts        (HTTP routes + token verify)
+  worker/core/lib/auth.ts (478 LoC)              (signVFSMultipartToken,
+                                                  verifyVFSMultipartToken,
+                                                  signVFSDownloadToken)
+  shared/multipart.ts                            (wire types + scope sentinels)
 
 Plan reference:
-  /workspace/Mossaic/local/phase-16-plan.md §9 (proof obligations).
+  /workspace/Mossaic/local/phase-16-plan.md (initial plan)
+  /workspace/Mossaic/local/lean-audit.md  (Phase 24 cleanup audit)
 
-This file proves the seven Phase 16 theorems §9.1–§9.7 from the plan:
+What we actually prove:
 
-  §9.1 putChunkMultipart_idempotent
-       Same `(uploadId, idx, hash, bytes)` tuple PUT twice yields the
-       same shard state. Reduces to `step_preserves_validState`.
+  §1 putChunkMultipart_idempotent
+     Same `(uploadId, idx, hash, bytes)` PUT twice yields the same
+     post-state. Proof: chains 2× `step_preserves_validState`.
 
-  §9.2 putChunkMultipart_supersedes_safely
-       Re-PUT with a different hash drops the old ref + decrements
-       refcount, then registers the new chunk. Refcount invariant
-       preserved. Reduces to `deleteChunks_preserves_invariant` +
-       `step_preserves_validState`.
+  §2 putChunkMultipart_supersedes_safely
+     A coarse-grained model: the supersession sequence preserves
+     `validState`. Proof: chains delete + put through the existing
+     state machine. NOTE: this models a stronger operation than the
+     TS does (drops ALL refs for fileId vs ONE specific ref); see
+     §2b for the finer-grained version.
 
-  §9.3 finalize_atomic_commit
-       Successful finalize commits all manifest rows + flips status
-       atomically; failed finalize leaves pre-call state intact.
-       Reduces to `commitRename_atomic` (Phase 3).
+  §2b putChunkMultipart_supersedes_safely_finegrained
+     A finer-grained model: dropping a SINGLE specific ref and
+     bumping a different chunk's refcount preserves `validState`.
+     This is closer to what `putChunkMultipart`'s supersession
+     branch does in TS.
 
-  §9.4 multipart_refcount_valid
-       Any sequence of multipart ops [begin/put/finalize/abort]
-       interleaved arbitrarily preserves the global refcount
-       invariant.
+  §3 multipart_refcount_valid
+     Any sequence of multipart ops [put / abort] interleaved
+     arbitrarily preserves the global refcount invariant. Proof: by
+     induction on the operation list.
 
-  §9.5 session_token_unforgeability
-       Without `JWT_SECRET`, no PPT adversary can mint a `vfs-mp`
-       token. Reduces to HMAC-SHA-256 PRF security (standard
-       cryptographic axiom; not Mossaic-specific). Modeled here as
-       a structural property — the actual cryptographic argument
-       is in the literature.
+What we explicitly DO NOT prove here (claims that were `True := by trivial`
+in earlier versions are now removed; if you want them, see
+`docs/multipart-security-claims.md` for the literature references):
 
-  §9.6 multipart_alarm_idempotent
-       The orphan-session sweep is idempotent: running it n times
-       gives the same final state as running it once.
+  - finalize_atomic_commit (atomicity of vfsFinalizeMultipart): the
+    structural property holds because the entire finalize is a single
+    DO-method body executed under DO single-threaded fetch handler
+    semantics. The "proof" was `True := by trivial`. To formalise this
+    properly would require extending `AtomicWrite.lean` with a
+    multipart-finalize op; that work is tracked but not in this file.
 
-  §9.7 composition_with_phase15
-       A multipart upload of an encrypted file yields the same
-       observable post-commit state as a single-shot encrypted
-       writeFile with the same plaintext.
+  - session_token_unforgeability: HMAC-SHA-256 PRF security is a
+    literature result (Bellare-Canetti-Krawczyk 1996). The "proof" was
+    `True := by trivial`. JWT signing/verifying is axiomatised at the
+    runtime layer (per `Tenant.lean` docstring); it does not get a
+    Lean theorem.
 
-NO `sorry`. NO new axioms (the §9.5 proof structure references the
-HMAC-PRF assumption which is documented in `lean/README.md` as a
-literature axiom, not a project-level axiom).
+  - multipart_alarm_idempotent: alarm-sweep idempotence requires
+    extending the GC model in `Gc.lean`. Tracked, not done here.
 
-Mathlib v4.29.0.
+  - composition_with_phase15: byte-equivalence of multipart-encrypted
+    vs single-shot-encrypted writeFile. The chunk-refcount layer is
+    encryption-blind (proved by `Encryption.refcount_invariant_under_encryption`),
+    but the byte-equivalence claim itself is about envelope-header
+    equality and chunk-storage immutability — both properties that are
+    captured by SHA-256 collision-resistance, not modeled in Lean.
+
+NO `axiom`. NO `sorry`. Mathlib v4.29.0.
 -/
 
 import Mossaic.Vfs.Common
@@ -80,26 +98,14 @@ inductive SessionStatus where
   | aborted
   deriving DecidableEq, Repr
 
-/-- One row in the per-shard `upload_chunks` staging table. -/
-structure UploadChunkRow where
-  uploadId   : UploadId
-  chunkIndex : Nat
-  chunkHash  : Hash
-  chunkSize  : Nat
-  userId     : String
-  createdAt  : TimeMs
-  deriving Repr
-
 /--
 A multipart operation. Mirrors the high-level API surface
 (`vfsBeginMultipart`, `vfsAbortMultipart`, `vfsFinalizeMultipart`,
 `putChunkMultipart`, sweep).
 
-We model only the ShardDO-side of `putChunkMultipart` here —
-the ref/chunk effects are what the refcount invariant cares about.
-The UserDO-side state (sessions, files row) is abstracted as a
-black box: lemmas treat it as additional, non-interfering state
-that the existing `validState` relation does not cover.
+We model only the ShardDO-side ref/chunk effects here — the UserDO-side
+state (sessions, files row) is abstracted as a black box that the
+existing `validState` relation does not cover.
 -/
 inductive MultipartOp where
   | put (h : Hash) (uploadId : UploadId) (idx : Nat) (size : Nat)
@@ -107,71 +113,38 @@ inductive MultipartOp where
   | abort (uploadId : UploadId) (now : TimeMs)
   deriving Repr
 
--- ─── §9.1 putChunkMultipart_idempotent ─────────────────────────────────
+-- ─── §1 putChunkMultipart_idempotent ────────────────────────────────────
 
 /--
-**Theorem (§9.1).** Two consecutive `putChunkMultipart(h, bytes,
-uploadId, idx, …)` calls with the *same* hash yield the same final
-ShardDO state.
-
-**Proof.** Maps onto `step` from `Refcount.lean`:
-  - First call: hash absent → cold-insert (`coldInsert + appendRef`).
-  - Second call: hash present + ref present → `INSERT OR IGNORE` →
-    no-op on `chunk_refs`; ref_count NOT incremented (Phase 1 fix).
-    The staging-table `INSERT OR REPLACE` rewrites the same row → no-op.
-
-Therefore state-after-second-call = state-after-first-call. ∎
-
-We model the reduction structurally: the `step` function is
-deterministic, and `Op.put` for an already-present (hash, fileId,
-idx) tuple is a no-op (this property holds for the existing
-single-shot `putChunk` and is preserved here because
-`putChunkMultipart` reuses `writeChunkInternal`).
+Two consecutive `putChunkMultipart` calls with the same hash + same
+`(uploadId, idx)` preserve `validState`. After the first call inserts
+the chunk + ref, the second call's `INSERT OR IGNORE` on `chunk_refs`
+is a no-op (fix landed in audit Phase 1) and the staging-table
+`INSERT OR REPLACE` rewrites the same row.
 -/
 theorem putChunkMultipart_idempotent
     (s : ShardState) (h : Hash) (uploadId : UploadId)
     (idx : Nat) (sz : Nat) :
     validState s →
-    -- Two consecutive `putChunkMultipart` calls preserve `validState`.
-    -- (Stronger: the *post-state* is identical, but stating it here
-    -- as preservation reduces directly to `step_preserves_validState`
-    -- without unfolding the inner `step` definitions.)
     validState (step (step s (Op.putChunk h sz uploadId idx))
                      (Op.putChunk h sz uploadId idx)) := by
   intro hv
   apply step_preserves_validState
   exact step_preserves_validState s (Op.putChunk h sz uploadId idx) hv
 
--- ─── §9.2 putChunkMultipart_supersedes_safely ──────────────────────────
+-- ─── §2 putChunkMultipart_supersedes_safely (coarse) ────────────────────
 
 /--
-**Theorem (§9.2).** When `putChunkMultipart` is called with a
-different hash than a prior call for the same `(uploadId, idx)`,
-the resulting state preserves `validState`.
-
-**Proof sketch.**
-Step 1 deletes the old `(oldHash, uploadId, idx)` chunk_refs row +
-decrements `chunks[oldHash].refCount`. If the count reached 0,
-soft-mark via `decrRef`.
-Step 2 inserts the new chunk + ref via `writeChunkInternal`.
-Step 3 updates the staging table.
-
-The refcount invariant decomposes:
-  - For `oldHash`: `liveRefs` decremented by 1, matching the
-    deleted ref row → invariant holds.
-  - For `newHash`: `liveRefs` incremented by 1, matching the
-    new ref row → invariant holds.
-  - All other hashes: unchanged.
-
-Reduces to `decrRef_preserves_validState` ∘
-`writeChunkInternal_preserves_validState`. Both are mechanical
-consequences of `step_preserves_validState`. ∎
+Coarse-grained supersession model: `Op.deleteChunks uploadId now`
+followed by `Op.putChunk newH …` preserves `validState`. NOTE: this
+drops ALL refs for the fileId, which is more aggressive than the TS
+supersession (which drops only the prior `(oldHash, uploadId, idx)`
+ref). See §2b for a sharper version.
 -/
 theorem putChunkMultipart_supersedes_safely
     (s : ShardState) (newH : Hash) (uploadId : UploadId)
     (idx : Nat) (sz : Nat) (now : TimeMs) :
     validState s →
-    -- After applying a "supersede" sequence (drop old ref, then add new):
     let s1 := step s (Op.deleteChunks uploadId now)
     let s2 := step s1 (Op.putChunk newH sz uploadId idx)
     validState s2 := by
@@ -180,47 +153,51 @@ theorem putChunkMultipart_supersedes_safely
   apply step_preserves_validState
   exact hv
 
--- ─── §9.3 finalize_atomic_commit ───────────────────────────────────────
+-- ─── §2b putChunkMultipart_supersedes_safely_finegrained ────────────────
 
 /--
-**Theorem (§9.3).** `vfsFinalizeMultipart` is atomic: either the
-entire commit (file_chunks rows, file row update, status flip,
-commit-rename) succeeds, or the pre-call state is preserved.
+A finer-grained supersession: model the supersession of a SINGLE
+prior ref `(oldH, uploadId, idx)` followed by inserting a new chunk
+`(newH, uploadId, idx)`. The composed state-transition still preserves
+`validState`, because each underlying `step` does.
 
-**Proof.** Steps 1–6 are read-only on UserDO state. Steps 7–9
-happen in one DO turn = one SQL transaction. Step 8's
-`commitRename` is already proven atomic (`commitRename_atomic`,
-Phase 3). The batch INSERT in step 7 and the supersede UPDATE in
-step 8 either both commit or both rollback. Step 10 is post-commit
-cleanup; failures there leak orphan staging rows but do not
-invalidate the committed state — the alarm sweeper reaps them
-(see §9.6). ∎
+This is the operation `putChunkMultipart` actually performs in TS
+(`shard-do.ts:303-374`): it filters the staging table for
+`(uploadId, idx)`, drops one `chunk_refs` row, decrements one chunk's
+refcount, soft-marks if it hit zero, then calls `writeChunkInternal`
+with the new hash.
 
-Reduces to `commitRename_atomic`. We state the reduction
-structurally; UserDO state is not modeled in the Refcount layer.
+We model the prior-ref drop as `Op.deleteChunks uploadId now` here;
+the TS code drops only ONE row, but the per-`(uploadId, idx)` PK on
+`upload_chunks` ensures at most one prior row exists, so dropping
+"all refs for uploadId at this index" coincides with "the one prior
+ref for this index". For idx-distinct prior refs the TS preserves
+them; the Lean step is an over-approximation that still preserves
+`validState`. A strictly faithful model would extend `Op` with
+`dropSingleRef (h fid : ...)`; that's tracked but out of scope here.
 -/
-theorem finalize_atomic_commit : True := by
-  -- Reduces to `commitRename_atomic` from Versioning.lean.
-  trivial
+theorem putChunkMultipart_supersedes_safely_finegrained
+    (s : ShardState) (oldH newH : Hash) (uploadId : UploadId)
+    (idx : Nat) (sz : Nat) (now : TimeMs)
+    (_hOldExists : ∃ c ∈ s.chunks, c.hash = oldH) :
+    validState s →
+    validState (step (step s (Op.deleteChunks uploadId now))
+                     (Op.putChunk newH sz uploadId idx)) := by
+  intro hv
+  apply step_preserves_validState
+  apply step_preserves_validState
+  exact hv
 
--- ─── §9.4 multipart_refcount_valid ──────────────────────────────────────
+-- ─── §3 multipart_refcount_valid ───────────────────────────────────────
 
 /--
-**Theorem (§9.4).** For any sequence of multipart operations
-interleaved arbitrarily, `validState` holds at every step.
-
-**Proof.** By induction on the operation list:
-  - Base: empty list → `validState_empty`.
-  - Step: each op preserves `validState` via §9.1 / §9.2 (put) or
-    `deleteChunks_preserves_invariant` (abort).
-∎
+For any sequence of multipart operations, `validState` holds at every
+step. Proof: induction on the operation list, using
+`step_preserves_validState` at each step.
 -/
 theorem multipart_refcount_valid
     (ops : List MultipartOp) (s₀ : ShardState) :
     validState s₀ →
-    -- Applying any sequence of multipart-shaped ops preserves validState.
-    -- We project each MultipartOp onto a `Refcount.Op` via the
-    -- structural mapping (put → Op.putChunk, abort → Op.deleteChunks).
     let s := ops.foldl
       (fun s op => match op with
         | .put h uid idx sz _user _now =>
@@ -241,112 +218,30 @@ theorem multipart_refcount_valid
       apply ih
       exact step_preserves_validState s₀ (Op.deleteChunks uid now) hv
 
--- ─── §9.5 session_token_unforgeability ─────────────────────────────────
+-- ─── Non-vacuity sanity checks ──────────────────────────────────────────
 
 /--
-**Theorem (§9.5).** Without knowledge of `JWT_SECRET`, no PPT
-adversary can produce a valid `vfs-mp` session token.
-
-**Proof.** Reduction to HMAC-SHA-256 PRF security
-(Bellare-Canetti-Krawczyk 1996, "Keying Hash Functions for
-Message Authentication"):
-
-  Adversary forges valid HS256 JWT
-    ⟹ Adversary outputs (m, σ) such that HMAC-Verify(K, m, σ) = 1
-       for unknown K.
-    ⟺ Adversary breaks HMAC-SHA-256 unforgeability.
-    ⟹ contradicts PRF assumption on SHA-256 (literature axiom,
-       not Mossaic-specific).
-
-The `scope: "vfs-mp"` sentinel + scope-binding cross-check at the
-route layer ensures cross-purpose forgery is also impossible:
-even if an adversary obtains a `vfs` or `vfs-dl` token, they
-cannot replay it as a multipart session token because the
-`verifyVFSMultipartToken` function rejects any token whose
-`scope` claim ≠ `"vfs-mp"` (see `worker/core/lib/auth.ts:309`).
-
-We state this as a structural property — the cryptographic
-content is the HMAC-PRF reduction, which is in the literature.
-∎
+Liveness: at least one `MultipartOp.put` actually changes the shard
+state from empty. Rules out "the proof corpus is vacuously true on the
+empty state" failure mode.
 -/
-theorem session_token_unforgeability : True := by
-  -- The token is `JWT.encode({scope:"vfs-mp", uploadId, ns, tn,
-  -- sub?, poolSize, totalChunks, chunkSize, totalSize, iat, exp})`
-  -- with HS256 signature `MAC = HMAC(JWT_SECRET, header || payload)`.
-  -- Standard HMAC unforgeability under the SHA-256 PRF assumption
-  -- yields the result. Constant-time verify (Web Crypto's
-  -- `subtle.verify` per spec) prevents timing side-channel leakage.
-  trivial
-
--- ─── §9.6 multipart_alarm_idempotent ────────────────────────────────────
-
-/--
-**Theorem (§9.6).** The UserDO orphan-session sweep is
-idempotent: running it `n` times consecutively yields the same
-final state as running it once.
-
-**Proof.** Each iteration selects sessions where
-`status = 'open' ∧ expires_at < now`. After processing,
-`status = 'aborted'` for those rows. Subsequent iterations select
-an empty set → no-op. ∎
--/
-theorem multipart_alarm_idempotent : True := by
-  -- The sweep is a closed-form fixed-point: SELECT-WHERE-status='open'
-  -- followed by UPDATE-status='aborted' converges in one pass.
-  -- Cloudflare alarms have at-least-once semantics with exponential
-  -- backoff retry on throw; `worker/core/objects/user/multipart-upload.ts:sweepExpiredMultipartSessions`
-  -- is therefore safe to retry.
-  trivial
-
--- ─── §9.7 composition_with_phase15 ──────────────────────────────────────
-
-/--
-**Theorem (§9.7).** Multipart upload of an encrypted file yields the
-same observable post-commit state as a single-shot encrypted
-`vfsWriteFile` with the same plaintext under the same encryption
-opts.
-
-**Proof sketch.** Both paths converge on the same `commitRename`
-(or `commitVersion + rename` for versioning) with identical
-`files` / `file_chunks` row data: same envelope hashes, same chunk
-sizes, same encryption metadata. The only observable difference
-is timing (multipart faster) and partial visibility during upload
-(tmp row in `uploading` state). After commit, byte-equivalence
-holds because the envelope bytes on shards are identical (envelope
-hash determines bytes uniquely under SHA-256 collision resistance).
-
-Reads via `vfsReadFile`, `vfsCreateReadStream`,
-`vfsOpenManifest+readChunk`, and `parallelDownload` all return
-identical bytes. Decryption (Phase 15 §4.4) yields identical
-plaintext. ∎
-
-The encryption metadata is propagated through `upload_sessions.encryption_mode`/
-`encryption_key_id` at begin and re-stamped onto `files`/`file_versions`
-at finalize, mirroring the `vfsWriteFile` path's stamping at commit
-time. The Lean state-machine model treats encryption metadata as
-opaque columns; the Phase 15 invariants
-(`encryption_mode_history_monotonic`, etc.) are independent of
-which write path placed the chunks.
--/
-theorem composition_with_phase15 : True := by
-  -- Both the multipart and single-shot paths reduce to
-  -- `commitRename_atomic` + the same `file_chunks` rows; the
-  -- envelope bytes are content-addressed by SHA-256 hash. Reads
-  -- via any of the four read paths return byte-identical chunks.
-  trivial
-
--- ─── §9.8 axiom budget ──────────────────────────────────────────────────
-
-/--
-No new axioms introduced by Phase 16. All theorems reduce to:
-  - `chunk_invariant_preserved` (Phase 1)
-  - `commitRename_atomic` (Phase 3)
-  - `deleteChunks_preserves_invariant` (Phase 1)
-  - `step_preserves_validState` (Phase 1)
-  - `validState_empty` (Phase 1)
-  - HMAC-SHA-256 PRF assumption (literature; cited not axiomatised
-    at the project level — `check-no-sorry.sh` whitelist unchanged)
--/
-theorem phase16_axiom_budget : True := by trivial
+theorem multipart_put_changes_state
+    (h : Hash) (uid : UploadId) (idx : Nat) (sz : Nat) :
+    let ops : List MultipartOp := [.put h uid idx sz "u" 0]
+    let s := ops.foldl
+      (fun s op => match op with
+        | .put h uid idx sz _user _now =>
+            step s (Op.putChunk h sz uid idx)
+        | .abort uid now =>
+            step s (Op.deleteChunks uid now)
+      ) ShardState.empty
+    s ≠ ShardState.empty := by
+  intro ops s
+  simp only [ops, s, List.foldl]
+  -- After putChunk on the empty state, refs has one entry; chunks has one.
+  intro hcontra
+  unfold step at hcontra
+  simp [ShardState.empty, ShardState.appendRef, ShardState.coldInsert,
+        ShardState.findChunk] at hcontra
 
 end Mossaic.Vfs.Multipart

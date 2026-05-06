@@ -11,7 +11,7 @@ annotations in the TS source. This makes drift detection mechanical:
 should yield only theorem names that exist in this file (verified by
 `lean/scripts/check-xrefs.sh`).
 
-Modeled file: worker/core/objects/shard/shard-do.ts (777 LoC).
+Modeled file: worker/core/objects/shard/shard-do.ts (821 LoC).
 -/
 
 import Mossaic.Vfs.Refcount

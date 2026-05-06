@@ -1,16 +1,17 @@
 /-
 Mossaic.Generated.UserDO — thin wrapper module for the UserDO TS files.
 
-Modeled files (HEAD post-Phase-19 vfs-ops split):
-  worker/core/objects/user/user-do-core.ts (2007 LoC; canonical surface)
-  worker/core/objects/user/vfs-ops.ts (71 LoC barrel) re-exporting:
-    worker/core/objects/user/vfs/helpers.ts      (393 LoC)
+Modeled files (HEAD post-Phase-19 vfs-ops split, refreshed Phase 24):
+  worker/core/objects/user/user-do-core.ts (2139 LoC; canonical surface)
+  worker/core/objects/user/vfs-ops.ts (74 LoC barrel) re-exporting:
+    worker/core/objects/user/vfs/helpers.ts      (459 LoC)
     worker/core/objects/user/vfs/reads.ts        (704 LoC)
-    worker/core/objects/user/vfs/write-commit.ts (959 LoC)
+    worker/core/objects/user/vfs/write-commit.ts (1033 LoC)
     worker/core/objects/user/vfs/mutations.ts    (540 LoC)
     worker/core/objects/user/vfs/metadata.ts     (204 LoC)
-    worker/core/objects/user/vfs/streams.ts      (734 LoC)
-  worker/core/objects/user/vfs-versions.ts (887 LoC)
+    worker/core/objects/user/vfs/streams.ts      (727 LoC)
+    worker/core/objects/user/vfs/preview.ts      (212 LoC)
+  worker/core/objects/user/vfs-versions.ts (888 LoC)
   worker/app/objects/user/user-do.ts (App-side typed-RPC subclass; not
     a Lean target — its body is wire-shape adaptation, no new
     invariants)

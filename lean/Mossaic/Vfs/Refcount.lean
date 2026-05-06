@@ -2,10 +2,10 @@
 Mossaic.Vfs.Refcount — I1: Per-shard refcount = liveRefs equality.
 
 Models:
-  worker/core/objects/shard/shard-do.ts (777 LoC)
+  worker/core/objects/shard/shard-do.ts (821 LoC)
     — chunks + chunk_refs schema (ensureInit)
-    — putChunk / writeChunkInternal (multipart staging + GC-on-conflict)
-    — deleteChunks / removeFileRefs (refcount decrement; soft-mark on 0)
+    — putChunk / writeChunkInternal (multipart staging + GC-on-conflict, lines 241-540)
+    — deleteChunks / removeFileRefs (refcount decrement; soft-mark on 0, lines 543-700)
 
 Audit reference:
   /workspace/local/audit-report.md §I1.
