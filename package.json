@@ -12,6 +12,8 @@
     "test:watch": "vitest",
     "typecheck": "tsc -b",
     "build:sdk": "pnpm -F @mossaic/sdk build",
+    "lint:no-phase-tags": "bash scripts/check-no-phase-tags.sh",
+    "ci:check": "pnpm typecheck && pnpm build:sdk && pnpm lint:no-phase-tags",
     "lean:build": "bash -c 'export PATH=$HOME/.elan/bin:$PATH; cd lean && lake build'",
     "verify:proofs": "bash -c 'export PATH=$HOME/.elan/bin:$PATH; cd lean && lake build && bash scripts/check-no-sorry.sh && cd .. && bash lean/scripts/check-xrefs.sh'"
   },

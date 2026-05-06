@@ -126,9 +126,8 @@ export function vfsArchive(
     target: r.leafId,
     payload: JSON.stringify({ path, kind: r.kind }),
   });
-  // Phase 46 — bump parent revision: default-listing visibility
-  // flipped from "shown" to "hidden" so any listChildren consumer
-  // re-fetches.
+  // Bump parent revision: default-listing visibility flipped from
+  // "shown" to "hidden" so any listChildren consumer re-fetches.
   bumpParentRevisionForFile(durableObject, userId, r.leafId);
 }
 
@@ -166,13 +165,13 @@ export function vfsUnarchive(
     target: r.leafId,
     payload: JSON.stringify({ path, kind: r.kind }),
   });
-  // Phase 46 — bump parent revision: visibility flipped from
-  // "hidden" back to "shown".
+  // Bump parent revision: visibility flipped from "hidden" back
+  // to "shown".
   bumpParentRevisionForFile(durableObject, userId, r.leafId);
 }
 
 /**
- * Phase 46 — read the file's parent_id and bump its folder revision.
+ * Read the file's parent_id and bump its folder revision.
  * Co-located with archive/unarchive so we don't pull mutations.ts
  * into archive.ts for one helper. The same SQL pattern is used by
  * vfsUnlink/vfsRename which read parent_id directly.

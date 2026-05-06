@@ -789,10 +789,10 @@ export async function vfsFinalizeMultipart(
     //  and the file_chunks / metadata / tags it carried are intact;
     //  the row IS the path's identity so we keep it.)
 
-    // Phase 46 — versioned multipart finalize advanced head_version_id
-    // on an existing path. commitRename only fires (and self-bumps)
-    // in the no-prior-row branch above; the prior-row branch needs
-    // an explicit bump so listChildren observers see the new head.
+    // Versioned multipart finalize advanced head_version_id on an
+    // existing path. commitRename only fires (and self-bumps) in
+    // the no-prior-row branch above; the prior-row branch needs an
+    // explicit bump so listChildren observers see the new head.
     if (liveRow) {
       bumpFolderRevision(durableObject, userId, session.parent_id);
     }

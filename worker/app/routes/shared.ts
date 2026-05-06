@@ -3,6 +3,7 @@ import type { EnvApp as Env } from "@shared/types";
 import { createVFS } from "@mossaic/sdk";
 import { userStub } from "../lib/user-stub";
 import { edgeCacheServe } from "@core/lib/edge-cache";
+import { serveBytesWithRange } from "@core/lib/http-range";
 import { verifyShareToken, VFSConfigError } from "@core/lib/auth";
 
 const shared = new Hono<{ Bindings: Env }>();
@@ -114,6 +115,29 @@ shared.get("/:token/image/:fileId", async (c) => {
   const { path, mimeType, updatedAt } = resolved;
   const userId = payload.userId;
 
+  // Range requests bypass the Workers Cache wrapper — the cached
+  // entry is a 200 with full bytes, and Workers Cache does not
+  // slice to 206 on hit. The ShardDO read is bounded so origin
+  // serving is acceptable; <video>/<audio> seek correctness
+  // requires this branch.
+  const rangeHeader = c.req.header("Range") ?? null;
+  if (rangeHeader !== null) {
+    const vfs = createVFS(c.env, { tenant: userId });
+    try {
+      const bytes = await vfs.readFile(path);
+      return serveBytesWithRange(bytes, rangeHeader, {
+        "Content-Type": mimeType,
+        "Cache-Control": "public, max-age=86400",
+      });
+    } catch (err) {
+      const code = (err as { code?: string }).code;
+      if (code === "ENOENT") {
+        return c.json({ error: "File not found" }, 404);
+      }
+      throw err;
+    }
+  }
+
   return edgeCacheServe(
     {
       surfaceTag: "simg",
@@ -132,6 +156,9 @@ shared.get("/:token/image/:fileId", async (c) => {
             "Content-Type": mimeType,
             "Content-Length": String(bytes.byteLength),
             "Cache-Control": "public, max-age=86400",
+            // Advertise Range so subsequent <video> seek requests
+            // know they can issue Range against this surface.
+            "Accept-Ranges": "bytes",
           },
         });
       } catch (err) {

@@ -526,10 +526,10 @@ async function vfsWriteFileVersioned(
   } else {
     bumpTagMtimes(durableObject, pathId, now);
   }
-  // Phase 46 — versioned writeFile changes the listChildren state
-  // for the parent (either added a fresh path or advanced the head
-  // version of an existing path; the head's mtime/size visible
-  // to listChildren has moved). Bump the parent revision once per
+  // Versioned writeFile changes the listChildren state for the
+  // parent (either added a fresh path or advanced the head version
+  // of an existing path; the head's mtime/size visible to
+  // listChildren has moved). Bump the parent revision once per
   // versioned write commit.
   bumpFolderRevision(durableObject, userId, parentId);
 }
@@ -1215,11 +1215,11 @@ export async function commitRename(
       for (const id of supersededIds) {
         await hardDeleteFileRow(durableObject, userId, scope, id);
       }
-      // Phase 46 — successful commit changes parent's child set
-      // (either added a new entry, or replaced an existing one with
-      // new bytes; either way listChildren observers should
-      // re-fetch). Bump after the rename UPDATE + supersede GC so
-      // the revision reflects the post-commit state.
+      // Successful commit changes parent's child set (either added
+      // a new entry, or replaced an existing one with new bytes;
+      // either way listChildren observers should re-fetch). Bump
+      // after the rename UPDATE + supersede GC so the revision
+      // reflects the post-commit state.
       bumpFolderRevision(durableObject, userId, parentId);
       return;
     } catch (err) {
