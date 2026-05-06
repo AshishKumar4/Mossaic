@@ -4,12 +4,12 @@
   // Copy this into your consumer Worker's wrangler.jsonc. Adjust
   // `name`, `main`, and route/custom_domain as appropriate. The DO
   // bindings + migrations block is what wrangler needs to discover
-  // and instantiate Mossaic's UserDO/ShardDO/SearchDO classes — your
-  // Worker's main module must re-export them:
+  // and instantiate Mossaic's UserDO/ShardDO classes — your Worker's
+  // main module must re-export them:
   //
   //   // src/index.ts
-  //   import { UserDO, ShardDO, SearchDO, createVFS } from "@mossaic/sdk";
-  //   export { UserDO, ShardDO, SearchDO };
+  //   import { UserDO, ShardDO, createVFS } from "@mossaic/sdk";
+  //   export { UserDO, ShardDO };
   //   export default {
   //     async fetch(req, env) {
   //       const vfs = createVFS(env, { tenant: "acme" });
@@ -28,17 +28,19 @@
   // import any node:* modules at runtime.
   "compatibility_flags": ["nodejs_compat"],
 
-  // The three DO classes — UserDO holds per-tenant manifest +
-  // metadata; ShardDO holds content-addressed chunk blobs; SearchDO
-  // holds embedding vectors (only used if you wire the search
-  // routes; can be omitted if you don't). The binding names on the
-  // left are configurable; the SDK's createVFS reads MOSSAIC_USER
-  // by default but accepts any name passed via env.
+  // The two DO classes — UserDO holds per-tenant manifest + metadata;
+  // ShardDO holds content-addressed chunk blobs. The binding names
+  // on the left are configurable; the SDK's createVFS reads
+  // MOSSAIC_USER by default but accepts any name passed via env.
+  //
+  // Phase 11.1: SearchDO is no longer part of the SDK surface. The
+  // CLIP/BGE vector search backed the photo-library's /api/search
+  // route specifically; SDK consumers who need semantic search
+  // should run their own Vectorize index or a separate DO.
   "durable_objects": {
     "bindings": [
       { "name": "MOSSAIC_USER", "class_name": "UserDO" },
-      { "name": "MOSSAIC_SHARD", "class_name": "ShardDO" },
-      { "name": "MOSSAIC_SEARCH", "class_name": "SearchDO" }
+      { "name": "MOSSAIC_SHARD", "class_name": "ShardDO" }
     ]
   },
 
@@ -47,7 +49,7 @@
   "migrations": [
     {
       "tag": "mossaic-v1",
-      "new_sqlite_classes": ["UserDO", "ShardDO", "SearchDO"]
+      "new_sqlite_classes": ["UserDO", "ShardDO"]
     }
   ],
 

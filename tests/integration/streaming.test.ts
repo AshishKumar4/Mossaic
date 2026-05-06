@@ -24,9 +24,9 @@ import { env, runInDurableObject } from "cloudflare:test";
  * env.USER_DO.idFromName(vfsUserDOName(...)) and call the new methods.
  */
 
-import type { UserDO } from "../../worker/objects/user/user-do";
-import type { ShardDO } from "../../worker/objects/shard/shard-do";
-import { vfsShardDOName, vfsUserDOName } from "../../worker/lib/utils";
+import type { UserDOCore as UserDO } from "@core/objects/user/user-do-core";
+import type { ShardDO } from "@core/objects/shard/shard-do";
+import { vfsShardDOName, vfsUserDOName } from "@core/lib/utils";
 import { INLINE_LIMIT } from "@shared/inline";
 
 interface E {

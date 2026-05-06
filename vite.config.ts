@@ -10,6 +10,7 @@ export default defineConfig({
     alias: {
       "@": path.resolve(__dirname, "./src"),
       "@shared": path.resolve(__dirname, "./shared"),
+      "@core": path.resolve(__dirname, "./worker/core"),
     },
   },
   server: {

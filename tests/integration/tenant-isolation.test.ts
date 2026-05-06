@@ -30,10 +30,10 @@ import { env, runInDurableObject } from "cloudflare:test";
  * runInDurableObject to confirm chunk presence/absence.
  */
 
-import type { UserDO } from "../../worker/objects/user/user-do";
-import type { ShardDO } from "../../worker/objects/shard/shard-do";
-import { vfsShardDOName, vfsUserDOName } from "../../worker/lib/utils";
-import { signVFSToken, verifyVFSToken } from "../../worker/lib/auth";
+import type { UserDOCore as UserDO } from "@core/objects/user/user-do-core";
+import type { ShardDO } from "@core/objects/shard/shard-do";
+import { vfsShardDOName, vfsUserDOName } from "@core/lib/utils";
+import { signVFSToken, verifyVFSToken } from "@core/lib/auth";
 
 interface E {
   USER_DO: DurableObjectNamespace<UserDO>;
@@ -431,7 +431,7 @@ describe("VFS JWT scope guard", () => {
   it("legacy login-shape JWT (no scope claim) is rejected by verifyVFSToken", async () => {
     // Mint a token with the legacy shape: { sub, email } and HS256
     // signed with the same JWT_SECRET. verifyVFSToken must reject it.
-    const { signJWT } = await import("../../worker/lib/auth");
+    const { signJWT } = await import("@core/lib/auth");
     const legacy = await signJWT(TEST_ENV, {
       userId: "user-123",
       email: "u@example.com",
@@ -441,7 +441,7 @@ describe("VFS JWT scope guard", () => {
   });
 
   it("VFS token is rejected by legacy verifyJWT (no email claim)", async () => {
-    const { verifyJWT } = await import("../../worker/lib/auth");
+    const { verifyJWT } = await import("@core/lib/auth");
     const vfs = await signVFSToken(TEST_ENV, {
       ns: "default",
       tenant: "acme",

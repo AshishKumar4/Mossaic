@@ -1,4 +1,4 @@
-import type { UserDO } from "./user-do";
+import type { UserDOCore as UserDO } from "./user-do-core";
 import {
   normalizePath,
   resolveSymlinkTarget,

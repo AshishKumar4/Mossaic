@@ -25,7 +25,7 @@ import {
   EACCES,
   VFSFsError,
 } from "../../sdk/src/index";
-import { signVFSToken, signJWT } from "../../worker/lib/auth";
+import { signVFSToken, signJWT } from "@core/lib/auth";
 
 interface E {
   USER_DO: DurableObjectNamespace;

@@ -23,7 +23,7 @@ import { env, runInDurableObject } from "cloudflare:test";
  *     append call, the server ignores it and uses its own state.
  */
 
-import { vfsUserDOName } from "../../worker/lib/utils";
+import { vfsUserDOName } from "@core/lib/utils";
 import { createVFS, type MossaicEnv } from "../../sdk/src/index";
 
 interface E {

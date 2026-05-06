@@ -1,0 +1,66 @@
+// Phase 11: Service-mode deployment.
+//
+// Deploys ONLY the SDK-essential surface (UserDOCore + ShardDO +
+// the Phase 7 HTTP fallback at /api/vfs and a /api/health route)
+// as a standalone Worker. Pair this with consumer Workers that
+// bind via `script_name: "mossaic-core"` to get a turn-key Mossaic
+// backend without re-exporting the DO classes from `@mossaic/sdk`
+// themselves.
+//
+// Phase 11.1: SearchDO was misclassified as Core in Phase 11. It
+// backs the photo-library's CLIP/BGE vector search and is App-only.
+// Service-mode no longer binds SEARCH_DO — vector search is not
+// part of the SDK contract.
+//
+// Class names: this Worker exports `UserDOCore` (NOT `UserDO`). The
+// service-mode namespace is therefore distinct from the App-mode
+// namespace at mossaic.ashishkumarsingh.com — different
+// `class_name`s ⇒ different runtime DO namespaces ⇒ different
+// SQLite databases. Production photo-app data is untouched.
+//
+// Required secrets (set via `wrangler secret put --config
+// deployments/service/wrangler.jsonc`, NEVER committed):
+//   JWT_SECRET — signs Phase 7 VFS tokens. Without it, /api/vfs
+//                refuses with 503.
+{
+  "name": "mossaic-core",
+  "main": "../../worker/core/index.ts",
+  "account_id": "f44999d1ddda7012e9a87729eba250f1",
+  "compatibility_date": "2026-03-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // Phase 11: esbuild path-alias config. Wrangler invokes esbuild
+  // for bundling and esbuild's `alias` map is keyed by FULL module
+  // specifier (no wildcard support; one entry per leaf module).
+  // The set below mirrors the `@shared/*` modules consumed by
+  // worker/core/. Adding a new shared/ file used from Core requires
+  // adding an entry here too. The production `wrangler.jsonc`
+  // doesn't need this because the Cloudflare vite-plugin resolves
+  // `@shared` automatically (see vite.config.ts).
+  "alias": {
+    "@shared/placement": "../../shared/placement.ts",
+    "@shared/types": "../../shared/types.ts",
+    "@shared/vfs-types": "../../shared/vfs-types.ts",
+    "@shared/crypto": "../../shared/crypto.ts",
+    "@shared/chunking": "../../shared/chunking.ts",
+    "@shared/inline": "../../shared/inline.ts",
+    "@shared/ino": "../../shared/ino.ts",
+    "@shared/vfs-paths": "../../shared/vfs-paths.ts",
+    "@shared/constants": "../../shared/constants.ts",
+    "@shared/embedding-types": "../../shared/embedding-types.ts"
+  },
+
+  "durable_objects": {
+    "bindings": [
+      { "name": "USER_DO", "class_name": "UserDOCore" },
+      { "name": "SHARD_DO", "class_name": "ShardDO" }
+    ]
+  },
+
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["UserDOCore", "ShardDO"]
+    }
+  ]
+}

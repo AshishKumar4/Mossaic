@@ -1,6 +1,6 @@
 import type { UserDO } from "./user-do";
 import { hashPassword, verifyPassword } from "../../lib/crypto";
-import { generateId } from "../../lib/utils";
+import { generateId } from "@core/lib/utils";
 
 export interface AuthResult {
   userId: string;

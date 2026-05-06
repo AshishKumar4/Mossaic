@@ -51,7 +51,7 @@ import {
 } from "../../sdk/src/index";
 import { VFS_MODE_YJS_BIT } from "../../sdk/src/yjs-mode-bit";
 import { openYDoc } from "../../sdk/src/yjs";
-import { vfsUserDOName } from "../../worker/lib/utils";
+import { vfsUserDOName } from "@core/lib/utils";
 
 interface E {
   USER_DO: DurableObjectNamespace<UserDO>;
