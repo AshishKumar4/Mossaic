@@ -243,3 +243,72 @@ export async function renderAndStoreVariant(
     result,
   };
 }
+
+/**
+ * Standard variants pre-generated at upload-finalize time. The
+ * gallery's typical access pattern hits `thumb` first, then
+ * `lightbox` on click; pre-rendering both removes the cold-render
+ * latency on the user's first interaction.
+ */
+const PRE_GEN_STANDARD_VARIANTS = ["thumb", "medium", "lightbox"] as const;
+
+/**
+ * Pre-generate standard preview variants for a freshly-written file,
+ * intended to run inside `c.executionCtx.waitUntil(...)`. Best-effort:
+ * each variant renders inside its own try/catch and a failure for one
+ * variant never bubbles up — the caller's request must not 500
+ * because the renderer didn't have a binding or hit an EFBIG.
+ *
+ * Skips non-renderable inputs:
+ *  - empty files (`fileSize === 0`)
+ *  - encrypted files (server can't decrypt; preview must be client-side)
+ *
+ * Idempotent: `renderAndStoreVariant` is content-addressed so re-runs
+ * with the same input produce the same chunk hash; the `file_variants`
+ * row already exists check inside the routing layer (`findVariantRow`)
+ * is the cache hit. We don't gate here — let the renderer dispatch
+ * decide whether to skip via mime.
+ */
+export async function preGenerateStandardVariants(
+  durableObject: UserDOCore,
+  scope: VFSScope,
+  args: {
+    fileId: string;
+    path: string;
+    mimeType: string;
+    fileName: string;
+    fileSize: number;
+    isEncrypted: boolean;
+  }
+): Promise<void> {
+  if (args.fileSize === 0 || args.isEncrypted) return;
+
+  for (const variant of PRE_GEN_STANDARD_VARIANTS) {
+    try {
+      // `renderAndStoreVariant` is idempotent: chunk bytes are
+      // content-addressed (variantHash = SHA-256 of rendered bytes)
+      // and the `file_variants` insert is `OR IGNORE` keyed by
+      // (file_id, variant_kind, renderer_kind). Re-running produces
+      // no observable change beyond a wasted render — acceptable on
+      // the rare double-finalize path; on the hot path each variant
+      // is fresh.
+      await renderAndStoreVariant(
+        durableObject,
+        scope,
+        args.fileId,
+        args.path,
+        args.mimeType,
+        args.fileName,
+        args.fileSize,
+        variant
+      );
+    } catch (err) {
+      // Best-effort. Log to console; never throw out of waitUntil.
+      console.warn(
+        `preGenerateStandardVariants: ${variant} failed for ${args.path}: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+    }
+  }
+}

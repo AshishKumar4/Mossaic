@@ -1758,6 +1758,33 @@ export class UserDOCore extends DurableObject<Env> {
     return dedupePaths(this, userId, scope);
   }
 
+  /**
+   * Pre-generate standard preview variants (`thumb`, `medium`,
+   * `lightbox`) for a freshly-finalized file. Intended to run
+   * inside the route layer's `c.executionCtx.waitUntil(...)` so
+   * pre-gen latency doesn't extend the finalize response.
+   *
+   * Best-effort: per-variant failures are logged and swallowed.
+   * Skips empty + encrypted files. Idempotent (content-addressed).
+   */
+  async adminPreGenerateStandardVariants(
+    scope: VFSScope,
+    args: {
+      fileId: string;
+      path: string;
+      mimeType: string;
+      fileName: string;
+      fileSize: number;
+      isEncrypted: boolean;
+    }
+  ): Promise<void> {
+    this.ensureInit();
+    const { preGenerateStandardVariants } = await import(
+      "./preview-variants"
+    );
+    await preGenerateStandardVariants(this, scope, args);
+  }
+
   // ── metadata + tags primitives ──────────────────────────────
 
   /**

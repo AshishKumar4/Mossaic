@@ -104,6 +104,21 @@ export interface MultipartFinalizeResponse {
   size: number;
   chunkCount: number;
   fileHash: string;
+  /**
+   * Absolute path the finalize committed to. Reconstructed from the
+   * session's `(parent_id, leaf)` server-side. Surfaced so the route
+   * layer can dispatch follow-on side effects (preview pre-gen)
+   * without re-querying.
+   */
+  path: string;
+  /** File's MIME type as recorded on the session. */
+  mimeType: string;
+  /**
+   * `true` when the file was uploaded with per-chunk encryption (the
+   * session carries an `encryption_mode`). Pre-gen renderers MUST
+   * skip encrypted files — the server can't decrypt envelopes.
+   */
+  isEncrypted: boolean;
 }
 
 /** Body of `POST /api/vfs/multipart/abort`. */
