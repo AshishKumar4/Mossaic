@@ -209,6 +209,17 @@ export default {
 
 The SDK is verified end-to-end against `isomorphic-git@1.37.x` in `tests/integration/igit-smoke.test.ts`. `git.init`, `add`, `commit`, `log` round-trip cleanly. Symlinks, `chmod`, batched `lstat` (for `git status`) are all supported.
 
+### Auto-batched lstat (opt-in)
+
+`git status` on a large tree fires hundreds of `lstat` calls in tight bursts. Without batching, that's hundreds of DO RPCs against Mossaic's per-invocation budget. With `{ batchLstat: true }`, the SDK coalesces concurrent lstats within a small window into one `readManyStat` RPC:
+
+```ts
+const fs = createIgitFs(vfs, { batchLstat: true, batchWindowMs: 10 });
+// Now: N concurrent fs.lstat() calls → 1 underlying readManyStat
+```
+
+Batched mode preserves the `lstat` contract — successful resolutions return identical `VFSStat` instances, missing paths throw `ENOENT`, transport errors reject every pending caller in the batch identically. Sequential awaited calls still hit one RPC each (the batching is a concurrency optimization, not a serial coalescer). Default off; opt-in for performance-sensitive workloads.
+
 ---
 
 ## Multi-tenancy
@@ -291,9 +302,88 @@ try {
 }
 ```
 
-Codes covered: `ENOENT`, `EEXIST`, `EISDIR`, `ENOTDIR`, `EFBIG`, `ELOOP`, `EBUSY`, `EINVAL`, `EACCES`, `EROFS`, `ENOTEMPTY`, plus `MossaicUnavailableError` (code `EMOSSAIC_UNAVAILABLE`) for graceful service-down handling.
+Codes covered: `ENOENT`, `EEXIST`, `EISDIR`, `ENOTDIR`, `EFBIG`, `ELOOP`, `EBUSY`, `EINVAL`, `EACCES`, `EROFS`, `ENOTEMPTY`, `EAGAIN` (rate-limit, see below), plus `MossaicUnavailableError` (code `EMOSSAIC_UNAVAILABLE`).
 
 isomorphic-git's index-lock retry path checks `e.code === "EEXIST"` / `EBUSY` / `EACCES` directly. The SDK's errors satisfy that contract.
+
+### Graceful degradation
+
+Transport-level failures (DO hibernation timeout, network drop, fetch reject, ECONNREFUSED) map to `MossaicUnavailableError` automatically. Consumers can soft-fail rather than seeing a raw `TypeError` or untyped error:
+
+```ts
+import { MossaicUnavailableError } from "@mossaic/sdk";
+
+try {
+  return await vfs.readFile("/important.json");
+} catch (e) {
+  if (e instanceof MossaicUnavailableError) {
+    // Mossaic is down. Soft-fail: return cached, schedule retry,
+    // serve a degraded experience.
+    return cached.fallback;
+  }
+  throw e; // application errors propagate
+}
+```
+
+The pattern detector matches: `fetch failed`, `Network connection lost`, `Durable Object hibernation timed out`, `ECONNREFUSED`, `ECONNRESET`, plus the standard fetch `TypeError`. Application-level errors (ENOENT, EEXIST, etc.) are NOT remapped — only true transport failures.
+
+## HTTP fallback (non-Worker consumers)
+
+Inside a Cloudflare Worker, prefer `createVFS(env, opts)` — it dispatches DO RPC over the binding with no network hop. From a non-Worker consumer (browser, Node server, third-party cloud), use the HTTP fallback:
+
+```ts
+// Non-Worker side (browser / Node / etc.)
+import { createMossaicHttpClient } from "@mossaic/sdk";
+
+const vfs = createMossaicHttpClient({
+  url: "https://mossaic.example.com",
+  // Token minted by the operator's Worker via issueVFSToken().
+  apiKey: process.env.MOSSAIC_VFS_TOKEN!,
+});
+
+await vfs.writeFile("/foo.txt", "hello");
+const back = await vfs.readFile("/foo.txt", { encoding: "utf8" });
+```
+
+Operator-side token issuance:
+
+```ts
+// Inside the Mossaic Worker, holding env.JWT_SECRET:
+import { issueVFSToken } from "@mossaic/sdk";
+
+const token = await issueVFSToken(env, {
+  ns: "default",
+  tenant: "acme-corp",
+  sub: "alice",
+});
+// Hand `token` to the downstream consumer. They send it as the
+// HTTP client's apiKey.
+```
+
+The HTTP client speaks the same `VFSClient` interface — same methods, same typed errors, same multi-tenant scope semantics — so consumer code is portable between binding and HTTP transports. Streaming methods (`createReadStream`, `createWriteStream`) throw `EINVAL` on the HTTP client in v1; use `openManifest` + `readChunk` for caller-orchestrated multi-invocation reads instead.
+
+## Per-tenant rate limits
+
+Each tenant DO instance runs a token-bucket limiter on the VFS RPC surface. Defaults: **100 ops/sec refill, 200 burst**. The legacy user-facing app (the `/api/upload`, `/api/download` routes) is exempt — back-compat with existing traffic.
+
+When a tenant exceeds its bucket, the next op throws `EAGAIN`:
+
+```ts
+import { EAGAIN } from "@mossaic/sdk";
+
+try {
+  await vfs.readFile("/x.txt");
+} catch (e) {
+  if (e instanceof EAGAIN) {
+    // Bucket exhausted; back off + retry.
+    await delay(100);
+    return retry();
+  }
+  throw e;
+}
+```
+
+Operators tighten or loosen per-tenant via direct SQL on the `quota` row (the columns `rate_limit_per_sec` and `rate_limit_burst` accept null to inherit defaults). Different tenants are in different DO instances entirely, so tenant A's burst doesn't affect tenant B.
 
 ---
 

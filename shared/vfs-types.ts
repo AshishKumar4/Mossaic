@@ -75,7 +75,8 @@ export type VFSErrorCode =
   | "EFBIG"
   | "ELOOP"
   | "EBUSY"
-  | "EINVAL";
+  | "EINVAL"
+  | "EAGAIN";
 
 /**
  * Error class thrown by VFS RPC methods. Workers RPC serializes the
