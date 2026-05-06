@@ -41,11 +41,29 @@ import type {
 // to work — `vfs.ts` is now the source of truth.
 export type { VFSClient } from "./vfs";
 
+/**
+ * Token provider. Either a pre-issued static Bearer token, or a callback
+ * the SDK invokes before every request. The callback form lets long-
+ * lived clients (e.g. a SPA's `getTransferClient()`) refresh the token
+ * inside the SDK without recreating the `HttpVFS` instance.
+ *
+ * The callback may return a string or a `Promise<string>`. Implementations
+ * are expected to cache and only fetch a new token near expiry; the SDK
+ * does NOT cache. A thrown / rejected callback surfaces to the caller as
+ * the originating syscall's error (typically `EACCES` after
+ * `mapServerError` on the resulting 401).
+ */
+export type ApiKeyProvider = string | (() => string | Promise<string>);
+
 export interface CreateMossaicHttpClientOptions {
   /** Base URL of the @mossaic/vfs Worker, e.g. "https://mossaic.example.com". The /api/vfs path is appended. */
   url: string;
-  /** Pre-issued VFS Bearer token (from `issueVFSToken`). The token's scope is the auth boundary. */
-  apiKey: string;
+  /**
+   * Pre-issued VFS Bearer token, or a provider callback the SDK calls
+   * before every request. Use the callback form for long-lived clients
+   * whose token rotates (e.g. the SPA's auth-bridge token).
+   */
+  apiKey: ApiKeyProvider;
   /** Optional: a fetch implementation. Defaults to globalThis.fetch. Useful for tests. */
   fetcher?: typeof fetch;
 }
@@ -63,7 +81,7 @@ export class HttpVFS implements VFSClient {
   readonly promises: HttpVFS;
   private readonly fetcher: typeof fetch;
   private readonly base: string;
-  private readonly apiKey: string;
+  private readonly apiKeyProvider: ApiKeyProvider;
 
   constructor(opts: CreateMossaicHttpClientOptions) {
     if (!opts || typeof opts.url !== "string" || opts.url.length === 0) {
@@ -72,7 +90,12 @@ export class HttpVFS implements VFSClient {
         path: "(opts.url)",
       });
     }
-    if (typeof opts.apiKey !== "string" || opts.apiKey.length === 0) {
+    if (
+      opts.apiKey === undefined ||
+      opts.apiKey === null ||
+      (typeof opts.apiKey !== "string" && typeof opts.apiKey !== "function") ||
+      (typeof opts.apiKey === "string" && opts.apiKey.length === 0)
+    ) {
       throw new EINVAL({
         syscall: "createMossaicHttpClient",
         path: "(opts.apiKey)",
@@ -80,9 +103,19 @@ export class HttpVFS implements VFSClient {
     }
     // Trim trailing slash to make path joining predictable.
     this.base = opts.url.replace(/\/$/, "");
-    this.apiKey = opts.apiKey;
+    this.apiKeyProvider = opts.apiKey;
     this.fetcher = opts.fetcher ?? fetch;
     this.promises = this;
+  }
+
+  /**
+   * Resolve the current Bearer token. Static `apiKey` returns immediately;
+   * callback `apiKey` is invoked on every request so the consumer can
+   * cache + refresh without recreating the client.
+   */
+  private async getApiKey(): Promise<string> {
+    if (typeof this.apiKeyProvider === "string") return this.apiKeyProvider;
+    return await this.apiKeyProvider();
   }
 
   // ── Wire helpers ──────────────────────────────────────────────────────
@@ -95,8 +128,9 @@ export class HttpVFS implements VFSClient {
     expect: "json" | "octet-stream"
   ): Promise<Response> {
     const url = `${this.base}/api/vfs/${method}`;
+    const apiKey = await this.getApiKey();
     const headers: Record<string, string> = {
-      Authorization: `Bearer ${this.apiKey}`,
+      Authorization: `Bearer ${apiKey}`,
     };
     let payload: BodyInit;
     if (body instanceof Uint8Array) {
@@ -243,6 +277,7 @@ export class HttpVFS implements VFSClient {
         opts.mode !== undefined ||
         opts.mimeType !== undefined);
     const url = `${this.base}/api/vfs/writeFile?path=${encodeURIComponent(p)}`;
+    const apiKey = await this.getApiKey();
     let res: Response;
     try {
       if (hasMeta) {
@@ -262,7 +297,7 @@ export class HttpVFS implements VFSClient {
         res = await this.fetcher(url, {
           method: "POST",
           headers: {
-            Authorization: `Bearer ${this.apiKey}`,
+            Authorization: `Bearer ${apiKey}`,
             // Don't set Content-Type — fetch sets multipart boundary.
           },
           body: form,
@@ -271,7 +306,7 @@ export class HttpVFS implements VFSClient {
         res = await this.fetcher(url, {
           method: "POST",
           headers: {
-            Authorization: `Bearer ${this.apiKey}`,
+            Authorization: `Bearer ${apiKey}`,
             "Content-Type": "application/octet-stream",
           },
           body: data,
@@ -434,8 +469,9 @@ export class HttpVFS implements VFSClient {
     opts?: ReadPreviewOpts
   ): Promise<ReadPreviewResult> {
     const url = `${this.base}/api/vfs/readPreview`;
+    const apiKey = await this.getApiKey();
     const headers: Record<string, string> = {
-      Authorization: `Bearer ${this.apiKey}`,
+      Authorization: `Bearer ${apiKey}`,
       "Content-Type": "application/json",
     };
     const payload = JSON.stringify({
@@ -643,10 +679,11 @@ export class HttpVFS implements VFSClient {
     signal?: AbortSignal
   ): Promise<import("../../shared/multipart").MultipartBeginResponse> {
     const url = `${this.base}/api/vfs/multipart/begin`;
+    const apiKey = await this.getApiKey();
     const res = await this.fetcher(url, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${this.apiKey}`,
+        Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify(body),
@@ -666,10 +703,11 @@ export class HttpVFS implements VFSClient {
     signal?: AbortSignal
   ): Promise<import("../../shared/multipart").MultipartPutChunkResponse> {
     const url = `${this.base}/api/vfs/multipart/${encodeURIComponent(uploadId)}/chunk/${idx}`;
+    const apiKey = await this.getApiKey();
     const res = await this.fetcher(url, {
       method: "PUT",
       headers: {
-        Authorization: `Bearer ${this.apiKey}`,
+        Authorization: `Bearer ${apiKey}`,
         "X-Session-Token": sessionToken,
         "Content-Type": "application/octet-stream",
         "Content-Length": String(bytes.byteLength),
@@ -688,10 +726,11 @@ export class HttpVFS implements VFSClient {
     chunkHashList: readonly string[]
   ): Promise<import("../../shared/multipart").MultipartFinalizeResponse> {
     const url = `${this.base}/api/vfs/multipart/finalize`;
+    const apiKey = await this.getApiKey();
     const res = await this.fetcher(url, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${this.apiKey}`,
+        Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ uploadId, chunkHashList }),
@@ -706,10 +745,11 @@ export class HttpVFS implements VFSClient {
     uploadId: string
   ): Promise<{ ok: true }> {
     const url = `${this.base}/api/vfs/multipart/abort`;
+    const apiKey = await this.getApiKey();
     const res = await this.fetcher(url, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${this.apiKey}`,
+        Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ uploadId }),
@@ -725,10 +765,11 @@ export class HttpVFS implements VFSClient {
     sessionToken: string
   ): Promise<import("../../shared/multipart").MultipartStatusResponse> {
     const url = `${this.base}/api/vfs/multipart/${encodeURIComponent(uploadId)}/status`;
+    const apiKey = await this.getApiKey();
     const res = await this.fetcher(url, {
       method: "GET",
       headers: {
-        Authorization: `Bearer ${this.apiKey}`,
+        Authorization: `Bearer ${apiKey}`,
         "X-Session-Token": sessionToken,
       },
     });
@@ -743,12 +784,13 @@ export class HttpVFS implements VFSClient {
     ttlMs?: number
   ): Promise<import("../../shared/multipart").DownloadTokenResponse> {
     const url = `${this.base}/api/vfs/multipart/download-token`;
+    const apiKey = await this.getApiKey();
     const body: { path: string; ttlMs?: number } = { path: p };
     if (ttlMs !== undefined) body.ttlMs = ttlMs;
     const res = await this.fetcher(url, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${this.apiKey}`,
+        Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify(body),
@@ -761,7 +803,7 @@ export class HttpVFS implements VFSClient {
 
   /**
    * Per-chunk read keyed by `(path, chunkIndex)`. Posts to canonical
-   * `POST /api/vfs/readChunk`; Bearer auth via `this.apiKey`.
+   * `POST /api/vfs/readChunk`; Bearer auth via `apiKey`.
    *
    * `fileId`, `hash`, and `token` are accepted in the signature for
    * forward-compatibility with a typed `/readChunkByFileId` endpoint
@@ -780,10 +822,11 @@ export class HttpVFS implements VFSClient {
     void hash;
     void token;
     const url = `${this.base}/api/vfs/readChunk`;
+    const apiKey = await this.getApiKey();
     const res = await this.fetcher(url, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${this.apiKey}`,
+        Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({

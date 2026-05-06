@@ -13,11 +13,12 @@
  * authenticated user's tenant, so cross-tenant impersonation is
  * impossible without forging the session JWT.
  *
- * The client is cached per session — `getTransferClient()` returns
- * the same instance until `resetTransferClient()` is called (e.g.
- * on logout / token refresh). The underlying VFS token is cached
- * inside `api.getVfsToken()` and refreshed automatically on
- * near-expiry.
+ * The HttpVFS instance is cached per session and resolves its Bearer
+ * token via the {@link ApiKeyProvider} callback on every request —
+ * so a long-lived client transparently rotates through multiple
+ * VFS tokens (15-min TTL each) without recreating itself.
+ * `resetTransferClient()` drops both the cached client and the
+ * underlying token cache (e.g. on logout).
  */
 
 import { createMossaicHttpClient, type HttpVFS } from "@mossaic/sdk/http";
@@ -26,33 +27,30 @@ import { api } from "./api";
 let client: HttpVFS | null = null;
 
 /**
- * Get the cached SDK HTTP client, lazily constructed against a
- * freshly-minted VFS Bearer token. Returns the same instance until
- * {@link resetTransferClient} is called.
+ * Get the cached SDK HTTP client. Construction is synchronous — the
+ * Bearer token is fetched lazily, per-request, via
+ * {@link api.getVfsToken} which itself caches with a 60-second
+ * near-expiry refresh window.
  *
- * Async because the auth-bridge requires a network round-trip to
- * mint the VFS token. Both call sites (`use-upload`, `use-download`)
- * are inside async functions so this is transparent.
- *
- * Throws if no App session JWT is set (caller must be authenticated)
- * or the auth-bridge endpoint returns an error (e.g. 503 when
- * JWT_SECRET is unset on the worker).
+ * Throws if no App session JWT is set (caller must be authenticated).
+ * Server-side 503s (e.g. JWT_SECRET unset) surface from the first SDK
+ * call as a typed `MossaicUnavailableError`.
  */
-export async function getTransferClient(): Promise<HttpVFS> {
+export function getTransferClient(): HttpVFS {
   if (!client) {
-    const vfsToken = await api.getVfsToken();
     client = createMossaicHttpClient({
       url: window.location.origin,
-      apiKey: vfsToken,
+      apiKey: () => api.getVfsToken(),
     });
   }
   return client;
 }
 
 /**
- * Drop the cached client. Call on logout, token refresh, or any
- * point where the VFS token becomes stale. The next
- * {@link getTransferClient} call re-mints.
+ * Drop the cached client. Call on logout or any point where the VFS
+ * token becomes invalid. The next {@link getTransferClient} call
+ * rebuilds and the next SDK request re-mints the token via the
+ * provider callback.
  */
 export function resetTransferClient(): void {
   client = null;

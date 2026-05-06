@@ -84,7 +84,7 @@ export function useDownload() {
 
       try {
         const bytes = await parallelDownload(
-          await getTransferClient(),
+          getTransferClient(),
           pathFromFileId(fileId),
           {
             onManifest: (m: ManifestEvent) => {
