@@ -218,6 +218,25 @@ export class ShardDO extends DurableObject<Env> {
       return { status: "deduplicated", bytesStored: 0 };
     }
 
+    // Audit C2 defense-in-depth: a 0-byte cold-path INSERT under any
+    // hash other than the well-known SHA-256 of the empty string is a
+    // strong signal that the caller passed a placeholder buffer
+    // expecting the dedup branch to short-circuit (e.g. restoreVersion
+    // when its source chunk has been swept). Rejecting the write here
+    // turns silent corruption into a loud failure that the caller can
+    // map to ENOENT.
+    //
+    // SHA-256("") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+    if (
+      data.byteLength === 0 &&
+      chunkHash !==
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    ) {
+      throw new Error(
+        `EINVAL: putChunk cold-path with empty buffer under hash ${chunkHash}; the chunk was expected to exist but has been swept`
+      );
+    }
+
     this.sql.exec(
       `INSERT INTO chunks (hash, data, size, ref_count, created_at)
        VALUES (?, ?, ?, 1, ?)`,
@@ -254,6 +273,41 @@ export class ShardDO extends DurableObject<Env> {
   async deleteChunks(fileId: string): Promise<{ marked: number }> {
     this.ensureInit();
     return this.removeFileRefs(fileId);
+  }
+
+  /**
+   * Existence + liveness probe for a set of chunk hashes (audit C2).
+   *
+   * Returns the subset of `hashes` that are present on this shard
+   * AND not soft-marked for deletion (`deleted_at IS NULL`) AND have
+   * `ref_count >= 1`. A "missing" chunk for our purposes is one where
+   * any of those conditions fail — the alarm sweeper might race the
+   * caller and hard-delete it before the caller's logic completes,
+   * but a soft-marked chunk is also unsafe to reuse (the grace window
+   * could elapse mid-operation).
+   *
+   * Used by `restoreVersion` to refuse to commit a manifest whose
+   * source chunks have been GC'd. Without this check the cold-path
+   * INSERT in `writeChunkInternal` would silently store a 0-byte chunk
+   * under the original hash and corrupt every subsequent read.
+   */
+  async chunksAlive(hashes: string[]): Promise<{ alive: string[] }> {
+    this.ensureInit();
+    if (hashes.length === 0) return { alive: [] };
+    // SQLite parameter list: bind one ? per hash. The list size is
+    // bounded by the caller (one shard's contribution to a manifest);
+    // typical manifests have dozens, not thousands, of chunks per shard.
+    const placeholders = hashes.map(() => "?").join(",");
+    const rows = this.sql
+      .exec(
+        `SELECT hash FROM chunks
+          WHERE hash IN (${placeholders})
+            AND deleted_at IS NULL
+            AND ref_count >= 1`,
+        ...hashes
+      )
+      .toArray() as { hash: string }[];
+    return { alive: rows.map((r) => r.hash) };
   }
 
   /**

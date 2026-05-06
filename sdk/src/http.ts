@@ -27,7 +27,11 @@ import { VFSStat } from "./stats";
 import { mapServerError, MossaicUnavailableError, EINVAL } from "./errors";
 import type { OpenManifestResult, VFSStatRaw } from "../../shared/vfs-types";
 import type { ReadHandle, WriteHandle } from "./streams";
-import type { VFSClient } from "./vfs";
+import type {
+  VFSClient,
+  VersionInfo,
+  DropVersionsPolicy,
+} from "./vfs";
 
 // Re-export so `import { VFSClient } from "@mossaic/sdk"` continues
 // to work — `vfs.ts` is now the source of truth.
@@ -365,6 +369,56 @@ export class HttpVFS implements VFSClient {
       "octet-stream"
     );
     return new Uint8Array(await res.arrayBuffer());
+  }
+
+  // ── Phase 9: versioning ───────────────────────────────────────────────
+  // The HTTP fallback router (worker/routes/vfs.ts) gains matching
+  // POST endpoints. Wire-shape mirrors the binding-client surface:
+  // listVersions returns VersionInfo[] with `id`; restoreVersion
+  // returns { id }; dropVersions returns { dropped, kept }.
+
+  async listVersions(
+    p: string,
+    opts?: { limit?: number }
+  ): Promise<VersionInfo[]> {
+    const res = await this.post(
+      "listVersions",
+      { path: p, limit: opts?.limit },
+      "listVersions",
+      p,
+      "json"
+    );
+    const body = (await res.json()) as { versions: VersionInfo[] };
+    return body.versions;
+  }
+
+  async restoreVersion(
+    p: string,
+    sourceVersionId: string
+  ): Promise<{ id: string }> {
+    const res = await this.post(
+      "restoreVersion",
+      { path: p, sourceVersionId },
+      "restoreVersion",
+      p,
+      "json"
+    );
+    const body = (await res.json()) as { id: string };
+    return body;
+  }
+
+  async dropVersions(
+    p: string,
+    policy: DropVersionsPolicy
+  ): Promise<{ dropped: number; kept: number }> {
+    const res = await this.post(
+      "dropVersions",
+      { path: p, policy },
+      "dropVersions",
+      p,
+      "json"
+    );
+    return (await res.json()) as { dropped: number; kept: number };
   }
 }
 

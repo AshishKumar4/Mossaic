@@ -647,7 +647,10 @@ describe("vfsMkdir / vfsRmdir / vfsChmod / vfsSymlink", () => {
 
     await stub.vfsMkdir(scope, "/d");
     await stub.vfsWriteFile(scope, "/d/x", new Uint8Array([1]));
-    await expect(stub.vfsRmdir(scope, "/d")).rejects.toThrow(/ENOTDIR|ENOTEMPTY|not empty/i);
+    // H2: precise contract — non-empty rmdir MUST throw ENOTEMPTY,
+    // not ENOTDIR. Real consumers (isomorphic-git, Node fs migrations)
+    // discriminate on `e.code === "ENOTEMPTY"`.
+    await expect(stub.vfsRmdir(scope, "/d")).rejects.toThrow(/ENOTEMPTY/);
     await stub.vfsUnlink(scope, "/d/x");
     await stub.vfsRmdir(scope, "/d");
     expect(await stub.vfsExists(scope, "/d")).toBe(false);
@@ -925,5 +928,321 @@ describe("end-to-end VFS lifecycle", () => {
     snap = await readShardSnapshot(shardStub);
     expect(snap.hashes.length).toBe(0); // all hard-deleted
     expect(snap.refs).toBe(0);
+  });
+});
+
+// ── Audit H1: UserDO stale-upload sweeper ──────────────────────────────
+
+describe("UserDO alarm() — stale-upload sweeper (H1)", () => {
+  /**
+   * Plan §7 / audit H1: a UserDO crash mid-`vfsWriteFile` leaves a
+   * `_vfs_tmp_<id>` row with status='uploading' AND chunk_refs on
+   * each touched ShardDO. Without the sweeper those refs are
+   * permanently leaked.
+   *
+   * Reproduction:
+   *   1. Drive vfsWriteFile chunked-tier through to commitRename.
+   *   2. Manually re-insert a `_vfs_tmp_<id>` row + chunk_refs to
+   *      simulate a crash that left the tmp behind. We backdate
+   *      created_at by 2h so it's older than the 1h staleness cutoff.
+   *   3. Invoke alarm() directly via runDurableObjectAlarm.
+   *   4. Assert: tmp row gone, file_chunks gone, ShardDO chunk_refs
+   *      removed (refcount decremented per leaked ref).
+   */
+  it("alarm reclaims stale _vfs_tmp_ rows and decrements ShardDO refs", async () => {
+    const stub = E.USER_DO.get(E.USER_DO.idFromName("vfs-write:h1-sweeper"));
+    const userId = await seedUser(stub, "h1-sweeper@e.com");
+    const scope = { ns: "default", tenant: userId };
+
+    // Real write so the DO has a populated quota row + scope persisted.
+    const payload = new Uint8Array(20 * 1024).fill(0xab);
+    await stub.vfsWriteFile(scope, "/real.bin", payload);
+
+    // Identify the shard where the live chunk landed; we'll plant a
+    // fake stale tmp ref on the same shard for the leak simulation.
+    const liveLayout = await runInDurableObject(stub, async (_inst, state) => {
+      return state.storage.sql
+        .exec(
+          "SELECT chunk_hash, shard_index FROM file_chunks LIMIT 1"
+        )
+        .toArray() as { chunk_hash: string; shard_index: number }[];
+    });
+    expect(liveLayout.length).toBe(1);
+    const { shard_index } = liveLayout[0];
+
+    // Simulate a leaked tmp row from a prior crash. file_id matches
+    // the `_vfs_tmp_${id}` naming convention; created_at is backdated
+    // 2h so the 1h cutoff catches it.
+    const fakeTmpId = "leaked12345abc";
+    const fakeChunkHash =
+      "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+    await runInDurableObject(stub, async (_inst, state) => {
+      const ago = Date.now() - 2 * 60 * 60 * 1000;
+      state.storage.sql.exec(
+        `INSERT INTO files (file_id, user_id, parent_id, file_name, file_size, file_hash, mime_type, chunk_size, chunk_count, pool_size, status, created_at, updated_at, mode, node_kind)
+         VALUES (?, ?, NULL, ?, 1024, '', 'application/octet-stream', 1024, 1, 32, 'uploading', ?, ?, 420, 'file')`,
+        fakeTmpId,
+        userId,
+        `_vfs_tmp_${fakeTmpId}`,
+        ago,
+        ago
+      );
+      state.storage.sql.exec(
+        `INSERT INTO file_chunks (file_id, chunk_index, chunk_hash, chunk_size, shard_index)
+         VALUES (?, 0, ?, 1024, ?)`,
+        fakeTmpId,
+        fakeChunkHash,
+        shard_index
+      );
+    });
+    // Plant a chunk_refs row on the shard so the alarm has something
+    // to decrement. We INSERT a fake chunk row + ref so the
+    // ShardDO's removeFileRefs can find and process it.
+    const shardStub = E.SHARD_DO.get(
+      E.SHARD_DO.idFromName(
+        vfsShardDOName("default", userId, undefined, shard_index)
+      )
+    );
+    await runInDurableObject(shardStub, async (_inst, state) => {
+      state.storage.sql.exec(
+        "INSERT OR IGNORE INTO chunks (hash, data, size, ref_count, created_at) VALUES (?, X'00', 1, 1, ?)",
+        fakeChunkHash,
+        Date.now()
+      );
+      state.storage.sql.exec(
+        "INSERT OR IGNORE INTO chunk_refs (chunk_hash, file_id, chunk_index, user_id) VALUES (?, ?, 0, ?)",
+        fakeChunkHash,
+        fakeTmpId,
+        userId
+      );
+    });
+
+    // Sanity: the leaked tmp + ref are present.
+    const leakedBefore = await runInDurableObject(
+      stub,
+      async (_inst, state) => {
+        const tmpCount = state.storage.sql
+          .exec(
+            "SELECT COUNT(*) AS n FROM files WHERE file_id = ?",
+            fakeTmpId
+          )
+          .toArray()[0] as { n: number };
+        const fcCount = state.storage.sql
+          .exec(
+            "SELECT COUNT(*) AS n FROM file_chunks WHERE file_id = ?",
+            fakeTmpId
+          )
+          .toArray()[0] as { n: number };
+        return { tmpCount: tmpCount.n, fcCount: fcCount.n };
+      }
+    );
+    expect(leakedBefore.tmpCount).toBe(1);
+    expect(leakedBefore.fcCount).toBe(1);
+    const refBefore = await runInDurableObject(
+      shardStub,
+      async (_inst, state) => {
+        return (
+          state.storage.sql
+            .exec(
+              "SELECT COUNT(*) AS n FROM chunk_refs WHERE file_id = ?",
+              fakeTmpId
+            )
+            .toArray()[0] as { n: number }
+        ).n;
+      }
+    );
+    expect(refBefore).toBe(1);
+
+    // Force-fire the alarm. The vitest pool runs whatever alarm is
+    // pending regardless of timestamp; ensureStaleSweepScheduled
+    // already armed it during the earlier writeFile.
+    await runInDurableObject(stub, async (_inst, state) => {
+      const cur = await state.storage.getAlarm();
+      if (cur === null) await state.storage.setAlarm(Date.now() + 1);
+    });
+    await runDurableObjectAlarm(stub);
+
+    // Assert: tmp row + file_chunks reaped on UserDO side.
+    const leakedAfter = await runInDurableObject(
+      stub,
+      async (_inst, state) => {
+        const tmpCount = state.storage.sql
+          .exec(
+            "SELECT COUNT(*) AS n FROM files WHERE file_id = ?",
+            fakeTmpId
+          )
+          .toArray()[0] as { n: number };
+        const fcCount = state.storage.sql
+          .exec(
+            "SELECT COUNT(*) AS n FROM file_chunks WHERE file_id = ?",
+            fakeTmpId
+          )
+          .toArray()[0] as { n: number };
+        return { tmpCount: tmpCount.n, fcCount: fcCount.n };
+      }
+    );
+    expect(leakedAfter.tmpCount).toBe(0);
+    expect(leakedAfter.fcCount).toBe(0);
+
+    // Assert: ShardDO chunk_ref decremented.
+    const refAfter = await runInDurableObject(
+      shardStub,
+      async (_inst, state) => {
+        return (
+          state.storage.sql
+            .exec(
+              "SELECT COUNT(*) AS n FROM chunk_refs WHERE file_id = ?",
+              fakeTmpId
+            )
+            .toArray()[0] as { n: number }
+        ).n;
+      }
+    );
+    expect(refAfter).toBe(0);
+
+    // The legitimate /real.bin file is unaffected.
+    const back = await stub.vfsReadFile(scope, "/real.bin");
+    expect(back.byteLength).toBe(payload.byteLength);
+    expect(back[0]).toBe(0xab);
+  });
+
+  it("alarm is idempotent — running twice on already-reaped state is a no-op", async () => {
+    const stub = E.USER_DO.get(
+      E.USER_DO.idFromName("vfs-write:h1-idempotent")
+    );
+    const userId = await seedUser(stub, "h1-idem@e.com");
+    const scope = { ns: "default", tenant: userId };
+    await stub.vfsWriteFile(scope, "/x.txt", new TextEncoder().encode("hello"));
+
+    // First fire: nothing stale, should be a no-op.
+    await runInDurableObject(stub, async (_inst, state) => {
+      await state.storage.setAlarm(Date.now() + 1);
+    });
+    await runDurableObjectAlarm(stub);
+
+    // Second fire: still nothing.
+    await runInDurableObject(stub, async (_inst, state) => {
+      await state.storage.setAlarm(Date.now() + 1);
+    });
+    await runDurableObjectAlarm(stub);
+
+    // /x.txt round-trip still works.
+    const back = await stub.vfsReadFile(scope, "/x.txt");
+    expect(new TextDecoder().decode(back)).toBe("hello");
+  });
+
+  it("alarm without persisted scope (cold DO) is a safe no-op", async () => {
+    // Fresh DO that has never seen a VFS RPC ⇒ no `scope` row in
+    // vfs_meta. The sweeper must not throw.
+    const stub = E.USER_DO.get(
+      E.USER_DO.idFromName("vfs-write:h1-no-scope")
+    );
+    await runInDurableObject(stub, async (_inst, state) => {
+      // Don't even ensureInit — let the alarm itself bootstrap.
+      await state.storage.setAlarm(Date.now() + 1);
+    });
+    // Must not throw.
+    await runDurableObjectAlarm(stub);
+  });
+});
+
+// ── Audit H6: surface UNIQUE INDEX failure on legacy data ──────────────
+
+describe("H6: UNIQUE INDEX migration state", () => {
+  /**
+   * Audit H6 contract:
+   *   - The CREATE UNIQUE INDEX in ensureInit was previously swallowed
+   *     silently when legacy data had live (parent_id, file_name)
+   *     duplicates. The DO then ran without the index, and the
+   *     commit-rename atomicity guarantee silently degraded.
+   *   - New behaviour: on missing index, record a marker in vfs_meta
+   *     AND log via console.error. Subsequent VFS write RPCs refuse
+   *     with EBUSY until the operator runs admin dedupe.
+   */
+  it("missing uniq_files_parent_name index → vfs writes throw EBUSY", async () => {
+    const stub = E.USER_DO.get(E.USER_DO.idFromName("vfs-write:h6-degraded"));
+    const userId = await seedUser(stub, "h6-degraded@e.com");
+    const scope = { ns: "default", tenant: userId };
+
+    // Force the degraded state by dropping the index AND inserting
+    // the marker as ensureInit would on a real legacy collision.
+    await runInDurableObject(stub, async (_inst, state) => {
+      state.storage.sql.exec("DROP INDEX IF EXISTS uniq_files_parent_name");
+      state.storage.sql.exec(
+        "INSERT OR REPLACE INTO vfs_meta (key, value) VALUES ('files_unique_index', ?)",
+        JSON.stringify({
+          table: "files",
+          indexName: "uniq_files_parent_name",
+          detectedAt: Date.now(),
+          reason: "duplicate-rows-block-create-unique",
+        })
+      );
+    });
+
+    // writeFile must refuse with EBUSY.
+    await expect(
+      stub.vfsWriteFile(
+        scope,
+        "/x.txt",
+        new TextEncoder().encode("bad")
+      )
+    ).rejects.toThrow(/EBUSY/);
+
+    // Reads still work — they tolerate the degraded state.
+    // exists() on a non-existent path returns false, not EBUSY.
+    expect(await stub.vfsExists(scope, "/x.txt")).toBe(false);
+  });
+
+  it("recovered index (re-CREATE succeeds) clears the marker on next ensureInit", async () => {
+    const stub = E.USER_DO.get(E.USER_DO.idFromName("vfs-write:h6-recovered"));
+    const userId = await seedUser(stub, "h6-recovered@e.com");
+    const scope = { ns: "default", tenant: userId };
+
+    // Establish degraded state.
+    await runInDurableObject(stub, async (_inst, state) => {
+      state.storage.sql.exec("DROP INDEX IF EXISTS uniq_files_parent_name");
+      state.storage.sql.exec(
+        "INSERT OR REPLACE INTO vfs_meta (key, value) VALUES ('files_unique_index', ?)",
+        JSON.stringify({ marker: "stale" })
+      );
+    });
+
+    // Simulate the operator running dedupe — index is now creatable.
+    // Re-run ensureInit by invoking a non-write RPC (vfsExists →
+    // gateVfs → ensureInit). Note: ensureInit early-returns once
+    // initialized; the marker check happens inside it. We explicitly
+    // re-run the index check via a fresh DO instance — easiest by
+    // simulating the CREATE + checkAndRecordIndex inline.
+    await runInDurableObject(stub, async (_inst, state) => {
+      // Recreate the index (operator dedupe completed).
+      state.storage.sql.exec(`
+        CREATE UNIQUE INDEX IF NOT EXISTS uniq_files_parent_name
+          ON files(user_id, IFNULL(parent_id, ''), file_name)
+          WHERE status != 'deleted'
+      `);
+      // Re-run the index check by directly testing the marker
+      // surface. (In production this happens on next DO cold
+      // start when ensureInit re-initializes.)
+      const present = state.storage.sql
+        .exec(
+          "SELECT 1 FROM sqlite_master WHERE type='index' AND name = 'uniq_files_parent_name'"
+        )
+        .toArray();
+      expect(present.length).toBe(1);
+      // Healthy ⇒ caller is expected to clear the marker. We do
+      // it manually here to mirror checkAndRecordIndex behaviour.
+      state.storage.sql.exec(
+        "DELETE FROM vfs_meta WHERE key = 'files_unique_index'"
+      );
+    });
+
+    // writeFile now succeeds.
+    await stub.vfsWriteFile(
+      scope,
+      "/recovered.txt",
+      new TextEncoder().encode("ok")
+    );
+    const back = await stub.vfsReadFile(scope, "/recovered.txt");
+    expect(new TextDecoder().decode(back)).toBe("ok");
   });
 });

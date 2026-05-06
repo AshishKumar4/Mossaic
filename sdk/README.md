@@ -136,7 +136,7 @@ This is **one** outbound DO RPC regardless of how many paths you batch.
 
 ## Streaming for large files
 
-The default `readFile` / `writeFile` cap at **500 MB** (configurable). Above that, use the streaming API:
+The default `readFile` / `writeFile` cap at **100 MB** (configurable). Above that, use the streaming API:
 
 ```ts
 // Read: ReadableStream<Uint8Array>, memory-bounded to one chunk
@@ -262,6 +262,112 @@ const token = await issueVFSToken(env, {
 The verifier strictly requires `scope === "vfs"`. Legacy login JWTs (with `email` claim, no `scope`) are rejected; VFS tokens are rejected by the legacy verifier. The two surfaces never cross-pollute even though both share `JWT_SECRET`.
 
 ---
+
+## File-level versioning (S3-style, opt-in)
+
+Per-tenant versioning is **opt-in** and **off by default** — when off, behavior is byte-equivalent to a non-versioning Mossaic deployment. When on, every `writeFile` and `unlink` creates a historical version row; `readFile` resolves the head; explicit version IDs read history; and a retention API keeps storage bounded.
+
+Enable per call:
+
+```ts
+const vfs = createVFS(env, { tenant: "acme-corp", versioning: "enabled" });
+
+await vfs.writeFile("/notes.md", "v1");
+await vfs.writeFile("/notes.md", "v2");
+await vfs.writeFile("/notes.md", "v3");
+
+// Head reads the newest non-tombstoned version.
+await vfs.readFile("/notes.md", { encoding: "utf8" }); // → "v3"
+
+// listVersions: newest-first; tombstones included with deleted=true.
+const versions = await vfs.listVersions("/notes.md");
+// [
+//   { id: "01J...c", mtimeMs: 1735689600100, size: 2, mode: 420, deleted: false },
+//   { id: "01J...b", mtimeMs: 1735689600050, size: 2, mode: 420, deleted: false },
+//   { id: "01J...a", mtimeMs: 1735689600000, size: 2, mode: 420, deleted: false },
+// ]
+
+// Read a specific historical version.
+const v1 = await vfs.readFile("/notes.md", {
+  version: versions[2].id,
+  encoding: "utf8",
+});
+// v1 === "v1"
+```
+
+### Tombstones
+
+`unlink` writes a tombstone version (deleted: true, no chunks) instead of hard-deleting:
+
+```ts
+await vfs.unlink("/notes.md");
+
+await vfs.exists("/notes.md");                       // → false
+await vfs.readFile("/notes.md");                     // → throws ENOENT
+await vfs.listVersions("/notes.md");                 // ← still returns full history
+                                                     //   (newest is the tombstone)
+```
+
+The previous content's chunks are NOT decremented; they remain reachable via the historical version IDs until you explicitly drop them. This matches S3's delete-marker semantics.
+
+### Restoring a version
+
+`restoreVersion(path, sourceId)` creates a NEW version row whose content matches the source (chunks dedupe automatically — no bytes re-uploaded):
+
+```ts
+const versions = await vfs.listVersions("/notes.md");
+const v1 = versions.find(v => !v.deleted)!;          // pick a live source
+const { id: newId } = await vfs.restoreVersion("/notes.md", v1.id);
+
+await vfs.readFile("/notes.md", { encoding: "utf8" }); // → v1's content
+```
+
+The restore is a copy, not a pointer — the source version remains in the history list, and the new version becomes the head. Restoring a tombstone is rejected with `EINVAL`.
+
+### Retention via dropVersions
+
+`dropVersions(path, policy)` reaps versions per a retention policy. The current head is always preserved (S3 invariant — you can't accidentally delete the live content via retention):
+
+```ts
+// Keep the head + 9 newest. Drop everything older.
+await vfs.dropVersions("/notes.md", { keepLast: 9 });
+
+// Drop versions older than a cutoff (ms epoch).
+await vfs.dropVersions("/notes.md", { olderThan: Date.now() - 30 * 86400_000 });
+
+// Combine: keep head + 5 newest + an explicit allowlist.
+await vfs.dropVersions("/notes.md", {
+  keepLast: 5,
+  exceptVersions: ["01J...important", "01J...also-important"],
+});
+
+// Drop everything except the head.
+await vfs.dropVersions("/notes.md", {});
+```
+
+Returns `{ dropped, kept }`. Chunks whose last reference was dropped become eligible for the Phase 3 alarm sweeper after its 30s grace.
+
+### Cross-version dedup
+
+Identical content across versions costs storage exactly once. Two writes of the same payload land on the same content-addressed shard, hit the dedup branch, and share a single chunk row whose `ref_count` equals the number of versions referencing it:
+
+```ts
+const payload = new Uint8Array(20 * 1024).fill(0xab);
+await vfs.writeFile("/big.bin", payload);            // chunk stored: ref=1
+await vfs.writeFile("/big.bin", payload);            // dedup hit:    ref=2
+await vfs.writeFile("/big.bin", payload);            // dedup hit:    ref=3
+
+// Storage cost: ONE chunk, three version rows pointing at it.
+// dropVersions({ keepLast: 1 }) → ref=1, two chunk_refs decremented.
+```
+
+### Mossaic vs Cloudflare Artifacts (versioning vs Git)
+
+Mossaic's versioning is **per-file** and **flat**: every overwrite creates a new immutable version_id; you can list, restore, and drop them. There are no branches, no commit graph, no merge resolution. It's the right fit for object-storage workloads (photos, datasets, attachments, ML weights) where users want "go back to yesterday's file" without buying into Git semantics.
+
+Cloudflare Artifacts is **per-tree** and **versioned-as-Git**: every commit is a snapshot of the entire tree, branches and tags name commit graphs, and Git-protocol clients clone/push/pull. It's the right fit for source-shaped workloads where the consumer wants real Git semantics + Git tooling integration.
+
+The two products **compose**. A Worker can hold both bindings: Artifacts for source repos, Mossaic for blob storage with per-file history. Use whichever shape matches the data.
 
 ## Subrequest model
 
@@ -475,10 +581,10 @@ Most behaviour is sensible-default. Knobs you can turn:
 
 | Knob | Default | Where |
 |---|---|---|
-| `READFILE_MAX` | 500 MB | `shared/inline.ts` constant; deployment-time |
-| `WRITEFILE_MAX` | 500 MB | `shared/inline.ts` constant; deployment-time |
+| `READFILE_MAX` | 100 MB | `shared/inline.ts` constant; deployment-time. Lowered from 500 MB per audit H7 — Worker soft memory is ~128 MB and `readFile` allocates the full buffer before chunk fetches. |
+| `WRITEFILE_MAX` | 100 MB | `shared/inline.ts` constant; deployment-time. Same rationale as `READFILE_MAX`. |
 | `INLINE_LIMIT`  | 16 KB  | `shared/inline.ts` constant; raise to ≤2 MB if you store many slightly-larger small files (note SQLite BLOB row cap) |
-| `JWT_SECRET`    | required | `wrangler secret put JWT_SECRET` in production |
+| `JWT_SECRET`    | **required, no fallback** | `wrangler secret put JWT_SECRET` in production. There is **no** dev fallback string in the source. Any `/api/auth/*` or `/api/vfs/*` request on a deploy without this secret returns 503 (`VFSConfigError`); the legacy `/api/upload`/`/api/download` and SPA assets remain available. Set the secret BEFORE routing real traffic. |
 
 The SDK does not currently expose these as runtime options on `createVFS`; they're per-deployment compile-time constants. Override by patching `shared/inline.ts` and rebuilding.
 

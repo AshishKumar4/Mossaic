@@ -52,6 +52,11 @@ export interface VFSClient {
   // Reads
   readFile(p: string): Promise<Uint8Array>;
   readFile(p: string, opts: { encoding: "utf8" }): Promise<string>;
+  readFile(p: string, opts: { version: string }): Promise<Uint8Array>;
+  readFile(
+    p: string,
+    opts: { version: string; encoding: "utf8" }
+  ): Promise<string>;
   readdir(p: string): Promise<string[]>;
   stat(p: string): Promise<VFSStat>;
   lstat(p: string): Promise<VFSStat>;
@@ -102,6 +107,20 @@ export interface VFSClient {
     chunkIndex: number,
     range?: { start?: number; end?: number }
   ): Promise<Uint8Array>;
+
+  // Phase 9: file-level versioning (only meaningful when the tenant
+  // has versioning enabled; the binding client surfaces these methods
+  // on every VFS instance for type-stability, but they throw ENOENT
+  // / EINVAL on tenants without versioning).
+  listVersions(
+    p: string,
+    opts?: { limit?: number }
+  ): Promise<VersionInfo[]>;
+  restoreVersion(p: string, sourceVersionId: string): Promise<{ id: string }>;
+  dropVersions(
+    p: string,
+    policy: DropVersionsPolicy
+  ): Promise<{ dropped: number; kept: number }>;
 }
 
 /**
@@ -121,7 +140,11 @@ export interface UserDOClient {
     scope: VFSScope,
     paths: string[]
   ): Promise<(VFSStatRaw | null)[]>;
-  vfsReadFile(scope: VFSScope, path: string): Promise<Uint8Array>;
+  vfsReadFile(
+    scope: VFSScope,
+    path: string,
+    opts?: { versionId?: string }
+  ): Promise<Uint8Array>;
   vfsWriteFile(
     scope: VFSScope,
     path: string,
@@ -180,6 +203,38 @@ export interface UserDOClient {
     chunkIndex: number,
     range?: { start?: number; end?: number }
   ): Promise<Uint8Array>;
+
+  // Phase 9: versioning RPCs. The wire shape uses `versionId`
+  // (server-side VersionRow) — the VFS class maps to the public
+  // `VersionInfo` shape with `id` for ergonomic Node-style.
+  vfsListVersions(
+    scope: VFSScope,
+    path: string,
+    opts?: { limit?: number }
+  ): Promise<
+    Array<{
+      versionId: string;
+      mtimeMs: number;
+      size: number;
+      mode: number;
+      deleted: boolean;
+    }>
+  >;
+  vfsRestoreVersion(
+    scope: VFSScope,
+    path: string,
+    sourceVersionId: string
+  ): Promise<{ versionId: string }>;
+  vfsDropVersions(
+    scope: VFSScope,
+    path: string,
+    policy: DropVersionsPolicy
+  ): Promise<{ dropped: number; kept: number }>;
+  adminSetVersioning(
+    userId: string,
+    enabled: boolean
+  ): Promise<{ enabled: boolean }>;
+  adminGetVersioning(userId: string): Promise<{ enabled: boolean }>;
 }
 
 /**
@@ -213,6 +268,62 @@ export interface CreateVFSOptions {
   tenant: string;
   /** Optional sub-tenant id. */
   sub?: string;
+  /**
+   * Phase 9: opt-in S3-style versioning. When `'enabled'`, every
+   * writeFile creates a new historical version (chunks dedupe via
+   * content-addressing); unlink writes a tombstone version
+   * (chunks NOT decremented). The default `'disabled'` is
+   * byte-equivalent to Phase 8 — no version rows touched, no head
+   * pointer used.
+   *
+   * The flag is also stored server-side per tenant; the SDK option
+   * here serves two purposes:
+   *   1. Auto-enable on first use (the SDK calls
+   *      adminSetVersioning(userId, true) lazily before the first
+   *      write when the option is 'enabled').
+   *   2. Surface listVersions / readFile-by-version /
+   *      restoreVersion / dropVersions on the VFS instance only
+   *      when the consumer signaled intent.
+   *
+   * Operators can also flip the server-side flag manually via
+   * stub.adminSetVersioning(userId, true).
+   */
+  versioning?: "enabled" | "disabled";
+}
+
+/**
+ * Phase 9: shape of a row returned by `vfs.listVersions(path)`.
+ * Newest-first iteration order.
+ */
+export interface VersionInfo {
+  /** Server-issued version_id (ULID-like). */
+  id: string;
+  /** Modification time (ms since epoch) — also the sort key. */
+  mtimeMs: number;
+  /** Bytes in this version (0 for tombstones). */
+  size: number;
+  /** POSIX mode bits (0 for tombstones). */
+  mode: number;
+  /** True iff this version is a tombstone (an unlink mark). */
+  deleted: boolean;
+}
+
+/**
+ * Phase 9: retention-policy parameters for `vfs.dropVersions(path, policy)`.
+ *
+ * The CURRENT head version is ALWAYS preserved, regardless of filters
+ * (S3 invariant). Surviving versions = (head) ∪ (exceptVersions) ∪
+ * (newest `keepLast`) ∪ (versions not older than `olderThan`).
+ *
+ * Pass an empty policy `{}` to drop everything except the head.
+ */
+export interface DropVersionsPolicy {
+  /** ms-since-epoch cutoff: keep versions with mtimeMs ≥ olderThan. */
+  olderThan?: number;
+  /** Keep the N newest versions (in addition to the head). */
+  keepLast?: number;
+  /** Explicit allowlist of version_ids to preserve. */
+  exceptVersions?: string[];
 }
 
 import { vfsUserDOName } from "../../worker/lib/utils";
@@ -234,6 +345,17 @@ export class VFS implements VFSClient {
    */
   readonly promises: VFS;
 
+  /**
+   * Phase 9: auto-enable-versioning latch. The first write or
+   * versioning-related call on a VFS instance with
+   * `versioning: 'enabled'` triggers a one-shot
+   * `adminSetVersioning(userId, true)` server call. Subsequent
+   * calls skip the round-trip thanks to this flag. The latch is
+   * idempotent — flipping it on a tenant that's already enabled
+   * is a no-op server-side.
+   */
+  private versioningLatched = false;
+
   constructor(
     private readonly env: MossaicEnv,
     private readonly opts: CreateVFSOptions
@@ -249,6 +371,25 @@ export class VFS implements VFSClient {
       });
     }
     this.promises = this;
+  }
+
+  /**
+   * If the consumer constructed with `versioning: 'enabled'`, ensure
+   * the server-side flag is on before issuing the actual operation.
+   * Skipped after the first successful latch.
+   */
+  private async ensureVersioning(): Promise<void> {
+    if (this.versioningLatched) return;
+    if (this.opts.versioning !== "enabled") return;
+    const userId = this.opts.sub
+      ? `${this.opts.tenant}::${this.opts.sub}`
+      : this.opts.tenant;
+    try {
+      await this.user().adminSetVersioning(userId, true);
+      this.versioningLatched = true;
+    } catch (err) {
+      throw mapServerError(err, { syscall: "adminSetVersioning" });
+    }
   }
 
   // ── DO stub resolution ────────────────────────────────────────────────
@@ -278,13 +419,22 @@ export class VFS implements VFSClient {
 
   async readFile(p: string): Promise<Uint8Array>;
   async readFile(p: string, opts: { encoding: "utf8" }): Promise<string>;
+  async readFile(p: string, opts: { version: string }): Promise<Uint8Array>;
   async readFile(
     p: string,
-    opts?: { encoding?: "utf8" }
+    opts: { version: string; encoding: "utf8" }
+  ): Promise<string>;
+  async readFile(
+    p: string,
+    opts?: { encoding?: "utf8"; version?: string }
   ): Promise<Uint8Array | string> {
     let buf: Uint8Array;
     try {
-      buf = await this.user().vfsReadFile(this.scope(), p);
+      buf = await this.user().vfsReadFile(
+        this.scope(),
+        p,
+        opts?.version ? { versionId: opts.version } : undefined
+      );
     } catch (err) {
       throw mapServerError(err, { path: p, syscall: "open" });
     }
@@ -350,6 +500,7 @@ export class VFS implements VFSClient {
     data: Uint8Array | string,
     opts?: { mode?: number; mimeType?: string }
   ): Promise<void> {
+    await this.ensureVersioning();
     const bytes =
       typeof data === "string" ? new TextEncoder().encode(data) : data;
     try {
@@ -360,6 +511,7 @@ export class VFS implements VFSClient {
   }
 
   async unlink(p: string): Promise<void> {
+    await this.ensureVersioning();
     try {
       await this.user().vfsUnlink(this.scope(), p);
     } catch (err) {
@@ -493,6 +645,70 @@ export class VFS implements VFSClient {
       );
     } catch (err) {
       throw mapServerError(err, { syscall: "read" });
+    }
+  }
+
+  // ── Phase 9: file-level versioning ────────────────────────────────────
+
+  /**
+   * List historical versions of a path, newest-first. Includes
+   * tombstones (deleted=true). Backed by the
+   * idx_file_versions_path_mtime index — sub-millisecond at 10k
+   * versions per path.
+   */
+  async listVersions(
+    p: string,
+    opts?: { limit?: number }
+  ): Promise<VersionInfo[]> {
+    try {
+      const rows = await this.user().vfsListVersions(this.scope(), p, opts);
+      return rows.map((r) => ({
+        id: r.versionId,
+        mtimeMs: r.mtimeMs,
+        size: r.size,
+        mode: r.mode,
+        deleted: r.deleted,
+      }));
+    } catch (err) {
+      throw mapServerError(err, { path: p, syscall: "listVersions" });
+    }
+  }
+
+  /**
+   * Restore a historical version: creates a NEW version row whose
+   * content is a copy of the source. Source must not be a
+   * tombstone. Returns the new version's id.
+   */
+  async restoreVersion(
+    p: string,
+    sourceVersionId: string
+  ): Promise<{ id: string }> {
+    await this.ensureVersioning();
+    try {
+      const r = await this.user().vfsRestoreVersion(
+        this.scope(),
+        p,
+        sourceVersionId
+      );
+      return { id: r.versionId };
+    } catch (err) {
+      throw mapServerError(err, { path: p, syscall: "restoreVersion" });
+    }
+  }
+
+  /**
+   * Drop versions per a retention policy. Head version is always
+   * preserved. Chunks whose last reference was dropped are reaped
+   * by the Phase 3 alarm sweeper after its 30s grace.
+   */
+  async dropVersions(
+    p: string,
+    policy: DropVersionsPolicy
+  ): Promise<{ dropped: number; kept: number }> {
+    try {
+      return await this.user().vfsDropVersions(this.scope(), p, policy);
+    } catch (err) {
+      throw mapServerError(err, { path: p, syscall: "dropVersions" });
     }
   }
 }

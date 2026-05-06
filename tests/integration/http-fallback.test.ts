@@ -144,8 +144,7 @@ describe("HTTP fallback round-trip via /api/vfs", () => {
     await vfs.writeFile("/work/sub/x.txt", "x");
     await vfs.writeFile("/work/y.txt", "y");
 
-    // rmdir on non-empty → ENOTDIR (mossaic surfaces this code; some
-    // POSIX systems use ENOTEMPTY).
+    // rmdir on non-empty → ENOTEMPTY (audit H2 fix; matches POSIX).
     let caught: VFSFsError | null = null;
     try {
       await vfs.rmdir("/work");
@@ -153,6 +152,7 @@ describe("HTTP fallback round-trip via /api/vfs", () => {
       caught = e as VFSFsError;
     }
     expect(caught).toBeInstanceOf(VFSFsError);
+    expect(caught?.code).toBe("ENOTEMPTY");
 
     await vfs.removeRecursive("/work");
     expect(await vfs.exists("/work")).toBe(false);

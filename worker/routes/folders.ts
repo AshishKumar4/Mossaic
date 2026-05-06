@@ -61,7 +61,11 @@ folders.get("/:folderId", async (c) => {
     new Request(`http://internal/folders/path/${folderId}`)
   );
 
-  const contents = await res.json();
+  // Type the JSON shapes — `Response.json()` is typed `unknown`/`any`
+  // depending on the platform's lib; `tsc -b` rejects spreading an
+  // unknown into an object literal. The DO returns the listFiles+folders
+  // tuple at this path; only the union shape matters for the client.
+  const contents = (await res.json()) as Record<string, unknown>;
   const path = await pathRes.json();
 
   return c.json({ ...contents, path });

@@ -14,6 +14,12 @@ import { hashChunk } from "@shared/crypto";
 import { computeChunkSpec } from "@shared/chunking";
 import { placeChunk } from "@shared/placement";
 import { generateId, vfsShardDOName } from "../../lib/utils";
+import {
+  commitVersion,
+  isVersioningEnabled,
+  placeChunkForVersion,
+  shardRefId,
+} from "./vfs-versions";
 import { resolvePath, resolvePathFollow } from "./path-walk";
 
 /**
@@ -201,9 +207,56 @@ function statForResolved(
       ino: inoFromId(row.file_id),
     };
   }
-  // Regular file. If inlined, size still reflects file_size (which equals
-  // inline_data byteLength by construction in the future Phase 3 write
-  // path; for legacy / non-inlined rows it's the chunked total).
+  // Phase 9: if a head_version_id exists, the truth-of-record is in
+  // file_versions, not in `files`. We consult the head version row
+  // for size/mode/mtime AND tombstone status. If the head is a
+  // tombstone, the path appears ENOENT — same semantics as readFile.
+  const headRow = durableObject.sql
+    .exec(
+      "SELECT head_version_id FROM files WHERE file_id=? AND user_id=?",
+      row.file_id,
+      userId
+    )
+    .toArray()[0] as { head_version_id: string | null } | undefined;
+  if (headRow?.head_version_id) {
+    const head = durableObject.sql
+      .exec(
+        `SELECT version_id, size, mode, mtime_ms, deleted, inline_data
+           FROM file_versions WHERE path_id=? AND version_id=?`,
+        row.file_id,
+        headRow.head_version_id
+      )
+      .toArray()[0] as
+      | {
+          version_id: string;
+          size: number;
+          mode: number;
+          mtime_ms: number;
+          deleted: number;
+          inline_data: ArrayBuffer | null;
+        }
+      | undefined;
+    if (head) {
+      if (head.deleted === 1) {
+        throw new VFSError("ENOENT", "stat: head version is a tombstone");
+      }
+      const vsize = head.inline_data ? head.inline_data.byteLength : head.size;
+      return {
+        type: "file",
+        mode: head.mode,
+        size: vsize,
+        mtimeMs: head.mtime_ms,
+        uid,
+        gid,
+        ino: inoFromId(row.file_id),
+      };
+    }
+  }
+
+  // Regular file (Phase 8 path). If inlined, size still reflects
+  // file_size (which equals inline_data byteLength by construction
+  // in the Phase 3 write path; for legacy / non-inlined rows it's
+  // the chunked total).
   const size = row.inline_data
     ? row.inline_data.byteLength
     : row.file_size;
@@ -265,7 +318,28 @@ export function vfsExists(
   } catch {
     return false;
   }
-  return r.kind === "file" || r.kind === "dir" || r.kind === "symlink";
+  if (r.kind === "dir" || r.kind === "symlink") return true;
+  if (r.kind !== "file") return false;
+  // Phase 9: when versioning is enabled and the head is a tombstone,
+  // exists() returns false to match readFile/stat semantics.
+  const headRow = durableObject.sql
+    .exec(
+      "SELECT head_version_id FROM files WHERE file_id=? AND user_id=?",
+      r.leafId,
+      userId
+    )
+    .toArray()[0] as { head_version_id: string | null } | undefined;
+  if (headRow?.head_version_id) {
+    const head = durableObject.sql
+      .exec(
+        "SELECT deleted FROM file_versions WHERE path_id=? AND version_id=?",
+        r.leafId,
+        headRow.head_version_id
+      )
+      .toArray()[0] as { deleted: number } | undefined;
+    if (head && head.deleted === 1) return false;
+  }
+  return true;
 }
 
 // ── readlink ───────────────────────────────────────────────────────────
@@ -394,7 +468,7 @@ export function vfsReadManyStat(
  *      (Phase 4). The recorded `shard_index` is unchanged from what
  *      `placeChunk` returned at write time, so reads remain
  *      deterministic across pool growth.
- *   3. Cap at READFILE_MAX (default 500 MB; configurable) — beyond
+ *   3. Cap at READFILE_MAX (default 100 MB; configurable) — beyond
  *      that, throw EFBIG and direct callers to createReadStream /
  *      openManifest+readChunk.
  *
@@ -404,10 +478,173 @@ export function vfsReadManyStat(
  * Each chunk fetch is one *internal* UserDO subrequest. The consumer
  * still pays exactly 1 subrequest for the entire readFile.
  */
+/**
+ * Phase 9 versioned read path.
+ *
+ * Resolution order:
+ *   - explicit versionId → that exact row (ENOENT if missing,
+ *     tombstone reads the metadata but throws ENOENT for the bytes)
+ *   - default → head_version_id; if it points at a tombstone OR no
+ *     head exists, ENOENT
+ *
+ * Inline tier short-circuits (zero shard subrequests). Chunked tier
+ * walks version_chunks (NOT file_chunks) so the version's own
+ * chunk manifest is the source of truth.
+ */
+async function readFileVersioned(
+  durableObject: UserDO,
+  scope: VFSScope,
+  pathId: string,
+  versionId: string | undefined
+): Promise<Uint8Array> {
+  // S3 semantics: when no versionId is passed, look at the literal
+  // HEAD version (whatever the most-recent write said). If it's a
+  // tombstone, ENOENT — even if older live versions still exist
+  // in history. Callers asking for an older version explicitly
+  // pass `versionId`.
+  let row;
+  if (versionId) {
+    row = durableObject.sql
+      .exec(
+        `SELECT version_id, size, inline_data, chunk_size, chunk_count, deleted
+           FROM file_versions
+          WHERE path_id=? AND version_id=?`,
+        pathId,
+        versionId
+      )
+      .toArray()[0];
+  } else {
+    // Resolve the head pointer; if there isn't one (zero versions
+    // ever) or it's a tombstone, ENOENT.
+    const headRow = durableObject.sql
+      .exec(
+        "SELECT head_version_id FROM files WHERE file_id=?",
+        pathId
+      )
+      .toArray()[0] as { head_version_id: string | null } | undefined;
+    if (!headRow?.head_version_id) {
+      throw new VFSError("ENOENT", "readFile: no head version");
+    }
+    row = durableObject.sql
+      .exec(
+        `SELECT version_id, size, inline_data, chunk_size, chunk_count, deleted
+           FROM file_versions
+          WHERE path_id=? AND version_id=?`,
+        pathId,
+        headRow.head_version_id
+      )
+      .toArray()[0];
+  }
+  if (!row) {
+    throw new VFSError(
+      "ENOENT",
+      versionId
+        ? `readFile: version ${versionId} not found`
+        : "readFile: no live version (tombstoned or empty history)"
+    );
+  }
+  const r = row as Record<string, unknown>;
+  const isTombstone = (r.deleted as number) === 1;
+  if (isTombstone) {
+    throw new VFSError(
+      "ENOENT",
+      `readFile: version ${r.version_id as string} is a tombstone`
+    );
+  }
+  const inline = (r.inline_data as ArrayBuffer | null) ?? null;
+  const size = r.size as number;
+  if (inline) {
+    if (inline.byteLength > READFILE_MAX) {
+      throw new VFSError(
+        "EFBIG",
+        "readFile: inline blob exceeds READFILE_MAX"
+      );
+    }
+    return new Uint8Array(inline);
+  }
+  if (size > READFILE_MAX) {
+    throw new VFSError(
+      "EFBIG",
+      `readFile: file_size ${size} > READFILE_MAX ${READFILE_MAX}; use createReadStream or openManifest+readChunk`
+    );
+  }
+  const vid = r.version_id as string;
+  const chunkRows = durableObject.sql
+    .exec(
+      `SELECT chunk_index, chunk_hash, chunk_size, shard_index
+         FROM version_chunks WHERE version_id=? ORDER BY chunk_index`,
+      vid
+    )
+    .toArray() as {
+    chunk_index: number;
+    chunk_hash: string;
+    chunk_size: number;
+    shard_index: number;
+  }[];
+  if (chunkRows.length === 0) return new Uint8Array(0);
+  const env = durableObject.envPublic;
+  const out = new Uint8Array(size);
+
+  // H3: parallel chunk fetches with bounded concurrency (mirrors the
+  // Phase 8 read path). Per-chunk destination offset is precomputed
+  // from chunk_size so order doesn't depend on arrival.
+  const offsets = new Array<number>(chunkRows.length);
+  {
+    let acc = 0;
+    for (let i = 0; i < chunkRows.length; i++) {
+      offsets[i] = acc;
+      acc += chunkRows[i].chunk_size;
+    }
+  }
+  const CONCURRENCY = 8;
+  let next = 0;
+  async function fetchOne(i: number): Promise<void> {
+    const c = chunkRows[i];
+    const shardName = vfsShardDOName(
+      scope.ns,
+      scope.tenant,
+      scope.sub,
+      c.shard_index
+    );
+    const stub = env.SHARD_DO.get(env.SHARD_DO.idFromName(shardName));
+    const res = await stub.fetch(
+      new Request(`http://internal/chunk/${c.chunk_hash}`)
+    );
+    if (!res.ok) {
+      throw new VFSError(
+        "ENOENT",
+        `readFile: chunk ${c.chunk_index} (${c.chunk_hash}) missing on shard ${c.shard_index}`
+      );
+    }
+    const buf = new Uint8Array(await res.arrayBuffer());
+    out.set(buf, offsets[i]);
+  }
+  async function lane(): Promise<void> {
+    while (true) {
+      const i = next++;
+      if (i >= chunkRows.length) return;
+      await fetchOne(i);
+    }
+  }
+  const lanes: Promise<void>[] = [];
+  for (let w = 0; w < Math.min(CONCURRENCY, chunkRows.length); w++) {
+    lanes.push(lane());
+  }
+  await Promise.all(lanes);
+
+  const written =
+    chunkRows.length > 0
+      ? offsets[chunkRows.length - 1] + chunkRows[chunkRows.length - 1].chunk_size
+      : 0;
+  if (written !== size) return out.slice(0, written);
+  return out;
+}
+
 export async function vfsReadFile(
   durableObject: UserDO,
   scope: VFSScope,
-  path: string
+  path: string,
+  opts: { versionId?: string } = {}
 ): Promise<Uint8Array> {
   const userId = userIdFor(scope);
   const r = resolveOrThrow(durableObject, userId, path, /*follow*/ true);
@@ -417,6 +654,24 @@ export async function vfsReadFile(
   if (r.kind !== "file") {
     // symlink would have been followed; if we got here it's something else
     throw new VFSError("EINVAL", `readFile: not a regular file: ${path}`);
+  }
+
+  // Phase 9: versioning fork. If the path has a head_version_id, OR
+  // an explicit versionId was passed, route through file_versions.
+  // Otherwise fall through to the Phase 8 file_chunks-based path
+  // (preserves byte-equivalence for versioning-OFF tenants and for
+  // legacy data written before versioning was ever enabled).
+  const headRow = durableObject.sql
+    .exec(
+      "SELECT head_version_id FROM files WHERE file_id=? AND user_id=?",
+      r.leafId,
+      userId
+    )
+    .toArray()[0] as { head_version_id: string | null } | undefined;
+  const useVersioned =
+    opts.versionId !== undefined || (headRow?.head_version_id ?? null) !== null;
+  if (useVersioned) {
+    return readFileVersioned(durableObject, scope, r.leafId, opts.versionId);
   }
 
   const row = durableObject.sql
@@ -475,8 +730,37 @@ export async function vfsReadFile(
   // the consumer's invocation only paid 1 to enter this method.
   const env = durableObject.envPublic;
   const out = new Uint8Array(row.file_size);
-  let written = 0;
-  for (const c of chunkRows) {
+
+  // H3: parallel chunk fetches with bounded concurrency.
+  //
+  // Previously: serial `for (...) await stub.fetch(...)` capped
+  // throughput at 1 chunk per ~10–30 ms intra-DO RPC, i.e. ~33–100 MB/s
+  // for 1 MB chunks. The feasibility study's 200–500 MB/s claim
+  // (study §5.2) needs parallel issuance.
+  //
+  // Bound at 8 concurrent in-flight to stay well under the Workers
+  // concurrent-subrequest limit (50 free, 1000 paid). 8 saturates
+  // typical home/cloud bandwidth on read while leaving headroom for
+  // any other RPCs the calling Worker has in flight. Order of `out.set`
+  // is preserved by the destination offset, which is computed from
+  // each chunk's known position in the manifest, not its arrival
+  // order. Throw-on-first-error is preserved by Promise.all semantics.
+  const CONCURRENCY = 8;
+  let next = 0;
+  // Each chunk's destination offset = sum of preceding chunks' sizes,
+  // computed up-front. This decouples the parallel fetches from any
+  // notion of arrival order — a chunk's slot is fixed by its index.
+  const offsets = new Array<number>(chunkRows.length);
+  {
+    let acc = 0;
+    for (let i = 0; i < chunkRows.length; i++) {
+      offsets[i] = acc;
+      acc += chunkRows[i].chunk_size;
+    }
+  }
+
+  async function fetchOne(i: number): Promise<void> {
+    const c = chunkRows[i];
     const shardName = vfsShardDOName(
       scope.ns,
       scope.tenant,
@@ -494,9 +778,25 @@ export async function vfsReadFile(
       );
     }
     const buf = new Uint8Array(await res.arrayBuffer());
-    out.set(buf, written);
-    written += buf.byteLength;
+    out.set(buf, offsets[i]);
   }
+
+  async function worker(): Promise<void> {
+    while (true) {
+      const i = next++;
+      if (i >= chunkRows.length) return;
+      await fetchOne(i);
+    }
+  }
+  const workers: Promise<void>[] = [];
+  for (let w = 0; w < Math.min(CONCURRENCY, chunkRows.length); w++) {
+    workers.push(worker());
+  }
+  await Promise.all(workers);
+
+  const written = offsets.length > 0
+    ? offsets[offsets.length - 1] + chunkRows[offsets.length - 1].chunk_size
+    : 0;
   // Trim if file_size disagrees with sum of chunks (defensive; should not happen).
   if (written !== row.file_size) {
     return out.slice(0, written);
@@ -790,6 +1090,21 @@ function folderExists(
  *
  * Subrequest cost: U fan-out RPCs to ShardDOs (one per unique shard).
  */
+/**
+ * External re-export of `hardDeleteFileRow` for the H1 alarm sweeper.
+ * The internal callers stay on the private name to keep the surface
+ * minimal; the alarm in `user-do.ts` reaches this via dynamic import
+ * (avoiding a module-init cycle on the type-side).
+ */
+export async function hardDeleteFileRowExternal(
+  durableObject: UserDO,
+  userId: string,
+  scope: VFSScope,
+  fileId: string
+): Promise<void> {
+  return hardDeleteFileRow(durableObject, userId, scope, fileId);
+}
+
 async function hardDeleteFileRow(
   durableObject: UserDO,
   userId: string,
@@ -877,6 +1192,183 @@ async function hardDeleteFileRow(
  * supersedes it (which may be the first writer's just-committed result —
  * last-writer-wins, POSIX-correct).
  */
+/**
+ * Phase 9 versioning-ON write path.
+ *
+ * Pure-function-ish (depends on durableObject + ShardDO env, but no
+ * cross-method state). Invariant we want a future TSLean proof to
+ * cover: after a successful return, the path has exactly one new
+ * head version row whose chunk_refs match the new content. On any
+ * thrown error before the commit, NO version row exists and
+ * ShardDO chunk_refs for `${pathId}#${versionId}` are reaped.
+ */
+async function vfsWriteFileVersioned(
+  durableObject: UserDO,
+  scope: VFSScope,
+  userId: string,
+  parentId: string | null,
+  leaf: string,
+  data: Uint8Array,
+  mode: number,
+  mimeType: string,
+  now: number
+): Promise<void> {
+  // 1. Ensure a stable `files` row exists at (parent_id, leaf).
+  //    Either reuse an existing one (path already has versions) or
+  //    create a fresh stable identity row. The unique partial index
+  //    on (user_id, parent_id, file_name) WHERE status != 'deleted'
+  //    guarantees at most one live row per path.
+  let pathId: string;
+  const existing = durableObject.sql
+    .exec(
+      `SELECT file_id FROM files
+        WHERE user_id=? AND IFNULL(parent_id,'')=IFNULL(?,'') AND file_name=? AND status='complete'`,
+      userId,
+      parentId,
+      leaf
+    )
+    .toArray()[0] as { file_id: string } | undefined;
+  if (existing) {
+    pathId = existing.file_id;
+  } else {
+    pathId = generateId();
+    durableObject.sql.exec(
+      `INSERT INTO files (file_id, user_id, parent_id, file_name, file_size, file_hash, mime_type, chunk_size, chunk_count, pool_size, status, created_at, updated_at, mode, node_kind)
+       VALUES (?, ?, ?, ?, 0, '', ?, 0, 0, ?, 'complete', ?, ?, ?, 'file')`,
+      pathId,
+      userId,
+      parentId,
+      leaf,
+      mimeType,
+      poolSizeFor(durableObject, userId),
+      now,
+      now,
+      mode
+    );
+  }
+
+  const versionId = generateId();
+
+  // 2a. Inline tier — no shards, no chunk_refs. Just insert the
+  //     file_versions row and flip the head pointer.
+  if (data.byteLength <= INLINE_LIMIT) {
+    commitVersion(durableObject, {
+      pathId,
+      versionId,
+      userId,
+      size: data.byteLength,
+      mode,
+      mtimeMs: now,
+      chunkSize: 0,
+      chunkCount: 0,
+      fileHash: "",
+      mimeType,
+      inlineData: data,
+    });
+    return;
+  }
+
+  // 2b. Chunked tier — push chunks under the synthetic
+  //     `${pathId}#${versionId}` ref key so refcount is per-version.
+  //     On any throw before commit, reap the partial chunk_refs we
+  //     inserted (no version row exists yet, so no metadata leak).
+  const { chunkSize, chunkCount } = computeChunkSpec(data.byteLength);
+  const poolSize = poolSizeFor(durableObject, userId);
+  const env = durableObject.envPublic;
+  const shardNs = env.SHARD_DO as unknown as DurableObjectNamespace<ShardDO>;
+  const refId = shardRefId(pathId, versionId);
+  const touchedShards = new Set<number>();
+
+  // H3: parallel chunk PUTs with bounded concurrency, mirroring the
+  // Phase 8 path. Each lane processes one chunk at a time; chunks
+  // are independent so up to CONCURRENCY can be in flight.
+  const fileHashByIdx = new Array<string>(chunkCount);
+  try {
+    const CONCURRENCY = 8;
+    let cursor = 0;
+    async function uploadOne(i: number): Promise<void> {
+      const start = i * chunkSize;
+      const end = Math.min(start + chunkSize, data.byteLength);
+      const slice = data.subarray(start, end);
+      const hash = await hashChunk(slice);
+      // Phase 9 invariant: place by CONTENT-HASH (not by
+      // (fileId, chunkIndex)). Same hash → same shard, every time.
+      // This is what makes cross-version dedup actually work — two
+      // versions with identical content land on the same ShardDO,
+      // hit the dedup branch, and share one chunk row with
+      // refcount = (number of versions referencing it).
+      // The Phase 8 / non-versioning path still uses (fileId, idx)
+      // placement for spread across shards on a single file.
+      // (H4 freezes poolSize at the chunk's first-write so pool
+      //  growth never re-routes a hash to a different shard.)
+      const sIdx = placeChunkForVersion(durableObject, userId, hash, poolSize);
+      const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, sIdx);
+      const stub = shardNs.get(shardNs.idFromName(shardName));
+      await stub.putChunk(hash, slice, refId, i, userId);
+      touchedShards.add(sIdx);
+      durableObject.sql.exec(
+        `INSERT OR REPLACE INTO version_chunks
+           (version_id, chunk_index, chunk_hash, chunk_size, shard_index)
+         VALUES (?, ?, ?, ?, ?)`,
+        versionId,
+        i,
+        hash,
+        slice.byteLength,
+        sIdx
+      );
+      fileHashByIdx[i] = hash;
+    }
+    async function lane(): Promise<void> {
+      while (true) {
+        const i = cursor++;
+        if (i >= chunkCount) return;
+        await uploadOne(i);
+      }
+    }
+    const lanes: Promise<void>[] = [];
+    for (let w = 0; w < Math.min(CONCURRENCY, chunkCount); w++) {
+      lanes.push(lane());
+    }
+    await Promise.all(lanes);
+  } catch (err) {
+    // Abort: reap the chunk_refs we already pushed under refId so
+    // ShardDO refcounts decrement. version_chunks rows: drop them;
+    // no file_versions row was inserted yet so there's nothing
+    // pointing at them.
+    durableObject.sql.exec(
+      "DELETE FROM version_chunks WHERE version_id = ?",
+      versionId
+    );
+    for (const sIdx of touchedShards) {
+      const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, sIdx);
+      const stub = shardNs.get(shardNs.idFromName(shardName));
+      try {
+        await stub.deleteChunks(refId);
+      } catch {
+        /* best-effort during abort */
+      }
+    }
+    throw err;
+  }
+
+  const fileHash = await hashChunk(
+    new TextEncoder().encode(fileHashByIdx.join(""))
+  );
+  commitVersion(durableObject, {
+    pathId,
+    versionId,
+    userId,
+    size: data.byteLength,
+    mode,
+    mtimeMs: now,
+    chunkSize,
+    chunkCount,
+    fileHash,
+    mimeType,
+    inlineData: null,
+  });
+}
+
 export async function vfsWriteFile(
   durableObject: UserDO,
   scope: VFSScope,
@@ -900,6 +1392,26 @@ export async function vfsWriteFile(
   const mode = opts.mode ?? 0o644;
   const mimeType = opts.mimeType ?? "application/octet-stream";
   const now = Date.now();
+
+  // Phase 9: versioning fork. When the tenant has versioning ON,
+  // every writeFile creates a new file_versions row referenced by
+  // a per-version synthetic shard key, and the `files` row is just
+  // the stable identity that holds the head pointer. When OFF,
+  // behavior is byte-equivalent to Phase 8 (no version rows
+  // touched, no head pointer used).
+  if (isVersioningEnabled(durableObject, userId)) {
+    return vfsWriteFileVersioned(
+      durableObject,
+      scope,
+      userId,
+      parentId,
+      leaf,
+      data,
+      mode,
+      mimeType,
+      now
+    );
+  }
 
   // ── Inline tier ──
   if (data.byteLength <= INLINE_LIMIT) {
@@ -925,12 +1437,15 @@ export async function vfsWriteFile(
       mode,
       data
     );
+    // H1: schedule the stale-upload sweep so this row is reclaimed
+    // even if commitRename never runs (DO crash mid-method).
+    await durableObject.scheduleStaleUploadSweep();
     await commitRename(durableObject, userId, scope, tmpId, parentId, leaf);
     return;
   }
 
   // ── Chunked tier ──
-  // EFBIG is already enforced above against WRITEFILE_MAX (500 MB).
+  // EFBIG is already enforced above against WRITEFILE_MAX (100 MB).
   // The previous redundant READFILE_MAX gate has been folded; both caps
   // are equal so a writeFile that succeeds is always readable via
   // readFile. For larger workloads use createWriteStream (memory-bounded
@@ -956,15 +1471,32 @@ export async function vfsWriteFile(
     now,
     mode
   );
+  // H1: schedule stale-upload sweep so a crash mid-streaming reclaims
+  // this row + its chunk_refs.
+  await durableObject.scheduleStaleUploadSweep();
 
   // Chunk + place + putChunk per chunk. Any throw aborts via abortTempFile.
+  //
+  // H3: parallel chunk PUTs with bounded concurrency. The previous
+  // serial loop capped throughput at one ShardDO RPC per chunk (~10–30
+  // ms each); 100 chunks took 1–3 s. The hash + put + record triple
+  // is parallelisable because each chunk is independent (no
+  // cross-chunk shared state), and the per-chunk file_chunks INSERT
+  // is sync SQL inside the DO single-thread so SQL ordering is
+  // preserved without coordination.
+  //
+  // Concurrency cap = 8 (same rationale as the read path: stays well
+  // inside the Workers concurrent-subrequest limit and saturates
+  // typical bandwidth).
   const env = durableObject.envPublic;
   // Cast the un-parameterized namespace to the typed one so .putChunk RPC
   // resolves. (See hardDeleteFileRow for the same pattern on deleteChunks.)
   const shardNs = env.SHARD_DO as unknown as DurableObjectNamespace<ShardDO>;
-  const fileHashParts: string[] = [];
+  const fileHashParts = new Array<string>(chunkCount);
   try {
-    for (let i = 0; i < chunkCount; i++) {
+    const CONCURRENCY = 8;
+    let cursor = 0;
+    async function uploadOne(i: number): Promise<void> {
       const start = i * chunkSize;
       const end = Math.min(start + chunkSize, data.byteLength);
       const slice = data.subarray(start, end);
@@ -982,8 +1514,20 @@ export async function vfsWriteFile(
         slice.byteLength,
         sIdx
       );
-      fileHashParts.push(hash);
+      fileHashParts[i] = hash;
     }
+    async function lane(): Promise<void> {
+      while (true) {
+        const i = cursor++;
+        if (i >= chunkCount) return;
+        await uploadOne(i);
+      }
+    }
+    const lanes: Promise<void>[] = [];
+    for (let w = 0; w < Math.min(CONCURRENCY, chunkCount); w++) {
+      lanes.push(lane());
+    }
+    await Promise.all(lanes);
   } catch (err) {
     // Abort: hard-delete the tmp row + dispatch deleteChunks for any
     // chunks already pushed.
@@ -1126,6 +1670,13 @@ async function abortTempFile(
 /**
  * unlink — hard-delete a regular file or symlink. Throws EISDIR for
  * directories (callers should use rmdir / removeRecursive). Plan §8.4.
+ *
+ * Phase 9: when versioning is enabled, unlink writes a TOMBSTONE
+ * version (deleted=1, no chunks) instead of hard-deleting. The
+ * existing version rows + their chunks remain intact; the path
+ * appears ENOENT to readFile but listVersions still surfaces history.
+ * dropVersions / dropVersions(allow-dangling) is the explicit way
+ * to permanently reap.
  */
 export async function vfsUnlink(
   durableObject: UserDO,
@@ -1140,6 +1691,28 @@ export async function vfsUnlink(
   if (r.kind !== "file" && r.kind !== "symlink") {
     throw new VFSError("EINVAL", `unlink: not a regular file: ${path}`);
   }
+
+  // Phase 9 versioning fork.
+  if (isVersioningEnabled(durableObject, userId)) {
+    const tombId = generateId();
+    const now = Date.now();
+    commitVersion(durableObject, {
+      pathId: r.leafId,
+      versionId: tombId,
+      userId,
+      size: 0,
+      mode: 0,
+      mtimeMs: now,
+      chunkSize: 0,
+      chunkCount: 0,
+      fileHash: "",
+      mimeType: "application/octet-stream",
+      inlineData: null,
+      deleted: true,
+    });
+    return;
+  }
+
   await hardDeleteFileRow(durableObject, userId, scope, r.leafId);
 }
 
@@ -1252,6 +1825,9 @@ export function vfsRmdir(
     throw new VFSError("EBUSY", "rmdir: cannot remove root");
   }
   // Empty check: any folder or live file with this folder as parent_id?
+  // H2: throw ENOTEMPTY (was ENOTDIR) — README + SDK promise the
+  // POSIX-aligned code. ENOTEMPTY now exists in the server-side
+  // VFSErrorCode union (shared/vfs-types.ts).
   const childFolder = durableObject.sql
     .exec(
       "SELECT 1 FROM folders WHERE user_id=? AND parent_id=? LIMIT 1",
@@ -1260,7 +1836,7 @@ export function vfsRmdir(
     )
     .toArray();
   if (childFolder.length > 0) {
-    throw new VFSError("ENOTDIR", `rmdir: directory not empty: ${path}`);
+    throw new VFSError("ENOTEMPTY", `rmdir: directory not empty: ${path}`);
   }
   const childFile = durableObject.sql
     .exec(
@@ -1270,7 +1846,7 @@ export function vfsRmdir(
     )
     .toArray();
   if (childFile.length > 0) {
-    throw new VFSError("ENOTDIR", `rmdir: directory not empty: ${path}`);
+    throw new VFSError("ENOTEMPTY", `rmdir: directory not empty: ${path}`);
   }
   durableObject.sql.exec(
     "DELETE FROM folders WHERE folder_id = ?",

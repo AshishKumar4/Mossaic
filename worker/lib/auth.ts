@@ -3,10 +3,45 @@ import type { Context, MiddlewareHandler } from "hono";
 import { JWT_EXPIRATION_MS } from "@shared/constants";
 import type { Env } from "@shared/types";
 
-const DEFAULT_SECRET = "mossaic-dev-secret-change-in-production";
+/**
+ * Thrown at request-time when `JWT_SECRET` is missing or empty.
+ *
+ * The class is exported so callers (route handlers, middleware, the SDK)
+ * can `instanceof`-discriminate this from a generic `Error` and surface
+ * a 503 / configuration-error response rather than a 500.
+ *
+ * Deliberately NOT thrown at module load — Workers evaluate modules
+ * eagerly during deploy, and a load-time throw would brick the entire
+ * Worker (including the legacy `/api/upload`/`/api/download` paths that
+ * don't need JWT) on any tenant whose secret rollout was incomplete.
+ * Request-time evaluation localises the failure to the auth surface.
+ */
+export class VFSConfigError extends Error {
+  readonly code = "VFS_CONFIG_ERROR" as const;
+  constructor(message: string) {
+    super(message);
+    this.name = "VFSConfigError";
+  }
+}
 
+/**
+ * Resolve the JWT signing secret from env. Throws `VFSConfigError`
+ * when the variable is missing/empty. There is intentionally NO dev
+ * fallback string — a hard-coded fallback in source enables anyone
+ * who reads the public repo to mint cross-tenant VFS tokens against
+ * any deployment that forgot to run `wrangler secret put JWT_SECRET`.
+ *
+ * Tests must inject `JWT_SECRET` via the test runner's vars (see
+ * `tests/wrangler.test.jsonc`).
+ */
 function getSecret(env: Env): Uint8Array {
-  const secret = env.JWT_SECRET || DEFAULT_SECRET;
+  const secret = env.JWT_SECRET;
+  if (typeof secret !== "string" || secret.length === 0) {
+    throw new VFSConfigError(
+      "JWT_SECRET is not configured. Set it via `wrangler secret put JWT_SECRET` " +
+        "before deploying. Refusing to sign or verify tokens with a missing/empty secret.",
+    );
+  }
   return new TextEncoder().encode(secret);
 }
 
@@ -32,8 +67,12 @@ export async function verifyJWT(
   env: Env,
   token: string
 ): Promise<{ userId: string; email: string } | null> {
+  // Resolve the secret OUTSIDE the try/catch so a missing JWT_SECRET
+  // surfaces as VFSConfigError (503) instead of being silently swallowed
+  // as "invalid token" (which would map to 401 and leak no signal that
+  // the deploy is mis-configured).
+  const secret = getSecret(env);
   try {
-    const secret = getSecret(env);
     const { payload } = await jwtVerify(token, secret);
     if (!payload.sub || !payload.email) return null;
     return { userId: payload.sub, email: payload.email as string };
@@ -57,7 +96,16 @@ export function authMiddleware(): MiddlewareHandler<{
     }
 
     const token = authHeader.slice(7);
-    const payload = await verifyJWT(c.env, token);
+    let payload: { userId: string; email: string } | null;
+    try {
+      payload = await verifyJWT(c.env, token);
+    } catch (err) {
+      // JWT_SECRET unset → 503 service-misconfigured, not 401.
+      if (err instanceof VFSConfigError) {
+        return c.json({ error: err.message }, 503);
+      }
+      throw err;
+    }
     if (!payload) {
       return c.json({ error: "Invalid or expired token" }, 401);
     }
@@ -129,8 +177,11 @@ export async function verifyVFSToken(
   env: Env,
   token: string
 ): Promise<VFSTokenPayload | null> {
+  // Same rationale as verifyJWT: resolve the secret OUTSIDE the catch
+  // so a missing JWT_SECRET surfaces as VFSConfigError up to the route
+  // and turns into a 503, not a silent 401 "invalid token".
+  const secret = getSecret(env);
   try {
-    const secret = getSecret(env);
     const { payload } = await jwtVerify(token, secret);
     if (payload.scope !== "vfs") return null;
     if (typeof payload.ns !== "string" || payload.ns.length === 0) return null;

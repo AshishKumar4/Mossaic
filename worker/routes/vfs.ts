@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import type { Env } from "@shared/types";
 import type { MiddlewareHandler } from "hono";
-import { verifyVFSToken } from "../lib/auth";
+import { verifyVFSToken, VFSConfigError } from "../lib/auth";
 import { vfsUserDOName } from "../lib/utils";
 import type { UserDO } from "../objects/user/user-do";
 import type { VFSScope } from "@shared/vfs-types";
@@ -66,7 +66,20 @@ const vfsAuth = (): MiddlewareHandler<{
     return c.json({ code: "EACCES", message: "Bearer token required" }, 401);
   }
   const token = auth.slice(7);
-  const payload = await verifyVFSToken(c.env, token);
+  let payload;
+  try {
+    payload = await verifyVFSToken(c.env, token);
+  } catch (err) {
+    // VFSConfigError = JWT_SECRET missing on the deploy. 503 surfaces
+    // a clear "service mis-configured" rather than masking as 401.
+    if (err instanceof VFSConfigError) {
+      return c.json(
+        { code: "EMOSSAIC_UNAVAILABLE", message: err.message },
+        503
+      );
+    }
+    throw err;
+  }
   if (!payload) {
     return c.json(
       { code: "EACCES", message: "Invalid or expired VFS token" },
@@ -433,6 +446,81 @@ vfs.post("/readChunk", async (c) => {
       status: 200,
       headers: { "Content-Type": "application/octet-stream" },
     });
+  } catch (err) {
+    const r = errToResponse(err);
+    return c.json(r.body, r.status as 400);
+  }
+});
+
+// ── Phase 9: versioning ────────────────────────────────────────────────
+
+vfs.post("/listVersions", async (c) => {
+  try {
+    const body = await c.req.json<{ path: string; limit?: number }>();
+    const path = expectPath(body);
+    const rows = await userStub(c).vfsListVersions(c.var.scope, path, {
+      limit: body.limit,
+    });
+    // Map server VersionRow → public VersionInfo (id field).
+    const versions = rows.map((r) => ({
+      id: r.versionId,
+      mtimeMs: r.mtimeMs,
+      size: r.size,
+      mode: r.mode,
+      deleted: r.deleted,
+    }));
+    return c.json({ versions });
+  } catch (err) {
+    const r = errToResponse(err);
+    return c.json(r.body, r.status as 400);
+  }
+});
+
+vfs.post("/restoreVersion", async (c) => {
+  try {
+    const body = await c.req.json<{
+      path: string;
+      sourceVersionId: string;
+    }>();
+    const path = expectPath(body);
+    if (typeof body.sourceVersionId !== "string") {
+      return c.json(
+        {
+          code: "EINVAL",
+          message: "body.sourceVersionId must be a string",
+        },
+        400
+      );
+    }
+    const r = await userStub(c).vfsRestoreVersion(
+      c.var.scope,
+      path,
+      body.sourceVersionId
+    );
+    return c.json({ id: r.versionId });
+  } catch (err) {
+    const r = errToResponse(err);
+    return c.json(r.body, r.status as 400);
+  }
+});
+
+vfs.post("/dropVersions", async (c) => {
+  try {
+    const body = await c.req.json<{
+      path: string;
+      policy: {
+        olderThan?: number;
+        keepLast?: number;
+        exceptVersions?: string[];
+      };
+    }>();
+    const path = expectPath(body);
+    const r = await userStub(c).vfsDropVersions(
+      c.var.scope,
+      path,
+      body.policy ?? {}
+    );
+    return c.json(r);
   } catch (err) {
     const r = errToResponse(err);
     return c.json(r.body, r.status as 400);
