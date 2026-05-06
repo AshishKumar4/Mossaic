@@ -137,3 +137,94 @@ describe("JWT_SECRET handling (C1)", () => {
     expect(verified!.ns).toBe("default");
   });
 });
+
+describe("Graceful JWT_SECRET rotation (multi-secret verify)", () => {
+  function envWith(
+    current: string | undefined,
+    previous?: string | undefined
+  ): Env {
+    return {
+      JWT_SECRET: current,
+      JWT_SECRET_PREVIOUS: previous,
+    } as unknown as Env;
+  }
+
+  it("verifyJWT accepts a token signed under the previous secret during rotation", async () => {
+    const oldSecret = "secret-old-very-long-string";
+    const newSecret = "secret-new-very-long-string";
+    // Sign under old secret (simulating a token issued before rotation).
+    const tokenOld = await signJWT(
+      envWith(oldSecret),
+      { userId: "u1", email: "a@example.com" }
+    );
+    // Deploy advances: current = new, previous = old.
+    const rotEnv = envWith(newSecret, oldSecret);
+    const verified = await verifyJWT(rotEnv, tokenOld);
+    expect(verified).toEqual({ userId: "u1", email: "a@example.com" });
+  });
+
+  it("verifyJWT accepts new-secret tokens during the rotation window", async () => {
+    const oldSecret = "secret-old-very-long-string";
+    const newSecret = "secret-new-very-long-string";
+    const rotEnv = envWith(newSecret, oldSecret);
+    const tokenNew = await signJWT(rotEnv, {
+      userId: "u2",
+      email: "b@example.com",
+    });
+    const verified = await verifyJWT(rotEnv, tokenNew);
+    expect(verified).toEqual({ userId: "u2", email: "b@example.com" });
+  });
+
+  it("verifyJWT rejects tokens signed under a third (unrelated) secret", async () => {
+    const rotEnv = envWith("current", "previous");
+    const otherEnv = envWith("totally-unrelated-secret");
+    const tokenOther = await signJWT(otherEnv, {
+      userId: "u3",
+      email: "c@example.com",
+    });
+    const verified = await verifyJWT(rotEnv, tokenOther);
+    expect(verified).toBeNull();
+  });
+
+  it("verifyVFSToken accepts a previous-secret VFS token during rotation", async () => {
+    const oldSecret = "secret-old-aaaaaaaaaaaaaaaaaaa";
+    const newSecret = "secret-new-bbbbbbbbbbbbbbbbbbb";
+    const tokenOld = await signVFSToken(envWith(oldSecret), {
+      ns: "default",
+      tenant: "alice",
+    });
+    const rotEnv = envWith(newSecret, oldSecret);
+    const verified = await verifyVFSToken(rotEnv, tokenOld);
+    expect(verified).not.toBeNull();
+    expect(verified!.tn).toBe("alice");
+  });
+
+  it("after rotation completes (PREVIOUS unset) old-secret tokens are rejected", async () => {
+    const oldSecret = "secret-old-aaaaaaaaaaaaaaaaaaa";
+    const newSecret = "secret-new-bbbbbbbbbbbbbbbbbbb";
+    const tokenOld = await signJWT(envWith(oldSecret), {
+      userId: "u4",
+      email: "d@example.com",
+    });
+    // Post-rotation: PREVIOUS unset; only NEW recognized.
+    const finishedEnv = envWith(newSecret);
+    const verified = await verifyJWT(finishedEnv, tokenOld);
+    expect(verified).toBeNull();
+  });
+
+  it("signing always uses the current (NEW) secret regardless of PREVIOUS", async () => {
+    const oldSecret = "secret-old-aaaaaaaaaaaaaaaaaaa";
+    const newSecret = "secret-new-bbbbbbbbbbbbbbbbbbb";
+    const rotEnv = envWith(newSecret, oldSecret);
+    const tokenFresh = await signJWT(rotEnv, {
+      userId: "u5",
+      email: "e@example.com",
+    });
+    // The fresh token validates under newSecret-only env, NOT the
+    // old-secret-only env — confirming sign used NEW.
+    expect(
+      await verifyJWT(envWith(newSecret), tokenFresh)
+    ).not.toBeNull();
+    expect(await verifyJWT(envWith(oldSecret), tokenFresh)).toBeNull();
+  });
+});

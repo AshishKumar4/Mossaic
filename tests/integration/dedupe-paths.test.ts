@@ -7,7 +7,7 @@ import { env, runInDurableObject } from "cloudflare:test";
  * UNIQUE partial index on (user_id, parent_id, file_name)
  * WHERE status != 'deleted' is created lazily in ensureInit. If a
  * legacy tenant has live duplicates pre-migration, the index
- * creation throws and is swallowed. dedupePaths(userId, scope?) is
+ * creation throws and is swallowed. dedupePaths(userId, scope) is
  * the manual cleanup pass:
  *
  *   - Finds groups of (parent_id, name) with >1 live rows
