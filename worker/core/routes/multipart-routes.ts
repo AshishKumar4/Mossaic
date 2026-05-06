@@ -410,6 +410,19 @@ mp.put("/:uploadId/chunk/:idx", async (c) => {
 
     const hash = await hashChunk(bytes);
     const userId = userIdFor(c.var.scope);
+    // Phase 32 Fix 4 + Phase 32.5 Fix 4 \u2014 multipart placement is
+    // intentionally pure-rendezvous (no `fullShards` skip-set).
+    // The per-chunk PUT here and `vfsFinalizeMultipart`'s touched-
+    // shard fan-out (multipart-upload.ts:573-587) MUST use the
+    // SAME placement decision; the `fullShards` set at finalize
+    // time may differ from the set at upload time, and the
+    // server has no reliable way to replay the upload-time
+    // snapshot. The signed `payload.poolSize` is server-
+    // authoritative (HMAC at begin) so adversarial clients
+    // can't tamper. Multipart cap-awareness is deferred until we
+    // persist a per-session full-shards snapshot \u2014 a Phase 32.x
+    // follow-up. Reads work either way; only the write
+    // \"prefer less-full shards\" optimization is missing here.
     const sIdx = placeChunk(userId, uploadId, idx, payload.poolSize);
     const stub = shardStub(c.env, c.var.scope, sIdx);
     let putResult;

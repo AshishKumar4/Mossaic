@@ -603,6 +603,22 @@ export async function dropVersionRows(
   const env = durableObject.envPublic;
   const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
 
+  // Phase 32.5 BUG #2 fix \u2014 accumulate inline-tier bytes across
+  // versions so we can issue ONE negative `recordWriteUsage` call
+  // at the end. `vfsWriteFileVersioned` inline branch
+  // (write-commit.ts:364-370) increments `quota.inline_bytes_used`
+  // on every versioned inline write; pre-fix `dropVersionRows`
+  // never decremented, so versioning-on tenants with inline
+  // history monotonically inflated the counter and INLINE_TIER_CAP
+  // (1 GiB) fired earlier than spec.
+  //
+  // Read inline_data BEFORE the file_versions DELETE (line 648
+  // below). Tombstones (`deleted=1` with NULL inline_data) and
+  // chunked-tier versions contribute 0. Accumulating across the
+  // whole batch keeps subrequest cost flat \u2014 one decrement RPC
+  // regardless of how many inline versions get reaped.
+  let inlineBytesReaped = 0;
+
   let reaped = 0;
   for (const versionId of versionIds) {
     // Audit C2 structural guard: we MUST NOT decrement ShardDO refs
@@ -628,14 +644,30 @@ export async function dropVersionRows(
     // `${pathId}#${versionId}`). Falls back to the synthetic form
     // when the column is NULL — matches every legacy and standard
     // versioned-write row.
+    //
+    // Phase 32.5 BUG #2 \u2014 also read inline_data + deleted in the
+    // same SELECT so we can accumulate inline-tier bytes for the
+    // post-loop decrement. Tombstones (`deleted=1`) skip the
+    // accumulation even if `inline_data` is non-NULL (defensive
+    // \u2014 commitVersion shouldn't write inline_data on a
+    // tombstone, but the gate makes the invariant explicit).
     const refRow = durableObject.sql
       .exec(
-        "SELECT shard_ref_id FROM file_versions WHERE path_id = ? AND version_id = ?",
+        "SELECT shard_ref_id, inline_data, deleted FROM file_versions WHERE path_id = ? AND version_id = ?",
         pathId,
         versionId
       )
-      .toArray()[0] as { shard_ref_id: string | null } | undefined;
+      .toArray()[0] as
+      | {
+          shard_ref_id: string | null;
+          inline_data: ArrayBuffer | null;
+          deleted: number;
+        }
+      | undefined;
     const explicitRefId = refRow?.shard_ref_id ?? null;
+    if (refRow && refRow.deleted === 0 && refRow.inline_data) {
+      inlineBytesReaped += refRow.inline_data.byteLength;
+    }
 
     // Drop UserDO-side metadata first (mirrors hardDeleteFileRow).
     // version_chunks must go before file_versions because some
@@ -682,6 +714,22 @@ export async function dropVersionRows(
       await stub.deleteChunks(shardFileId);
     }
     reaped++;
+  }
+
+  // Phase 32.5 BUG #2 fix \u2014 single decrement for the whole batch.
+  // Lazy import to keep this module free of cross-module cycles
+  // when bundled. Skipped when inlineBytesReaped is 0 (chunked-tier
+  // versions and tombstones contribute nothing) so the SQL UPDATE
+  // is only issued when there's real work.
+  //
+  // Plain storage_used / file_count decrement on dropped versions
+  // is intentionally OUT of scope for Phase 32.5 \u2014 see Phase 32.6
+  // in docs/scaling-roadmap.md. Inline-bytes accounting is the
+  // load-bearing invariant (cap depends on it); plain quota is
+  // cosmetic.
+  if (inlineBytesReaped > 0) {
+    const { recordWriteUsage } = await import("./vfs/helpers");
+    recordWriteUsage(durableObject, userId, 0, 0, -inlineBytesReaped);
   }
 
   // After dropping, if no live version remains AND no tombstone
