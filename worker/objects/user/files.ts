@@ -100,20 +100,35 @@ export function getFileManifest(
   if (fileRows.length === 0) return null;
 
   const file = fileRows[0] as Record<string, unknown>;
-  const chunkRows = durableObject.sql
-    .exec(
-      "SELECT chunk_index, chunk_hash, chunk_size, shard_index FROM file_chunks WHERE file_id = ? ORDER BY chunk_index",
-      fileId
-    )
-    .toArray();
 
-  const chunks: ChunkSpec[] = chunkRows.map((c: Record<string, unknown>) => ({
-    index: c.chunk_index as number,
-    offset: (c.chunk_index as number) * (file.chunk_size as number),
-    size: c.chunk_size as number,
-    hash: c.chunk_hash as string,
-    shardIndex: c.shard_index as number,
-  }));
+  // VFS additions (sdk-impl-plan §11): when inline_data is non-NULL we
+  // skip the file_chunks lookup entirely. Legacy rows have NULL/undefined
+  // here so behavior is unchanged.
+  const inlineData = (file.inline_data ?? null) as ArrayBuffer | null;
+  const nodeKind =
+    ((file.node_kind as string | undefined) ?? "file") === "symlink"
+      ? "symlink"
+      : "file";
+  const symlinkTarget = (file.symlink_target as string | null | undefined) ?? null;
+  const mode = (file.mode as number | undefined) ?? 420;
+
+  let chunks: ChunkSpec[] = [];
+  if (inlineData === null && nodeKind !== "symlink") {
+    const chunkRows = durableObject.sql
+      .exec(
+        "SELECT chunk_index, chunk_hash, chunk_size, shard_index FROM file_chunks WHERE file_id = ? ORDER BY chunk_index",
+        fileId
+      )
+      .toArray();
+
+    chunks = chunkRows.map((c: Record<string, unknown>) => ({
+      index: c.chunk_index as number,
+      offset: (c.chunk_index as number) * (file.chunk_size as number),
+      size: c.chunk_size as number,
+      hash: c.chunk_hash as string,
+      shardIndex: c.shard_index as number,
+    }));
+  }
 
   return {
     fileId: file.file_id as string,
@@ -126,6 +141,10 @@ export function getFileManifest(
     poolSize: file.pool_size as number,
     chunks,
     createdAt: file.created_at as number,
+    mode,
+    nodeKind,
+    symlinkTarget,
+    inlineData,
   };
 }
 

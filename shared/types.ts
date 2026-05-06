@@ -21,6 +21,18 @@ export interface FileManifest {
   poolSize: number;
   chunks: ChunkSpec[];
   createdAt: number;
+  // ── VFS additions (sdk-impl-plan §3.1, §11) ──
+  // All optional and absent on legacy rows / legacy clients. Phase 2 read
+  // paths consult these to short-circuit on inlined files and surface
+  // symlinks. Existing consumers (download.ts, gallery.ts) ignore them.
+  /** POSIX file mode (defaults to 0o644 / 420 in the schema). */
+  mode?: number;
+  /** 'file' (default) or 'symlink'. */
+  nodeKind?: "file" | "symlink";
+  /** Target path when nodeKind === 'symlink'. */
+  symlinkTarget?: string | null;
+  /** Inline blob for files ≤ INLINE_LIMIT (16 KB). When present, chunks is empty. */
+  inlineData?: ArrayBuffer | null;
 }
 
 export interface UserFile {
