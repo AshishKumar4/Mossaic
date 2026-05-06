@@ -34,13 +34,13 @@ import type { UserDOCore } from "@core/objects/user/user-do-core";
 import { vfsUserDOName } from "@core/lib/utils";
 
 interface E {
-  USER_DO: DurableObjectNamespace<UserDOCore>;
+  MOSSAIC_USER: DurableObjectNamespace<UserDOCore>;
 }
 const E = env as unknown as E;
 const NS = "default";
 
 function userStub(tenant: string) {
-  return E.USER_DO.get(E.USER_DO.idFromName(vfsUserDOName(NS, tenant)));
+  return E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName(vfsUserDOName(NS, tenant)));
 }
 
 const SCOPE = (tenant: string) => ({ ns: NS, tenant });

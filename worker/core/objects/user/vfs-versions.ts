@@ -489,7 +489,7 @@ export async function dropVersionRows(
 ): Promise<number> {
   if (versionIds.length === 0) return 0;
   const env = durableObject.envPublic;
-  const shardNs = env.SHARD_DO as unknown as DurableObjectNamespace<ShardDO>;
+  const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
 
   let reaped = 0;
   for (const versionId of versionIds) {
@@ -727,7 +727,7 @@ export async function restoreVersion(
   // existing chunks (still referenced by the source version) are
   // ALREADY on the right shards. We only add a new ref slot.
   const env = durableObject.envPublic;
-  const shardNs = env.SHARD_DO as unknown as DurableObjectNamespace<ShardDO>;
+  const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
   const newRefId = shardRefId(pathId, newVersionId);
 
   const chunks = durableObject.sql

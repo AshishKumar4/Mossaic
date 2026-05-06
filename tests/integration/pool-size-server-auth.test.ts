@@ -27,21 +27,21 @@ import { vfsUserDOName } from "@core/lib/utils";
 import { createVFS, type MossaicEnv } from "../../sdk/src/index";
 
 interface E {
-  USER_DO: DurableObjectNamespace;
+  MOSSAIC_USER: DurableObjectNamespace;
 }
 const E = env as unknown as E;
 
 const NS = "default";
 
 function makeEnv(): MossaicEnv {
-  return { MOSSAIC_USER: E.USER_DO as MossaicEnv["MOSSAIC_USER"] };
+  return { MOSSAIC_USER: E.MOSSAIC_USER as MossaicEnv["MOSSAIC_USER"] };
 }
 
 describe("server-authoritative pool size in VFS write path", () => {
   it("vfsBeginWriteStream uses quota.pool_size; tampered handle.poolSize does NOT influence placement", async () => {
     const tenant = "psa-begin";
-    const stub = E.USER_DO.get(
-      E.USER_DO.idFromName(vfsUserDOName(NS, tenant))
+    const stub = E.MOSSAIC_USER.get(
+      E.MOSSAIC_USER.idFromName(vfsUserDOName(NS, tenant))
     );
     const scope = { ns: NS, tenant };
 
@@ -102,8 +102,8 @@ describe("server-authoritative pool size in VFS write path", () => {
   it("vfsWriteFile (one-shot, chunked tier) reads quota.pool_size server-side", async () => {
     const tenant = "psa-writefile";
     const vfs = createVFS(makeEnv(), { tenant });
-    const stub = E.USER_DO.get(
-      E.USER_DO.idFromName(vfsUserDOName(NS, tenant))
+    const stub = E.MOSSAIC_USER.get(
+      E.MOSSAIC_USER.idFromName(vfsUserDOName(NS, tenant))
     );
 
     // Trigger init via a no-op call.

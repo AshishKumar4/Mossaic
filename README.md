@@ -31,15 +31,14 @@ pnpm add @mossaic/sdk
 
 ```ts
 // src/index.ts
-import { UserDO, ShardDO, SearchDO, createVFS } from "@mossaic/sdk";
+import { UserDO, ShardDO, createVFS } from "@mossaic/sdk";
 
 // wrangler discovers DO classes from the Worker's main-module exports.
-export { UserDO, ShardDO, SearchDO };
+export { UserDO, ShardDO };
 
 export interface Env {
-  MOSSAIC_USER:   DurableObjectNamespace<UserDO>;
-  MOSSAIC_SHARD:  DurableObjectNamespace<ShardDO>;
-  MOSSAIC_SEARCH: DurableObjectNamespace<SearchDO>;
+  MOSSAIC_USER:  DurableObjectNamespace<UserDO>;
+  MOSSAIC_SHARD: DurableObjectNamespace<ShardDO>;
 }
 
 export default {
@@ -61,13 +60,12 @@ export default {
 
   "durable_objects": {
     "bindings": [
-      { "name": "MOSSAIC_USER",   "class_name": "UserDO" },
-      { "name": "MOSSAIC_SHARD",  "class_name": "ShardDO" },
-      { "name": "MOSSAIC_SEARCH", "class_name": "SearchDO" }
+      { "name": "MOSSAIC_USER",  "class_name": "UserDO" },
+      { "name": "MOSSAIC_SHARD", "class_name": "ShardDO" }
     ]
   },
   "migrations": [
-    { "tag": "mossaic-v1", "new_sqlite_classes": ["UserDO", "ShardDO", "SearchDO"] }
+    { "tag": "mossaic-v1", "new_sqlite_classes": ["UserDO", "ShardDO"] }
   ]
 }
 ```
@@ -86,7 +84,7 @@ handle.doc.getText("content").insert(0, "DRAFT — ");
 await handle.close();
 ```
 
-`yjs` is an optional peer dep; importing from `@mossaic/sdk/yjs` is the opt-in. See the [Live editing with Yjs](#live-editing-with-yjs) section below and **[`sdk/README.md`](./sdk/README.md)** for the full DX walkthrough.
+`yjs` and `y-protocols` are optional peer deps; importing from `@mossaic/sdk/yjs` is the opt-in. See the [Live editing with Yjs](#live-editing-with-yjs) section below, the **[integration guide](./docs/integration-guide.md)** for the canonical shape of every public API, and **[`sdk/README.md`](./sdk/README.md)** for the full DX walkthrough.
 
 ---
 
@@ -173,15 +171,19 @@ Stat surfaces the bit on `mode` (`VFS_MODE_YJS_BIT === 0o4000`).
 import { openYDoc } from "@mossaic/sdk/yjs";
 
 const handle = await openYDoc(vfs, "/notes/today.md");
-await handle.synced;                                  // initial round-trip complete
-handle.doc.getText("content").insert(0, "DRAFT — "); // standard Y.Doc mutations
-handle.doc.on("update", (update, origin) => { /* … */ });
+await handle.synced;                                       // initial round-trip complete
+handle.doc.getText("content").insert(0, "DRAFT — ");      // standard Y.Doc mutations
+handle.doc.on("update", (update, origin) => { /* … */ });  // Y.Doc events
+handle.awareness.setLocalState({ name: "alice", cursor: 0 });
+handle.awareness.on("change", () => render(handle.awareness.getStates()));
 await handle.close();
 ```
 
-`yjs` is an **optional peer dependency** — bring your own version (tested against `yjs >=13.6.0`).
+The `YDocHandle` shape: `{ doc: Y.Doc; awareness: Awareness; synced: Promise<void>; close(): Promise<void>; flush({ label? }): Promise<{ versionId, checkpointSeq }>; onClose(cb); onError(cb) }`. Note: there is no `handle.on("sync")` or `handle.on("update")` — those events live on the underlying `doc` and `awareness` instances, not on the handle itself.
 
-**Wire protocol & transport.** The standard Yjs sync protocol (`sync_step_1` / `sync_step_2` / `update`) tagged with a single byte, transported as **binary WebSocket frames** end-to-end — no JSON, no base64, no envelope overhead. The WebSocket terminates inside the tenant's UserDO via Cloudflare's Hibernation API: idle connections cost **$0**, per-socket state survives eviction via `serializeAttachment`. Awareness (cursors, selections, presence) ships on a separate channel in a follow-up minor; the v1 wire carries sync only.
+`yjs` and `y-protocols` are **optional peer dependencies** — bring your own versions (tested against `yjs >=13.6.0`, `y-protocols >=1.0.6`).
+
+**Wire protocol & transport.** The standard Yjs sync protocol (`sync_step_1` / `sync_step_2` / `update`) plus a fourth tag for awareness, transported as **binary WebSocket frames** end-to-end — no JSON, no base64, no envelope overhead. The WebSocket terminates inside the tenant's UserDO via Cloudflare's Hibernation API: idle connections cost **$0**, per-socket state survives eviction via `serializeAttachment`. Awareness frames are relayed by the server but **never persisted** — the per-pathId Awareness instance lives only in DO memory and resets on eviction; clients re-broadcast their state on reconnect (standard y-websocket semantics).
 
 **Storage model.** Every Yjs update lands in a `yjs_oplog` row keyed by `(path_id, seq)`. The update bytes are content-hashed and pushed into Mossaic's existing chunk fabric — same rendezvous-hashed shard placement, same refcounted GC, same per-tenant isolation that ordinary blobs use. Periodic **compaction** (every N ops or T minutes) emits a `Y.Doc` state snapshot as a checkpoint chunk and reaps the prior op-log chunks via the standard alarm sweeper.
 

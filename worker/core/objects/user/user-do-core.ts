@@ -28,6 +28,7 @@ import {
   vfsUnlink,
   vfsWriteFile,
   type VFSReadHandle,
+  type VFSWriteFileOpts,
   type VFSWriteHandle,
 } from "./vfs-ops";
 import type {
@@ -1066,7 +1067,7 @@ export class UserDOCore extends DurableObject<Env> {
   async vfsBeginWriteStream(
     scope: VFSScope,
     path: string,
-    opts?: { mode?: number; mimeType?: string }
+    opts?: VFSWriteFileOpts
   ): Promise<VFSWriteHandle> {
     this.gateVfsWrite(scope);
     const handle = vfsBeginWriteStream(this, scope, path, opts);
@@ -1121,7 +1122,7 @@ export class UserDOCore extends DurableObject<Env> {
   async vfsCreateWriteStream(
     scope: VFSScope,
     path: string,
-    opts?: { mode?: number; mimeType?: string }
+    opts?: VFSWriteFileOpts
   ): Promise<{ stream: WritableStream<Uint8Array>; handle: VFSWriteHandle }> {
     this.gateVfsWrite(scope);
     return vfsCreateWriteStream(this, scope, path, opts);
@@ -1583,6 +1584,16 @@ export class UserDOCore extends DurableObject<Env> {
             att.userId,
             att.pathId,
             att.poolSize,
+            decoded.update,
+            ws
+          );
+          return;
+        }
+        case "awareness": {
+          // Phase 13 — relay awareness frames; never persisted.
+          await this.yjsRuntime.relayAwareness(
+            att.scope,
+            att.pathId,
             decoded.update,
             ws
           );

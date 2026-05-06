@@ -38,13 +38,13 @@ import {
 import { vfsUserDOName, vfsShardDOName } from "@core/lib/utils";
 
 interface E {
-  USER_DO: DurableObjectNamespace<UserDO>;
-  SHARD_DO: DurableObjectNamespace;
+  MOSSAIC_USER: DurableObjectNamespace<UserDO>;
+  MOSSAIC_SHARD: DurableObjectNamespace;
 }
 const E = env as unknown as E;
 
 function envFor(): MossaicEnv {
-  return { MOSSAIC_USER: E.USER_DO as MossaicEnv["MOSSAIC_USER"] };
+  return { MOSSAIC_USER: E.MOSSAIC_USER as MossaicEnv["MOSSAIC_USER"] };
 }
 
 describe("Phase 9 — versioning OFF (default): byte-equivalent to Phase 8 (I1)", () => {
@@ -55,8 +55,8 @@ describe("Phase 9 — versioning OFF (default): byte-equivalent to Phase 8 (I1)"
     await vfs.writeFile("/x.txt", "second");
     await vfs.writeFile("/x.txt", "third");
 
-    const stub = E.USER_DO.get(
-      E.USER_DO.idFromName(vfsUserDOName("default", tenant))
+    const stub = E.MOSSAIC_USER.get(
+      E.MOSSAIC_USER.idFromName(vfsUserDOName("default", tenant))
     );
     const counts = await runInDurableObject(stub, async (_inst, state) => {
       const vCount = state.storage.sql
@@ -279,8 +279,8 @@ describe("Phase 9 — cross-version dedup (I9) + chunk reclamation", () => {
     await vfs.writeFile("/big.bin", payload); // identical content
 
     // Pull the shard the chunk landed on, count refs for that hash.
-    const userStub = E.USER_DO.get(
-      E.USER_DO.idFromName(vfsUserDOName("default", tenant))
+    const userStub = E.MOSSAIC_USER.get(
+      E.MOSSAIC_USER.idFromName(vfsUserDOName("default", tenant))
     );
     const { hash, shardIdx, refCount } = await runInDurableObject(
       userStub,
@@ -306,8 +306,8 @@ describe("Phase 9 — cross-version dedup (I9) + chunk reclamation", () => {
     expect(refCount).toBe(2); // two versions both reference the hash
 
     // ShardDO's chunk row exists once; ref_count on that single row = 2.
-    const shardStub = E.SHARD_DO.get(
-      E.SHARD_DO.idFromName(
+    const shardStub = E.MOSSAIC_SHARD.get(
+      E.MOSSAIC_SHARD.idFromName(
         vfsShardDOName("default", tenant, undefined, shardIdx)
       )
     );
@@ -343,8 +343,8 @@ describe("Phase 9 — cross-version dedup (I9) + chunk reclamation", () => {
     await vfs.writeFile("/x.bin", v2);
     await vfs.writeFile("/x.bin", v3);
 
-    const userStub = E.USER_DO.get(
-      E.USER_DO.idFromName(vfsUserDOName("default", tenant))
+    const userStub = E.MOSSAIC_USER.get(
+      E.MOSSAIC_USER.idFromName(vfsUserDOName("default", tenant))
     );
     const before = await runInDurableObject(userStub, async (_inst, state) => {
       const r = state.storage.sql
@@ -375,8 +375,8 @@ describe("Phase 9 — cross-version dedup (I9) + chunk reclamation", () => {
     // Trigger the ShardDO alarm to immediately reap soft-marked
     // chunks. Probe each touched shard.
     for (const { shard_index } of shards) {
-      const shard = E.SHARD_DO.get(
-        E.SHARD_DO.idFromName(
+      const shard = E.MOSSAIC_SHARD.get(
+        E.MOSSAIC_SHARD.idFromName(
           vfsShardDOName("default", tenant, undefined, shard_index)
         )
       );
@@ -408,8 +408,8 @@ describe("Phase 9 — inline tier (no shard call)", () => {
     await vfs.writeFile("/note.txt", "hello small");
 
     // Verify no version_chunks row exists for the inline version.
-    const stub = E.USER_DO.get(
-      E.USER_DO.idFromName(vfsUserDOName("default", tenant))
+    const stub = E.MOSSAIC_USER.get(
+      E.MOSSAIC_USER.idFromName(vfsUserDOName("default", tenant))
     );
     const stats = await runInDurableObject(stub, async (_inst, state) => {
       const v = state.storage.sql
@@ -503,15 +503,15 @@ describe("Phase 9 — restoreVersion vs swept chunks (audit C2 regression)", () 
     expect(dropped.dropped).toBe(1);
 
     // Force the alarm sweep on every shard touched.
-    const userStub = E.USER_DO.get(
-      E.USER_DO.idFromName(vfsUserDOName("default", tenant))
+    const userStub = E.MOSSAIC_USER.get(
+      E.MOSSAIC_USER.idFromName(vfsUserDOName("default", tenant))
     );
     // Identify shards via the surviving version_chunks rows + shard
     // capacity. Easier: enumerate the 32-shard pool head and force-
     // sweep any with soft-marked chunks.
     for (let s = 0; s < 32; s++) {
-      const shard = E.SHARD_DO.get(
-        E.SHARD_DO.idFromName(vfsShardDOName("default", tenant, undefined, s))
+      const shard = E.MOSSAIC_SHARD.get(
+        E.MOSSAIC_SHARD.idFromName(vfsShardDOName("default", tenant, undefined, s))
       );
       // Backdate any deleted_at into the past, force the alarm to
       // run immediately. If the shard has no soft-marked rows OR
@@ -570,8 +570,8 @@ describe("Phase 9 — restoreVersion vs swept chunks (audit C2 regression)", () 
     await vfs.writeFile("/x.bin", buf);
 
     // Find one shard that holds a chunk for /x.bin.
-    const userStub = E.USER_DO.get(
-      E.USER_DO.idFromName(vfsUserDOName("default", tenant))
+    const userStub = E.MOSSAIC_USER.get(
+      E.MOSSAIC_USER.idFromName(vfsUserDOName("default", tenant))
     );
     const refs = await runInDurableObject(userStub, async (_inst, state) => {
       return state.storage.sql
@@ -580,8 +580,8 @@ describe("Phase 9 — restoreVersion vs swept chunks (audit C2 regression)", () 
     });
     expect(refs.length).toBe(1);
     const { chunk_hash, shard_index } = refs[0];
-    const shard = E.SHARD_DO.get(
-      E.SHARD_DO.idFromName(
+    const shard = E.MOSSAIC_SHARD.get(
+      E.MOSSAIC_SHARD.idFromName(
         vfsShardDOName("default", tenant, undefined, shard_index)
       )
     );

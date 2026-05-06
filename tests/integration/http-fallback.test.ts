@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { SELF, env } from "cloudflare:test";
+import { SELF, env, runInDurableObject } from "cloudflare:test";
 
 /**
  * Phase 7 — HTTP fallback acceptance gate.
@@ -28,7 +28,7 @@ import {
 import { signVFSToken, signJWT } from "@core/lib/auth";
 
 interface E {
-  USER_DO: DurableObjectNamespace;
+  MOSSAIC_USER: DurableObjectNamespace;
   JWT_SECRET?: string;
 }
 const TEST_ENV = env as unknown as E;
@@ -300,6 +300,80 @@ describe("HTTP fallback security / scope guards", () => {
     await expect(vfs.createReadStream("/x")).rejects.toThrow(/EINVAL/);
     await expect(vfs.createWriteStream("/x")).rejects.toThrow(/EINVAL/);
     await expect(vfs.openReadStream("/x")).rejects.toThrow(/EINVAL/);
+  });
+});
+
+// ── Phase 13 — multipart envelope for metadata/tags/version on bytes ───
+describe("Phase 13 — HTTP writeFile multipart envelope (metadata/tags/version parity)", () => {
+  it("HTTP writeFile (bytes + multipart) applies metadata + tags", async () => {
+    const vfs = await client("default", "http-multipart-meta");
+    const payload = new TextEncoder().encode("photo bytes go here");
+    await vfs.writeFile("/photo.bin", payload, {
+      metadata: { camera: "x100", iso: 400 },
+      tags: ["urgent", "client/acme"],
+    });
+    // Confirm via listFiles (Phase 12 indexed list, paginated).
+    const page = await vfs.listFiles({ includeMetadata: true });
+    const f = page.items.find((i) => i.path === "/photo.bin");
+    expect(f).toBeDefined();
+    expect(f!.metadata).toEqual({ camera: "x100", iso: 400 });
+    expect([...f!.tags].sort()).toEqual(["client/acme", "urgent"]);
+  });
+
+  it("HTTP writeFile (string JSON path) applies metadata + tags + version label", async () => {
+    const vfs = await client("default", "http-json-meta");
+    // Enable versioning at the DO level (HTTP client doesn't expose
+    // adminSetVersioning; reach in via the test env's MOSSAIC_USER stub).
+    const tenantStub = TEST_ENV.MOSSAIC_USER.get(
+      TEST_ENV.MOSSAIC_USER.idFromName("vfs:default:http-json-meta")
+    );
+    const tenantStubTyped = tenantStub as unknown as {
+      adminSetVersioning(uid: string, enabled: boolean): Promise<unknown>;
+    };
+    await tenantStubTyped.adminSetVersioning("http-json-meta", true);
+
+    await vfs.writeFile("/note.txt", "json-payload-here", {
+      metadata: { project: "alpha" },
+      tags: ["draft"],
+      version: { label: "first", userVisible: true },
+    });
+    // The HTTP listVersions route doesn't currently surface `label` /
+    // `userVisible`; verify directly via raw SQL in the DO. (Extending
+    // the HTTP route is a follow-up and out of scope for Phase 13.)
+    const row = await runInDurableObject(tenantStub, async (_inst, state) => {
+      return state.storage.sql
+        .exec(
+          `SELECT v.label, v.user_visible
+             FROM file_versions v
+             JOIN files f ON v.path_id = f.file_id
+            WHERE f.file_name = 'note.txt'`
+        )
+        .toArray()[0] as { label: string | null; user_visible: number } | undefined;
+    });
+    expect(row).toBeDefined();
+    expect(row!.label).toBe("first");
+    expect(row!.user_visible).toBe(1);
+  });
+
+  it("HTTP writeFile (octet-stream path, no opts) is unchanged — backward compat", async () => {
+    const vfs = await client("default", "http-octet-bc");
+    const payload = new Uint8Array(2048);
+    for (let i = 0; i < payload.length; i++) payload[i] = i & 0xff;
+    await vfs.writeFile("/raw.bin", payload);
+    const back = await vfs.readFile("/raw.bin");
+    expect(back.byteLength).toBe(2048);
+    expect(back[100]).toBe(100);
+  });
+
+  it("HTTP writeFile (multipart) rejects oversize tags with EINVAL (400)", async () => {
+    const vfs = await client("default", "http-cap");
+    // 33 unique tags > TAGS_MAX_PER_FILE (32) — server-side validation
+    // should surface as EINVAL through the mapped error.
+    const tooMany: string[] = [];
+    for (let i = 0; i < 33; i++) tooMany.push(`t${i}`);
+    await expect(
+      vfs.writeFile("/cap.bin", new Uint8Array(16), { tags: tooMany })
+    ).rejects.toThrow(/EINVAL/);
   });
 });
 

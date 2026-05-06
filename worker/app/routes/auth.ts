@@ -44,8 +44,8 @@ auth.post("/signup", async (c) => {
   }
 
   // Route to a UserDO named by email (consistent routing)
-  const doId = c.env.USER_DO.idFromName(`auth:${email}`);
-  const stub = c.env.USER_DO.get(doId);
+  const doId = c.env.MOSSAIC_USER.idFromName(`auth:${email}`);
+  const stub = c.env.MOSSAIC_USER.get(doId);
 
   const res = await stub.fetch(
     new Request("http://internal/signup", {
@@ -84,8 +84,8 @@ auth.post("/login", async (c) => {
     return c.json({ error: "Email and password are required" }, 400);
   }
 
-  const doId = c.env.USER_DO.idFromName(`auth:${email}`);
-  const stub = c.env.USER_DO.get(doId);
+  const doId = c.env.MOSSAIC_USER.idFromName(`auth:${email}`);
+  const stub = c.env.MOSSAIC_USER.get(doId);
 
   const res = await stub.fetch(
     new Request("http://internal/login", {

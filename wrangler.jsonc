@@ -6,10 +6,17 @@
 //                sign or verify any token (auth.ts:VFSConfigError → 503).
 //                Set with: `wrangler secret put JWT_SECRET`
 //
-// REQUIRED bindings: USER_DO, SHARD_DO, SEARCH_DO (below). The Worker
-// boots without JWT_SECRET; auth-bearing routes refuse with 503 until
-// the secret is set, so legacy `/api/upload`/`/api/download` paths that
-// don't touch JWT remain available during a partial rollout.
+// REQUIRED bindings: MOSSAIC_USER, MOSSAIC_SHARD, SEARCH_DO (below). The
+// Worker boots without JWT_SECRET; auth-bearing routes refuse with 503
+// until the secret is set, so legacy `/api/upload`/`/api/download` paths
+// that don't touch JWT remain available during a partial rollout.
+//
+// Phase 13: binding names use the MOSSAIC_ prefix for consumer-env safety.
+// Class names (UserDO/ShardDO/SearchDO) are unchanged — per CF docs
+// (https://developers.cloudflare.com/durable-objects/reference/durable-objects-migrations/),
+// renaming the wrangler `name` while keeping `class_name` is data-safe and
+// requires no migration entry. SEARCH_DO stays unprefixed because SearchDO
+// is App-mode internal and not part of the SDK contract.
 {
   "name": "mossaic",
   "main": "worker/app/index.ts",
@@ -32,8 +39,8 @@
 
   "durable_objects": {
     "bindings": [
-      { "name": "USER_DO", "class_name": "UserDO" },
-      { "name": "SHARD_DO", "class_name": "ShardDO" },
+      { "name": "MOSSAIC_USER", "class_name": "UserDO" },
+      { "name": "MOSSAIC_SHARD", "class_name": "ShardDO" },
       { "name": "SEARCH_DO", "class_name": "SearchDO" }
     ]
   },

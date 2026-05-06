@@ -25,8 +25,8 @@ folders.post("/", async (c) => {
     return c.json({ error: "Folder name is required" }, 400);
   }
 
-  const doId = c.env.USER_DO.idFromName(userDOName(userId));
-  const stub = c.env.USER_DO.get(doId);
+  const doId = c.env.MOSSAIC_USER.idFromName(userDOName(userId));
+  const stub = c.env.MOSSAIC_USER.get(doId);
 
   const res = await stub.fetch(
     new Request("http://internal/folders/create", {
@@ -46,8 +46,8 @@ folders.get("/:folderId", async (c) => {
   const userId = c.get("userId");
   const folderId = c.req.param("folderId");
 
-  const doId = c.env.USER_DO.idFromName(userDOName(userId));
-  const stub = c.env.USER_DO.get(doId);
+  const doId = c.env.MOSSAIC_USER.idFromName(userDOName(userId));
+  const stub = c.env.MOSSAIC_USER.get(doId);
 
   const res = await stub.fetch(
     new Request("http://internal/files/list", {

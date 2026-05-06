@@ -28,20 +28,20 @@ import { env, runInDurableObject } from "cloudflare:test";
 import { vfsShardDOName, vfsUserDOName } from "@core/lib/utils";
 
 interface E {
-  USER_DO: DurableObjectNamespace;
-  SHARD_DO: DurableObjectNamespace;
+  MOSSAIC_USER: DurableObjectNamespace;
+  MOSSAIC_SHARD: DurableObjectNamespace;
 }
 const E = env as unknown as E;
 
 const NS = "default";
 
 function userStub(tenant: string) {
-  return E.USER_DO.get(E.USER_DO.idFromName(vfsUserDOName(NS, tenant)));
+  return E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName(vfsUserDOName(NS, tenant)));
 }
 
 function shardStub(tenant: string, idx: number) {
-  return E.SHARD_DO.get(
-    E.SHARD_DO.idFromName(vfsShardDOName(NS, tenant, undefined, idx))
+  return E.MOSSAIC_SHARD.get(
+    E.MOSSAIC_SHARD.idFromName(vfsShardDOName(NS, tenant, undefined, idx))
   );
 }
 

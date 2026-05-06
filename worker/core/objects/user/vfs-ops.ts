@@ -22,6 +22,12 @@ import {
 } from "./vfs-versions";
 import { resolvePath, resolvePathFollow } from "./path-walk";
 import { purgeYjs, readYjsAsBytes, writeYjsBytes } from "./yjs";
+import {
+  validateLabel,
+  validateMetadata,
+  validateTags,
+} from "@shared/metadata-validate";
+import { replaceTags } from "./metadata-tags";
 
 /**
  * Phase 2 read-side VFS operations.
@@ -612,7 +618,7 @@ async function readFileVersioned(
       scope.sub,
       c.shard_index
     );
-    const stub = env.SHARD_DO.get(env.SHARD_DO.idFromName(shardName));
+    const stub = env.MOSSAIC_SHARD.get(env.MOSSAIC_SHARD.idFromName(shardName));
     const res = await stub.fetch(
       new Request(`http://internal/chunk/${c.chunk_hash}`)
     );
@@ -784,7 +790,7 @@ export async function vfsReadFile(
       scope.sub,
       c.shard_index
     );
-    const stub = env.SHARD_DO.get(env.SHARD_DO.idFromName(shardName));
+    const stub = env.MOSSAIC_SHARD.get(env.MOSSAIC_SHARD.idFromName(shardName));
     const res = await stub.fetch(
       new Request(`http://internal/chunk/${c.chunk_hash}`)
     );
@@ -952,7 +958,7 @@ export async function vfsReadChunk(
     scope.sub,
     chunkRow.shard_index
   );
-  const stub = env.SHARD_DO.get(env.SHARD_DO.idFromName(shardName));
+  const stub = env.MOSSAIC_SHARD.get(env.MOSSAIC_SHARD.idFromName(shardName));
   const res = await stub.fetch(
     new Request(`http://internal/chunk/${chunkRow.chunk_hash}`)
   );
@@ -1186,12 +1192,12 @@ async function hardDeleteFileRow(
 
   // Then dispatch one deleteChunks RPC per touched shard.
   const env = durableObject.envPublic;
-  // Env.SHARD_DO is the un-parameterized DurableObjectNamespace; cast to
+  // Env.MOSSAIC_SHARD is the un-parameterized DurableObjectNamespace; cast to
   // the typed namespace so the .deleteChunks RPC method is visible.
   // Double cast (via `unknown`) because TS treats the un-parameterized
   // form as DurableObjectNamespace<undefined> which doesn't structurally
   // overlap with the typed form.
-  const shardNs = env.SHARD_DO as unknown as DurableObjectNamespace<ShardDO>;
+  const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
   for (const { shard_index } of shardRows) {
     const shardName = vfsShardDOName(
       scope.ns,
@@ -1381,7 +1387,7 @@ async function vfsWriteFileVersioned(
   const { chunkSize, chunkCount } = computeChunkSpec(data.byteLength);
   const poolSize = poolSizeFor(durableObject, userId);
   const env = durableObject.envPublic;
-  const shardNs = env.SHARD_DO as unknown as DurableObjectNamespace<ShardDO>;
+  const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
   const refId = shardRefId(pathId, versionId);
   const touchedShards = new Set<number>();
 
@@ -1715,7 +1721,7 @@ export async function vfsWriteFile(
   const env = durableObject.envPublic;
   // Cast the un-parameterized namespace to the typed one so .putChunk RPC
   // resolves. (See hardDeleteFileRow for the same pattern on deleteChunks.)
-  const shardNs = env.SHARD_DO as unknown as DurableObjectNamespace<ShardDO>;
+  const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
   const fileHashParts = new Array<string>(chunkCount);
   try {
     const CONCURRENCY = 8;
@@ -2726,6 +2732,19 @@ export interface VFSWriteHandle {
   chunkSize: number;
   /** server-authoritative pool size for placement */
   poolSize: number;
+  /**
+   * Phase 13: metadata/tags/version snapshot captured at begin-time and
+   * applied at commit-time. Internal-only; not surfaced to SDK consumers
+   * (the SDK's `WriteHandle` interface is a structural subset that omits
+   * this field). Validated at begin so the caller fails fast — commit
+   * just SETs.
+   */
+  commitOpts?: {
+    metadataEncoded?: Uint8Array | null;
+    tags?: readonly string[];
+    versionLabel?: string;
+    versionUserVisible?: boolean;
+  };
 }
 
 /** Opaque read handle returned by vfsOpenReadStream. */
@@ -2858,7 +2877,7 @@ export async function vfsPullReadStream(
     scope.sub,
     chunkRow.shard_index
   );
-  const stub = env.SHARD_DO.get(env.SHARD_DO.idFromName(shardName));
+  const stub = env.MOSSAIC_SHARD.get(env.MOSSAIC_SHARD.idFromName(shardName));
   const res = await stub.fetch(
     new Request(`http://internal/chunk/${chunkRow.chunk_hash}`)
   );
@@ -2986,7 +3005,7 @@ export function vfsBeginWriteStream(
   durableObject: UserDO,
   scope: VFSScope,
   path: string,
-  opts: { mode?: number; mimeType?: string } = {}
+  opts: VFSWriteFileOpts = {}
 ): VFSWriteHandle {
   const userId = userIdFor(scope);
   const { parentId, leaf } = resolveParent(durableObject, userId, path);
@@ -2995,6 +3014,22 @@ export function vfsBeginWriteStream(
       "EISDIR",
       `beginWriteStream: target is a directory: ${path}`
     );
+  }
+
+  // Phase 13: validate metadata + tags + version label up front so the
+  // caller fails fast rather than late-at-commit. Validated payload is
+  // stashed on the handle and re-applied at commit.
+  let metadataEncoded: Uint8Array | null | undefined;
+  if (opts.metadata === null) {
+    metadataEncoded = null;
+  } else if (opts.metadata !== undefined) {
+    metadataEncoded = validateMetadata(opts.metadata).encoded;
+  }
+  if (opts.tags !== undefined) {
+    validateTags(opts.tags);
+  }
+  if (opts.version?.label !== undefined) {
+    validateLabel(opts.version.label);
   }
 
   const mode = opts.mode ?? 0o644;
@@ -3028,7 +3063,30 @@ export function vfsBeginWriteStream(
     mode
   );
 
-  return { tmpId, parentId, leaf, chunkSize: defaultChunkSize, poolSize };
+  // Stash the validated commit-time payload on the handle. Cheap to
+  // re-pass through the caller; the SDK's structural `WriteHandle` does
+  // NOT expose this field so consumers cannot tamper with it.
+  const hasCommitOpts =
+    metadataEncoded !== undefined ||
+    opts.tags !== undefined ||
+    opts.version !== undefined;
+  return {
+    tmpId,
+    parentId,
+    leaf,
+    chunkSize: defaultChunkSize,
+    poolSize,
+    ...(hasCommitOpts
+      ? {
+          commitOpts: {
+            metadataEncoded,
+            tags: opts.tags,
+            versionLabel: opts.version?.label,
+            versionUserVisible: opts.version?.userVisible,
+          },
+        }
+      : {}),
+  };
 }
 
 /**
@@ -3089,7 +3147,7 @@ export async function vfsAppendWriteStream(
   const hash = await hashChunk(data);
   const sIdx = placeChunk(userId, handle.tmpId, chunkIndex, handle.poolSize);
   const env = durableObject.envPublic;
-  const shardNs = env.SHARD_DO as unknown as DurableObjectNamespace<ShardDO>;
+  const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
   const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, sIdx);
   const stub = shardNs.get(shardNs.idFromName(shardName));
   await stub.putChunk(hash, data, handle.tmpId, chunkIndex, userId);
@@ -3120,6 +3178,15 @@ export async function vfsAppendWriteStream(
  * hash, then commit-rename the tmp row onto the target leaf via the
  * same supersede protocol as vfsWriteFile. The displaced row (if any)
  * is hard-deleted and its chunks are queued for GC.
+ *
+ * Phase 13: when the handle carries `commitOpts` (metadata/tags/version
+ * captured at begin-time, validated then), apply them to the tmp row
+ * BEFORE commitRename. metadata is written to `files.metadata`; tags
+ * are recorded via `replaceTags` (which uses path_id == tmpId, and
+ * commitRename carries them forward by virtue of the rename being a
+ * file-name-only update — file_id stays stable). The `version` opts
+ * are wired only when versioning is enabled for the tenant; when
+ * disabled they are silently dropped (matches `writeFile`).
  */
 export async function vfsCommitWriteStream(
   durableObject: UserDO,
@@ -3157,6 +3224,28 @@ export async function vfsCommitWriteStream(
     fileHash,
     handle.tmpId
   );
+
+  // Phase 13: apply metadata + tags BEFORE commitRename. The opts
+  // were validated at begin-time so we can write directly.
+  const co = handle.commitOpts;
+  if (co) {
+    if (co.metadataEncoded === null) {
+      durableObject.sql.exec(
+        "UPDATE files SET metadata = NULL WHERE file_id = ?",
+        handle.tmpId
+      );
+    } else if (co.metadataEncoded !== undefined) {
+      durableObject.sql.exec(
+        "UPDATE files SET metadata = ? WHERE file_id = ?",
+        co.metadataEncoded,
+        handle.tmpId
+      );
+    }
+    if (co.tags !== undefined) {
+      replaceTags(durableObject, userId, handle.tmpId, co.tags);
+    }
+  }
+
   await commitRename(
     durableObject,
     userId,
@@ -3165,6 +3254,52 @@ export async function vfsCommitWriteStream(
     handle.parentId,
     handle.leaf
   );
+
+  // Phase 13: version row creation. Streaming writes don't go through
+  // commitVersion (the versioned write path is content-addressed by
+  // hash; streaming uses tmp-file-id refs). For tenants with versioning
+  // enabled, we add a post-commit version row capturing the file_hash
+  // + size + label + visibility flag, mirroring writeFile's contract.
+  // The chunks themselves are already placed under the path_id (the
+  // post-rename file_id == tmpId) which provides the dedup boundary.
+  if (co?.versionLabel !== undefined || co?.versionUserVisible !== undefined) {
+    if (isVersioningEnabled(durableObject, userId)) {
+      const final = durableObject.sql
+        .exec(
+          "SELECT file_id, file_size, chunk_size, chunk_count, mime_type, mode FROM files WHERE file_id=?",
+          handle.tmpId
+        )
+        .toArray()[0] as
+        | {
+            file_id: string;
+            file_size: number;
+            chunk_size: number;
+            chunk_count: number;
+            mime_type: string;
+            mode: number;
+          }
+        | undefined;
+      if (final) {
+        const versionId = generateId();
+        commitVersion(durableObject, {
+          pathId: final.file_id,
+          versionId,
+          userId,
+          size: final.file_size,
+          mode: final.mode,
+          mtimeMs: Date.now(),
+          chunkSize: final.chunk_size,
+          chunkCount: final.chunk_count,
+          fileHash,
+          mimeType: final.mime_type,
+          inlineData: null,
+          userVisible: co.versionUserVisible ?? true,
+          label: co.versionLabel,
+          metadata: co.metadataEncoded ?? null,
+        });
+      }
+    }
+  }
 }
 
 /**
@@ -3194,7 +3329,7 @@ export async function vfsCreateWriteStream(
   durableObject: UserDO,
   scope: VFSScope,
   path: string,
-  opts: { mode?: number; mimeType?: string } = {}
+  opts: VFSWriteFileOpts = {}
 ): Promise<{ stream: WritableStream<Uint8Array>; handle: VFSWriteHandle }> {
   const handle = vfsBeginWriteStream(durableObject, scope, path, opts);
   let buffer = new Uint8Array(0);

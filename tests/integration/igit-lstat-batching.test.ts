@@ -27,12 +27,12 @@ import {
 } from "../../sdk/src/index";
 
 interface E {
-  USER_DO: DurableObjectNamespace;
+  MOSSAIC_USER: DurableObjectNamespace;
 }
 const E = env as unknown as E;
 
 function envFor(): MossaicEnv {
-  return { MOSSAIC_USER: E.USER_DO as MossaicEnv["MOSSAIC_USER"] };
+  return { MOSSAIC_USER: E.MOSSAIC_USER as MossaicEnv["MOSSAIC_USER"] };
 }
 
 /**

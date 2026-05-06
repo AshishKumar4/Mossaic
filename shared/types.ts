@@ -275,10 +275,19 @@ export interface SharedAlbumPhotosResponse {
 }
 
 // ── Env Bindings (Worker) ──
+//
+// Phase 13: canonical binding names are `MOSSAIC_USER` and `MOSSAIC_SHARD`
+// (prefixed for consumer-env safety). `SEARCH_DO` is App-mode only and not
+// part of the SDK contract — consumers in library mode never see it.
+//
+// Renaming the wrangler `name` field while keeping `class_name` is a safe
+// no-data-loss change; storage is keyed by `(class_name, idFromName)` per
+// https://developers.cloudflare.com/durable-objects/reference/durable-objects-migrations/
 
+/** @internal */
 export interface Env {
-  USER_DO: DurableObjectNamespace;
-  SHARD_DO: DurableObjectNamespace;
+  MOSSAIC_USER: DurableObjectNamespace;
+  MOSSAIC_SHARD: DurableObjectNamespace;
   SEARCH_DO: DurableObjectNamespace;
   ASSETS: Fetcher;
   AI?: Ai;

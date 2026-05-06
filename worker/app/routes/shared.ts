@@ -26,8 +26,8 @@ shared.get("/:token/photos", async (c) => {
       return c.json({ error: "Invalid share token" }, 400);
     }
 
-    const doId = c.env.USER_DO.idFromName(userDOName(userId));
-    const stub = c.env.USER_DO.get(doId);
+    const doId = c.env.MOSSAIC_USER.idFromName(userDOName(userId));
+    const stub = c.env.MOSSAIC_USER.get(doId);
 
     // Fetch file metadata for each file
     const photos = [];
@@ -77,8 +77,8 @@ shared.get("/:token/image/:fileId", async (c) => {
       return c.json({ error: "Unauthorized" }, 403);
     }
 
-    const doId = c.env.USER_DO.idFromName(userDOName(userId));
-    const stub = c.env.USER_DO.get(doId);
+    const doId = c.env.MOSSAIC_USER.idFromName(userDOName(userId));
+    const stub = c.env.MOSSAIC_USER.get(doId);
 
     const manifestRes = await stub.fetch(
       new Request(`http://internal/files/manifest/${fileId}`)
@@ -101,10 +101,10 @@ shared.get("/:token/image/:fileId", async (c) => {
 
     if (manifest.chunks.length === 1) {
       const chunk = manifest.chunks[0];
-      const shardId = c.env.SHARD_DO.idFromName(
+      const shardId = c.env.MOSSAIC_SHARD.idFromName(
         shardDOName(userId, chunk.shardIndex)
       );
-      const shardStub = c.env.SHARD_DO.get(shardId);
+      const shardStub = c.env.MOSSAIC_SHARD.get(shardId);
       const chunkRes = await shardStub.fetch(
         new Request(`http://internal/chunk/${chunk.hash}`)
       );
@@ -125,10 +125,10 @@ shared.get("/:token/image/:fileId", async (c) => {
     // Multi-chunk assembly
     const chunkBuffers: ArrayBuffer[] = [];
     for (const chunk of manifest.chunks.sort((a, b) => a.index - b.index)) {
-      const shardId = c.env.SHARD_DO.idFromName(
+      const shardId = c.env.MOSSAIC_SHARD.idFromName(
         shardDOName(userId, chunk.shardIndex)
       );
-      const shardStub = c.env.SHARD_DO.get(shardId);
+      const shardStub = c.env.MOSSAIC_SHARD.get(shardId);
       const chunkRes = await shardStub.fetch(
         new Request(`http://internal/chunk/${chunk.hash}`)
       );

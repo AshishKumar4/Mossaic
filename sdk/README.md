@@ -2,6 +2,8 @@
 
 Cloudflare-Worker-native VFS over Mossaic. fs/promises-shaped, isomorphic-git compatible, multi-tenant, content-addressed, deduplicating, streaming-aware.
 
+> For the canonical shape of every public API (`MossaicEnv`, `WriteFileOpts`, `YDocHandle`, HTTP envelope), see the **[integration guide](../docs/integration-guide.md)**. This README is a DX walkthrough; the integration guide is the source of truth.
+
 ```
                                   Phases 10–12 architecture
                                   ─────────────────────────
@@ -417,7 +419,7 @@ Phase 10 adds **native Yjs** as a per-file mode. A regular file can be promoted 
 - **Wire protocol**: standard Yjs sync protocol (sync_step_1 / sync_step_2 / update) tagged with a single byte. **Binary frames** end-to-end — no JSON, no base64, no envelope overhead.
 - **WebSocket transport**: Cloudflare's [Hibernation API](https://developers.cloudflare.com/durable-objects/api/websockets/#hibernation-api). **Idle connections cost $0** — workerd evicts the DO between frames and rehydrates per message. Per-socket state survives via `serializeAttachment`.
 - **Versioning interop**: when both versioning and yjs-mode are on, **compaction snapshots** create Mossaic version rows. Live ops between snapshots are NOT versioned — the Yjs op log IS the live history.
-- **`yjs` is an optional peer dependency** — bring your own Yjs version. Importing from `@mossaic/sdk/yjs` is the opt-in.
+- **`yjs` and `y-protocols` are optional peer dependencies** — bring your own versions. Importing from `@mossaic/sdk/yjs` is the opt-in (the main bundle stays Yjs-free).
 
 ### Example
 
@@ -445,6 +447,15 @@ export default {
     handle.doc.getText("content").insert(0, "DRAFT — ");
     // ... edits propagate to every other open client ...
 
+    // Phase 13: presence / cursors / selections via y-protocols/awareness.
+    handle.awareness.setLocalState({ name: "alice", cursor: 7 });
+    handle.awareness.on("change", () => {
+      // remote awareness states arrived — render them
+      for (const [clientID, state] of handle.awareness.getStates()) {
+        // ...
+      }
+    });
+
     await handle.close();
     return new Response("ok");
   },
@@ -470,8 +481,9 @@ if ((stat.mode & VFS_MODE_YJS_BIT) !== 0) {
 - **Demoting back to plain mode is rejected** (`EINVAL`) — it would silently lose CRDT history. If you need a plain copy, do `readFile` and `writeFile` to a different path.
 - **`writeFile` semantics on yjs-mode files**: the new bytes **replace** the value of `Y.Text("content")` inside a single `doc.transact`. If two writers race, both transactions commit and merge in CRDT order — neither is lost. To make finer-grained edits, open a `Y.Doc` via `openYDoc` and mutate it directly.
 - **isomorphic-git interop**: a tracked file can be promoted in-place. Once promoted, blob hashes change every transaction (the underlying chunks are Yjs updates, not the file content), so don't expect Git-friendly diffs against earlier commits — promote a file when you want CRDT semantics, not on the source you want Git to track.
-- **`yjs` peer dependency**: install in your consumer Worker. Mossaic does NOT bundle it. Tested against `yjs >=13.6.0`.
-- **No awareness yet**: the WebSocket protocol carries sync only in v1. Awareness (cursors, selections, presence) ships in a follow-up minor.
+- **`yjs` and `y-protocols` peer dependencies**: install both in your consumer Worker. Mossaic does NOT bundle them. Tested against `yjs >=13.6.0`, `y-protocols >=1.0.6`.
+- **Awareness is relay-only and never persisted.** The server forwards awareness frames between connected editors but never writes them to SQLite. On DO eviction the per-pathId Awareness instance resets; clients re-broadcast their state on reconnect (this is the same behavior as a vanilla y-websocket server).
+- **`YDocHandle` shape (Phase 13).** `{ doc: Y.Doc, awareness: Awareness, synced: Promise<void>, close(): Promise<void>, flush({ label? }): Promise<{ versionId, checkpointSeq }>, onClose(cb), onError(cb) }`. Note: there is no `handle.on("sync")` or `handle.on("update")` event-emitter surface. Subscribe to `doc` and `awareness` instances directly via their respective `on(...)` methods.
 
 ## Phase 12: copy, metadata, tags, indexed listFiles, version marks
 

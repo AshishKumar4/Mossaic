@@ -206,8 +206,8 @@ search.post("/reindex", async (c) => {
   const userId = c.get("userId");
 
   // Get all user files from UserDO
-  const userDoId = c.env.USER_DO.idFromName(userDOName(userId));
-  const userStub = c.env.USER_DO.get(userDoId);
+  const userDoId = c.env.MOSSAIC_USER.idFromName(userDOName(userId));
+  const userStub = c.env.MOSSAIC_USER.get(userDoId);
 
   const filesRes = await userStub.fetch(new Request("http://internal/files/list"));
   if (!filesRes.ok) {
@@ -346,8 +346,8 @@ async function fetchFileBytes(
   fileId: string
 ): Promise<Uint8Array | null> {
   try {
-    const userDoId = env.USER_DO.idFromName(userDOName(userId));
-    const userStub = env.USER_DO.get(userDoId);
+    const userDoId = env.MOSSAIC_USER.idFromName(userDOName(userId));
+    const userStub = env.MOSSAIC_USER.get(userDoId);
 
     const manifestRes = await userStub.fetch(
       new Request(`http://internal/files/manifest/${fileId}`)
@@ -362,8 +362,8 @@ async function fetchFileBytes(
     // Single chunk — fast path
     if (manifest.chunks.length === 1) {
       const chunk = manifest.chunks[0];
-      const shardId = env.SHARD_DO.idFromName(shardDOName(userId, chunk.shardIndex));
-      const shardStub = env.SHARD_DO.get(shardId);
+      const shardId = env.MOSSAIC_SHARD.idFromName(shardDOName(userId, chunk.shardIndex));
+      const shardStub = env.MOSSAIC_SHARD.get(shardId);
       const chunkRes = await shardStub.fetch(
         new Request(`http://internal/chunk/${chunk.hash}`)
       );
@@ -377,8 +377,8 @@ async function fetchFileBytes(
     let offset = 0;
 
     for (const chunk of sortedChunks) {
-      const shardId = env.SHARD_DO.idFromName(shardDOName(userId, chunk.shardIndex));
-      const shardStub = env.SHARD_DO.get(shardId);
+      const shardId = env.MOSSAIC_SHARD.idFromName(shardDOName(userId, chunk.shardIndex));
+      const shardStub = env.MOSSAIC_SHARD.get(shardId);
       const chunkRes = await shardStub.fetch(
         new Request(`http://internal/chunk/${chunk.hash}`)
       );

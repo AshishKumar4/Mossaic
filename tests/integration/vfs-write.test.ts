@@ -32,8 +32,8 @@ import { INLINE_LIMIT } from "@shared/inline";
 import { vfsShardDOName } from "@core/lib/utils";
 
 interface E {
-  USER_DO: DurableObjectNamespace<UserDO>;
-  SHARD_DO: DurableObjectNamespace<ShardDO>;
+  MOSSAIC_USER: DurableObjectNamespace<UserDO>;
+  MOSSAIC_SHARD: DurableObjectNamespace<ShardDO>;
 }
 const E = env as unknown as E;
 
@@ -131,7 +131,7 @@ async function fireAlarmNow(stub: DurableObjectStub<ShardDO>): Promise<boolean> 
 
 describe("vfsWriteFile (inline tier)", () => {
   it("inlines a small payload, never touches ShardDO", async () => {
-    const stub = E.USER_DO.get(E.USER_DO.idFromName("vfs-write:inline-small"));
+    const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-write:inline-small"));
     const userId = await seedUser(stub, "il-w@e.com");
     const scope = { ns: "default", tenant: userId };
 
@@ -175,7 +175,7 @@ describe("vfsWriteFile (inline tier)", () => {
   });
 
   it("EISDIR when target path is a directory", async () => {
-    const stub = E.USER_DO.get(E.USER_DO.idFromName("vfs-write:isdir"));
+    const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-write:isdir"));
     const userId = await seedUser(stub, "isd@e.com");
     const scope = { ns: "default", tenant: userId };
 
@@ -186,7 +186,7 @@ describe("vfsWriteFile (inline tier)", () => {
   });
 
   it("ENOENT when parent directory is missing", async () => {
-    const stub = E.USER_DO.get(E.USER_DO.idFromName("vfs-write:noparent"));
+    const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-write:noparent"));
     const userId = await seedUser(stub, "np@e.com");
     const scope = { ns: "default", tenant: userId };
 
@@ -205,7 +205,7 @@ describe("vfsWriteFile atomicity (temp-id-then-rename)", () => {
     // can verify correctness by post-conditions: there must be exactly
     // ONE live row at the leaf name (the new one), no _vfs_tmp_*
     // rows, and chunk_count consistent with inline branch.
-    const stub = E.USER_DO.get(E.USER_DO.idFromName("vfs-write:atomic-inline"));
+    const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-write:atomic-inline"));
     const userId = await seedUser(stub, "at@e.com");
     const scope = { ns: "default", tenant: userId };
 
@@ -236,7 +236,7 @@ describe("vfsWriteFile atomicity (temp-id-then-rename)", () => {
   });
 
   it("overwrite leaves the old file's rows hard-deleted, not lingering", async () => {
-    const stub = E.USER_DO.get(E.USER_DO.idFromName("vfs-write:overwrite-clean"));
+    const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-write:overwrite-clean"));
     const userId = await seedUser(stub, "ow@e.com");
     const scope = { ns: "default", tenant: userId };
 
@@ -278,7 +278,7 @@ describe("vfsWriteFile atomicity (temp-id-then-rename)", () => {
 
 describe("vfsWriteFile (chunked tier) + ShardDO refcount", () => {
   it("writes a >INLINE_LIMIT file as chunks and dedups on rewrite of identical content", async () => {
-    const stub = E.USER_DO.get(E.USER_DO.idFromName("vfs-write:chunked"));
+    const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-write:chunked"));
     const userId = await seedUser(stub, "ch-w@e.com");
     const scope = { ns: "default", tenant: userId };
 
@@ -332,8 +332,8 @@ describe("vfsWriteFile (chunked tier) + ShardDO refcount", () => {
     // ref_count=0 + deleted_at set; the new shard's chunks live at
     // ref_count=1.
     const oldShardIdx = meta.chunks[0].shard_index;
-    const oldShard = E.SHARD_DO.get(
-      E.SHARD_DO.idFromName(vfsShardDOName("default", userId, undefined, oldShardIdx))
+    const oldShard = E.MOSSAIC_SHARD.get(
+      E.MOSSAIC_SHARD.idFromName(vfsShardDOName("default", userId, undefined, oldShardIdx))
     );
     const oldHashes = (await readShardSnapshot(oldShard)).hashes.map(
       (h) => h.hash
@@ -361,8 +361,8 @@ describe("vfsWriteFile (chunked tier) + ShardDO refcount", () => {
     let liveCount = 0;
     let markedCount = 0;
     for (const idx of shardIdxsToCheck) {
-      const ss = E.SHARD_DO.get(
-        E.SHARD_DO.idFromName(vfsShardDOName("default", userId, undefined, idx))
+      const ss = E.MOSSAIC_SHARD.get(
+        E.MOSSAIC_SHARD.idFromName(vfsShardDOName("default", userId, undefined, idx))
       );
       const snap = await readShardSnapshot(ss);
       for (const h of snap.hashes) {
@@ -388,7 +388,7 @@ describe("vfsWriteFile (chunked tier) + ShardDO refcount", () => {
 
 describe("vfsUnlink + ShardDO chunk GC alarm sweeper", () => {
   it("unlink decrements ref_count to 0, marks deleted_at, alarm hard-deletes", async () => {
-    const stub = E.USER_DO.get(E.USER_DO.idFromName("vfs-write:unlink-gc"));
+    const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-write:unlink-gc"));
     const userId = await seedUser(stub, "un@e.com");
     const scope = { ns: "default", tenant: userId };
 
@@ -404,8 +404,8 @@ describe("vfsUnlink + ShardDO chunk GC alarm sweeper", () => {
         .toArray()[0] as { shard_index: number };
       return r.shard_index;
     });
-    const shardStub = E.SHARD_DO.get(
-      E.SHARD_DO.idFromName(vfsShardDOName("default", userId, undefined, shardIdx))
+    const shardStub = E.MOSSAIC_SHARD.get(
+      E.MOSSAIC_SHARD.idFromName(vfsShardDOName("default", userId, undefined, shardIdx))
     );
 
     // Pre-unlink: ref_count=1 on each hash, no deleted_at.
@@ -444,8 +444,8 @@ describe("vfsUnlink + ShardDO chunk GC alarm sweeper", () => {
     // Direct ShardDO test: deleteChunks twice on the same fileId. The
     // MAX(0, ref_count - 1) clause should keep things sane; second
     // call must be a no-op.
-    const shardStub = E.SHARD_DO.get(
-      E.SHARD_DO.idFromName("vfs-write:negdrift-shard")
+    const shardStub = E.MOSSAIC_SHARD.get(
+      E.MOSSAIC_SHARD.idFromName("vfs-write:negdrift-shard")
     );
 
     const hash = "f".repeat(64);
@@ -480,8 +480,8 @@ describe("vfsUnlink + ShardDO chunk GC alarm sweeper", () => {
   });
 
   it("resurrection: re-uploading the same hash before the alarm clears deleted_at", async () => {
-    const shardStub = E.SHARD_DO.get(
-      E.SHARD_DO.idFromName("vfs-write:resurrect-shard")
+    const shardStub = E.MOSSAIC_SHARD.get(
+      E.MOSSAIC_SHARD.idFromName("vfs-write:resurrect-shard")
     );
 
     const hash = "1".repeat(64);
@@ -530,7 +530,7 @@ describe("vfsUnlink + ShardDO chunk GC alarm sweeper", () => {
 
 describe("vfsRename", () => {
   it("simple rename: src no longer resolves, dst does, chunks intact", async () => {
-    const stub = E.USER_DO.get(E.USER_DO.idFromName("vfs-write:rename-simple"));
+    const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-write:rename-simple"));
     const userId = await seedUser(stub, "rn@e.com");
     const scope = { ns: "default", tenant: userId };
 
@@ -544,7 +544,7 @@ describe("vfsRename", () => {
   });
 
   it("rename-replace: dst's old chunks are GC'd, new path inherits src chunks", async () => {
-    const stub = E.USER_DO.get(E.USER_DO.idFromName("vfs-write:rename-replace"));
+    const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-write:rename-replace"));
     const userId = await seedUser(stub, "rr@e.com");
     const scope = { ns: "default", tenant: userId };
 
@@ -570,7 +570,7 @@ describe("vfsRename", () => {
     );
 
     const shardStubs = allShardIdxs.map((idx) =>
-      E.SHARD_DO.get(E.SHARD_DO.idFromName(vfsShardDOName("default", userId, undefined, idx)))
+      E.MOSSAIC_SHARD.get(E.MOSSAIC_SHARD.idFromName(vfsShardDOName("default", userId, undefined, idx)))
     );
 
     // Pre-rename: every chunk has ref_count=1.
@@ -602,7 +602,7 @@ describe("vfsRename", () => {
   });
 
   it("EISDIR when dst is a directory", async () => {
-    const stub = E.USER_DO.get(E.USER_DO.idFromName("vfs-write:rename-isdir"));
+    const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-write:rename-isdir"));
     const userId = await seedUser(stub, "rnd@e.com");
     const scope = { ns: "default", tenant: userId };
 
@@ -614,7 +614,7 @@ describe("vfsRename", () => {
   });
 
   it("ENOENT when src is missing", async () => {
-    const stub = E.USER_DO.get(E.USER_DO.idFromName("vfs-write:rename-noent"));
+    const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-write:rename-noent"));
     const userId = await seedUser(stub, "rne@e.com");
     const scope = { ns: "default", tenant: userId };
     await expect(stub.vfsRename(scope, "/nope", "/other")).rejects.toThrow(
@@ -627,7 +627,7 @@ describe("vfsRename", () => {
 
 describe("vfsMkdir / vfsRmdir / vfsChmod / vfsSymlink", () => {
   it("mkdir EEXIST on collision; recursive mkdir is idempotent", async () => {
-    const stub = E.USER_DO.get(E.USER_DO.idFromName("vfs-write:mkdir"));
+    const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-write:mkdir"));
     const userId = await seedUser(stub, "mk@e.com");
     const scope = { ns: "default", tenant: userId };
 
@@ -641,7 +641,7 @@ describe("vfsMkdir / vfsRmdir / vfsChmod / vfsSymlink", () => {
   });
 
   it("rmdir refuses non-empty; ok on empty", async () => {
-    const stub = E.USER_DO.get(E.USER_DO.idFromName("vfs-write:rmdir"));
+    const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-write:rmdir"));
     const userId = await seedUser(stub, "rm@e.com");
     const scope = { ns: "default", tenant: userId };
 
@@ -657,7 +657,7 @@ describe("vfsMkdir / vfsRmdir / vfsChmod / vfsSymlink", () => {
   });
 
   it("chmod updates mode on a file and a dir", async () => {
-    const stub = E.USER_DO.get(E.USER_DO.idFromName("vfs-write:chmod"));
+    const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-write:chmod"));
     const userId = await seedUser(stub, "cm@e.com");
     const scope = { ns: "default", tenant: userId };
 
@@ -673,7 +673,7 @@ describe("vfsMkdir / vfsRmdir / vfsChmod / vfsSymlink", () => {
   });
 
   it("symlink: create + lstat + stat-follow", async () => {
-    const stub = E.USER_DO.get(E.USER_DO.idFromName("vfs-write:symlink"));
+    const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-write:symlink"));
     const userId = await seedUser(stub, "sm@e.com");
     const scope = { ns: "default", tenant: userId };
 
@@ -705,7 +705,7 @@ describe("vfsMkdir / vfsRmdir / vfsChmod / vfsSymlink", () => {
 
 describe("concurrent vfsWriteFile (UNIQUE-index serialization)", () => {
   it("two parallel writeFile to same path: exactly one survives, content intact", async () => {
-    const stub = E.USER_DO.get(E.USER_DO.idFromName("vfs-write:concurrent"));
+    const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-write:concurrent"));
     const userId = await seedUser(stub, "co@e.com");
     const scope = { ns: "default", tenant: userId };
 
@@ -742,7 +742,7 @@ describe("concurrent vfsWriteFile (UNIQUE-index serialization)", () => {
   });
 
   it("ten back-to-back overwrites of same path: still one live row, no tmp leaks", async () => {
-    const stub = E.USER_DO.get(E.USER_DO.idFromName("vfs-write:overwrite-x10"));
+    const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-write:overwrite-x10"));
     const userId = await seedUser(stub, "ox@e.com");
     const scope = { ns: "default", tenant: userId };
 
@@ -783,7 +783,7 @@ describe("concurrent vfsWriteFile (UNIQUE-index serialization)", () => {
 
 describe("vfsRemoveRecursive", () => {
   it("rm -rf: empties subtree, GCs orphan chunks, leaves shared chunks alive", async () => {
-    const stub = E.USER_DO.get(E.USER_DO.idFromName("vfs-write:rmrf"));
+    const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-write:rmrf"));
     const userId = await seedUser(stub, "rf@e.com");
     const scope = { ns: "default", tenant: userId };
 
@@ -815,7 +815,7 @@ describe("vfsRemoveRecursive", () => {
       }
     );
     const shardStubs = allShardIdxs.map((idx) =>
-      E.SHARD_DO.get(E.SHARD_DO.idFromName(vfsShardDOName("default", userId, undefined, idx)))
+      E.MOSSAIC_SHARD.get(E.MOSSAIC_SHARD.idFromName(vfsShardDOName("default", userId, undefined, idx)))
     );
 
     // rm -rf the tree.
@@ -878,7 +878,7 @@ describe("vfsRemoveRecursive", () => {
 
 describe("end-to-end VFS lifecycle", () => {
   it("writeFile → readFile → unlink → readFile(ENOENT) → chunks GC'd", async () => {
-    const stub = E.USER_DO.get(E.USER_DO.idFromName("vfs-write:lifecycle"));
+    const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-write:lifecycle"));
     const userId = await seedUser(stub, "lc@e.com");
     const scope = { ns: "default", tenant: userId };
 
@@ -900,8 +900,8 @@ describe("end-to-end VFS lifecycle", () => {
         .toArray()[0] as { shard_index: number };
       return r.shard_index;
     });
-    const shardStub = E.SHARD_DO.get(
-      E.SHARD_DO.idFromName(vfsShardDOName("default", userId, undefined, shardIdx))
+    const shardStub = E.MOSSAIC_SHARD.get(
+      E.MOSSAIC_SHARD.idFromName(vfsShardDOName("default", userId, undefined, shardIdx))
     );
     let snap = await readShardSnapshot(shardStub);
     expect(snap.hashes.length).toBeGreaterThan(0);
@@ -950,7 +950,7 @@ describe("UserDO alarm() — stale-upload sweeper (H1)", () => {
    *      removed (refcount decremented per leaked ref).
    */
   it("alarm reclaims stale _vfs_tmp_ rows and decrements ShardDO refs", async () => {
-    const stub = E.USER_DO.get(E.USER_DO.idFromName("vfs-write:h1-sweeper"));
+    const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-write:h1-sweeper"));
     const userId = await seedUser(stub, "h1-sweeper@e.com");
     const scope = { ns: "default", tenant: userId };
 
@@ -998,8 +998,8 @@ describe("UserDO alarm() — stale-upload sweeper (H1)", () => {
     // Plant a chunk_refs row on the shard so the alarm has something
     // to decrement. We INSERT a fake chunk row + ref so the
     // ShardDO's removeFileRefs can find and process it.
-    const shardStub = E.SHARD_DO.get(
-      E.SHARD_DO.idFromName(
+    const shardStub = E.MOSSAIC_SHARD.get(
+      E.MOSSAIC_SHARD.idFromName(
         vfsShardDOName("default", userId, undefined, shard_index)
       )
     );
@@ -1107,8 +1107,8 @@ describe("UserDO alarm() — stale-upload sweeper (H1)", () => {
   });
 
   it("alarm is idempotent — running twice on already-reaped state is a no-op", async () => {
-    const stub = E.USER_DO.get(
-      E.USER_DO.idFromName("vfs-write:h1-idempotent")
+    const stub = E.MOSSAIC_USER.get(
+      E.MOSSAIC_USER.idFromName("vfs-write:h1-idempotent")
     );
     const userId = await seedUser(stub, "h1-idem@e.com");
     const scope = { ns: "default", tenant: userId };
@@ -1134,8 +1134,8 @@ describe("UserDO alarm() — stale-upload sweeper (H1)", () => {
   it("alarm without persisted scope (cold DO) is a safe no-op", async () => {
     // Fresh DO that has never seen a VFS RPC ⇒ no `scope` row in
     // vfs_meta. The sweeper must not throw.
-    const stub = E.USER_DO.get(
-      E.USER_DO.idFromName("vfs-write:h1-no-scope")
+    const stub = E.MOSSAIC_USER.get(
+      E.MOSSAIC_USER.idFromName("vfs-write:h1-no-scope")
     );
     await runInDurableObject(stub, async (_inst, state) => {
       // Don't even ensureInit — let the alarm itself bootstrap.
@@ -1160,7 +1160,7 @@ describe("H6: UNIQUE INDEX migration state", () => {
    *     with EBUSY until the operator runs admin dedupe.
    */
   it("missing uniq_files_parent_name index → vfs writes throw EBUSY", async () => {
-    const stub = E.USER_DO.get(E.USER_DO.idFromName("vfs-write:h6-degraded"));
+    const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-write:h6-degraded"));
     const userId = await seedUser(stub, "h6-degraded@e.com");
     const scope = { ns: "default", tenant: userId };
 
@@ -1194,7 +1194,7 @@ describe("H6: UNIQUE INDEX migration state", () => {
   });
 
   it("recovered index (re-CREATE succeeds) clears the marker on next ensureInit", async () => {
-    const stub = E.USER_DO.get(E.USER_DO.idFromName("vfs-write:h6-recovered"));
+    const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-write:h6-recovered"));
     const userId = await seedUser(stub, "h6-recovered@e.com");
     const scope = { ns: "default", tenant: userId };
 

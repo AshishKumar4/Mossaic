@@ -49,6 +49,12 @@
  */
 
 import * as Y from "yjs";
+import {
+  Awareness,
+  applyAwarenessUpdate,
+  encodeAwarenessUpdate,
+  removeAwarenessStates,
+} from "y-protocols/awareness";
 import type { UserDOCore as UserDO } from "./user-do-core";
 import type { ShardDO } from "../shard/shard-do";
 import { VFSError, type VFSScope } from "@shared/vfs-types";
@@ -80,11 +86,14 @@ export function yjsShardRefId(pathId: string, seq: number): string {
 
 /**
  * Yjs sync protocol message types (subset we actually use).
- * Standard Yjs protocol from y-protocols/sync.
+ * Standard Yjs protocol from y-protocols/sync, plus the Phase 13
+ * awareness tag whose payload is `encodeAwarenessUpdate(awareness, [...ids])`
+ * from y-protocols/awareness — relayed but NEVER persisted.
  */
 export const YJS_SYNC_STEP_1 = 0;
 export const YJS_SYNC_STEP_2 = 1;
 export const YJS_UPDATE = 2;
+export const YJS_AWARENESS = 3;
 
 /** Result of bumping the seq counter — pure function exposed for tests. */
 export function computeNextSeq(currentNextSeq: number): {
@@ -206,7 +215,7 @@ async function appendUpdate(
   const refId = yjsShardRefId(pathId, seq);
 
   const env = durableObject.envPublic;
-  const shardNs = env.SHARD_DO as unknown as DurableObjectNamespace<ShardDO>;
+  const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
   const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, sIdx);
   const stub = shardNs.get(shardNs.idFromName(shardName));
   await stub.putChunk(hash, bytes, refId, 0, userId);
@@ -277,7 +286,7 @@ async function dropOpsBefore(
   );
 
   const env = durableObject.envPublic;
-  const shardNs = env.SHARD_DO as unknown as DurableObjectNamespace<ShardDO>;
+  const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
   for (const { seq, shard_index } of rows) {
     const refId = yjsShardRefId(pathId, seq);
     const shardName = vfsShardDOName(
@@ -335,7 +344,7 @@ async function loadDoc(
         scope.sub,
         ck.shard_index
       );
-      const stub = env.SHARD_DO.get(env.SHARD_DO.idFromName(shardName));
+      const stub = env.MOSSAIC_SHARD.get(env.MOSSAIC_SHARD.idFromName(shardName));
       const res = await stub.fetch(
         new Request(`http://internal/chunk/${ck.chunk_hash}`)
       );
@@ -368,7 +377,7 @@ async function loadDoc(
       scope.sub,
       op.shard_index
     );
-    const stub = env.SHARD_DO.get(env.SHARD_DO.idFromName(shardName));
+    const stub = env.MOSSAIC_SHARD.get(env.MOSSAIC_SHARD.idFromName(shardName));
     const res = await stub.fetch(
       new Request(`http://internal/chunk/${op.chunk_hash}`)
     );
@@ -422,8 +431,84 @@ export class YjsRuntime {
    */
   private readonly sockets = new Map<string, Set<WebSocket>>();
 
+  /**
+   * Phase 13 — Awareness relay (presence / cursors / selections).
+   *
+   * One `Awareness` instance per pathId, lazily created. Held only in
+   * memory; on DO eviction these reset and clients re-broadcast their
+   * state on reconnect (standard y-websocket semantics). NEVER written
+   * to SQLite — the storage-cost guarantee.
+   *
+   * `clientIDsBySocket` maps each connected socket to the set of
+   * Awareness clientIDs it has registered. On disconnect we call
+   * `removeAwarenessStates` for those ids and broadcast the resulting
+   * "removed" frame to remaining peers — this is how y-websocket
+   * surfaces departures.
+   */
+  private readonly awarenessByPath = new Map<string, Awareness>();
+  private readonly clientIDsBySocket = new Map<WebSocket, Set<number>>();
+
   constructor(durableObject: UserDO) {
     this.durableObject = durableObject;
+  }
+
+  /**
+   * Lazily get the per-pathId Awareness instance. The instance is
+   * NEVER persisted; on DO eviction it evaporates and clients re-
+   * broadcast on reconnect (standard y-websocket behavior).
+   */
+  private getAwareness(pathId: string, doc: Y.Doc): Awareness {
+    let aw = this.awarenessByPath.get(pathId);
+    if (aw) return aw;
+    aw = new Awareness(doc);
+    // Server has no local state; we only track other clients'.
+    aw.setLocalState(null);
+    this.awarenessByPath.set(pathId, aw);
+    return aw;
+  }
+
+  /**
+   * Apply an awareness update from one socket and relay it (verbatim
+   * bytes) to every other socket on the same pathId. Server NEVER
+   * persists awareness frames.
+   *
+   * Tracks which Awareness clientIDs each socket owns so disconnects
+   * can emit a synthetic "removed" frame to surviving peers.
+   */
+  async relayAwareness(
+    scope: VFSScope,
+    pathId: string,
+    update: Uint8Array,
+    fromSocket: WebSocket
+  ): Promise<void> {
+    // Materialise the doc lazily so the Awareness instance has the
+    // right Y.Doc clientID space available.
+    const doc = await this.getDoc(scope, pathId);
+    const aw = this.getAwareness(pathId, doc);
+
+    // Apply locally so server-side `aw.getStates()` reflects the
+    // current population. The origin === fromSocket lets the update
+    // observer (installed once-per-Awareness) discriminate which
+    // socket the update came from for clientID bookkeeping.
+    const before = new Set<number>(aw.getStates().keys());
+    applyAwarenessUpdate(aw, update, fromSocket);
+    const after = aw.getStates().keys();
+
+    // Diff: any clientIDs that became known via THIS socket are
+    // "owned" by it (until that socket closes).
+    let owned = this.clientIDsBySocket.get(fromSocket);
+    if (!owned) {
+      owned = new Set();
+      this.clientIDsBySocket.set(fromSocket, owned);
+    }
+    for (const id of after) {
+      if (!before.has(id)) owned.add(id);
+    }
+
+    // Relay raw bytes to every OTHER socket on this pathId. We do
+    // NOT re-encode — forwarding the original payload is byte-faithful
+    // and CPU-cheap.
+    this.broadcast(pathId, encodeAwarenessMessage(update), fromSocket);
   }
 
   /**
@@ -691,7 +776,54 @@ export class YjsRuntime {
     const set = this.sockets.get(pathId);
     if (!set) return;
     set.delete(ws);
-    if (set.size === 0) this.sockets.delete(pathId);
+
+    // Phase 13 — Awareness disconnect cleanup. Synthesize a "removed"
+    // frame for any clientIDs this socket owned and broadcast to
+    // remaining peers, then drop the socket's clientID set.
+    const owned = this.clientIDsBySocket.get(ws);
+    if (owned && owned.size > 0) {
+      const aw = this.awarenessByPath.get(pathId);
+      if (aw) {
+        const ids = [...owned];
+        // removeAwarenessStates fires an `update` event whose
+        // payload is the "removed" frame bytes. We capture it via
+        // a one-shot listener so we can broadcast verbatim.
+        let removalUpdate: Uint8Array | null = null;
+        const captureOnce = (
+          { added, updated, removed }: { added: number[]; updated: number[]; removed: number[] },
+          _origin: unknown
+        ) => {
+          // After removeAwarenessStates, the affected clientIDs land in `removed`.
+          if (removed.length > 0) {
+            removalUpdate = encodeAwarenessUpdate(aw, removed);
+          }
+          void added;
+          void updated;
+        };
+        aw.on("update", captureOnce);
+        try {
+          removeAwarenessStates(aw, ids, "server-disconnect");
+        } finally {
+          aw.off("update", captureOnce);
+        }
+        if (removalUpdate) {
+          // Broadcast to all surviving sockets on this path.
+          this.broadcast(pathId, encodeAwarenessMessage(removalUpdate), ws);
+        }
+      }
+      this.clientIDsBySocket.delete(ws);
+    }
+
+    if (set.size === 0) {
+      this.sockets.delete(pathId);
+      // Last socket gone — drop the per-pathId Awareness so memory
+      // doesn't grow unbounded across many ephemeral docs.
+      const aw = this.awarenessByPath.get(pathId);
+      if (aw) {
+        aw.destroy();
+        this.awarenessByPath.delete(pathId);
+      }
+    }
   }
 
   /** Broadcast bytes to all sockets attached to pathId, except `exclude`. */
@@ -779,10 +911,23 @@ export function encodeSyncStep2(diff: Uint8Array): Uint8Array {
   return out;
 }
 
+/**
+ * Frame an awareness update. Payload is the y-protocols/awareness
+ * encodeAwarenessUpdate(...) bytes, relayed verbatim — server does NOT
+ * decode + re-encode for peers (saves CPU and preserves byte-identity).
+ */
+export function encodeAwarenessMessage(update: Uint8Array): Uint8Array {
+  const out = new Uint8Array(update.byteLength + 1);
+  out[0] = YJS_AWARENESS;
+  out.set(update, 1);
+  return out;
+}
+
 export type DecodedYjsMessage =
   | { kind: "syncStep1"; stateVector: Uint8Array }
   | { kind: "syncStep2"; diff: Uint8Array }
   | { kind: "update"; update: Uint8Array }
+  | { kind: "awareness"; update: Uint8Array }
   | { kind: "unknown"; tag: number };
 
 /** Parse a single tagged message; tolerant of unknown tags. */
@@ -793,6 +938,7 @@ export function decodeYjsMessage(msg: Uint8Array): DecodedYjsMessage {
   if (tag === YJS_SYNC_STEP_1) return { kind: "syncStep1", stateVector: body };
   if (tag === YJS_SYNC_STEP_2) return { kind: "syncStep2", diff: body };
   if (tag === YJS_UPDATE) return { kind: "update", update: body };
+  if (tag === YJS_AWARENESS) return { kind: "awareness", update: body };
   return { kind: "unknown", tag };
 }
 

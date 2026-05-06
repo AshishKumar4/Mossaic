@@ -36,6 +36,11 @@
  */
 
 import * as Y from "yjs";
+import {
+  Awareness,
+  applyAwarenessUpdate,
+  encodeAwarenessUpdate,
+} from "y-protocols/awareness";
 import type { VFS } from "./vfs";
 import { VFS_MODE_YJS_BIT as _VFS_MODE_YJS_BIT } from "./yjs-mode-bit";
 
@@ -51,6 +56,12 @@ export const VFS_MODE_YJS_BIT = _VFS_MODE_YJS_BIT;
 const YJS_SYNC_STEP_1 = 0;
 const YJS_SYNC_STEP_2 = 1;
 const YJS_UPDATE = 2;
+/**
+ * Phase 13 — awareness relay. Payload is `encodeAwarenessUpdate(...)`
+ * from `y-protocols/awareness`; relayed by the server but never
+ * persisted (resets on DO eviction; clients re-broadcast on reconnect).
+ */
+const YJS_AWARENESS = 3;
 
 function encodeUpdateMessage(update: Uint8Array): Uint8Array {
   const out = new Uint8Array(update.byteLength + 1);
@@ -73,6 +84,13 @@ function encodeSyncStep2(diff: Uint8Array): Uint8Array {
   return out;
 }
 
+function encodeAwarenessMessage(update: Uint8Array): Uint8Array {
+  const out = new Uint8Array(update.byteLength + 1);
+  out[0] = YJS_AWARENESS;
+  out.set(update, 1);
+  return out;
+}
+
 /**
  * Handle returned by `openYDoc`. Owns the WebSocket; the `doc`
  * field is the caller-visible `Y.Doc`. Idiomatic usage:
@@ -80,6 +98,8 @@ function encodeSyncStep2(diff: Uint8Array): Uint8Array {
  *     const handle = await openYDoc(vfs, "/notes/today.md");
  *     await handle.synced; // first round of sync complete
  *     handle.doc.getText("content").insert(0, "hello");
+ *     handle.awareness.setLocalState({ name: "alice", cursor: 0 });
+ *     handle.awareness.on("change", () => render(handle.awareness.getStates()));
  *     // ... later ...
  *     await handle.close();
  */
@@ -89,6 +109,22 @@ export interface YDocHandle {
    * are streamed to the server automatically.
    */
   readonly doc: Y.Doc;
+
+  /**
+   * Phase 13 — y-protocols/awareness instance for cursors,
+   * selections, and presence. Local state is set via
+   * `awareness.setLocalState({...})` and broadcast to the server,
+   * which relays to other connected editors. The server NEVER
+   * persists awareness — on DO eviction or restart the state
+   * resets and clients re-broadcast on reconnect.
+   *
+   * Subscribe to remote changes with `awareness.on("change", cb)`
+   * or `awareness.on("update", cb)`. Iterate states via
+   * `awareness.getStates()` (`Map<clientID, state>`).
+   *
+   * Destroyed automatically when `handle.close()` is called.
+   */
+  readonly awareness: Awareness;
 
   /**
    * Resolves once the initial sync round-trip with the server has
@@ -184,6 +220,7 @@ export async function openYDoc(
   ws.accept();
 
   const doc = opts.doc ?? new Y.Doc();
+  const awareness = new Awareness(doc);
 
   // Install the outbound update pump. Origin === ws means a frame
   // from this very socket — don't echo back.
@@ -196,6 +233,31 @@ export async function openYDoc(
     }
   };
   doc.on("update", onLocalUpdate);
+
+  // Phase 13 — outbound awareness pump. y-protocols emits an
+  // `update` event whenever the local Awareness state changes
+  // (added/updated/removed clientIDs). We send the encoded update
+  // to the server which relays to other peers. Origin === ws means
+  // the update arrived FROM the server; don't echo back.
+  const onLocalAwareness = (
+    {
+      added,
+      updated,
+      removed,
+    }: { added: number[]; updated: number[]; removed: number[] },
+    origin: unknown
+  ) => {
+    if (origin === ws) return;
+    const ids = [...added, ...updated, ...removed];
+    if (ids.length === 0) return;
+    try {
+      const payload = encodeAwarenessUpdate(awareness, ids);
+      ws.send(encodeAwarenessMessage(payload));
+    } catch {
+      /* socket may be closing */
+    }
+  };
+  awareness.on("update", onLocalAwareness);
 
   // Initial sync: send our state vector. Server will reply with
   // sync-step-2 (the diff we need) and its own sync-step-1.
@@ -239,6 +301,13 @@ export async function openYDoc(
         Y.applyUpdate(doc, body, ws);
         return;
       }
+      case YJS_AWARENESS: {
+        // Phase 13 — apply remote awareness update. Origin === ws
+        // tells our outbound pump (`onLocalAwareness`) not to echo
+        // this back to the server.
+        applyAwarenessUpdate(awareness, body, ws);
+        return;
+      }
       default:
         // Unknown — forward-compat ignore.
         return;
@@ -257,6 +326,8 @@ export async function openYDoc(
     if (closed) return;
     closed = true;
     doc.off("update", onLocalUpdate);
+    awareness.off("update", onLocalAwareness);
+    awareness.destroy();
     if (!gotServerStep2) {
       rejectSynced(new Error("openYDoc: socket closed before initial sync"));
     }
@@ -275,11 +346,14 @@ export async function openYDoc(
 
   return {
     doc,
+    awareness,
     synced,
     async close(): Promise<void> {
       if (closed) return;
       closed = true;
       doc.off("update", onLocalUpdate);
+      awareness.off("update", onLocalAwareness);
+      awareness.destroy();
       try {
         ws.close(1000, "client close");
       } catch {

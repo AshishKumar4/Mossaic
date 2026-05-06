@@ -36,8 +36,8 @@ import { vfsShardDOName, vfsUserDOName } from "@core/lib/utils";
 import { signVFSToken, verifyVFSToken } from "@core/lib/auth";
 
 interface E {
-  USER_DO: DurableObjectNamespace<UserDO>;
-  SHARD_DO: DurableObjectNamespace<ShardDO>;
+  MOSSAIC_USER: DurableObjectNamespace<UserDO>;
+  MOSSAIC_SHARD: DurableObjectNamespace<ShardDO>;
   JWT_SECRET?: string;
 }
 const E = env as unknown as E;
@@ -46,11 +46,11 @@ const TEST_ENV = E as unknown as Parameters<typeof signVFSToken>[0];
 const NS_DEFAULT = "default";
 
 function userStub(ns: string, tenant: string, sub?: string) {
-  return E.USER_DO.get(E.USER_DO.idFromName(vfsUserDOName(ns, tenant, sub)));
+  return E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName(vfsUserDOName(ns, tenant, sub)));
 }
 function shardStub(ns: string, tenant: string, sub: string | undefined, idx: number) {
-  return E.SHARD_DO.get(
-    E.SHARD_DO.idFromName(vfsShardDOName(ns, tenant, sub, idx))
+  return E.MOSSAIC_SHARD.get(
+    E.MOSSAIC_SHARD.idFromName(vfsShardDOName(ns, tenant, sub, idx))
   );
 }
 
