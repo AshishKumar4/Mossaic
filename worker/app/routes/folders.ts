@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import type { EnvApp as Env } from "@shared/types";
 import { authMiddleware } from "@core/lib/auth";
-import { userDOName } from "@core/lib/utils";
+import { userStub } from "../lib/user-stub";
 
 const folders = new Hono<{
   Bindings: Env;
@@ -13,6 +13,8 @@ folders.use("*", authMiddleware());
 /**
  * POST /api/folders
  * Create a new folder.
+ *
+ * Phase 17: typed RPC `appCreateFolder`.
  */
 folders.post("/", async (c) => {
   const userId = c.get("userId");
@@ -25,48 +27,29 @@ folders.post("/", async (c) => {
     return c.json({ error: "Folder name is required" }, 400);
   }
 
-  const doId = c.env.MOSSAIC_USER.idFromName(userDOName(userId));
-  const stub = c.env.MOSSAIC_USER.get(doId);
-
-  const res = await stub.fetch(
-    new Request("http://internal/folders/create", {
-      method: "POST",
-      body: JSON.stringify({ userId, name, parentId: parentId ?? null }),
-    })
+  const folder = await userStub(c.env, userId).appCreateFolder(
+    userId,
+    name,
+    parentId ?? null
   );
-
-  return c.json(await res.json(), 201);
+  return c.json(folder, 201);
 });
 
 /**
  * GET /api/folders/:folderId
- * List contents of a folder.
+ * List contents of a folder + breadcrumb path.
+ *
+ * Phase 17: typed RPCs `appListFiles` + `appGetFolderPath`.
  */
 folders.get("/:folderId", async (c) => {
   const userId = c.get("userId");
   const folderId = c.req.param("folderId");
 
-  const doId = c.env.MOSSAIC_USER.idFromName(userDOName(userId));
-  const stub = c.env.MOSSAIC_USER.get(doId);
-
-  const res = await stub.fetch(
-    new Request("http://internal/files/list", {
-      method: "POST",
-      body: JSON.stringify({ userId, parentId: folderId }),
-    })
-  );
-
-  // Also get folder path for breadcrumbs
-  const pathRes = await stub.fetch(
-    new Request(`http://internal/folders/path/${folderId}`)
-  );
-
-  // Type the JSON shapes — `Response.json()` is typed `unknown`/`any`
-  // depending on the platform's lib; `tsc -b` rejects spreading an
-  // unknown into an object literal. The DO returns the listFiles+folders
-  // tuple at this path; only the union shape matters for the client.
-  const contents = (await res.json()) as Record<string, unknown>;
-  const path = await pathRes.json();
+  const stub = userStub(c.env, userId);
+  const [contents, path] = await Promise.all([
+    stub.appListFiles(userId, folderId),
+    stub.appGetFolderPath(folderId),
+  ]);
 
   return c.json({ ...contents, path });
 });

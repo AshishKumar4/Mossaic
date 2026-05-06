@@ -1,7 +1,11 @@
 import { useState, useCallback } from "react";
 import { api } from "@/lib/api";
+// Phase 17: import the AIMD primitive from `@mossaic/sdk/http` (the
+// browser-safe entry — omits Worker-only DO classes). Same
+// implementation as before; the SDK re-exports `AIMDController` for
+// consumers who can't reach into `@shared/*` directly.
+import { AIMDController } from "@mossaic/sdk/http";
 import { MAX_RETRIES, RETRY_BASE_DELAY } from "@shared/constants";
-import { AIMDController } from "@shared/aimd";
 import { addTransferStats } from "@/lib/transfer-stats";
 import type { TransferProgress, ChunkProgress, ChunkStatus, CompletedTransferStats } from "@app/types";
 

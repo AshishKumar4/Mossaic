@@ -14,14 +14,16 @@ import { env, runInDurableObject } from "cloudflare:test";
  * - legacy rows (without the new columns) read back with safe defaults
  */
 
+import type { UserDO } from "@app/objects/user/user-do";
+
 interface Env {
-  MOSSAIC_USER: DurableObjectNamespace;
+  MOSSAIC_USER: DurableObjectNamespace<UserDO>;
   MOSSAIC_SHARD: DurableObjectNamespace;
 }
 
 const E = env as unknown as Env;
 
-function userStub(name: string) {
+function userStub(name: string): DurableObjectStub<UserDO> {
   return E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName(name));
 }
 function shardStub(name: string) {
@@ -32,14 +34,10 @@ describe("UserDO schema migrations", () => {
   it("adds new columns with correct defaults to a fresh DO", async () => {
     const stub = userStub("migration:fresh");
 
-    // First request triggers ensureInit.
-    const res = await stub.fetch(
-      new Request("http://internal/quota", {
-        method: "POST",
-        body: JSON.stringify({ userId: "u1" }),
-      })
-    );
-    expect(res.ok).toBe(true);
+    // First RPC triggers ensureInit (Phase 17 — typed RPC replaces
+    // the legacy POST /quota fetch).
+    const quota = await stub.appGetQuota("u1");
+    expect(quota.poolSize).toBeGreaterThan(0);
 
     // Inspect schema directly.
     await runInDurableObject(stub, async (_instance, state) => {
@@ -86,22 +84,10 @@ describe("UserDO schema migrations", () => {
   it("is idempotent — running ensureInit twice does not throw", async () => {
     const stub = userStub("migration:idempotent");
 
-    // Trigger init twice through two requests. The second one runs the
+    // Trigger init twice through two RPCs. The second one runs the
     // in-memory `initialized` flag short-circuit.
-    const r1 = await stub.fetch(
-      new Request("http://internal/quota", {
-        method: "POST",
-        body: JSON.stringify({ userId: "u1" }),
-      })
-    );
-    expect(r1.ok).toBe(true);
-    const r2 = await stub.fetch(
-      new Request("http://internal/quota", {
-        method: "POST",
-        body: JSON.stringify({ userId: "u1" }),
-      })
-    );
-    expect(r2.ok).toBe(true);
+    await stub.appGetQuota("u1");
+    await stub.appGetQuota("u1");
 
     // Force a re-run of the migrations in a *fresh* call by directly invoking
     // the same SQL the migrations issue. This proves try/catch absorbs the
@@ -136,79 +122,45 @@ describe("UserDO schema migrations", () => {
   it("legacy rows (no inline_data) read back with default node_kind='file' and inlineData=null", async () => {
     const stub = userStub("migration:legacy");
 
-    // Signup to get a user, then create a file via the existing legacy
-    // /files/create + /files/chunk + /files/complete path. The new columns
-    // should be auto-populated with defaults — `node_kind='file'`,
-    // `inline_data=NULL`, `mode=420`.
-    const signup = await stub.fetch(
-      new Request("http://internal/signup", {
-        method: "POST",
-        body: JSON.stringify({
-          email: "legacy@example.com",
-          password: "password123",
-        }),
-      })
+    // Signup to get a user, then create a file via the App's typed
+    // RPCs. The new columns should be auto-populated with defaults —
+    // `node_kind='file'`, `inline_data=NULL`, `mode=420`.
+    const { userId } = await stub.appHandleSignup(
+      "legacy@example.com",
+      "password123"
     );
-    expect(signup.ok).toBe(true);
-    const { userId } = (await signup.json()) as { userId: string };
 
-    const create = await stub.fetch(
-      new Request("http://internal/files/create", {
-        method: "POST",
-        body: JSON.stringify({
-          userId,
-          fileName: "legacy.txt",
-          fileSize: 11,
-          mimeType: "text/plain",
-          parentId: null,
-        }),
-      })
+    const created = await stub.appCreateFile(
+      userId,
+      "legacy.txt",
+      11,
+      "text/plain",
+      null
     );
-    expect(create.ok).toBe(true);
-    const created = (await create.json()) as { fileId: string };
 
     // Record one chunk + complete
-    await stub.fetch(
-      new Request("http://internal/files/chunk", {
-        method: "POST",
-        body: JSON.stringify({
-          fileId: created.fileId,
-          chunkIndex: 0,
-          chunkHash: "deadbeef".repeat(8),
-          chunkSize: 11,
-          shardIndex: 0,
-        }),
-      })
+    await stub.appRecordChunk(
+      created.fileId,
+      0,
+      "deadbeef".repeat(8),
+      11,
+      0
     );
-    await stub.fetch(
-      new Request("http://internal/files/complete", {
-        method: "POST",
-        body: JSON.stringify({
-          fileId: created.fileId,
-          fileHash: "feedface".repeat(8),
-          userId,
-          fileSize: 11,
-        }),
-      })
+    await stub.appCompleteFile(
+      created.fileId,
+      "feedface".repeat(8),
+      userId,
+      11
     );
 
     // Read back the manifest — should include the new fields with defaults.
-    const manRes = await stub.fetch(
-      new Request(`http://internal/files/manifest/${created.fileId}`)
-    );
-    expect(manRes.ok).toBe(true);
-    const manifest = (await manRes.json()) as {
-      mode?: number;
-      nodeKind?: string;
-      symlinkTarget?: string | null;
-      inlineData?: ArrayBuffer | null;
-      chunks: { index: number }[];
-    };
-    expect(manifest.mode).toBe(420);
-    expect(manifest.nodeKind).toBe("file");
-    expect(manifest.symlinkTarget).toBeNull();
-    expect(manifest.inlineData).toBeNull();
-    expect(manifest.chunks).toHaveLength(1);
+    const manifest = await stub.appGetFileManifest(created.fileId);
+    expect(manifest).not.toBeNull();
+    expect(manifest!.mode).toBe(420);
+    expect(manifest!.nodeKind).toBe("file");
+    expect(manifest!.symlinkTarget).toBeNull();
+    expect(manifest!.inlineData).toBeNull();
+    expect(manifest!.chunks).toHaveLength(1);
   });
 });
 

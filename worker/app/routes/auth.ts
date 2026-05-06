@@ -1,6 +1,7 @@
 import { Hono, type Context } from "hono";
 import type { EnvApp as Env } from "@shared/types";
 import { signJWT, VFSConfigError } from "@core/lib/auth";
+import { userStubByName } from "../lib/user-stub";
 
 const auth = new Hono<{ Bindings: Env }>();
 
@@ -8,8 +9,7 @@ type AuthCtx = Context<{ Bindings: Env }>;
 
 /**
  * Mint a JWT, mapping a missing-secret VFSConfigError to a clean
- * 503 instead of a generic 500. Auth signup/login pre-existed but
- * inherited the same JWT_SECRET; they now share the same fail-mode.
+ * 503 instead of a generic 500.
  */
 async function mintJWT(
   c: AuthCtx,
@@ -28,6 +28,9 @@ async function mintJWT(
 /**
  * POST /api/auth/signup
  * Create a new user account.
+ *
+ * Phase 17: replaced direct DO `stub.fetch("http://internal/signup")`
+ * with a typed RPC call to `UserDO.appHandleSignup`.
  */
 auth.post("/signup", async (c) => {
   const { email, password } = await c.req.json<{
@@ -43,23 +46,19 @@ auth.post("/signup", async (c) => {
     return c.json({ error: "Password must be at least 8 characters" }, 400);
   }
 
-  // Route to a UserDO named by email (consistent routing)
-  const doId = c.env.MOSSAIC_USER.idFromName(`auth:${email}`);
-  const stub = c.env.MOSSAIC_USER.get(doId);
+  // Route to a UserDO named by email (consistent routing — the email
+  // namespace is App-specific because the SDK's `vfs:*` form is keyed
+  // by tenant, not by an account-discovery email).
+  const stub = userStubByName(c.env, `auth:${email}`);
 
-  const res = await stub.fetch(
-    new Request("http://internal/signup", {
-      method: "POST",
-      body: JSON.stringify({ email, password }),
-    })
-  );
-
-  if (!res.ok) {
-    const err = (await res.json()) as { error: string };
-    return c.json({ error: err.error }, res.status as 400);
+  let result: { userId: string; email: string };
+  try {
+    result = await stub.appHandleSignup(email, password);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Signup failed";
+    return c.json({ error: message }, 400);
   }
 
-  const result = (await res.json()) as { userId: string; email: string };
   const tokenOrResp = await mintJWT(c, result);
   if (typeof tokenOrResp !== "string") return tokenOrResp;
 
@@ -73,6 +72,8 @@ auth.post("/signup", async (c) => {
 /**
  * POST /api/auth/login
  * Authenticate and get a JWT.
+ *
+ * Phase 17: replaced direct DO fetch with `UserDO.appHandleLogin`.
  */
 auth.post("/login", async (c) => {
   const { email, password } = await c.req.json<{
@@ -84,22 +85,16 @@ auth.post("/login", async (c) => {
     return c.json({ error: "Email and password are required" }, 400);
   }
 
-  const doId = c.env.MOSSAIC_USER.idFromName(`auth:${email}`);
-  const stub = c.env.MOSSAIC_USER.get(doId);
+  const stub = userStubByName(c.env, `auth:${email}`);
 
-  const res = await stub.fetch(
-    new Request("http://internal/login", {
-      method: "POST",
-      body: JSON.stringify({ email, password }),
-    })
-  );
-
-  if (!res.ok) {
-    const err = (await res.json()) as { error: string };
-    return c.json({ error: err.error }, res.status as 401);
+  let result: { userId: string; email: string };
+  try {
+    result = await stub.appHandleLogin(email, password);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Invalid credentials";
+    return c.json({ error: message }, 401);
   }
 
-  const result = (await res.json()) as { userId: string; email: string };
   const tokenOrResp = await mintJWT(c, result);
   if (typeof tokenOrResp !== "string") return tokenOrResp;
 

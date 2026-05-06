@@ -1,8 +1,9 @@
 import { Hono } from "hono";
 import type { EnvApp as Env } from "@shared/types";
-import type { ShardStats, UserStats, AnalyticsOverview } from "../types";
+import type { ShardStats, AnalyticsOverview } from "../types";
 import { authMiddleware } from "@core/lib/auth";
-import { userDOName, shardDOName } from "@core/lib/utils";
+import { shardDOName } from "@core/lib/utils";
+import { userStub } from "../lib/user-stub";
 
 const analytics = new Hono<{
   Bindings: Env;
@@ -13,53 +14,33 @@ analytics.use("*", authMiddleware());
 
 /**
  * GET /api/analytics/overview
- * Returns aggregated analytics: user stats + per-shard breakdown + totals.
+ * Returns aggregated analytics: user stats + per-shard breakdown +
+ * totals.
+ *
+ * Phase 17: typed RPCs `appGetUserStats` + `appGetQuota` replace the
+ * legacy fetch indirection. ShardDO `/stats` is still HTTP because
+ * ShardDO doesn't expose a typed RPC for stats.
  */
 analytics.get("/overview", async (c) => {
   const userId = c.get("userId");
+  const stub = userStub(c.env, userId);
 
-  // 1. Get user stats from UserDO
-  const userDoId = c.env.MOSSAIC_USER.idFromName(userDOName(userId));
-  const userStub = c.env.MOSSAIC_USER.get(userDoId);
-
-  const userRes = await userStub.fetch(
-    new Request("http://internal/stats", {
-      method: "POST",
-      body: JSON.stringify({ userId }),
-    })
-  );
-
-  if (!userRes.ok) {
-    return c.json({ error: "Failed to fetch user stats" }, 500);
-  }
-
-  const userStats = (await userRes.json()) as UserStats;
-
-  // 2. Determine pool size from user's quota
-  const quotaRes = await userStub.fetch(
-    new Request("http://internal/quota", {
-      method: "POST",
-      body: JSON.stringify({ userId }),
-    })
-  );
-
-  const quota = (await quotaRes.json()) as { poolSize: number };
+  const [userStats, quota] = await Promise.all([
+    stub.appGetUserStats(userId),
+    stub.appGetQuota(userId),
+  ]);
   const poolSize = quota.poolSize;
 
-  // 3. Only query ShardDOs if the user actually has files — avoids
-  //    waking up all 32 DOs for a brand-new user with nothing stored.
+  // Only query ShardDOs if the user actually has files — avoids
+  // waking up all 32 DOs for a brand-new user with nothing stored.
   let shards: ShardStats[] = [];
-
-  const hasFiles = userStats.totalFiles > 0 || userStats.shardDistribution.length > 0;
+  const hasFiles =
+    userStats.totalFiles > 0 || userStats.shardDistribution.length > 0;
 
   if (hasFiles) {
-    // Only query shards that UserDO says have data (from file_chunks table).
-    // This avoids waking up empty ShardDOs entirely.
     const activeShardIndices = new Set(
       userStats.shardDistribution.map((s) => s.shardIndex)
     );
-
-    // If no shard distribution data but files exist, fall back to querying all
     const indicesToQuery =
       activeShardIndices.size > 0
         ? Array.from(activeShardIndices)
@@ -82,7 +63,6 @@ analytics.get("/overview", async (c) => {
               totalRefs: number;
               capacityUsed: number;
             };
-            // Skip shards that have no data
             if (stats.totalChunks === 0 && stats.totalBytes === 0) return null;
             const dedupRatio =
               stats.totalRefs > 0
@@ -102,7 +82,7 @@ analytics.get("/overview", async (c) => {
     shards = shardResults.filter((s): s is ShardStats => s !== null);
   }
 
-  // 4. Compute totals
+  // Compute totals.
   let totalChunksAcrossShards = 0;
   let totalBytesAcrossShards = 0;
   let totalUniqueChunks = 0;

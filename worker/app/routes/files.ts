@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import type { EnvApp as Env } from "@shared/types";
 import { authMiddleware } from "@core/lib/auth";
-import { userDOName } from "@core/lib/utils";
+import { userStub } from "../lib/user-stub";
 
 const files = new Hono<{
   Bindings: Env;
@@ -13,46 +13,33 @@ files.use("*", authMiddleware());
 /**
  * GET /api/files
  * List files and folders in root or a specific folder.
+ *
+ * Phase 17: typed RPC `appListFiles` replaces the legacy fetch
+ * indirection. Wire shape (`{files, folders}`) is preserved 1:1.
  */
 files.get("/", async (c) => {
   const userId = c.get("userId");
   const parentId = c.req.query("parentId") || null;
 
-  const doId = c.env.MOSSAIC_USER.idFromName(userDOName(userId));
-  const stub = c.env.MOSSAIC_USER.get(doId);
-
-  const res = await stub.fetch(
-    new Request("http://internal/files/list", {
-      method: "POST",
-      body: JSON.stringify({ userId, parentId }),
-    })
-  );
-
-  return c.json(await res.json());
+  const result = await userStub(c.env, userId).appListFiles(userId, parentId);
+  return c.json(result);
 });
 
 /**
  * DELETE /api/files/:fileId
- * Soft-delete a file.
+ * Soft-delete a file and decrement the user's quota.
+ *
+ * Phase 17: typed RPC `appDeleteFile` (atomic delete + quota update
+ * on the DO side, no extra round-trips).
  */
 files.delete("/:fileId", async (c) => {
   const userId = c.get("userId");
   const fileId = c.req.param("fileId");
 
-  const doId = c.env.MOSSAIC_USER.idFromName(userDOName(userId));
-  const stub = c.env.MOSSAIC_USER.get(doId);
-
-  const res = await stub.fetch(
-    new Request(`http://internal/files/delete/${fileId}`, {
-      method: "DELETE",
-      headers: { "X-User-Id": userId },
-    })
-  );
-
-  if (!res.ok) {
+  const result = await userStub(c.env, userId).appDeleteFile(fileId, userId);
+  if (!result.ok) {
     return c.json({ error: "File not found" }, 404);
   }
-
   return c.json({ ok: true });
 });
 
