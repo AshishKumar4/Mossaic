@@ -571,6 +571,19 @@ export async function vfsFinalizeMultipart(
   }
 
   // 3. Compute touched shards.
+  //
+  // Phase 32 Fix 4 NOTE: multipart placement intentionally does
+  // NOT pass `fullShards` to `placeChunk`. The route layer
+  // (`multipart-routes.ts`) places each chunk PUT via the same
+  // `placeChunk(uploadId, idx, payload.poolSize)` call without a
+  // skip-set; the `fullShards` set at finalize time may differ
+  // from the set at upload time, and we have no reliable way to
+  // replay the upload-time snapshot here. The deterministic
+  // pure-rendezvous form keeps finalize verification consistent
+  // with placement. Multipart cap-awareness is deferred until we
+  // persist the per-session full-shards snapshot \u2014 a Phase 32.x
+  // follow-up. Reads work either way; only the write \"prefer
+  // less-full shards\" optimization is missing for multipart.
   const touched = new Set<number>();
   const idxToShard = new Array<number>(session.total_chunks);
   for (let i = 0; i < session.total_chunks; i++) {

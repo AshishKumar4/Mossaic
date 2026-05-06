@@ -26,47 +26,90 @@ function placementScore(
 }
 
 /**
+ * Sentinel returned by `placeChunk` when every shard in the pool
+ * is in `fullShards`. Caller's contract: trigger pool growth and
+ * retry placement with the new `poolSize`. Negative-int sentinel
+ * keeps the return type `number` and avoids a Maybe wrapper on
+ * the hot write path.
+ */
+export const POOL_FULL = -1;
+
+/**
  * Determine which shard index holds a specific chunk.
- * FULLY DETERMINISTIC: depends only on (userId, fileId, chunkIndex, poolSize).
- * No network calls. No state lookups.
  *
- * Phase 28.1 — TODO: cap-aware placement. The current implementation
- * picks the pure-rendezvous winner with no fullness check, so a
- * shard that's at the soft cap (9 GB) keeps receiving chunks until
- * pool growth (Phase 23 `recordWriteUsage`) widens the rendezvous
- * space. Pool growth IS the primary capacity mechanism, but in a
- * burst-write scenario where many chunks land before the next 5 GB
- * boundary trips, individual shards could approach the workerd
- * SQLite ceiling.
+ * **Phase 32 Fix 4 — cap-aware placement.** The pure-rendezvous
+ * winner is checked against `fullShards` (a snapshot of shards
+ * at-or-over the soft cap, populated by
+ * `worker/core/objects/user/shard-capacity.ts`). If the winner is
+ * full, the loop continues at the next-best score until either a
+ * non-full shard is found OR every shard in the pool is full
+ * (returns `POOL_FULL`). Caller responsibilities:
+ *  - When `fullShards` is `undefined` or empty: behaviour is
+ *    byte-equivalent to the pre-Phase-32 deterministic top-1
+ *    winner. ALL existing tests + readers depending on
+ *    deterministic placement see the same result.
+ *  - When `placeChunk` returns `POOL_FULL`: trigger pool growth
+ *    via Phase 23 `recordWriteUsage` (writing one chunk normally
+ *    would not advance pool_size by itself; the operator may need
+ *    to bump quota.storage_used to force a 5 GiB-boundary cross),
+ *    then retry placement with the new poolSize.
  *
- * The Phase 28 follow-up will accept an optional `skip?: Set<number>`
- * (shards over softCap, populated from the `monitorShardCapacity`
- * cache) and fall over to next-best rendezvous score. Backward
- * compat: when `skip` is absent or empty, behaviour is unchanged
- * (deterministic). For now, the warning at
- * `worker/core/objects/user/shard-capacity.ts` gives operators
- * visibility into approaching-cap conditions before any user-visible
- * write failure.
+ * Reads are UNCHANGED: every chunk's recorded `shard_index` in
+ * `file_chunks` / `version_chunks` stays valid forever. A "full"
+ * shard continues to serve reads; only writes are rerouted.
+ *
+ * FULLY DETERMINISTIC given identical (userId, fileId,
+ * chunkIndex, poolSize, fullShards) tuple. The non-determinism
+ * comes from the cache itself, which can change as shards fill
+ * over time \u2014 that's expected.
  */
 export function placeChunk(
   userId: string,
   fileId: string,
   chunkIndex: number,
-  poolSize: number
+  poolSize: number,
+  fullShards?: ReadonlySet<number>
 ): number {
-  let bestShard = 0;
-  let bestScore = -1;
-
-  for (let shard = 0; shard < poolSize; shard++) {
-    const shardId = scoreKey(userId, shard);
-    const score = placementScore(fileId, chunkIndex, shardId);
-    if (score > bestScore) {
-      bestScore = score;
-      bestShard = shard;
+  // Fast path: no skip-set or empty skip-set \u2014 byte-equivalent to
+  // the pre-Phase-32 implementation. The hot write path (every
+  // chunk PUT) takes this branch when the cache is cold or
+  // empty.
+  if (!fullShards || fullShards.size === 0) {
+    let bestShard = 0;
+    let bestScore = -1;
+    for (let shard = 0; shard < poolSize; shard++) {
+      const score = placementScore(
+        fileId,
+        chunkIndex,
+        scoreKey(userId, shard)
+      );
+      if (score > bestScore) {
+        bestScore = score;
+        bestShard = shard;
+      }
     }
+    return bestShard;
   }
 
-  return bestShard;
+  // Slow path: skip-aware. Score every shard in the pool, sort
+  // descending, return the first non-full one. Bounded by
+  // poolSize; placement work scales O(poolSize \xb7 log poolSize)
+  // which is fine: poolSize is already small (\u2264 ~256 in any
+  // realistic deployment) and chunk PUTs are not in the inner
+  // loop of any per-byte iteration.
+  const scored: { shard: number; score: number }[] = [];
+  for (let shard = 0; shard < poolSize; shard++) {
+    scored.push({
+      shard,
+      score: placementScore(fileId, chunkIndex, scoreKey(userId, shard)),
+    });
+  }
+  scored.sort((a, b) => b.score - a.score);
+  for (const s of scored) {
+    if (!fullShards.has(s.shard)) return s.shard;
+  }
+  // Every shard in the pool is full. Caller triggers pool growth.
+  return POOL_FULL;
 }
 
 /**
