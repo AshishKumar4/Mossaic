@@ -12,9 +12,9 @@ import type { RenderInput } from "@shared/preview-types";
  *
  *   V1.  canRender accepts video/*.
  *   V2.  Output is the same bytes as iconCardRenderer for the same
- *        input — confirming stable degradation. The Browser-Run
- *        upgrade will swap the body in via `env.BROWSER`; this
- *        test will change there.
+ *        input — confirming stable degradation. (BROWSER binding
+ *        removed in Phase 39; a future video-snapshot pipeline
+ *        will swap the body and this test will change.)
  */
 
 function fakeVideoInput(): RenderInput {

@@ -118,15 +118,6 @@ export type ImagesBinding = {
 };
 
 /**
- * Cloudflare Browser Run binding. Reserved for the deferred
- * preview renderers (PDF page-1, video poster, Office). * wires the binding optionally; renderers requiring it fall through
- * to the icon-card when the binding is absent.
- */
-export type BrowserBinding = {
-  fetch: (request: Request) => Promise<Response>;
-};
-
-/**
  * Core VFS bindings. Service-mode worker and SDK library-mode
  * consumers satisfy this shape with two DO namespaces and (optionally)
  * a JWT secret for token issuance.
@@ -147,8 +138,11 @@ export interface EnvCore {
   JWT_SECRET_PREVIOUS?: string;
   /** Cloudflare Images binding; optional — renderers fall through. */
   IMAGES?: ImagesBinding;
-  /** Cloudflare Browser Run binding; optional — renderers fall through. */
-  BROWSER?: BrowserBinding;
+  // BROWSER (Browser Run) binding was removed in Phase 39. The
+  // deferred renderers (PDF page-1, video poster, Office) never
+  // had a production code path wired and the binding kept the
+  // Worker on a billing tier it didn't need. If/when those
+  // renderers ship, re-add the binding under a new name.
 }
 
 /**

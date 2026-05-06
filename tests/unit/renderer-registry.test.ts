@@ -130,9 +130,14 @@ describe("RendererRegistry", () => {
   });
 
   it("list() returns kinds in registration order", () => {
+    // Phase 39 A3 added image-passthrough (registered AFTER
+    // image-resize so MIME dispatch still picks image-resize first;
+    // passthrough is a dispatchByKind-only target for the
+    // EMOSSAIC_UNAVAILABLE fallback path).
     const reg = buildDefaultRegistry();
     expect(reg.list()).toEqual([
       "image-resize",
+      "image-passthrough",
       "code-svg",
       "waveform-svg",
       "video-poster",
