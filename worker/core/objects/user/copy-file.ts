@@ -28,7 +28,8 @@
 import type { UserDOCore as UserDO } from "./user-do-core";
 import type { ShardDO } from "../shard/shard-do";
 import { VFSError, type VFSScope } from "../../../../shared/vfs-types";
-import { generateId, vfsShardDOName } from "../../lib/utils";
+import { generateId } from "../../lib/utils";
+import { getPlacement } from "../../lib/placement-resolver";
 import { commitVersion, isVersioningEnabled, shardRefId } from "./vfs-versions";
 
 interface CopyOpts {
@@ -418,7 +419,7 @@ async function copyChunked(
     }
     await Promise.all(
       Array.from(byShard.entries()).map(async ([sIdx, chunks]) => {
-        const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, sIdx);
+        const shardName = getPlacement(scope).shardDOName(scope, sIdx);
         const stub = shardNs.get(shardNs.idFromName(shardName));
         for (const c of chunks) {
           await stub.putChunk(
@@ -583,7 +584,7 @@ async function copyVersioned(
     }
     await Promise.all(
       Array.from(byShard.entries()).map(async ([sIdx, chunks]) => {
-        const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, sIdx);
+        const shardName = getPlacement(scope).shardDOName(scope, sIdx);
         const stub = shardNs.get(shardNs.idFromName(shardName));
         for (const c of chunks) {
           await stub.putChunk(
@@ -657,12 +658,7 @@ async function preflightChunksAlive(
   }
   await Promise.all(
     Array.from(byShard.entries()).map(async ([shardIndex, hashes]) => {
-      const shardName = vfsShardDOName(
-        scope.ns,
-        scope.tenant,
-        scope.sub,
-        shardIndex
-      );
+      const shardName = getPlacement(scope).shardDOName(scope, shardIndex);
       const stub = shardNs.get(shardNs.idFromName(shardName));
       const { alive } = await stub.chunksAlive(hashes);
       if (alive.length !== hashes.length) {

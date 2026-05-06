@@ -75,7 +75,8 @@ describe("Phase 16 — multipart session token", () => {
     });
     // Mangle the signature segment.
     const parts = token.split(".");
-    parts[2] = parts[2].replace(/.$/, (c) => (c === "A" ? "B" : "A"));
+    // Mutate enough bytes that the chance of a collision is zero.
+    parts[2] = parts[2].slice(0, -4) + (parts[2].slice(-4) === "AAAA" ? "BBBB" : "AAAA");
     const v = await verifyVFSMultipartToken(TEST_ENV, parts.join("."));
     expect(v).toBeNull();
   });

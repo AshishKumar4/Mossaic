@@ -7,7 +7,7 @@ import {
   type VFSStatRaw,
 } from "../../../../../shared/vfs-types";
 import { READFILE_MAX } from "../../../../../shared/inline";
-import { vfsShardDOName } from "../../../lib/utils";
+import { getPlacement } from "../../../lib/placement-resolver";
 import { resolvePath } from "../path-walk";
 import { resolveOrThrow, statForResolved, userIdFor } from "./helpers";
 import { isYjsMode } from "./metadata";
@@ -358,12 +358,7 @@ async function readFileVersioned(
   let next = 0;
   async function fetchOne(i: number): Promise<void> {
     const c = chunkRows[i];
-    const shardName = vfsShardDOName(
-      scope.ns,
-      scope.tenant,
-      scope.sub,
-      c.shard_index
-    );
+    const shardName = getPlacement(scope).shardDOName(scope, c.shard_index);
     const stub = env.MOSSAIC_SHARD.get(env.MOSSAIC_SHARD.idFromName(shardName));
     const res = await stub.fetch(
       new Request(`http://internal/chunk/${c.chunk_hash}`)
@@ -531,12 +526,7 @@ export async function vfsReadFile(
 
   async function fetchOne(i: number): Promise<void> {
     const c = chunkRows[i];
-    const shardName = vfsShardDOName(
-      scope.ns,
-      scope.tenant,
-      scope.sub,
-      c.shard_index
-    );
+    const shardName = getPlacement(scope).shardDOName(scope, c.shard_index);
     const stub = env.MOSSAIC_SHARD.get(env.MOSSAIC_SHARD.idFromName(shardName));
     const res = await stub.fetch(
       new Request(`http://internal/chunk/${c.chunk_hash}`)
@@ -699,12 +689,7 @@ export async function vfsReadChunk(
     );
   }
   const env = durableObject.envPublic;
-  const shardName = vfsShardDOName(
-    scope.ns,
-    scope.tenant,
-    scope.sub,
-    chunkRow.shard_index
-  );
+  const shardName = getPlacement(scope).shardDOName(scope, chunkRow.shard_index);
   const stub = env.MOSSAIC_SHARD.get(env.MOSSAIC_SHARD.idFromName(shardName));
   const res = await stub.fetch(
     new Request(`http://internal/chunk/${chunkRow.chunk_hash}`)

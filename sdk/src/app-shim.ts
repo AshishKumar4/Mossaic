@@ -53,46 +53,37 @@
  * `local/phase-17-plan.md` §5.9).
  */
 
-import { VFS, type CreateVFSOptions, type MossaicEnv, type UserDOClient } from "./vfs";
-import type { VFSScope } from "../../shared/vfs-types";
-import { userDOName } from "../../worker/core/lib/utils";
+import { VFS, type CreateVFSOptions, type MossaicEnv } from "./vfs";
+import { legacyAppPlacement } from "../../shared/placement";
 
 export interface CreateAppVFSOptions
-  extends Omit<CreateVFSOptions, "namespace" | "sub"> {
+  extends Omit<CreateVFSOptions, "namespace" | "sub" | "placement"> {
   /** App user id; addresses DOs as `user:<userId>`. */
   userId: string;
 }
 
 /**
- * App-only VFS subclass. Overrides `user()` to address the legacy
- * `user:<userId>` UserDO instance. `scope()` still returns a
- * canonical-shaped `VFSScope` because the server-side typed RPCs
- * (`vfsListFiles`, `vfsMkdir`, etc.) all expect a `VFSScope`
- * argument; the scope drives only the rate-limiter accounting and
- * (for shard-touching ops) the shard naming. Since this shim is
- * scoped to non-shard operations, the scope's tenant identity is
- * what matters.
- */
-class AppVFS extends VFS {
-  protected override user(): UserDOClient {
-    const id = this.env.MOSSAIC_USER.idFromName(userDOName(this.opts.tenant));
-    return this.env.MOSSAIC_USER.get(id) as UserDOClient;
-  }
-
-  protected override scope(): VFSScope {
-    return { ns: "default", tenant: this.opts.tenant };
-  }
-}
-
-/**
- * Construct an `AppVFS` instance bound to the legacy UserDO naming
- * (`user:<userId>`). The returned object satisfies the same
- * `VFSClient` surface as `createVFS`, but with the documented
- * shard-addressing caveat.
+ * Construct a VFS instance bound to the legacy UserDO naming
+ * (`user:<userId>`) and legacy ShardDO naming
+ * (`shard:<userId>:<idx>`).
+ *
+ * Phase 17.5: this is now a thin factory that passes
+ * `placement: legacyAppPlacement` to the canonical `VFS` constructor.
+ * No subclass override needed — the base class's `user()` method
+ * routes through the placement abstraction (`sdk/src/vfs.ts`).
+ *
+ * The returned `VFS` satisfies the same `VFSClient` surface as
+ * `createVFS`, with the documented constraint that chunk-touching
+ * operations land on the legacy `shard:${userId}:${idx}` instances
+ * where the App's existing photo-library data lives.
  */
 export function createAppVFS(
   env: MossaicEnv,
   opts: CreateAppVFSOptions
-): AppVFS {
-  return new AppVFS(env, { tenant: opts.userId, ...opts });
+): VFS {
+  return new VFS(env, {
+    tenant: opts.userId,
+    ...opts,
+    placement: legacyAppPlacement,
+  });
 }

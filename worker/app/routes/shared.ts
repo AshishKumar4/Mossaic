@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import type { EnvApp as Env } from "@shared/types";
-import { shardDOName } from "@core/lib/utils";
+import { legacyAppPlacement } from "@shared/placement";
 import { userStub } from "../lib/user-stub";
 
 const shared = new Hono<{ Bindings: Env }>();
@@ -90,7 +90,7 @@ shared.get("/:token/image/:fileId", async (c) => {
   if (manifest.chunks.length === 1) {
     const chunk = manifest.chunks[0];
     const shardId = c.env.MOSSAIC_SHARD.idFromName(
-      shardDOName(userId, chunk.shardIndex)
+      legacyAppPlacement.shardDOName({ ns: "default", tenant: userId }, chunk.shardIndex)
     );
     const shardStub = c.env.MOSSAIC_SHARD.get(shardId);
     const chunkRes = await shardStub.fetch(
@@ -112,7 +112,7 @@ shared.get("/:token/image/:fileId", async (c) => {
   const chunkBuffers: ArrayBuffer[] = [];
   for (const chunk of manifest.chunks.sort((a, b) => a.index - b.index)) {
     const shardId = c.env.MOSSAIC_SHARD.idFromName(
-      shardDOName(userId, chunk.shardIndex)
+      legacyAppPlacement.shardDOName({ ns: "default", tenant: userId }, chunk.shardIndex)
     );
     const shardStub = c.env.MOSSAIC_SHARD.get(shardId);
     const chunkRes = await shardStub.fetch(

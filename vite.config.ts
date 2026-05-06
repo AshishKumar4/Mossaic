@@ -7,6 +7,10 @@ import path from "node:path";
 export default defineConfig({
   plugins: [react(), tailwindcss(), cloudflare()],
   resolve: {
+    // "workspace" matches the SDK"s conditional exports, routing imports
+    // to TS sources (./src/*.ts) instead of dist/. Eliminates SDK build
+    // prerequisite for SPA dev/build; matches worker + test resolution.
+    conditions: ["workspace", "import", "module", "browser", "default"],
     alias: {
       "@": path.resolve(__dirname, "./src"),
       "@shared": path.resolve(__dirname, "./shared"),

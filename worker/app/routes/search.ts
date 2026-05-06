@@ -3,7 +3,7 @@ import type { EnvApp as Env } from "@shared/types";
 import type { SearchResult, ProviderStatus, VectorSpace } from "@shared/embedding-types";
 import { classifyResultType, isClipIndexable, isImageMime } from "@shared/embedding-types";
 import { authMiddleware } from "@core/lib/auth";
-import { shardDOName } from "@core/lib/utils";
+import { legacyAppPlacement } from "@shared/placement";
 import { userStub } from "../lib/user-stub";
 import {
   createEmbeddingProviders,
@@ -352,7 +352,7 @@ async function fetchFileBytes(
     // Single chunk — fast path
     if (manifest.chunks.length === 1) {
       const chunk = manifest.chunks[0];
-      const shardId = env.MOSSAIC_SHARD.idFromName(shardDOName(userId, chunk.shardIndex));
+      const shardId = env.MOSSAIC_SHARD.idFromName(legacyAppPlacement.shardDOName({ ns: "default", tenant: userId }, chunk.shardIndex));
       const shardStub = env.MOSSAIC_SHARD.get(shardId);
       const chunkRes = await shardStub.fetch(
         new Request(`http://internal/chunk/${chunk.hash}`)
@@ -367,7 +367,7 @@ async function fetchFileBytes(
     let offset = 0;
 
     for (const chunk of sortedChunks) {
-      const shardId = env.MOSSAIC_SHARD.idFromName(shardDOName(userId, chunk.shardIndex));
+      const shardId = env.MOSSAIC_SHARD.idFromName(legacyAppPlacement.shardDOName({ ns: "default", tenant: userId }, chunk.shardIndex));
       const shardStub = env.MOSSAIC_SHARD.get(shardId);
       const chunkRes = await shardStub.fetch(
         new Request(`http://internal/chunk/${chunk.hash}`)
