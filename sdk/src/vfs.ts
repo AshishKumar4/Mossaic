@@ -33,6 +33,8 @@ import type {
   VFSScope,
   VFSStatRaw,
 } from "../../shared/vfs-types";
+import { hashChunk } from "../../shared/crypto";
+import { placeChunk } from "../../shared/placement";
 import type {
   PreviewInfo,
   PreviewInfoBatchEntry,
@@ -40,6 +42,7 @@ import type {
   ReadPreviewOpts,
   ReadPreviewResult,
 } from "../../shared/preview-types";
+import type { ShardDO } from "../../worker/core/objects/shard/shard-do";
 
 /**
  * Public consumer-facing VFS contract. Both the binding `VFS` class
@@ -113,7 +116,7 @@ export interface VFSClient {
   removeRecursive(p: string): Promise<void>;
   symlink(target: string, p: string): Promise<void>;
   chmod(p: string, mode: number): Promise<void>;
-  rename(src: string, dst: string): Promise<void>;
+  rename(src: string, dst: string, opts?: RenameOpts): Promise<void>;
   /** deep-merge metadata + add/remove tags atomically. */
   patchMetadata(
     p: string,
@@ -192,7 +195,8 @@ export interface VFSClient {
   putMultipartChunk(
     handle: MultipartUploadHandle,
     index: number,
-    chunk: Uint8Array | ArrayBuffer | Blob
+    chunk: Uint8Array | ArrayBuffer | Blob,
+    opts?: MultipartRequestOpts
   ): Promise<PutMultipartChunkResult>;
 
   /**
@@ -203,7 +207,8 @@ export interface VFSClient {
    */
   finalizeMultipartUpload(
     handle: MultipartUploadHandle,
-    chunkHashList: readonly string[]
+    chunkHashList: readonly string[],
+    opts?: MultipartRequestOpts
   ): Promise<FinalizeMultipartUploadResult>;
 
   /**
@@ -213,7 +218,8 @@ export interface VFSClient {
    * returns `{aborted: false}` rather than throwing.
    */
   abortMultipartUpload(
-    handle: MultipartUploadHandle
+    handle: MultipartUploadHandle,
+    opts?: MultipartRequestOpts
   ): Promise<AbortMultipartUploadResult>;
 
   // Low-level escape hatch
@@ -386,6 +392,20 @@ export interface UserDOClient {
     path: string,
     opts?: { versionId?: string }
   ): Promise<Uint8Array>;
+  vfsBeginMultipart(
+    scope: VFSScope,
+    path: string,
+    opts: BeginMultipartUploadOpts
+  ): Promise<import("../../shared/multipart").MultipartBeginResponse>;
+  vfsFinalizeMultipart(
+    scope: VFSScope,
+    uploadId: string,
+    chunkHashList: readonly string[]
+  ): Promise<import("../../shared/multipart").MultipartFinalizeResponse>;
+  vfsAbortMultipart(
+    scope: VFSScope,
+    uploadId: string
+  ): Promise<{ ok: true }>;
   vfsWriteFile(
     scope: VFSScope,
     path: string,
@@ -523,7 +543,8 @@ export interface UserDOClient {
   vfsRename(
     scope: VFSScope,
     src: string,
-    dst: string
+    dst: string,
+    opts?: RenameOpts
   ): Promise<void>;
   vfsOpenManifest(
     scope: VFSScope,
@@ -805,6 +826,11 @@ export interface VersionMarkOpts {
   userVisible?: boolean;
 }
 
+export interface RenameOpts {
+  /** Default true preserves POSIX-like replace semantics for file destinations. */
+  overwrite?: boolean;
+}
+
 // ── Manual multipart-upload surface ─────────────────────────────────
 
 /**
@@ -876,6 +902,11 @@ export interface BeginMultipartUploadOpts {
   resumeFrom?: string;
   /** Session TTL in milliseconds. Server clamps to its policy. */
   ttlMs?: number;
+  signal?: AbortSignal;
+}
+
+export interface MultipartRequestOpts {
+  signal?: AbortSignal;
 }
 
 /** Result of {@link VFSClient.putMultipartChunk}. */
@@ -1214,6 +1245,7 @@ export interface DropVersionsPolicy {
 }
 
 import { vfsUserDOName } from "../../worker/core/lib/utils";
+import { vfsShardDOName } from "../../worker/core/lib/utils";
 
 /**
  * fs/promises-shaped client.
@@ -1893,9 +1925,9 @@ export class VFS implements VFSClient {
     return response;
   }
 
-  async rename(src: string, dst: string): Promise<void> {
+  async rename(src: string, dst: string, opts?: RenameOpts): Promise<void> {
     try {
-      await this.user().vfsRename(this.scope(), src, dst);
+      await this.user().vfsRename(this.scope(), src, dst, opts);
     } catch (err) {
       throw mapServerError(err, { path: dst, syscall: "rename" });
     }
@@ -1931,41 +1963,72 @@ export class VFS implements VFSClient {
     return createWriteStreamWithHandleRpc(this.user(), this.scope(), p, opts);
   }
 
-  // ── Manual multipart upload (HTTP-only surface) ───────────────────
-  //
-  // The binding client (DO RPC) has no need for the manual multipart
-  // surface — `writeFile` and `createWriteStream` route directly
-  // through the DO's RPC methods without a public chunk PUT path.
-  // Callers who reach `VFS.beginMultipartUpload` are misusing the
-  // binding client; surface a clear EINVAL pointing them at
-  // `createMossaicHttpClient`.
-
   async beginMultipartUpload(
-    _p: string,
-    _opts: BeginMultipartUploadOpts
+    p: string,
+    opts: BeginMultipartUploadOpts
   ): Promise<MultipartUploadHandle> {
-    throw new EINVAL({ syscall: "beginMultipartUpload-binding-mode" });
+    try {
+      const res = await this.user().vfsBeginMultipart(this.scope(), p, opts);
+      return {
+        uploadId: res.uploadId,
+        path: p,
+        chunkSize: res.chunkSize,
+        expectedChunks: res.totalChunks,
+        poolSize: res.poolSize,
+        sessionToken: res.sessionToken,
+        expiresAtMs: res.expiresAtMs,
+      };
+    } catch (err) {
+      throw mapServerError(err, { path: p, syscall: "open" });
+    }
   }
 
   async putMultipartChunk(
-    _handle: MultipartUploadHandle,
-    _index: number,
-    _chunk: Uint8Array | ArrayBuffer | Blob
+    handle: MultipartUploadHandle,
+    index: number,
+    chunk: Uint8Array | ArrayBuffer | Blob,
+    _opts?: MultipartRequestOpts
   ): Promise<PutMultipartChunkResult> {
-    throw new EINVAL({ syscall: "putMultipartChunk-binding-mode" });
+    const bytes = await coerceMultipartChunk(chunk);
+    const hash = await hashChunk(bytes);
+    const scope = this.scope();
+    const userId = userIdForScope(scope);
+    const shardIndex = placeChunk(userId, handle.uploadId, index, handle.poolSize);
+    const shardNs = this.env.MOSSAIC_SHARD as DurableObjectNamespace<ShardDO>;
+    const stub = shardNs.get(shardNs.idFromName(vfsShardDOName(scope.ns, scope.tenant, scope.sub, shardIndex)));
+    try {
+      const result = await stub.putChunkMultipart(hash, bytes, handle.uploadId, index, userId);
+      return { chunkHash: hash, accepted: true, status: result.status };
+    } catch (err) {
+      throw mapServerError(err, { syscall: "open" });
+    }
   }
 
   async finalizeMultipartUpload(
-    _handle: MultipartUploadHandle,
-    _chunkHashList: readonly string[]
+    handle: MultipartUploadHandle,
+    chunkHashList: readonly string[],
+    _opts?: MultipartRequestOpts
   ): Promise<FinalizeMultipartUploadResult> {
-    throw new EINVAL({ syscall: "finalizeMultipartUpload-binding-mode" });
+    try {
+      const r = await this.user().vfsFinalizeMultipart(this.scope(), handle.uploadId, chunkHashList);
+      return { path: r.path, pathId: r.fileId, versionId: "", size: r.size, fileHash: r.fileHash, isEncrypted: r.isEncrypted };
+    } catch (err) {
+      throw mapServerError(err, { syscall: "open" });
+    }
   }
 
   async abortMultipartUpload(
-    _handle: MultipartUploadHandle
+    handle: MultipartUploadHandle,
+    _opts?: MultipartRequestOpts
   ): Promise<AbortMultipartUploadResult> {
-    throw new EINVAL({ syscall: "abortMultipartUpload-binding-mode" });
+    try {
+      const r = await this.user().vfsAbortMultipart(this.scope(), handle.uploadId);
+      return { aborted: r.ok === true };
+    } catch (err) {
+      const code = (err as { code?: string }).code;
+      if (code === "ENOENT" || code === "EBUSY") return { aborted: false };
+      throw mapServerError(err, { syscall: "open" });
+    }
   }
 
   // ── Low-level escape hatch (caller-orchestrated multi-invocation reads) ──
@@ -2396,4 +2459,15 @@ export class VFS implements VFSClient {
       throw mapServerError(err, { path: p, syscall: "dropVersions" });
     }
   }
+}
+
+async function coerceMultipartChunk(chunk: Uint8Array | ArrayBuffer | Blob): Promise<Uint8Array> {
+  if (chunk instanceof Uint8Array) return chunk;
+  if (chunk instanceof ArrayBuffer) return new Uint8Array(chunk);
+  if (typeof Blob !== "undefined" && chunk instanceof Blob) return new Uint8Array(await chunk.arrayBuffer());
+  throw new EINVAL({ syscall: "putMultipartChunk" });
+}
+
+function userIdForScope(scope: VFSScope): string {
+  return scope.sub !== undefined ? `${scope.tenant}::${scope.sub}` : scope.tenant;
 }

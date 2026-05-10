@@ -474,7 +474,7 @@ export async function vfsReadFile(
   // the live truth is the YjsRuntime materialized doc. Routing
   // through readYjsAsBytes ensures readFile reflects unflushed
   // ops still cached in the in-memory Y.Doc.
-  if (isYjsMode(durableObject, userId, r.leafId)) {
+  if (opts.versionId === undefined && isYjsMode(durableObject, userId, r.leafId)) {
     const { readYjsAsBytes } = await import("../yjs");
     return readYjsAsBytes(durableObject, scope, r.leafId);
   }

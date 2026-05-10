@@ -253,25 +253,11 @@ describe("SDK manual multipart", () => {
     await vfs.abortMultipartUpload(handle);
   });
 
-  it("M10 — encrypted-tagged session round-trips", async () => {
-    // Server records `encryption_mode` on the session; finalize
-    // surfaces `isEncrypted: true`. We don't actually encrypt the
-    // bytes here (server doesn't decrypt either) — this just
-    // confirms the metadata pass-through.
+  it("M10 — manual multipart rejects encryption without encrypted chunks", async () => {
     const vfs = await clientFor("mp-manual-10");
-    const data = makeBytes(2048, 10);
-    const handle = await vfs.beginMultipartUpload("/manual-enc.bin", {
-      size: data.byteLength,
-      chunkSize: 1024,
+    await expect(vfs.beginMultipartUpload("/manual-enc.bin", {
+      size: 2048,
       encryption: { mode: "convergent", keyId: "test-key" },
-    });
-    const chunks = sliceChunks(data, handle.chunkSize);
-    const hashes: string[] = [];
-    for (let i = 0; i < chunks.length; i++) {
-      const r = await vfs.putMultipartChunk(handle, i, chunks[i]);
-      hashes.push(r.chunkHash);
-    }
-    const result = await vfs.finalizeMultipartUpload(handle, hashes);
-    expect(result.isEncrypted).toBe(true);
+    })).rejects.toThrow(/EINVAL/);
   });
 });

@@ -596,6 +596,19 @@ describe("vfsRename", () => {
     expect(totalMarked).toBe(1); // payloadB's hash, displaced
   });
 
+  it("EEXIST when overwrite=false and dst exists", async () => {
+    const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-write:rename-no-overwrite"));
+    const userId = await seedUser(stub, "rno@e.com");
+    const scope = { ns: "default", tenant: userId };
+
+    await stub.vfsWriteFile(scope, "/a.txt", new Uint8Array([1]));
+    await stub.vfsWriteFile(scope, "/b.txt", new Uint8Array([2]));
+
+    await expect(stub.vfsRename(scope, "/a.txt", "/b.txt", { overwrite: false })).rejects.toThrow(/EEXIST/);
+    expect(await stub.vfsReadFile(scope, "/a.txt")).toEqual(new Uint8Array([1]));
+    expect(await stub.vfsReadFile(scope, "/b.txt")).toEqual(new Uint8Array([2]));
+  });
+
   it("EISDIR when dst is a directory", async () => {
     const stub = E.MOSSAIC_USER.get(E.MOSSAIC_USER.idFromName("vfs-write:rename-isdir"));
     const userId = await seedUser(stub, "rnd@e.com");

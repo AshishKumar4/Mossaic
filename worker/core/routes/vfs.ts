@@ -562,14 +562,14 @@ vfs.post("/rmdir", async (c) => {
 
 vfs.post("/rename", async (c) => {
   try {
-    const body = await c.req.json<{ src: string; dst: string }>();
+    const body = await c.req.json<{ src: string; dst: string; overwrite?: boolean }>();
     if (typeof body.src !== "string" || typeof body.dst !== "string") {
       return c.json(
         { code: "EINVAL", message: "body.src and body.dst must be strings" },
         400
       );
     }
-    await userStub(c).vfsRename(c.var.scope, body.src, body.dst);
+    await userStub(c).vfsRename(c.var.scope, body.src, body.dst, { overwrite: body.overwrite });
     return c.json({ ok: true });
   } catch (err) {
     const r = errToResponse(err);

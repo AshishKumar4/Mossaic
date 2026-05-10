@@ -26,7 +26,7 @@
  */
 
 import type { HttpVFS } from "./http";
-import { mapServerError, MossaicUnavailableError } from "./errors";
+import { EINVAL, mapServerError, MossaicUnavailableError } from "./errors";
 
 /**
  * Public client alias. The transfer engine is a method
@@ -231,10 +231,11 @@ export async function putChunk(
 export async function finalizeUpload(
   client: MossaicHttpClient,
   session: BeginUploadResult,
-  chunkHashList: readonly string[]
+  chunkHashList: readonly string[],
+  signal?: AbortSignal
 ): Promise<MultipartFinalizeResponse> {
   try {
-    return await client.multipartFinalize(session.uploadId, chunkHashList);
+    return await client.multipartFinalize(session.uploadId, chunkHashList, signal);
   } catch (err) {
     throw mapServerError(err, {
       syscall: "open",
@@ -245,10 +246,11 @@ export async function finalizeUpload(
 /** Drop the session — releases chunks via the existing GC. */
 export async function abortUpload(
   client: MossaicHttpClient,
-  session: BeginUploadResult
+  session: BeginUploadResult,
+  signal?: AbortSignal
 ): Promise<{ ok: true }> {
   try {
-    return await client.multipartAbort(session.uploadId);
+    return await client.multipartAbort(session.uploadId, signal);
   } catch (err) {
     throw mapServerError(err, { syscall: "open" });
   }
@@ -595,6 +597,9 @@ export async function parallelUpload(
   uploadId: string;
   fileHash: string;
 }> {
+  if (opts.encryption !== undefined && opts.chunkTransform === undefined) {
+    throw new EINVAL({ syscall: "parallelUpload", path });
+  }
   const totalSize =
     source instanceof Uint8Array ? source.byteLength : source.size;
 
@@ -616,10 +621,11 @@ export async function parallelUpload(
   const chunkSize = session.chunkSize;
   const chunkHashList = new Array<string>(totalChunks);
   const landed = new Set<number>(session.landed);
+  let bytesAccepted = 0;
 
   if (totalChunks === 0) {
     // Empty file. Finalize immediately with an empty hash list.
-    const f = await finalizeUpload(client, session, []);
+    const f = await finalizeUpload(client, session, [], opts.signal);
     return {
       fileId: f.fileId,
       size: f.size,
@@ -638,6 +644,7 @@ export async function parallelUpload(
       ? await opts.chunkTransform(slice, idx)
       : slice;
     chunkHashList[idx] = await hashChunk(transformed);
+    bytesAccepted += transformed.byteLength;
   }
 
   // Adaptive state.
@@ -817,6 +824,7 @@ export async function parallelUpload(
         const start = pick * chunkSize;
         const end = Math.min(start + chunkSize, totalSize);
         uploaded += end - start;
+        bytesAccepted += r.bytesAccepted;
         // per-chunk `completed` event after success.
         if (onChunkEvent) {
           onChunkEvent({
@@ -897,7 +905,10 @@ export async function parallelUpload(
 
   // Finalize. The server cross-checks our hash list against shard
   // staging — any divergence throws EBADF.
-  const f = await finalizeUpload(client, session, chunkHashList);
+  const f = await finalizeUpload(client, session, chunkHashList, opts.signal);
+  if (f.size !== bytesAccepted) {
+    throw new EINVAL({ syscall: "parallelUpload", path });
+  }
   return {
     fileId: f.fileId,
     size: f.size,

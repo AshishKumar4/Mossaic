@@ -1968,10 +1968,11 @@ export class UserDOCore extends DurableObject<Env> {
   async vfsRename(
     scope: VFSScope,
     src: string,
-    dst: string
+    dst: string,
+    opts?: { overwrite?: boolean }
   ): Promise<void> {
     this.gateVfsWrite(scope);
-    return vfsRename(this, scope, src, dst);
+    return vfsRename(this, scope, src, dst, opts);
   }
 
   /** chmod() — update mode bits on a file/symlink/dir. */

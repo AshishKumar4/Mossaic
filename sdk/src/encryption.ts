@@ -80,11 +80,11 @@ export class ENCRYPTION_REQUIRED extends VFSFsError {
  */
 export class WRONG_KEY extends VFSFsError {
   readonly cause?: unknown;
-  constructor(opts: { syscall?: string; path?: string; cause?: unknown } = {}) {
+  constructor(opts: { syscall?: string; path?: string; cause?: unknown; message?: string } = {}) {
     super("EINVAL", {
       ...(opts.syscall !== undefined ? { syscall: opts.syscall } : {}),
       ...(opts.path !== undefined ? { path: opts.path } : {}),
-      message: "EINVAL: decryption failed (wrong master key, wrong tenantSalt, or auth-tag-tampered ciphertext)",
+      message: opts.message ?? "EINVAL: decryption failed (wrong master key, wrong tenantSalt, or auth-tag-tampered ciphertext)",
     });
     this.name = "WRONG_KEY";
     if (opts.cause !== undefined) this.cause = opts.cause;
@@ -111,18 +111,11 @@ export class WRONG_KEY extends VFSFsError {
  */
 export class CORRUPT_ENVELOPE extends WRONG_KEY {
   constructor(opts: { syscall?: string; path?: string; cause?: unknown } = {}) {
-    super(opts);
-    this.name = "CORRUPT_ENVELOPE";
-    // Override the message inherited from WRONG_KEY to reflect the
-    // actual failure mode. (The `code` stays EINVAL — both classes
-    // map to the same HTTP status / typed error code.)
-    Object.defineProperty(this, "message", {
-      value:
-        "EINVAL: decryption failed (envelope corrupt: truncated, unsupported version, or AAD cross-purpose mismatch)",
-      enumerable: false,
-      writable: true,
-      configurable: true,
+    super({
+      ...opts,
+      message: "EINVAL: decryption failed (envelope corrupt: truncated, unsupported version, or AAD cross-purpose mismatch)",
     });
+    this.name = "CORRUPT_ENVELOPE";
   }
 }
 
@@ -248,10 +241,15 @@ function isAesGcmAuthFailure(err: unknown): boolean {
   }
   // DOMException / Error shape from WebCrypto.
   if (e.name === "OperationError") return true;
-  // workerd / Node fallback: Error with a message we don't
-  // recognise. Treat as AES-GCM auth failure (the most common
-  // residual case once structural failures are filtered).
-  return true;
+  if (typeof e.message === "string") {
+    const message = e.message.toLowerCase();
+    return message.includes("operationerror")
+      || message.includes("operation-specific")
+      || message.includes("decrypt")
+      || message.includes("authentication")
+      || message.includes("auth tag");
+  }
+  return false;
 }
 
 /**

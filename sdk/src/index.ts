@@ -46,6 +46,7 @@ export {
   type ListFilesPage,
   type ListVersionsOpts,
   type VersionMarkOpts,
+  type RenameOpts,
   type BeginMultipartUploadOpts,
   type MultipartUploadHandle,
   type PutMultipartChunkResult,
