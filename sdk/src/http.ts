@@ -44,7 +44,18 @@ import type {
   FinalizeMultipartUploadResult,
   AbortMultipartUploadResult,
 } from "./vfs";
-import { hashChunk } from "../../shared/crypto";
+export { hashChunk } from "../../shared/crypto";
+
+const HTTP_MULTIPART_TIMEOUT_MS = 10 * 60_000;
+
+interface MultipartRequestOpts {
+  signal?: AbortSignal;
+}
+
+function signalWithTimeout(signal?: AbortSignal): AbortSignal {
+  const timeout = AbortSignal.timeout(HTTP_MULTIPART_TIMEOUT_MS);
+  return signal ? AbortSignal.any([signal, timeout]) : timeout;
+}
 
 // Re-export so `import { VFSClient } from "@mossaic/sdk"` continues
 // to work — `vfs.ts` is now the source of truth.
@@ -406,8 +417,8 @@ export class HttpVFS implements VFSClient {
     await this.post("chmod", { path: p, mode }, "chmod", p, "json");
   }
 
-  async rename(src: string, dst: string): Promise<void> {
-    await this.post("rename", { src, dst }, "rename", dst, "json");
+  async rename(src: string, dst: string, opts?: import("./vfs").RenameOpts): Promise<void> {
+    await this.post("rename", { src, dst, overwrite: opts?.overwrite }, "rename", dst, "json");
   }
 
   // ── Streams (NOT supported on HTTP fallback in v1) ────────────────────
@@ -462,6 +473,9 @@ export class HttpVFS implements VFSClient {
     p: string,
     opts: BeginMultipartUploadOpts
   ): Promise<MultipartUploadHandle> {
+    if (opts.encryption !== undefined) {
+      throw new EINVAL({ syscall: "beginMultipartUpload", path: p });
+    }
     const body: import("../../shared/multipart").MultipartBeginRequest = {
       path: p,
       size: opts.size,
@@ -475,7 +489,7 @@ export class HttpVFS implements VFSClient {
       ...(opts.resumeFrom !== undefined ? { resumeFrom: opts.resumeFrom } : {}),
       ...(opts.ttlMs !== undefined ? { ttlMs: opts.ttlMs } : {}),
     };
-    const res = await this.multipartBegin(body);
+    const res = await this.multipartBegin(body, signalWithTimeout(opts.signal));
     return {
       uploadId: res.uploadId,
       path: p,
@@ -490,14 +504,16 @@ export class HttpVFS implements VFSClient {
   async putMultipartChunk(
     handle: MultipartUploadHandle,
     index: number,
-    chunk: Uint8Array | ArrayBuffer | Blob
+    chunk: Uint8Array | ArrayBuffer | Blob,
+    opts?: MultipartRequestOpts
   ): Promise<PutMultipartChunkResult> {
     const bytes = await coerceChunkToUint8Array(chunk);
     const result = await this.multipartPutChunk(
       handle.uploadId,
       index,
       bytes,
-      handle.sessionToken
+      handle.sessionToken,
+      signalWithTimeout(opts?.signal)
     );
     return {
       chunkHash: result.hash,
@@ -508,9 +524,10 @@ export class HttpVFS implements VFSClient {
 
   async finalizeMultipartUpload(
     handle: MultipartUploadHandle,
-    chunkHashList: readonly string[]
+    chunkHashList: readonly string[],
+    opts?: MultipartRequestOpts
   ): Promise<FinalizeMultipartUploadResult> {
-    const r = await this.multipartFinalize(handle.uploadId, chunkHashList);
+    const r = await this.multipartFinalize(handle.uploadId, chunkHashList, signalWithTimeout(opts?.signal));
     return {
       path: r.path,
       pathId: r.fileId,
@@ -526,10 +543,11 @@ export class HttpVFS implements VFSClient {
   }
 
   async abortMultipartUpload(
-    handle: MultipartUploadHandle
+    handle: MultipartUploadHandle,
+    opts?: MultipartRequestOpts
   ): Promise<AbortMultipartUploadResult> {
     try {
-      const r = await this.multipartAbort(handle.uploadId);
+      const r = await this.multipartAbort(handle.uploadId, signalWithTimeout(opts?.signal));
       return { aborted: r.ok === true };
     } catch (err) {
       // Server raises ENOENT for an unknown / already-aborted session
@@ -1047,7 +1065,8 @@ export class HttpVFS implements VFSClient {
 
   async multipartFinalize(
     uploadId: string,
-    chunkHashList: readonly string[]
+    chunkHashList: readonly string[],
+    signal?: AbortSignal
   ): Promise<import("../../shared/multipart").MultipartFinalizeResponse> {
     const url = `${this.base}/api/vfs/multipart/finalize`;
     const apiKey = await this.getApiKey();
@@ -1058,6 +1077,7 @@ export class HttpVFS implements VFSClient {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ uploadId, chunkHashList }),
+      signal,
     });
     if (!res.ok) {
       await this.throwHttp(res, "open", undefined);
@@ -1066,7 +1086,8 @@ export class HttpVFS implements VFSClient {
   }
 
   async multipartAbort(
-    uploadId: string
+    uploadId: string,
+    signal?: AbortSignal
   ): Promise<{ ok: true }> {
     const url = `${this.base}/api/vfs/multipart/abort`;
     const apiKey = await this.getApiKey();
@@ -1077,6 +1098,7 @@ export class HttpVFS implements VFSClient {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ uploadId }),
+      signal,
     });
     if (!res.ok) {
       await this.throwHttp(res, "open", undefined);
@@ -1232,8 +1254,3 @@ async function coerceChunkToUint8Array(
     }; expected Uint8Array | ArrayBuffer | Blob)`
   );
 }
-
-// Re-export `hashChunk` so callers running outside a SubtleCrypto-
-// equipped environment have a sane default available without
-// reaching across the package boundary.
-void hashChunk;

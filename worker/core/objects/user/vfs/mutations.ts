@@ -428,7 +428,8 @@ export async function vfsRename(
   durableObject: UserDO,
   scope: VFSScope,
   src: string,
-  dst: string
+  dst: string,
+  opts: { overwrite?: boolean } = {}
 ): Promise<void> {
   const userId = userIdFor(scope);
   const srcR = resolveOrThrow(durableObject, userId, src, /*follow*/ false);
@@ -523,6 +524,12 @@ export async function vfsRename(
   }
 
   // src is file/symlink.
+  if ((dstFolder || dstFile) && opts.overwrite === false) {
+    throw new VFSError(
+      "EEXIST",
+      `rename: destination exists and overwrite=false: ${dst}`
+    );
+  }
   if (dstFolder) {
     throw new VFSError(
       "EISDIR",
@@ -760,7 +767,8 @@ async function renameOverwriteVersioned(
   const srcRow = durableObject.sql
     .exec(
       `SELECT file_id, file_size, file_hash, mime_type, mode,
-              chunk_size, chunk_count, head_version_id, inline_data
+              chunk_size, chunk_count, head_version_id, inline_data,
+              node_kind, mode_yjs, encryption_mode, encryption_key_id
          FROM files
         WHERE file_id = ? AND user_id = ?`,
       srcFileId,
@@ -777,6 +785,10 @@ async function renameOverwriteVersioned(
         chunk_count: number;
         head_version_id: string | null;
         inline_data: ArrayBuffer | null;
+        node_kind: string;
+        mode_yjs: number;
+        encryption_mode: string | null;
+        encryption_key_id: string | null;
       }
     | undefined;
   if (!srcRow) {
@@ -785,6 +797,12 @@ async function renameOverwriteVersioned(
     // branch is unreachable under DO single-thread but satisfies
     // the type system.
     throw new VFSError("ENOENT", `rename: source vanished: ${srcFileId}`);
+  }
+  if (srcRow.node_kind !== "file" || srcRow.mode_yjs === 1) {
+    throw new VFSError(
+      "ENOTSUP",
+      "rename: versioned overwrite only supports regular byte files"
+    );
   }
 
   // Resolve the head version row for the src. Versioning-ON
@@ -803,13 +821,15 @@ async function renameOverwriteVersioned(
         fileHash: string;
         mimeType: string;
         inlineData: ArrayBuffer | null;
+        encryption?: { mode: "convergent" | "random"; keyId?: string };
       }
     | null = null;
   if (srcRow.head_version_id) {
     const v = durableObject.sql
       .exec(
         `SELECT version_id, size, mode, chunk_size, chunk_count,
-                file_hash, mime_type, inline_data
+                file_hash, mime_type, inline_data,
+                encryption_mode, encryption_key_id
            FROM file_versions
           WHERE path_id = ? AND version_id = ?`,
         srcFileId,
@@ -825,6 +845,8 @@ async function renameOverwriteVersioned(
           file_hash: string;
           mime_type: string;
           inline_data: ArrayBuffer | null;
+          encryption_mode: string | null;
+          encryption_key_id: string | null;
         }
       | undefined;
     if (!v) {
@@ -842,6 +864,9 @@ async function renameOverwriteVersioned(
       fileHash: v.file_hash,
       mimeType: v.mime_type,
       inlineData: v.inline_data,
+      encryption: v.encryption_mode
+        ? { mode: v.encryption_mode as "convergent" | "random", keyId: v.encryption_key_id ?? undefined }
+        : undefined,
     };
   } else {
     // Legacy un-versioned src row on a versioning-ON tenant: rare
@@ -858,6 +883,9 @@ async function renameOverwriteVersioned(
       fileHash: srcRow.file_hash,
       mimeType: srcRow.mime_type,
       inlineData: srcRow.inline_data,
+      encryption: srcRow.encryption_mode
+        ? { mode: srcRow.encryption_mode as "convergent" | "random", keyId: srcRow.encryption_key_id ?? undefined }
+        : undefined,
     };
   }
 
@@ -879,6 +907,7 @@ async function renameOverwriteVersioned(
       mimeType: srcHead.mimeType,
       inlineData: new Uint8Array(srcHead.inlineData),
       userVisible: true,
+      encryption: srcHead.encryption,
     });
     // Drop src history + files row (no shard fan-out — inline).
     await reapSourceVersionedRow(durableObject, scope, userId, srcFileId);
@@ -924,6 +953,7 @@ async function renameOverwriteVersioned(
       mimeType: srcHead.mimeType,
       inlineData: null,
       userVisible: true,
+      encryption: srcHead.encryption,
     });
     await reapSourceVersionedRow(durableObject, scope, userId, srcFileId);
     return;
@@ -1030,6 +1060,7 @@ async function renameOverwriteVersioned(
     inlineData: null,
     userVisible: true,
     shardRefId: newRefId,
+    encryption: srcHead.encryption,
   });
   await reapSourceVersionedRow(durableObject, scope, userId, srcFileId);
 }

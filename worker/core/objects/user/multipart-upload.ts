@@ -671,6 +671,7 @@ export async function vfsFinalizeMultipart(
   // supersede — correct semantics for versioning-off tenants.
   const versioning = isVersioningEnabled(durableObject, userId);
   const now = Date.now();
+  let finalizedFileId = uploadId;
 
   if (versioning) {
     // Locate the pre-existing live row at (parent, leaf), if any. Its
@@ -707,6 +708,7 @@ export async function vfsFinalizeMultipart(
       );
       pathId = uploadId;
     }
+    finalizedFileId = pathId;
 
     // Apply commit-time metadata + tags to the path's stable row,
     // before the version is committed (so subsequent reads of the
@@ -892,7 +894,7 @@ export async function vfsFinalizeMultipart(
   );
 
   return {
-    fileId: uploadId,
+    fileId: finalizedFileId,
     size: totalSize,
     chunkCount: session.total_chunks,
     fileHash,

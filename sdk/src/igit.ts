@@ -220,7 +220,7 @@ class BatchedLstatFs implements VFSClient {
     return this.inner.symlink(target, p);
   }
   chmod(p: string, mode: number) { return this.inner.chmod(p, mode); }
-  rename(src: string, dst: string) { return this.inner.rename(src, dst); }
+  rename(src: string, dst: string, opts?: import("./vfs").RenameOpts) { return this.inner.rename(src, dst, opts); }
   createReadStream(
     p: string,
     opts?: { start?: number; end?: number }
@@ -240,15 +240,18 @@ class BatchedLstatFs implements VFSClient {
   putMultipartChunk(
     handle: Parameters<VFSClient["putMultipartChunk"]>[0],
     index: number,
-    chunk: Parameters<VFSClient["putMultipartChunk"]>[2]
-  ) { return this.inner.putMultipartChunk(handle, index, chunk); }
+    chunk: Parameters<VFSClient["putMultipartChunk"]>[2],
+    opts?: Parameters<VFSClient["putMultipartChunk"]>[3]
+  ) { return this.inner.putMultipartChunk(handle, index, chunk, opts); }
   finalizeMultipartUpload(
     handle: Parameters<VFSClient["finalizeMultipartUpload"]>[0],
-    chunkHashList: readonly string[]
-  ) { return this.inner.finalizeMultipartUpload(handle, chunkHashList); }
+    chunkHashList: readonly string[],
+    opts?: Parameters<VFSClient["finalizeMultipartUpload"]>[2]
+  ) { return this.inner.finalizeMultipartUpload(handle, chunkHashList, opts); }
   abortMultipartUpload(
-    handle: Parameters<VFSClient["abortMultipartUpload"]>[0]
-  ) { return this.inner.abortMultipartUpload(handle); }
+    handle: Parameters<VFSClient["abortMultipartUpload"]>[0],
+    opts?: Parameters<VFSClient["abortMultipartUpload"]>[1]
+  ) { return this.inner.abortMultipartUpload(handle, opts); }
   openManifest(p: string) { return this.inner.openManifest(p); }
   openManifests(paths: string[]) { return this.inner.openManifests(paths); }
   readPreview(p: string, opts?: Parameters<VFSClient["readPreview"]>[1]) {

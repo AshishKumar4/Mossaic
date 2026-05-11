@@ -77,7 +77,7 @@ wrangler secret put JWT_SECRET --config deployments/service/wrangler.jsonc
 Multi-secret rotation via `JWT_SECRET_PREVIOUS` is honored by every
 verifier (`verifyJWT`, `verifyVFSToken`, `verifyVFSMultipartToken`,
 `verifyVFSDownloadToken`, `verifyShareToken`, `verifyPreviewToken`).
-See `docs/operations.md` for the rotation procedure.
+See `./operations.md` for the rotation procedure.
 
 ## Smoke after deploy
 
@@ -137,4 +137,4 @@ Never run the load test against the personal-account deployment.
 
 `pnpm ci:check` runs `typecheck` &rarr; `build:sdk` &rarr;
 `lint:no-phase-tags`. Run before every deploy. `pnpm verify:proofs`
-re-checks the Lean invariants (226 theorems, 0 axioms, 0 sorrys).
+re-checks the Lean invariants (224 theorems, 0 axioms, 0 sorrys).

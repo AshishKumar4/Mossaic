@@ -431,7 +431,7 @@ console.log(`uploaded ${result.size} bytes to ${result.path}`);
 
 `abortMultipartUpload` is idempotent — aborting an already-finalized or already-aborted session returns `{aborted: false}` rather than throwing.
 
-The binding-mode client (`createVFS(env, opts)`) does **not** support these methods — they throw `EINVAL` because DO RPC has no public chunk-PUT path. Use the HTTP client (`createMossaicHttpClient(...)`) for manual multipart.
+Both SDK clients support these methods: `createMossaicHttpClient(...)` routes through the public multipart HTTP endpoints, while binding-mode `createVFS(env, opts)` exposes the same surface for Workers with Mossaic bindings.
 
 ---
 

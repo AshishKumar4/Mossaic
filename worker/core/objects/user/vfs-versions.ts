@@ -5,6 +5,7 @@ import { generateId, vfsShardDOName } from "../../lib/utils";
 import { placeChunk } from "../../../../shared/placement";
 import {
   bumpFolderRevision,
+  poolSizeFor,
   recordWriteUsage,
   userIdFor,
 } from "./vfs/helpers";
@@ -1115,9 +1116,24 @@ export async function restoreVersion(
   // warrants a folder-revision bump so listChildren observers
   // re-fetch. Read parent_id of the path's stable row.
   const parentRow = durableObject.sql
-    .exec("SELECT parent_id FROM files WHERE file_id = ?", pathId)
-    .toArray()[0] as { parent_id: string | null } | undefined;
+    .exec("SELECT parent_id, mode_yjs FROM files WHERE file_id = ?", pathId)
+    .toArray()[0] as { parent_id: string | null; mode_yjs: number } | undefined;
   const parentId = parentRow ? parentRow.parent_id : null;
+
+  if (parentRow?.mode_yjs === 1) {
+    if (src.encryption) {
+      throw new VFSError("ENOTSUP", "restoreVersion: encrypted Yjs versions require client-side restore");
+    }
+    if (!src.inlineData) {
+      throw new VFSError("ENOTSUP", "restoreVersion: Yjs version is not an inline snapshot");
+    }
+    const bytes = new Uint8Array(src.inlineData);
+    const { hasYjsSnapshotMagic, writeYjsBytes } = await import("./yjs");
+    if (!hasYjsSnapshotMagic(bytes)) {
+      throw new VFSError("ENOTSUP", "restoreVersion: Yjs version is not a restorable snapshot");
+    }
+    await writeYjsBytes(durableObject, scope, userId, pathId, poolSizeFor(durableObject, userId), bytes);
+  }
 
   if (src.inlineData) {
     // Inline restore: no shard work; just insert + flip head.

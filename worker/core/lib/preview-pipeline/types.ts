@@ -52,9 +52,16 @@ export interface Renderer {
  * context so observability is preserved.
  */
 export class RenderError extends Error {
+  readonly rendererKind: string;
+  readonly code:
+    | "EINVAL"
+    | "ENOTSUP"
+    | "EINTERNAL"
+    | "EMOSSAIC_UNAVAILABLE";
+
   constructor(
-    public readonly rendererKind: string,
-    public readonly code:
+    rendererKind: string,
+    code:
       | "EINVAL"
       | "ENOTSUP"
       | "EINTERNAL"
@@ -63,5 +70,7 @@ export class RenderError extends Error {
   ) {
     super(`${code}: [${rendererKind}] ${message}`);
     this.name = "RenderError";
+    this.rendererKind = rendererKind;
+    this.code = code;
   }
 }
