@@ -23,18 +23,15 @@
  *   2. Cache key includes `namespace` (`<userId>` for private,
  *      `<shareToken>` for public). Cross-tenant collision
  *      requires breaking SHA-256 / forging a share token.
- *   3. Bust tokens (`updatedAt`, `headVersionId`,
- *      `encryptionFingerprint`) advance on every write that
- *      changes the response bytes — stale-after-write is
- *      structurally impossible.
+ *   3. Callers are responsible for supplying every bust signal relevant
+ *      to their response and for changing one when response bytes change.
  *   4. Cached responses keep their original Cache-Control;
  *      intermediaries respect the shorter TTL of either
  *      the response or their own policy.
  *
- * @lean-invariant Mossaic.Vfs.Cache.bust_token_completeness —
- * the cache key must include every column any write path can
- * mutate AND that affects the response. See
- * `local/cache-staleness-audit.md` for the per-surface proof.
+ * @lean-invariant Mossaic.Vfs.Cache.bust_state_changes_when_signal_changes
+ * The abstract theorem requires an explicit changed-signal premise; it does
+ * not prove this helper's callers or TypeScript write paths are complete.
  */
 
 /**
@@ -110,12 +107,14 @@ export interface EdgeCacheOpts {
  * pick one ordering and stick with it.
  */
 export function edgeCacheKey(opts: EdgeCacheOpts): Request {
+  const enc = (part: string): string =>
+    encodeURIComponent(part).replaceAll(".", "%2E");
   const base =
     `https://${opts.surfaceTag}.mossaic.local/` +
-    `${opts.namespace}/${opts.fileId}/${opts.updatedAt}`;
+    `${enc(opts.namespace)}/${enc(opts.fileId)}/${opts.updatedAt}`;
   const tail =
     opts.extraKeyParts && opts.extraKeyParts.length > 0
-      ? "/" + opts.extraKeyParts.join("/")
+      ? "/" + opts.extraKeyParts.map(enc).join("/")
       : "";
   return new Request(base + tail, { method: "GET" });
 }

@@ -1,0 +1,23 @@
+{
+	"$schema": "https://json.schemastore.org/tsconfig",
+	"compilerOptions": {
+		"target": "ES2023",
+		"module": "ES2022",
+		"moduleResolution": "bundler",
+		"isolatedModules": true,
+		"forceConsistentCasingInFileNames": true,
+		"strict": true,
+		"noUnusedLocals": true,
+		"noUnusedParameters": true,
+		"verbatimModuleSyntax": true,
+		"erasableSyntaxOnly": true,
+		"moduleDetection": "force",
+		"noEmit": true,
+		"incremental": true,
+		"skipLibCheck": true,
+		"noFallthroughCasesInSwitch": true,
+		"noUncheckedSideEffectImports": true,
+		"allowImportingTsExtensions": true
+	},
+	"exclude": ["node_modules"]
+}

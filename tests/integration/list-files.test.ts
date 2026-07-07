@@ -116,6 +116,39 @@ describe("listFiles basic (L1, L2, L7, L9)", () => {
     await expect(vfs.fileInfo("/docs")).rejects.toMatchObject({ code: "EISDIR" });
     await expect(vfs.fileInfo("/docs/missing.md")).rejects.toMatchObject({ code: "ENOENT" });
   });
+
+  it("fileInfoByPathId returns the same item without scanning by path", async () => {
+    const tenant = "p12-file-info-by-path-id";
+    const vfs = createVFS(envFor(), { tenant });
+    await vfs.mkdir("/docs");
+    await vfs.writeFile("/docs/report.md", "hello", {
+      metadata: { title: "Report" },
+      tags: ["seal:output"],
+    });
+
+    const byPath = await vfs.fileInfo("/docs/report.md", { includeMetadata: true });
+    const byId = await vfs.fileInfoByPathId(byPath.pathId, { includeMetadata: true });
+
+    expect(byId.path).toBe("/docs/report.md");
+    expect(byId.pathId).toBe(byPath.pathId);
+    expect(byId.stat?.isFile()).toBe(true);
+    expect(byId.metadata).toEqual({ title: "Report" });
+    expect(byId.tags).toEqual(["seal:output"]);
+  });
+
+  it("fileInfoByPathId returns ENOENT for missing and cross-tenant ids", async () => {
+    const owner = createVFS(envFor(), { tenant: "p12-file-info-by-path-id-owner" });
+    const other = createVFS(envFor(), { tenant: "p12-file-info-by-path-id-other" });
+    await owner.writeFile("/secret.md", "owner-only", { tags: ["seal:output"] });
+    const ownerInfo = await owner.fileInfo("/secret.md");
+
+    await expect(owner.fileInfoByPathId("missing-path-id")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expect(other.fileInfoByPathId(ownerInfo.pathId)).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
 });
 
 describe("cursor security (L3, L4)", () => {

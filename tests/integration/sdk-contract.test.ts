@@ -50,6 +50,7 @@ import {
   type MossaicEnv,
   type UserDO,
 } from "../../sdk/src/index";
+import { vfsUserDOName } from "../../worker/core/lib/utils";
 
 interface E {
   MOSSAIC_USER: DurableObjectNamespace<UserDO>;
@@ -62,6 +63,14 @@ function envFor(): MossaicEnv {
     MOSSAIC_USER: E.MOSSAIC_USER as MossaicEnv["MOSSAIC_USER"],
     MOSSAIC_SHARD: E.MOSSAIC_SHARD as unknown as MossaicEnv["MOSSAIC_SHARD"],
   };
+}
+
+async function enableVersioning(tenant: string): Promise<void> {
+  const id = E.MOSSAIC_USER.idFromName(vfsUserDOName("default", tenant));
+  const stub = E.MOSSAIC_USER.get(id) as unknown as {
+    adminSetVersioning(userId: string, enabled: boolean): Promise<{ enabled: boolean }>;
+  };
+  await stub.adminSetVersioning(tenant, true);
 }
 
 const TXT = "sdk-contract bytes\n";
@@ -193,6 +202,89 @@ describe("SDK ↔ Worker contract — listFiles + fileInfo (C6, C11)", () => {
     expect(Array.isArray(info.tags)).toBe(true);
     expect(info.stat).toBeInstanceOf(VFSStat);
     expect(info.stat!.size).toBe(3);
+  });
+
+  it("surfaces headVersionId on listFiles and fileInfo for versioned files", async () => {
+    const tenant = "sdk-contract-head-version";
+    await enableVersioning(tenant);
+    const vfs = createVFS(envFor(), { tenant });
+
+    await vfs.writeFile("/versioned.txt", "one");
+    const first = await vfs.fileInfo("/versioned.txt");
+    expect(typeof first.headVersionId).toBe("string");
+
+    await vfs.writeFile("/versioned.txt", "two");
+    const second = await vfs.fileInfo("/versioned.txt");
+    expect(typeof second.headVersionId).toBe("string");
+    expect(second.headVersionId).not.toBe(first.headVersionId);
+
+    const page = await vfs.listFiles({ prefix: "/" });
+    const listed = page.items.find((item) => item.path === "/versioned.txt");
+    expect(listed?.headVersionId).toBe(second.headVersionId);
+  });
+
+  it("atomically patches metadata only when pathId still has the expected head", async () => {
+    const tenant = "sdk-contract-patch-if-head";
+    await enableVersioning(tenant);
+    const vfs = createVFS(envFor(), { tenant });
+
+    await vfs.writeFile("/reviewed.txt", "one");
+    const first = await vfs.fileInfo("/reviewed.txt");
+    const firstHeadVersionId = first.headVersionId;
+    expect(typeof firstHeadVersionId).toBe("string");
+    if (typeof firstHeadVersionId !== "string") {
+      throw new Error("expected first headVersionId to be defined");
+    }
+
+    const applied = await vfs.patchMetadataIfHead(
+      first.pathId,
+      firstHeadVersionId,
+      { review: { status: "approved" } },
+      { addTags: ["reviewed"] },
+    );
+    expect(applied).toEqual({
+      patched: true,
+      headVersionId: firstHeadVersionId,
+    });
+    expect(
+      await vfs.fileInfo("/reviewed.txt", { includeMetadata: true })
+    ).toMatchObject({
+      metadata: { review: { status: "approved" } },
+      tags: ["reviewed"],
+    });
+
+    const beforeNoop = await vfs.folderRevision("/");
+    const noop = await vfs.patchMetadataIfHead(
+      first.pathId,
+      firstHeadVersionId,
+      {},
+    );
+    const afterNoop = await vfs.folderRevision("/");
+    expect(noop).toEqual({
+      patched: true,
+      headVersionId: firstHeadVersionId,
+    });
+    expect(afterNoop.revision).toBe(beforeNoop.revision);
+
+    await vfs.writeFile("/reviewed.txt", "two");
+    const second = await vfs.fileInfo("/reviewed.txt");
+    expect(second.headVersionId).not.toBe(first.headVersionId);
+
+    const stale = await vfs.patchMetadataIfHead(
+      first.pathId,
+      firstHeadVersionId,
+      { review: { status: "stale" } },
+      { addTags: ["stale-review"] },
+    );
+    expect(stale).toEqual({
+      patched: false,
+      headVersionId: second.headVersionId,
+    });
+    const afterStale = await vfs.fileInfo("/reviewed.txt", {
+      includeMetadata: true,
+    });
+    expect(afterStale.metadata).toEqual({ review: { status: "approved" } });
+    expect(afterStale.tags).toEqual(["reviewed"]);
   });
 });
 

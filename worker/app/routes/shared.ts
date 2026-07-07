@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import type { EnvApp as Env } from "@shared/types";
 import { createVFS } from "@mossaic/sdk";
 import { userStub } from "../lib/user-stub";
+import { buildImageResponseHeaders } from "../lib/image-response-security";
 import { edgeCacheServe } from "@core/lib/edge-cache";
 import { serveBytesWithRange } from "@core/lib/http-range";
 import { verifyShareToken, VFSConfigError } from "@core/lib/auth";
@@ -125,10 +126,11 @@ shared.get("/:token/image/:fileId", async (c) => {
     const vfs = createVFS(c.env, { tenant: userId });
     try {
       const bytes = await vfs.readFile(path);
-      return serveBytesWithRange(bytes, rangeHeader, {
-        "Content-Type": mimeType,
-        "Cache-Control": "public, max-age=86400",
-      });
+      return serveBytesWithRange(
+        bytes,
+        rangeHeader,
+        buildImageResponseHeaders(mimeType, "public, max-age=86400")
+      );
     } catch (err) {
       const code = (err as { code?: string }).code;
       if (code === "ENOENT") {
@@ -151,15 +153,13 @@ shared.get("/:token/image/:fileId", async (c) => {
       const vfs = createVFS(c.env, { tenant: userId });
       try {
         const bytes = await vfs.readFile(path);
+        const headers = buildImageResponseHeaders(
+          mimeType,
+          "public, max-age=86400",
+          bytes.byteLength
+        );
         return new Response(bytes, {
-          headers: {
-            "Content-Type": mimeType,
-            "Content-Length": String(bytes.byteLength),
-            "Cache-Control": "public, max-age=86400",
-            // Advertise Range so subsequent <video> seek requests
-            // know they can issue Range against this surface.
-            "Accept-Ranges": "bytes",
-          },
+          headers,
         });
       } catch (err) {
         const code = (err as { code?: string }).code;

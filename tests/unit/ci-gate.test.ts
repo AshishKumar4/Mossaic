@@ -6,9 +6,9 @@ import { describe, it, expect } from "vitest";
  * The Workers vitest pool runs tests inside a Worker isolate
  * which does NOT have node:fs / readFileSync. We therefore can't
  * read the YAML / JSON files at test time. Instead we use a
- * compile-time import of package.json and a static-string assert
- * on the tsup config (which IS bundled into the SDK build, so its
- * presence in the runtime is the test).
+ * compile-time import of package.json and assert on the wired
+ * scripts (which are resolved at compile time, so their presence
+ * in the runtime is the test).
  *
  * Cases:
  *   CG1 — package.json has build:sdk + lint:no-phase-tags + ci:check

@@ -46,9 +46,8 @@
  * `JWT_SECRET` rotation window via `verifyAgainstSecrets`.
  *
  * @lean-invariant Mossaic.Vfs.PreviewToken.scope_binding \u2014 the
- *   scope claim `vfs-pv` rejects any verifyVFSDownloadToken /
- *   verifyVFSToken / verifyShareToken / verifyMultipartToken
- *   forgery attempt that swaps payload between token shapes.
+ *   abstract verifier rejects a payload with the wrong scope. HMAC,
+ *   JOSE, parsing, and this implementation are outside the theorem.
  */
 
 import { jwtVerify } from "jose";

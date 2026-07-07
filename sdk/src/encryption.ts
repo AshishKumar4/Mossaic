@@ -3,7 +3,7 @@
  *
  * This module is loaded LAZILY via `await import("./encryption")` from
  * vfs.ts. Consumers who never set `encryption` on createVFS pay zero
- * bundle cost — the encryption code lives in its own tsup chunk.
+ * bundle cost — the encryption code lives in its own build chunk.
  *
  * All crypto is delegated to `shared/encryption.ts` (pure WebCrypto).
  * No userspace crypto libraries are used or imported.

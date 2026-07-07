@@ -462,6 +462,37 @@ theorem putChunk_preserves_invariant
       rw [hcomm]
       exact putChunk_cold_preserves s h size fid idx hv hkey_fresh hh_fresh
 
+/-- Once a composite chunk-ref key exists, retrying that `putChunk` is a
+state-level no-op in the abstract transition system. -/
+theorem putChunk_existing_ref_noop
+    (s : ShardState) (h : Hash) (size : Nat) (fid : FileId) (idx : Nat)
+    (h_exists : s.refs.any
+      (fun x => x.key = (⟨h, fid, idx⟩ : ChunkRef).key) = true) :
+    step s (.putChunk h size fid idx) = s := by
+  unfold step
+  simp [h_exists]
+  cases s.findChunk h <;> rfl
+
+/-- After any abstract `putChunk`, its composite chunk-ref key is present. -/
+theorem putChunk_records_ref
+    (s : ShardState) (h : Hash) (size : Nat) (fid : FileId) (idx : Nat) :
+    (step s (.putChunk h size fid idx)).refs.any
+      (fun x => x.key = (⟨h, fid, idx⟩ : ChunkRef).key) = true := by
+  by_cases h_exists : s.refs.any
+      (fun x => x.key = (⟨h, fid, idx⟩ : ChunkRef).key) = true
+  · rw [putChunk_existing_ref_noop s h size fid idx h_exists]
+    exact h_exists
+  · have h_refs : (step s (.putChunk h size fid idx)).refs =
+        s.refs ++ [⟨h, fid, idx⟩] := by
+      unfold step
+      simp [h_exists]
+      split <;> rfl
+    rw [List.any_eq_true]
+    refine ⟨⟨h, fid, idx⟩, ?_, ?_⟩
+    · rw [h_refs]
+      simp
+    · simp [ChunkRef.key]
+
 -- ─── deleteChunks ───────────────────────────────────────────────────────
 
 /-- liveRefs after filtering refs by predicate `p`: cardinality drops by
@@ -911,7 +942,7 @@ def restoreChunkRef (s : ShardState) (h : Hash) (fid : FileId) (idx : Nat) :
     ShardState × RestoreStatus :=
   let r : ChunkRef := ⟨h, fid, idx⟩
   let refExists := s.refs.any (fun x => x.key = r.key)
-  if refExists then (s, .alreadyReferenced)
+  if refExists = true then (s, .alreadyReferenced)
   else (s.appendRef r |>.incrRef h, .restored)
 
 /-- Liveness precondition: a chunk is alive on the shard. Mirrors the
@@ -954,9 +985,11 @@ theorem restoreChunkRef_preserves_validState
   -- on this branch.
   have h_eq : (restoreChunkRef s h fid idx).1 = step s (.putChunk h 0 fid idx) := by
     unfold restoreChunkRef step
-    by_cases h_exists : s.refs.any (fun x => x.key = (⟨h, fid, idx⟩ : ChunkRef).key)
+    by_cases h_exists : s.refs.any (fun x => x.key = (⟨h, fid, idx⟩ : ChunkRef).key) = true
     · simp [h_exists, hc]
-    · simp [h_exists, hc]
+    · have hc' : (s.appendRef ⟨h, fid, idx⟩).findChunk h = some c := by
+        simpa [ShardState.appendRef, ShardState.findChunk] using hc
+      simp [h_exists, hc']
   rw [h_eq]
   exact step_preserves_validState s _ hv
 
@@ -971,26 +1004,16 @@ race (refs/chunks split across awaits) is structurally impossible.
 -/
 theorem restoreChunkRef_atomic
     (s : ShardState) (h : Hash) (fid : FileId) (idx : Nat) :
-    let (s', status) := restoreChunkRef s h fid idx
-    (status = .alreadyReferenced ∧ s' = s) ∨
-    (status = .restored ∧
-      s'.refs = s.refs ++ [⟨h, fid, idx⟩] ∧
-      s'.chunks = (s.incrRef h).chunks) := by
+    ((restoreChunkRef s h fid idx).2 = .alreadyReferenced ∧
+      (restoreChunkRef s h fid idx).1 = s) ∨
+    ((restoreChunkRef s h fid idx).2 = .restored ∧
+      (restoreChunkRef s h fid idx).1.refs = s.refs ++ [⟨h, fid, idx⟩] ∧
+      (restoreChunkRef s h fid idx).1.chunks = (s.incrRef h).chunks) := by
   unfold restoreChunkRef
-  by_cases h_exists : s.refs.any (fun x => x.key = (⟨h, fid, idx⟩ : ChunkRef).key)
-  · left
-    simp [h_exists]
-  · right
-    simp [h_exists]
-    refine ⟨?_, ?_⟩
-    · -- Goal: ((s.appendRef r).incrRef h).refs = s.refs ++ [r].
-      rw [incrRef_refs]
-      rfl
-    · -- Goal: ((s.appendRef r).incrRef h).chunks = (s.incrRef h).chunks.
-      -- appendRef preserves chunks, incrRef is a function of chunks
-      -- only.
-      unfold ShardState.incrRef ShardState.appendRef
-      rfl
+  dsimp
+  split
+  · exact Or.inl ⟨rfl, rfl⟩
+  · exact Or.inr ⟨rfl, rfl, rfl⟩
 
 /--
 **(R4) restoreChunkRef bumps liveRefs by exactly 1 on .restored.**
@@ -1003,16 +1026,13 @@ consequence.
 -/
 theorem restoreChunkRef_liveRefs_bump
     (s : ShardState) (h : Hash) (fid : FileId) (idx : Nat) :
-    let (s', status) := restoreChunkRef s h fid idx
-    status = .restored →
-    liveRefs s' h = liveRefs s h + 1 := by
+    (restoreChunkRef s h fid idx).2 = .restored →
+    liveRefs (restoreChunkRef s h fid idx).1 h = liveRefs s h + 1 := by
   unfold restoreChunkRef
-  by_cases h_exists : s.refs.any (fun x => x.key = (⟨h, fid, idx⟩ : ChunkRef).key)
-  · simp [h_exists]
-  · simp [h_exists]
-    -- s' = (s.appendRef r).incrRef h. liveRefs is unaffected by
-    -- incrRef (refs unchanged). So liveRefs s' h = liveRefs (s.appendRef r) h.
-    -- And liveRefs_appendRef gives the +1 (since r.chunkHash = h).
+  dsimp
+  split
+  · simp
+  · intro _
     rw [liveRefs_incrRef]
     rw [liveRefs_appendRef]
     simp

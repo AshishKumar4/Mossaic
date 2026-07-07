@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Verify that every `@lean-invariant Foo.Bar.baz` annotation in TS source
-# resolves to an actual `theorem baz` in `lean/Foo/Bar.lean`.
+# resolves to an imported Lean theorem declaration.
 #
 # This is the drift-detection gate: if a TS source comment references a
 # Lean theorem that has been deleted or renamed, this script fails CI.
@@ -11,10 +11,15 @@ REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$REPO_ROOT"
 
 failed=0
+probe_dir=$(mktemp -d)
+probe="$probe_dir/Xrefs.lean"
+trap 'rm -rf "$probe_dir"' EXIT
+printf 'import Mossaic\n' > "$probe"
 
 # Find all `@lean-invariant <full.theorem.name>` annotations in TS.
 # Format expected: `@lean-invariant Mossaic.{Vfs,Generated}.<Module>.<theorem>`
-xrefs=$(grep -rEn '@lean-invariant\s+\S+' worker/ shared/ sdk/ src/ 2>/dev/null | \
+xrefs=$(grep -rEn --include='*.ts' --exclude-dir=dist --exclude-dir=node_modules \
+  '@lean-invariant\s+\S+' worker/ shared/ sdk/ src/ 2>/dev/null | \
   sed -E 's/.*@lean-invariant[[:space:]]+([A-Za-z0-9._]+).*/\1/' | \
   sort -u || true)
 
@@ -47,6 +52,7 @@ while IFS= read -r theorem_path; do
     failed=1
     continue
   fi
+  printf '#check %s\n' "$theorem_path" >> "$probe"
 done <<< "$xrefs"
 
 if [[ $failed -ne 0 ]]; then
@@ -56,4 +62,10 @@ if [[ $failed -ne 0 ]]; then
   exit 1
 fi
 
-echo "OK: all @lean-invariant xrefs resolve."
+if ! (cd lean && lake env lean "$probe"); then
+  echo "FAIL: an @lean-invariant name is not present in the imported Lean environment."
+  exit 1
+fi
+
+echo "OK: all @lean-invariant names resolve to imported theorem declarations."
+echo "NOTE: this is name-resolution only; it does not prove TypeScript/Lean semantic correspondence."

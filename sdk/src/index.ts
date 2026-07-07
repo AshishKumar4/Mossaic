@@ -40,10 +40,13 @@ export {
   type WriteFileOpts,
   type CopyFileOpts,
   type PatchMetadataOpts,
+  type PatchMetadataIfHeadResult,
   type FileInfoOpts,
   type ListFilesOpts,
   type ListFilesItem,
   type ListFilesPage,
+  type ListChildrenOpts,
+  type ListChildrenPage,
   type ListVersionsOpts,
   type VersionMarkOpts,
   type RenameOpts,
@@ -163,7 +166,13 @@ export {
 // VFSScope is the wire shape of the multi-tenant scope; consumers
 // rarely need it directly but isomorphic-git plugins or HTTP fallback
 // adapters may.
-export type { VFSScope } from "../../shared/vfs-types";
+export type { VFSScope, CacheResolveResult } from "../../shared/vfs-types";
+
+// Boundary validators for HTTP-fallback responses — RFC-009.
+export {
+  parseCacheResolveResult,
+  parseReadManyFileBytes,
+} from "../../shared/vfs-types";
 
 // Token issuance helpers (operator-side; needs JWT_SECRET in env).
 export { issueVFSToken, verifyVFSToken, type VFSTokenPayload } from "./auth";

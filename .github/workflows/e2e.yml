@@ -9,6 +9,7 @@ on:
       - "shared/**"
       - "pnpm-lock.yaml"
       - "pnpm-workspace.yaml"
+      - "tsconfig.base.json"
       - ".github/workflows/e2e.yml"
   schedule:
     # Nightly run against the live deploy.
@@ -22,23 +23,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
-        with:
-          version: 10
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - name: Lint — no Phase NN tags in runtime code
         run: pnpm lint:no-phase-tags
-      - name: Build SDK
-        run: pnpm -F @mossaic/sdk build
       - name: Build CLI
         run: pnpm -F @mossaic/cli build
       - name: Typecheck workspace
-        run: npx tsc -b
-      - name: CLI typecheck
-        run: pnpm -F @mossaic/cli typecheck
+        run: pnpm typecheck
       - name: CLI unit tests
         run: pnpm -F @mossaic/cli test
       - name: CLI functional + E2E tests (live)
@@ -55,22 +50,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
-        with:
-          version: 10
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - name: Lint — no Phase NN tags in runtime code
         run: pnpm lint:no-phase-tags
-      - name: Build SDK
-        run: pnpm -F @mossaic/sdk build
       - name: Workspace typecheck
-        run: npx tsc -b
+        run: pnpm typecheck
+      - name: Production build
+        run: pnpm build
       - name: Wrangler dry-run (App mode)
-        run: npx wrangler deploy --dry-run
+        run: pnpm exec wrangler deploy --dry-run
       - name: Wrangler dry-run (Service mode)
-        run: npx wrangler deploy --dry-run -c deployments/service/wrangler.jsonc
+        run: pnpm exec wrangler deploy --dry-run -c deployments/service/wrangler.jsonc
       - name: Vitest (worker integration)
-        run: npx vitest run
+        run: pnpm test

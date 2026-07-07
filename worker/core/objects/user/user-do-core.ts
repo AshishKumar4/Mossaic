@@ -33,6 +33,7 @@ import {
   vfsUnarchive,
   vfsWriteFile,
   type CacheResolveResult,
+  type PatchMetadataIfHeadResult,
   type VFSReadHandle,
   type VFSWriteFileOpts,
   type VFSWriteHandle,
@@ -68,6 +69,15 @@ import {
 } from "./preview-variants";
 import { defaultRegistry } from "../../lib/preview-pipeline";
 import { resolvePath } from "./path-walk";
+import {
+  vfsFileInfo,
+  vfsFileInfoByPathId,
+  vfsListChildren,
+  vfsListFiles,
+  type ListChildrenResult,
+  type ListFilesItemRaw,
+  type ListFilesResult,
+} from "./list-files";
 import {
   userIdFor,
   FILE_HEAD_JOIN,
@@ -871,13 +881,11 @@ export class UserDOCore extends DurableObject<Env> {
     // Idempotent CREATE TABLE; no migration tag.
     //
     // @lean-invariant Mossaic.Vfs.Preview.stepVariant_preserves_validState
-    //   Lean proves all variant ops (insert / delete / cascadeFileDelete)
-    //   preserve the PK uniqueness invariant. See
-    //   `lean/Mossaic/Vfs/Preview.lean :: stepVariant_preserves_validState`.
+    //   All transitions in the abstract list model preserve modeled key
+    //   uniqueness; the SQL schema is not refined by this theorem.
     // @lean-invariant Mossaic.Vfs.Preview.cascade_delete_drops_all
-    //   Lean proves CASCADE-delete drops every variant row for the
-    //   deleted file_id. See
-    //   `lean/Mossaic/Vfs/Preview.lean :: cascade_delete_drops_all`.
+    //   The abstract cascade transition removes all modeled rows for a
+    //   file id; SQLite cascade semantics are outside the proof.
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS file_variants (
         file_id        TEXT NOT NULL,
@@ -1435,6 +1443,42 @@ export class UserDOCore extends DurableObject<Env> {
   }
 
   /**
+   * readManyFile() — batched readFile for multi-file fetch.
+   *
+   * Mirrors `vfsReadManyStat`'s per-path try/catch null-on-ENOENT
+   * shape and `previewInfoMany`'s 256-path soft cap. Inline-tier
+   * files served from SQL; chunked files fan out per shard via
+   * `getChunksBatch`. Encrypted bytes are returned as-is (envelope).
+   */
+  async vfsReadManyFile(
+    scope: VFSScope,
+    paths: string[]
+  ): Promise<(Uint8Array | null)[]> {
+    this.gateVfs(scope);
+    if (paths.length === 0) return [];
+    if (paths.length > 256) {
+      throw new VFSError(
+        "EINVAL",
+        `vfsReadManyFile: max 256 paths per call (got ${paths.length})`
+      );
+    }
+    const { vfsReadFile } = await import("./vfs/reads");
+    const out: (Uint8Array | null)[] = [];
+    for (const p of paths) {
+      try {
+        out.push(await vfsReadFile(this, scope, p));
+      } catch (err) {
+        if (err instanceof VFSError && err.code === "ENOENT") {
+          out.push(null);
+          continue;
+        }
+        throw err;
+      }
+    }
+    return out;
+  }
+
+  /**
    * readFile() — returns Uint8Array bytes. EISDIR/EFBIG/ENOENT/ELOOP.
    * pass `opts.versionId` to read a historical version
    * directly. Tombstone versions throw ENOENT.
@@ -1502,6 +1546,25 @@ export class UserDOCore extends DurableObject<Env> {
   ): Promise<CacheResolveResult> {
     this.gateVfs(scope);
     return vfsResolveCacheKey(this, scope, path);
+  }
+
+  /**
+   * Cheap cache-bust oracle for folder-surface ops (`readdir` /
+   * `listChildren` / `listFiles` / `stat` / `fileInfo` /
+   * `readManyStat`). Returns the parent folder's `revision`
+   * counter — bumped by every mutation that affects the listing.
+   *
+   * Resolves `path` as the FOLDER itself: `/` returns the root
+   * counter; `/foo` returns the revision of folder `foo`. ENOTDIR
+   * for non-folder paths.
+   */
+  async vfsFolderRevision(
+    scope: VFSScope,
+    path: string
+  ): Promise<{ revision: number }> {
+    this.gateVfs(scope);
+    const { vfsFolderRevision } = await import("./vfs/folder-revision");
+    return vfsFolderRevision(this, scope, path);
   }
 
   /**
@@ -2246,6 +2309,18 @@ export class UserDOCore extends DurableObject<Env> {
     }
     const { markVersion } = await import("./vfs-versions");
     markVersion(this, pathId, versionId, opts);
+    // markVersion mutates file_versions.{label,user_visible}; both
+    // are visible via listVersions feeding into folder-surface
+    // tooling. Bump parent revision so cache invalidates.
+    const { bumpFolderRevision } = await import("./vfs/helpers");
+    const parentRow = this.sql
+      .exec(
+        "SELECT parent_id FROM files WHERE file_id=? AND user_id=?",
+        pathId,
+        userId,
+      )
+      .toArray()[0] as { parent_id: string | null } | undefined;
+    bumpFolderRevision(this, userId, parentRow?.parent_id ?? null);
   }
 
   /**
@@ -2724,6 +2799,29 @@ export class UserDOCore extends DurableObject<Env> {
   }
 
   /**
+   * Stable-id CAS metadata patch. Lets review systems key decisions by
+   * (userId, pathId, versionId) and avoid a read-head-then-patch race.
+   */
+  async vfsPatchMetadataIfHead(
+    scope: VFSScope,
+    pathId: string,
+    expectedHeadVersionId: string | null,
+    patch: Record<string, unknown> | null,
+    opts?: { addTags?: readonly string[]; removeTags?: readonly string[] }
+  ): Promise<PatchMetadataIfHeadResult> {
+    this.gateVfsWrite(scope);
+    const { vfsPatchMetadataIfHead } = await import("./vfs-ops");
+    return vfsPatchMetadataIfHead(
+      this,
+      scope,
+      pathId,
+      expectedHeadVersionId,
+      patch,
+      opts,
+    );
+  }
+
+  /**
    * same-tenant copyFile. Manifest-only copy for chunked +
    * versioned tiers; bytes-only copy for inline tier; bytes-snapshot
    * fork for yjs-mode src. See `copy-file.ts` for the refcount and
@@ -2766,12 +2864,8 @@ export class UserDOCore extends DurableObject<Env> {
       includeArchived?: boolean;
       includeContentHash?: boolean;
     }
-  ): Promise<{
-    items: import("./list-files").ListFilesItemRaw[];
-    cursor?: string;
-  }> {
+  ): Promise<ListFilesResult> {
     this.gateVfs(scope);
-    const { vfsListFiles } = await import("./list-files");
     return vfsListFiles(this, scope, opts);
   }
 
@@ -2785,10 +2879,24 @@ export class UserDOCore extends DurableObject<Env> {
       includeArchived?: boolean;
       includeContentHash?: boolean;
     }
-  ): Promise<import("./list-files").ListFilesItemRaw> {
+  ): Promise<ListFilesItemRaw> {
     this.gateVfs(scope);
-    const { vfsFileInfo } = await import("./list-files");
     return vfsFileInfo(this, scope, path, opts);
+  }
+
+  async vfsFileInfoByPathId(
+    scope: VFSScope,
+    pathId: string,
+    opts?: {
+      includeStat?: boolean;
+      includeMetadata?: boolean;
+      includeTombstones?: boolean;
+      includeArchived?: boolean;
+      includeContentHash?: boolean;
+    }
+  ): Promise<ListFilesItemRaw> {
+    this.gateVfs(scope);
+    return vfsFileInfoByPathId(this, scope, pathId, opts);
   }
 
   /**
@@ -2813,9 +2921,8 @@ export class UserDOCore extends DurableObject<Env> {
       includeTombstones?: boolean;
       includeArchived?: boolean;
     }
-  ): Promise<import("./list-files").ListChildrenResult> {
+  ): Promise<ListChildrenResult> {
     this.gateVfs(scope);
-    const { vfsListChildren } = await import("./list-files");
     return vfsListChildren(this, scope, opts);
   }
 

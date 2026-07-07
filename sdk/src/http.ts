@@ -25,7 +25,18 @@
 
 import { VFSStat } from "./stats";
 import { mapServerError, MossaicUnavailableError, EINVAL } from "./errors";
-import type { OpenManifestResult, VFSStatRaw } from "../../shared/vfs-types";
+import type {
+  CacheResolveResult,
+  OpenManifestResult,
+  VFSStatRaw,
+} from "../../shared/vfs-types";
+import {
+  parseCacheResolveResult,
+  parseReadManyFileBytes,
+} from "../../shared/vfs-types";
+import {
+  parsePatchMetadataIfHeadResult,
+} from "../../shared/patch-metadata-if-head";
 import type {
   PreviewInfo,
   PreviewInfoBatchEntry,
@@ -36,8 +47,13 @@ import type {
 import type { ReadHandle, WriteHandle } from "./streams";
 import type {
   VFSClient,
+  FileInfoOpts,
+  ListFilesItem,
+  ListFilesOpts,
+  ListFilesPage,
   VersionInfo,
   DropVersionsPolicy,
+  PatchMetadataIfHeadResult,
   BeginMultipartUploadOpts,
   MultipartUploadHandle,
   PutMultipartChunkResult,
@@ -50,6 +66,37 @@ const HTTP_MULTIPART_TIMEOUT_MS = 10 * 60_000;
 
 interface MultipartRequestOpts {
   signal?: AbortSignal;
+}
+
+interface ListFilesItemWire {
+  path: string;
+  pathId: string;
+  headVersionId?: string;
+  stat?: VFSStatRaw;
+  metadata?: Record<string, unknown> | null;
+  tags: string[];
+  contentHash?: string;
+}
+
+interface ListFilesResponseWire {
+  items: ListFilesItemWire[];
+  cursor?: string;
+}
+
+interface FileInfoResponseWire {
+  item: ListFilesItemWire;
+}
+
+function listFilesItemFromWire(raw: ListFilesItemWire): ListFilesItem {
+  return {
+    path: raw.path,
+    pathId: raw.pathId,
+    headVersionId: raw.headVersionId,
+    stat: raw.stat ? new VFSStat(raw.stat) : undefined,
+    metadata: raw.metadata,
+    tags: raw.tags,
+    ...(raw.contentHash !== undefined ? { contentHash: raw.contentHash } : {}),
+  };
 }
 
 function signalWithTimeout(signal?: AbortSignal): AbortSignal {
@@ -146,7 +193,7 @@ export class HttpVFS implements VFSClient {
 
   private async post(
     method: string,
-    body: Record<string, unknown> | Uint8Array,
+    body: object | Uint8Array,
     syscall: string,
     path: string | undefined,
     expect: "json" | "octet-stream"
@@ -261,6 +308,63 @@ export class HttpVFS implements VFSClient {
     );
     const body = (await res.json()) as { stats: (VFSStatRaw | null)[] };
     return body.stats.map((s) => (s ? new VFSStat(s) : null));
+  }
+
+  async readManyFile(paths: string[]): Promise<(Uint8Array | null)[]> {
+    const res = await this.post(
+      "readManyFile",
+      { paths },
+      "open",
+      undefined,
+      "json"
+    );
+    // Validate at the boundary (RFC-009) — server drift mustn't
+    // silently produce malformed Uint8Array entries downstream.
+    return parseReadManyFileBytes(await res.json());
+  }
+
+  async folderRevision(p: string): Promise<{ revision: number }> {
+    const res = await this.post(
+      "folderRevision",
+      { path: p },
+      "stat",
+      p,
+      "json"
+    );
+    const body = (await res.json()) as unknown;
+    if (
+      body === null ||
+      typeof body !== "object" ||
+      !("revision" in body) ||
+      typeof (body as { revision: unknown }).revision !== "number"
+    ) {
+      throw new TypeError(
+        "folderRevision response: missing or non-numeric 'revision' field"
+      );
+    }
+    return { revision: (body as { revision: number }).revision };
+  }
+
+  async resolveCacheKey(p: string): Promise<CacheResolveResult> {
+    const res = await this.post(
+      "resolveCacheKey",
+      { path: p },
+      "stat",
+      p,
+      "json"
+    );
+    // Validate the JSON boundary explicitly. The server is trusted
+    // but a contract drift (server upgraded ahead of SDK) would
+    // silently corrupt the cache key shape; structural validation
+    // surfaces the drift at the boundary instead of mis-keying
+    // Workers Cache entries downstream (RFC-009).
+    const body = (await res.json()) as unknown;
+    if (body === null || typeof body !== "object" || !("cacheKey" in body)) {
+      throw new TypeError(
+        "resolveCacheKey response: missing 'cacheKey' field"
+      );
+    }
+    return parseCacheResolveResult((body as { cacheKey: unknown }).cacheKey);
   }
 
   // ── Writes ────────────────────────────────────────────────────────────
@@ -795,6 +899,22 @@ export class HttpVFS implements VFSClient {
     );
   }
 
+  async patchMetadataIfHead(
+    pathId: string,
+    expectedHeadVersionId: string | null,
+    patch: Record<string, unknown> | null,
+    opts?: import("./vfs").PatchMetadataOpts
+  ): Promise<PatchMetadataIfHeadResult> {
+    const res = await this.post(
+      "patchMetadataIfHead",
+      { pathId, expectedHeadVersionId, patch, opts },
+      "open",
+      pathId,
+      "json"
+    );
+    return parsePatchMetadataIfHeadResult(await res.json());
+  }
+
   async copyFile(
     src: string,
     dest: string,
@@ -809,44 +929,22 @@ export class HttpVFS implements VFSClient {
     );
   }
 
-  async listFiles(
-    opts: import("./vfs").ListFilesOpts = {}
-  ): Promise<import("./vfs").ListFilesPage> {
+  async listFiles(opts: ListFilesOpts = {}): Promise<ListFilesPage> {
     const res = await this.post(
       "listFiles",
-      opts as Record<string, unknown>,
+      opts,
       "scandir",
       opts.prefix,
       "json"
     );
-    const raw = (await res.json()) as {
-      items: Array<{
-        path: string;
-        pathId: string;
-        stat?: import("../../shared/vfs-types").VFSStatRaw;
-        metadata?: Record<string, unknown> | null;
-        tags: string[];
-        contentHash?: string;
-      }>;
-      cursor?: string;
-    };
+    const raw: ListFilesResponseWire = await res.json();
     return {
-      items: raw.items.map((r) => ({
-        path: r.path,
-        pathId: r.pathId,
-        stat: r.stat ? new VFSStat(r.stat) : undefined,
-        metadata: r.metadata,
-        tags: r.tags,
-        ...(r.contentHash !== undefined ? { contentHash: r.contentHash } : {}),
-      })),
+      items: raw.items.map(listFilesItemFromWire),
       cursor: raw.cursor,
     };
   }
 
-  async fileInfo(
-    p: string,
-    opts: import("./vfs").FileInfoOpts = {}
-  ): Promise<import("./vfs").ListFilesItem> {
+  async fileInfo(p: string, opts: FileInfoOpts = {}): Promise<ListFilesItem> {
     const res = await this.post(
       "fileInfo",
       { path: p, ...opts },
@@ -854,26 +952,23 @@ export class HttpVFS implements VFSClient {
       p,
       "json"
     );
-    const raw = (await res.json()) as {
-      item: {
-        path: string;
-        pathId: string;
-        stat?: import("../../shared/vfs-types").VFSStatRaw;
-        metadata?: Record<string, unknown> | null;
-        tags: string[];
-        contentHash?: string;
-      };
-    };
-    return {
-      path: raw.item.path,
-      pathId: raw.item.pathId,
-      stat: raw.item.stat ? new VFSStat(raw.item.stat) : undefined,
-      metadata: raw.item.metadata,
-      tags: raw.item.tags,
-      ...(raw.item.contentHash !== undefined
-        ? { contentHash: raw.item.contentHash }
-        : {}),
-    };
+    const raw: FileInfoResponseWire = await res.json();
+    return listFilesItemFromWire(raw.item);
+  }
+
+  async fileInfoByPathId(
+    pathId: string,
+    opts: FileInfoOpts = {}
+  ): Promise<ListFilesItem> {
+    const res = await this.post(
+      "fileInfoByPathId",
+      { pathId, ...opts },
+      "stat",
+      pathId,
+      "json"
+    );
+    const raw: FileInfoResponseWire = await res.json();
+    return listFilesItemFromWire(raw.item);
   }
 
   async listChildren(
@@ -902,6 +997,7 @@ export class HttpVFS implements VFSClient {
             path: string;
             pathId: string;
             name: string;
+            headVersionId?: string;
             stat?: import("../../shared/vfs-types").VFSStatRaw;
             metadata?: Record<string, unknown> | null;
             tags: string[];
@@ -947,6 +1043,7 @@ export class HttpVFS implements VFSClient {
         name: e.name,
         tags: e.tags,
       };
+      if (e.headVersionId !== undefined) out.headVersionId = e.headVersionId;
       if (e.stat) out.stat = new VFSStat(e.stat);
       if (e.metadata !== undefined) out.metadata = e.metadata;
       if (e.contentHash !== undefined) out.contentHash = e.contentHash;

@@ -1,22 +1,29 @@
 {
-  "compilerOptions": {
-    "target": "ES2022",
-    "lib": ["ES2022"],
-    "module": "ESNext",
-    "moduleResolution": "bundler",
-    "strict": true,
-    "esModuleInterop": true,
-    "skipLibCheck": true,
-    "forceConsistentCasingInFileNames": true,
-    "resolveJsonModule": true,
-    "isolatedModules": true,
-    "noEmit": true,
-    "types": ["@cloudflare/workers-types"],
-    "paths": {
-      "@shared/*": ["./shared/*"],
-      "@core/*": ["./worker/core/*"],
-      "@app/*": ["./worker/app/*"]
-    }
-  },
-  "include": ["worker", "shared"]
+	"extends": "./tsconfig.base.json",
+	"compilerOptions": {
+		// Cloudflare Worker code under `worker/`. Extending `base` rather
+		// than a Workers preset because the latter would
+		// auto-include a top-level `worker-configuration.d.ts` that mossaic
+		// doesn't have at this tsconfig's root.
+		"target": "ES2022",
+		"module": "ESNext",
+		"moduleResolution": "bundler",
+		"lib": ["ES2022"],
+		"esModuleInterop": true,
+		"resolveJsonModule": true,
+		"types": ["@cloudflare/workers-types"],
+		"paths": {
+			"@shared/*": ["./shared/*"],
+			"@core/*": ["./worker/core/*"],
+			"@app/*": ["./worker/app/*"]
+		},
+		// TODO(mossaic): re-enable from the standalone base after the surfaced
+		// issues are fixed. Suppressed only to preserve pre-extension behavior.
+		"noUnusedLocals": false,
+		"noUnusedParameters": false,
+		"noFallthroughCasesInSwitch": false,
+		"verbatimModuleSyntax": false,
+		"erasableSyntaxOnly": false
+	},
+	"include": ["worker", "shared"]
 }

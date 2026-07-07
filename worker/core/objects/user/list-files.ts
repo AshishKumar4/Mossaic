@@ -43,6 +43,8 @@ import {
 export interface ListFilesItemRaw {
   path: string;
   pathId: string;
+  /** Current non-tombstoned head version id, when versioning has materialized one. */
+  headVersionId?: string;
   stat?: VFSStatRaw;
   metadata?: Record<string, unknown> | null;
   tags: string[];
@@ -81,6 +83,7 @@ export type VFSChildRaw =
       path: string;
       pathId: string;
       name: string;
+      headVersionId?: string;
       stat?: VFSStatRaw;
       metadata?: Record<string, unknown> | null;
       tags: string[];
@@ -407,6 +410,33 @@ export async function vfsFileInfo(
   return item;
 }
 
+export async function vfsFileInfoByPathId(
+  durableObject: UserDO,
+  scope: VFSScope,
+  pathId: string,
+  opts: FileInfoOpts = {}
+): Promise<ListFilesItemRaw> {
+  const userId = userIdFor(scope);
+  // Tenant isolation is enforced in `hydrateItem`'s SQL predicate:
+  // `files.file_id = pathId AND files.user_id = userId`. A guessed pathId
+  // from another tenant is indistinguishable from a missing id.
+  const item = hydrateItem(
+    durableObject,
+    userId,
+    scope,
+    pathId,
+    opts.includeStat !== false,
+    opts.includeMetadata === true,
+    opts.includeTombstones === true,
+    opts.includeArchived === true,
+    opts.includeContentHash === true
+  );
+  if (!item) {
+    throw new VFSError("ENOENT", `fileInfoByPathId: pathId not found: ${pathId}`);
+  }
+  return item;
+}
+
 /**
  * Batched directory listing with hydrated stat / metadata / tags /
  * contentHash for every direct child (folders, files, symlinks).
@@ -648,6 +678,7 @@ export async function vfsListChildren(
         name: leafName(item.path),
         tags: item.tags,
       };
+      if (item.headVersionId !== undefined) fileEntry.headVersionId = item.headVersionId;
       if (item.stat !== undefined) fileEntry.stat = item.stat;
       if (includeMetadata) fileEntry.metadata = item.metadata ?? null;
       if (includeContentHash && item.contentHash !== undefined) {
@@ -1537,6 +1568,10 @@ function hydrateItem(
     pathId,
     tags,
   };
+
+  if (f.head_version_id !== null) {
+    out.headVersionId = f.head_version_id;
+  }
 
   if (includeStat) {
     // Build a VFSStatRaw aligned with `statForResolved`'s file

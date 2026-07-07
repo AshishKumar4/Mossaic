@@ -11,23 +11,18 @@ text below is the honest accounting.
 update, status flip, commit-rename) succeeds, or the pre-call state is
 preserved.
 
-**Argument:** Steps 1–6 are read-only on UserDO state. Steps 7–9 happen
-in one DO turn = one SQL transaction. Step 8's `commitRename` is
-already proven atomic in `AtomicWrite.lean` (theorem
-`readFile_no_torn_state` plus the temp-id-then-rename state machine).
-The batch INSERT in step 7 and the supersede UPDATE in step 8 either
-both commit or both rollback. Step 10 is post-commit cleanup;
-failures there leak orphan staging rows but do not invalidate the
-committed state — the alarm sweeper reaps them.
+**Implementation rationale, not a proof:** validation and shard collection
+precede the UserDO-side manifest/file updates, and readers ignore uploading
+temporary rows. The current Lean `AtomicWrite` model establishes selected
+visibility properties for two atomic abstract transitions only. It does not
+model the SQL sequence, cross-DO awaits, rollback, crashes, or the multipart
+implementation, so it does not prove this claim.
 
-**Why not formalised in Lean:** the structural property holds because
-the entire finalize is a single DO-method body executed under
-Cloudflare DO single-threaded fetch handler semantics. To
-formalise it as a Lean theorem we would need to extend
+**Why not formalised in Lean:** to establish this claim we would need to extend
 `AtomicWrite.lean`'s state machine with a `multipartFinalize` op
-that takes the staging-table contents as part of the state and
-proves that `readFile path` linearizes through the finalize. This
-is tracked as future work.
+that takes staging tables, SQL transaction boundaries, cross-DO results, and
+failure points as state, then prove refinement from the implementation and
+full trace linearizability. That work has not been done.
 
 **Implementation:** `worker/core/objects/user/multipart-upload.ts:519`
 (`vfsFinalizeMultipart`).
@@ -109,15 +104,17 @@ re-stamped onto `files` / `file_versions` at finalize, mirroring the
 
 ## What IS formalised in Lean
 
-`Mossaic.Vfs.Multipart` carries 5 real theorems:
+`Mossaic.Vfs.Multipart` includes these relevant abstract-model theorems:
 
-  - `putChunkMultipart_idempotent` — same-hash retry preserves `validState`.
+  - `putChunkMultipart_idempotent` — same-ref retry yields exact abstract shard-state equality.
+  - `putChunkMultipart_retry_preserves_validState` — same-ref retry preserves `validState`.
+  - `commitManifest_success_is_complete` — modeled successful commit implies declared-count and collected index/hash completeness.
   - `putChunkMultipart_supersedes_safely` — coarse supersession preserves `validState`.
   - `putChunkMultipart_supersedes_safely_finegrained` — finer-grained version with prior-hash existence premise.
   - `multipart_refcount_valid` — induction over a list of multipart ops preserves `validState`.
   - `multipart_put_changes_state` — non-vacuity (the model is not `step = id`).
 
-These cover the refcount-correctness portion of the multipart pipeline.
-They do NOT cover atomicity, token unforgeability, alarm idempotence,
-or byte-equivalence with the single-shot path — those four claims live
-in this document.
+These cover parts of the abstract refcount, retry, and manifest-gate models.
+They do not prove the SQL/TypeScript implementation, full finalize atomicity,
+token unforgeability, alarm idempotence, or byte-equivalence with the
+single-shot path.

@@ -20,38 +20,22 @@
  * cost at ~1ms inside the UserDO. The route then builds the cache
  * key locally and proceeds.
  *
- * @lean-invariant Mossaic.Vfs.Cache.bust_token_completeness —
- * the cache key includes every column that any write path might
- * mutate AND that affects the response bytes. See
- * `local/cache-staleness-audit.md` for the per-surface proof.
+ * @lean-invariant Mossaic.Vfs.Cache.bust_state_changes_when_signal_changes
+ * The abstract theorem says a genuinely changed returned signal changes
+ * BustState. It does not prove SQL/TypeScript correspondence or write-path
+ * completeness.
  */
 
 import type { UserDOCore as UserDO } from "../user-do-core";
-import { VFSError, type VFSScope } from "../../../../../shared/vfs-types";
+import {
+  VFSError,
+  type CacheResolveResult,
+  type VFSScope,
+} from "../../../../../shared/vfs-types";
 import { resolvePath } from "../path-walk";
 import { userIdFor } from "./helpers";
 
-export interface CacheResolveResult {
-  /** Stable file_id (immutable for the lifetime of the path). */
-  fileId: string;
-  /**
-   * Current head version_id, or `null` for versioning-OFF / yjs
-   * tenants (in which case `updatedAt` is the bust signal).
-   */
-  headVersionId: string | null;
-  /**
-   * `files.updated_at` in ms-since-epoch. Bumped by every meaningful
-   * write (commitVersion's UPDATE, commitInlineTier, rename,
-   * archive, metadata change). Always non-null.
-   */
-  updatedAt: number;
-  /**
-   * Per-file encryption stamp. NULL for plaintext. A rotation
-   * between writes flips one of these and the bytes change.
-   */
-  encryptionMode: string | null;
-  encryptionKeyId: string | null;
-}
+export type { CacheResolveResult };
 
 /**
  * Resolve `path` to its cache-bust state. Throws ENOENT for

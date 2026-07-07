@@ -1,10 +1,16 @@
 import { Hono } from "hono";
+import type { Context } from "hono";
 import type { EnvCore as Env } from "../../../shared/types";
 import type { MiddlewareHandler } from "hono";
 import { verifyVFSToken, VFSConfigError } from "../lib/auth";
 import { vfsUserDOName } from "../lib/utils";
 import type { UserDOCore } from "../objects/user/user-do-core";
-import type { VFSScope } from "../../../shared/vfs-types";
+import { VFSError, type VFSScope } from "../../../shared/vfs-types";
+import {
+  PatchMetadataIfHeadRequestSchema,
+  type PatchMetadataIfHeadRequest,
+} from "../../../shared/patch-metadata-if-head";
+import { parseRequestBody } from "../../../shared/schemas/parse";
 import { edgeCacheServe } from "../lib/edge-cache";
 import { userIdFor } from "../objects/user/vfs/helpers";
 
@@ -54,6 +60,8 @@ const vfs = new Hono<{
   Bindings: Env;
   Variables: { scope: VFSScope };
 }>();
+
+type VfsRouteContext = Context<{ Bindings: Env; Variables: { scope: VFSScope } }>;
 
 /**
  * Auth middleware: extract Bearer token from Authorization, verify
@@ -171,6 +179,23 @@ export function errToResponse(err: unknown): { status: number; body: { code: str
   };
 }
 
+function vfsJsonErrorResponse(r: ReturnType<typeof errToResponse>): Response {
+  return new Response(JSON.stringify(r.body), {
+    status: r.status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+/** Base64-encode bytes in 8 KiB chunks to avoid V8's spread-arg limit. */
+function bytesToBase64(b: Uint8Array): string {
+  const CHUNK = 0x2000;
+  let out = "";
+  for (let i = 0; i < b.length; i += CHUNK) {
+    out += String.fromCharCode(...b.subarray(i, i + CHUNK));
+  }
+  return btoa(out);
+}
+
 /**
  * Validate a path string from the request body. The DO-side userIdFor
  * + path resolution already validate, so all we need here is type
@@ -184,6 +209,14 @@ export function expectPath(body: unknown): string {
     });
   }
   return b.path;
+}
+
+function parsePatchMetadataIfHeadBody(body: unknown): PatchMetadataIfHeadRequest {
+  return parseRequestBody(
+    PatchMetadataIfHeadRequestSchema,
+    body,
+    "patchMetadataIfHead",
+  );
 }
 
 // ── Reads ──────────────────────────────────────────────────────────────
@@ -236,7 +269,7 @@ vfs.post("/readFile", async (c) => {
     });
   } catch (err) {
     const r = errToResponse(err);
-    return c.json(r.body, r.status as 400);
+    return vfsJsonErrorResponse(r);
   }
 });
 
@@ -248,7 +281,7 @@ vfs.post("/readdir", async (c) => {
     return c.json({ entries });
   } catch (err) {
     const r = errToResponse(err);
-    return c.json(r.body, r.status as 400);
+    return vfsJsonErrorResponse(r);
   }
 });
 
@@ -260,7 +293,7 @@ vfs.post("/stat", async (c) => {
     return c.json({ stat });
   } catch (err) {
     const r = errToResponse(err);
-    return c.json(r.body, r.status as 400);
+    return vfsJsonErrorResponse(r);
   }
 });
 
@@ -272,7 +305,7 @@ vfs.post("/lstat", async (c) => {
     return c.json({ stat });
   } catch (err) {
     const r = errToResponse(err);
-    return c.json(r.body, r.status as 400);
+    return vfsJsonErrorResponse(r);
   }
 });
 
@@ -284,7 +317,7 @@ vfs.post("/exists", async (c) => {
     return c.json({ exists });
   } catch (err) {
     const r = errToResponse(err);
-    return c.json(r.body, r.status as 400);
+    return vfsJsonErrorResponse(r);
   }
 });
 
@@ -296,7 +329,19 @@ vfs.post("/readlink", async (c) => {
     return c.json({ target });
   } catch (err) {
     const r = errToResponse(err);
-    return c.json(r.body, r.status as 400);
+    return vfsJsonErrorResponse(r);
+  }
+});
+
+vfs.post("/resolveCacheKey", async (c) => {
+  try {
+    const body = await c.req.json<{ path: string }>();
+    const path = expectPath(body);
+    const ck = await userStub(c).vfsResolveCacheKey(c.var.scope, path);
+    return c.json({ cacheKey: ck });
+  } catch (err) {
+    const r = errToResponse(err);
+    return vfsJsonErrorResponse(r);
   }
 });
 
@@ -313,7 +358,50 @@ vfs.post("/readManyStat", async (c) => {
     return c.json({ stats });
   } catch (err) {
     const r = errToResponse(err);
-    return c.json(r.body, r.status as 400);
+    return vfsJsonErrorResponse(r);
+  }
+});
+
+vfs.post("/folderRevision", async (c) => {
+  try {
+    const body = await c.req.json<{ path: string }>();
+    const path = expectPath(body);
+    const result = await userStub(c).vfsFolderRevision(c.var.scope, path);
+    return c.json(result);
+  } catch (err) {
+    const r = errToResponse(err);
+    return vfsJsonErrorResponse(r);
+  }
+});
+
+vfs.post("/readManyFile", async (c) => {
+  try {
+    const body = await c.req.json<{ paths: string[] }>();
+    if (!Array.isArray(body.paths)) {
+      return c.json(
+        { code: "EINVAL", message: "body.paths must be a string[]" },
+        400
+      );
+    }
+    // Belt-and-braces request-size cap (DO enforces too) — mirrors
+    // previewInfoMany at vfs-preview.ts.
+    if (body.paths.length > 256) {
+      return c.json(
+        { code: "EINVAL", message: "max 256 paths per request" },
+        400
+      );
+    }
+    const bytes = await userStub(c).vfsReadManyFile(c.var.scope, body.paths);
+    // JSON can't carry raw bytes — base64 each entry. Chunked
+    // encoding avoids the spread-to-args RangeError that hits at
+    // ~65 KiB on V8.
+    const encoded = bytes.map((b) =>
+      b === null ? null : { base64: bytesToBase64(b) }
+    );
+    return c.json({ bytes: encoded });
+  } catch (err) {
+    const r = errToResponse(err);
+    return vfsJsonErrorResponse(r);
   }
 });
 
@@ -474,7 +562,7 @@ vfs.post("/writeFile", async (c) => {
     return c.json({ ok: true });
   } catch (err) {
     const r = errToResponse(err);
-    return c.json(r.body, r.status as 400);
+    return vfsJsonErrorResponse(r);
   }
 });
 
@@ -486,7 +574,7 @@ vfs.post("/unlink", async (c) => {
     return c.json({ ok: true });
   } catch (err) {
     const r = errToResponse(err);
-    return c.json(r.body, r.status as 400);
+    return vfsJsonErrorResponse(r);
   }
 });
 
@@ -498,7 +586,7 @@ vfs.post("/purge", async (c) => {
     return c.json({ ok: true });
   } catch (err) {
     const r = errToResponse(err);
-    return c.json(r.body, r.status as 400);
+    return vfsJsonErrorResponse(r);
   }
 });
 
@@ -513,7 +601,7 @@ vfs.post("/archive", async (c) => {
     return c.json({ ok: true });
   } catch (err) {
     const r = errToResponse(err);
-    return c.json(r.body, r.status as 400);
+    return vfsJsonErrorResponse(r);
   }
 });
 
@@ -525,7 +613,7 @@ vfs.post("/unarchive", async (c) => {
     return c.json({ ok: true });
   } catch (err) {
     const r = errToResponse(err);
-    return c.json(r.body, r.status as 400);
+    return vfsJsonErrorResponse(r);
   }
 });
 
@@ -544,7 +632,7 @@ vfs.post("/mkdir", async (c) => {
     return c.json({ ok: true });
   } catch (err) {
     const r = errToResponse(err);
-    return c.json(r.body, r.status as 400);
+    return vfsJsonErrorResponse(r);
   }
 });
 
@@ -556,7 +644,7 @@ vfs.post("/rmdir", async (c) => {
     return c.json({ ok: true });
   } catch (err) {
     const r = errToResponse(err);
-    return c.json(r.body, r.status as 400);
+    return vfsJsonErrorResponse(r);
   }
 });
 
@@ -573,7 +661,7 @@ vfs.post("/rename", async (c) => {
     return c.json({ ok: true });
   } catch (err) {
     const r = errToResponse(err);
-    return c.json(r.body, r.status as 400);
+    return vfsJsonErrorResponse(r);
   }
 });
 
@@ -591,7 +679,7 @@ vfs.post("/chmod", async (c) => {
     return c.json({ ok: true });
   } catch (err) {
     const r = errToResponse(err);
-    return c.json(r.body, r.status as 400);
+    return vfsJsonErrorResponse(r);
   }
 });
 
@@ -608,7 +696,7 @@ vfs.post("/symlink", async (c) => {
     return c.json({ ok: true });
   } catch (err) {
     const r = errToResponse(err);
-    return c.json(r.body, r.status as 400);
+    return vfsJsonErrorResponse(r);
   }
 });
 
@@ -632,7 +720,7 @@ vfs.post("/setYjsMode", async (c) => {
     return c.json({ ok: true });
   } catch (err) {
     const r = errToResponse(err);
-    return c.json(r.body, r.status as 400);
+    return vfsJsonErrorResponse(r);
   }
 });
 
@@ -658,7 +746,7 @@ vfs.post("/readYjsSnapshot", async (c) => {
     });
   } catch (err) {
     const r = errToResponse(err);
-    return c.json(r.body, r.status as 400);
+    return vfsJsonErrorResponse(r);
   }
 });
 
@@ -686,7 +774,7 @@ vfs.post("/admin/setVersioning", async (c) => {
     return c.json(r);
   } catch (err) {
     const r = errToResponse(err);
-    return c.json(r.body, r.status as 400);
+    return vfsJsonErrorResponse(r);
   }
 });
 
@@ -704,7 +792,7 @@ vfs.post("/flushYjs", async (c) => {
     return c.json(r);
   } catch (err) {
     const r = errToResponse(err);
-    return c.json(r.body, r.status as 400);
+    return vfsJsonErrorResponse(r);
   }
 });
 
@@ -724,7 +812,7 @@ vfs.post("/removeRecursive", async (c) => {
     return c.json(r);
   } catch (err) {
     const r = errToResponse(err);
-    return c.json(r.body, r.status as 400);
+    return vfsJsonErrorResponse(r);
   }
 });
 
@@ -773,7 +861,7 @@ vfs.post("/openManifest", async (c) => {
     });
   } catch (err) {
     const r = errToResponse(err);
-    return c.json(r.body, r.status as 400);
+    return vfsJsonErrorResponse(r);
   }
 });
 
@@ -837,7 +925,7 @@ vfs.post("/readChunk", async (c) => {
     });
   } catch (err) {
     const r = errToResponse(err);
-    return c.json(r.body, r.status as 400);
+    return vfsJsonErrorResponse(r);
   }
 });
 
@@ -874,7 +962,7 @@ vfs.post("/listVersions", async (c) => {
     return c.json({ versions });
   } catch (err) {
     const r = errToResponse(err);
-    return c.json(r.body, r.status as 400);
+    return vfsJsonErrorResponse(r);
   }
 });
 
@@ -902,7 +990,7 @@ vfs.post("/restoreVersion", async (c) => {
     return c.json({ id: r.versionId });
   } catch (err) {
     const r = errToResponse(err);
-    return c.json(r.body, r.status as 400);
+    return vfsJsonErrorResponse(r);
   }
 });
 
@@ -925,14 +1013,14 @@ vfs.post("/dropVersions", async (c) => {
     return c.json(r);
   } catch (err) {
     const r = errToResponse(err);
-    return c.json(r.body, r.status as 400);
+    return vfsJsonErrorResponse(r);
   }
 });
 
 // ── copyFile, metadata, listFiles, version-mark ──────────────
 
 const copyFileHandler = async (
-  c: import("hono").Context<{ Bindings: Env; Variables: { scope: VFSScope } }>
+  c: VfsRouteContext
 ) => {
   try {
     const body = await c.req.json<{
@@ -955,7 +1043,7 @@ const copyFileHandler = async (
     return c.json({ ok: true });
   } catch (err) {
     const r = errToResponse(err);
-    return c.json(r.body, r.status as 400);
+    return vfsJsonErrorResponse(r);
   }
 };
 vfs.post("/copy", copyFileHandler);
@@ -965,7 +1053,7 @@ vfs.post("/copyFile", copyFileHandler);
 // so the HttpVFS client (which uses a single POST helper) can call
 // the same handler.
 const patchMetadataHandler = async (
-  c: import("hono").Context<{ Bindings: Env; Variables: { scope: VFSScope } }>
+  c: VfsRouteContext
 ) => {
   try {
     const body = await c.req.json<{
@@ -978,14 +1066,34 @@ const patchMetadataHandler = async (
     return c.json({ ok: true });
   } catch (err) {
     const r = errToResponse(err);
-    return c.json(r.body, r.status as 400);
+    return vfsJsonErrorResponse(r);
   }
 };
 vfs.patch("/metadata", patchMetadataHandler);
 vfs.post("/patchMetadata", patchMetadataHandler);
 
+const patchMetadataIfHeadHandler = async (
+  c: VfsRouteContext
+) => {
+  try {
+    const body = parsePatchMetadataIfHeadBody(await c.req.json());
+    const result = await userStub(c).vfsPatchMetadataIfHead(
+      c.var.scope,
+      body.pathId,
+      body.expectedHeadVersionId,
+      body.patch,
+      body.opts,
+    );
+    return c.json(result);
+  } catch (err) {
+    const r = errToResponse(err);
+    return vfsJsonErrorResponse(r);
+  }
+};
+vfs.post("/patchMetadataIfHead", patchMetadataIfHeadHandler);
+
 const listFilesHandler = async (
-  c: import("hono").Context<{ Bindings: Env; Variables: { scope: VFSScope } }>
+  c: VfsRouteContext
 ) => {
   try {
     // Use POST for /list so callers can pass complex `metadata`
@@ -1009,7 +1117,7 @@ const listFilesHandler = async (
     return c.json(r);
   } catch (err) {
     const r = errToResponse(err);
-    return c.json(r.body, r.status as 400);
+    return vfsJsonErrorResponse(r);
   }
 };
 vfs.post("/list", listFilesHandler);
@@ -1036,14 +1144,41 @@ vfs.post("/fileInfo", async (c) => {
     return c.json({ item });
   } catch (err) {
     const r = errToResponse(err);
-    return c.json(r.body, r.status as 400);
+    return vfsJsonErrorResponse(r);
+  }
+});
+
+vfs.post("/fileInfoByPathId", async (c) => {
+  try {
+    const body = await c.req.json<{
+      pathId: string;
+      includeStat?: boolean;
+      includeMetadata?: boolean;
+      includeTombstones?: boolean;
+      includeArchived?: boolean;
+      includeContentHash?: boolean;
+    }>();
+    if (typeof body.pathId !== "string" || body.pathId.length === 0) {
+      throw new VFSError("EINVAL", "fileInfoByPathId: pathId required");
+    }
+    const item = await userStub(c).vfsFileInfoByPathId(c.var.scope, body.pathId, {
+      includeStat: body.includeStat,
+      includeMetadata: body.includeMetadata,
+      includeTombstones: body.includeTombstones,
+      includeArchived: body.includeArchived,
+      includeContentHash: body.includeContentHash,
+    });
+    return c.json({ item });
+  } catch (err) {
+    const r = errToResponse(err);
+    return vfsJsonErrorResponse(r);
   }
 });
 
 // Batched directory listing. Body shape mirrors `ListChildrenOpts`.
 // Returns `{ revision, entries, cursor? }`.
 const listChildrenHandler = async (
-  c: import("hono").Context<{ Bindings: Env; Variables: { scope: VFSScope } }>
+  c: VfsRouteContext
 ) => {
   try {
     const body = await c.req.json<{
@@ -1074,13 +1209,13 @@ const listChildrenHandler = async (
     return c.json(r);
   } catch (err) {
     const r = errToResponse(err);
-    return c.json(r.body, r.status as 400);
+    return vfsJsonErrorResponse(r);
   }
 };
 vfs.post("/listChildren", listChildrenHandler);
 
 const markVersionHandler = async (
-  c: import("hono").Context<{ Bindings: Env; Variables: { scope: VFSScope } }>
+  c: VfsRouteContext
 ) => {
   try {
     const body = await c.req.json<{
@@ -1103,7 +1238,7 @@ const markVersionHandler = async (
     return c.json({ ok: true });
   } catch (err) {
     const r = errToResponse(err);
-    return c.json(r.body, r.status as 400);
+    return vfsJsonErrorResponse(r);
   }
 };
 vfs.put("/version-mark", markVersionHandler);

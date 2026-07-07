@@ -331,7 +331,7 @@ theorem userVisibleScan_monotonic_under_map
           { x with userVisible := true } else x)).any
        (fun r => decide (r.pathId = pidQ ∧ r.versionId = vidQ) &&
                  r.userVisible)) = true)
-    simp only [List.map, List.any_cons, Bool.or_eq_true]
+    simp only [List.any_cons, Bool.or_eq_true]
     -- hpre splits on whether the head matched.
     have hpre' : (decide (hd.pathId = pidQ ∧ hd.versionId = vidQ) &&
                    hd.userVisible) = true ∨
@@ -400,8 +400,8 @@ theorem markUserVisible_scan_monotonic
 --   /workspace/Mossaic/local/phase-36-plan.md
 --
 -- Theorems:
---   (M1) commitVersion_idempotent — same args produce same effect (the
---        SQL INSERT OR REPLACE / UPDATE shapes are idempotent).
+--   (M1) repeated_commit_appends_twice — the abstract append model records
+--        both calls; it does not model SQL primary-key retry semantics.
 --   (M2) accounting_balanced — write deltaFiles +1, delete deltaFiles -1;
 --        the sum across a write↔delete pair is zero.
 --   (M3) versioning_on_pool_growth_works — the Phase 36 fix proper:
@@ -444,7 +444,7 @@ def applyQuotaOp (vs : VersionState) (qr : QuotaRow) (op : QuotaOp) :
      { qr with fileCount := qr.fileCount.pred })
 
 /--
-**(M1) commitVersion_idempotent.**
+**(M1) repeated_commit_appends_twice.**
 Two consecutive `commitVersionWrite` ops with the same args yield a
 state that is structurally consistent — the second insert appends
 another row (each version_id is fresh in TS, so distinct args is the
@@ -458,7 +458,7 @@ caller's responsibility to use unique vids, which the SDK enforces
 via generateId()). What we prove is the structural lemma: each call
 appends exactly one row, so the post-state is determined by the input.
 -/
-theorem commitVersion_idempotent
+theorem repeated_commit_appends_twice
     (vs : VersionState) (qr : QuotaRow)
     (pid : PathId) (vid : String) (mtime : TimeMs) (db : Nat) :
     let post1 := applyQuotaOp vs qr (.commitVersionWrite pid vid mtime db)
@@ -467,11 +467,6 @@ theorem commitVersion_idempotent
     post2.2.storageUsed = qr.storageUsed + db + db ∧
     post2.2.fileCount = qr.fileCount + 1 + 1 := by
   simp [applyQuotaOp, step]
-  refine ⟨?_, ?_, ?_⟩
-  · rw [List.length_append, List.length_append]
-    simp
-  · rfl
-  · rfl
 
 /--
 **(M2) accounting_balanced.**
@@ -481,12 +476,11 @@ stays at high-water — pool_size is monotone, see Quota.lean.)
 -/
 theorem accounting_balanced
     (vs : VersionState) (qr : QuotaRow)
-    (pid : PathId) (vidW vidD : String) (mtime : TimeMs) (db : Nat)
-    (h_pos : qr.fileCount + 1 ≥ 1) :
+    (pid : PathId) (vidW vidD : String) (mtime : TimeMs) (db : Nat) :
     let postW := applyQuotaOp vs qr (.commitVersionWrite pid vidW mtime db)
     let postD := applyQuotaOp postW.1 postW.2 (.commitVersionDelete pid vidD mtime)
     postD.2.fileCount = qr.fileCount := by
-  simp [applyQuotaOp, Nat.pred_succ]
+  simp [applyQuotaOp]
 
 /--
 **(M3) versioning_on_pool_growth_works.**
@@ -518,7 +512,6 @@ theorem pool_growth_monotonic
     let post := applyQuotaOp vs qr (.commitVersionWrite pid vid mtime db)
     post.2.storageUsed ≥ qr.storageUsed := by
   simp [applyQuotaOp]
-  omega
 
 -- ─── Non-vacuity sanity checks ─────────────────────────────────────────
 

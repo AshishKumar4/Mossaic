@@ -179,29 +179,22 @@ theorem fileInfo_returns_row_on_non_tombstone
   rw [h_lookup]
   simp [h_not_tomb]
 
-/-- Auxiliary: `(l.map f).get? i` corresponds to `(l.get? i).map f`.
-This is `List.get?_map` in newer Mathlib; we prove it by induction
-to avoid name-stability concerns across Lean / Mathlib versions. -/
-private theorem get?_map_eq {α β : Type} (f : α → β) (l : List α) (i : Nat) :
-    (l.map f).get? i = (l.get? i).map f := by
-  induction l generalizing i with
-  | nil => simp
-  | cons hd tl ih =>
-    cases i with
-    | zero => simp
-    | succ k => simp [List.get?, ih]
+/-- Auxiliary: indexing through `map` maps the indexed value. -/
+private theorem getElem?_map_eq {α β : Type} (f : α → β) (l : List α) (i : Nat) :
+    (l.map f)[i]? = (l[i]?).map f := by
+  simp
 
 /-- (T3) `vfsReadManyStat` returns `none` at every position whose path
 resolves to a tombstoned-head file. The batch isolates each per-path
 ENOENT to a single position; surrounding positions are untouched. -/
 theorem readManyStat_returns_null_per_tombstone
     (s : PathState) (paths : List String) (i : Nat) (path : String) (f : FileRow)
-    (h_idx : paths.get? i = some path)
+    (h_idx : paths[i]? = some path)
     (h_lookup : s.files.find? (·.fileName = path) = some f)
     (h_tomb : isTombstonedHead s f = true) :
-    (readManyStat s paths).get? i = some none := by
+    (readManyStat s paths)[i]? = some none := by
   unfold readManyStat
-  rw [get?_map_eq, h_idx]
+  rw [getElem?_map_eq, h_idx]
   simp
   rw [h_lookup]
   simp [h_tomb]
@@ -247,7 +240,7 @@ private theorem find?_eq_some_of_mem_unique
     · -- hd matches the predicate. By unique, hd = f.
       have hhd_eq : hd = f := h_unique hd List.mem_cons_self hhd
       -- find? on hd::tl with predicate true at hd returns some hd = some f.
-      simp [List.find?, hhd, hhd_eq]
+      simp [List.find?, hhd_eq]
     · -- hd doesn't match. Recurse on tl with f ∈ tl.
       have h_in_tl : f ∈ tl := by
         rcases List.mem_cons.mp h_in with rfl | h

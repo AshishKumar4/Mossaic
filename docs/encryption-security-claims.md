@@ -72,11 +72,11 @@ is negligible per Claim 3) but does not change the structural
 property.
 
 **Lean coverage:** `Mossaic.Vfs.Tenant.cross_tenant_isolation` and
-`Mossaic.Vfs.Tenant.cross_tenant_user_isolation` already prove the
-DO-namespace property. Encryption-layer isolation is an immediate
-consequence; no separate Lean theorem is needed (the previous
+`Mossaic.Vfs.Tenant.cross_tenant_user_isolation` prove injectivity in the
+hand-written name-encoding model. They do not refine the deployed DO runtime
+or establish encryption-layer isolation. The previous
 `encryption_preserves_tenant_isolation : True := by trivial` was
-removed in Phase 24 because its formal content was empty).
+removed in Phase 24 because its formal content was empty.
 
 ## Claim 5 — HMAC-SHA-256 PRF unforgeability (used by JWT signing)
 

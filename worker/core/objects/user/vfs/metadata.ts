@@ -3,6 +3,9 @@ import {
   VFSError,
   type VFSScope,
 } from "../../../../../shared/vfs-types";
+import type {
+  PatchMetadataIfHeadResult,
+} from "../../../../../shared/patch-metadata-if-head";
 import {
   validateMetadata,
   validateTags,
@@ -14,7 +17,39 @@ import {
   writeMetadata,
 } from "../metadata-tags";
 import { deepMerge } from "../../../../../shared/metadata-merge";
-import { resolveOrThrow, userIdFor } from "./helpers";
+import { bumpFolderRevision, resolveOrThrow, userIdFor } from "./helpers";
+
+export type { PatchMetadataIfHeadResult } from "../../../../../shared/patch-metadata-if-head";
+
+// Parent-id lookup for a resolved leaf. Folders carry parent_id in
+// the same row; files in `files.parent_id`. Returns null for the
+// root sentinel folder.
+function parentFolderIdOf(
+  durableObject: UserDO,
+  userId: string,
+  leafId: string,
+  kind: "file" | "dir" | "symlink",
+): string | null {
+  if (kind === "dir") {
+    if (leafId === "") return null;
+    const row = durableObject.sql
+      .exec(
+        "SELECT parent_id FROM folders WHERE folder_id=? AND user_id=?",
+        leafId,
+        userId,
+      )
+      .toArray()[0] as { parent_id: string | null } | undefined;
+    return row?.parent_id ?? null;
+  }
+  const row = durableObject.sql
+    .exec(
+      "SELECT parent_id FROM files WHERE file_id=? AND user_id=?",
+      leafId,
+      userId,
+    )
+    .toArray()[0] as { parent_id: string | null } | undefined;
+  return row?.parent_id ?? null;
+}
 
 /**
  * VFS metadata + mode + yjs-mode bit.
@@ -63,6 +98,13 @@ export function vfsChmod(
       userId
     );
   }
+  // Bust the parent folder's listing cache. mode is part of stat
+  // which feeds readManyStat / listChildren responses.
+  bumpFolderRevision(
+    durableObject,
+    userId,
+    parentFolderIdOf(durableObject, userId, r.leafId, r.kind),
+  );
 }
 
 /**
@@ -108,24 +150,120 @@ export async function vfsPatchMetadata(
       `patchMetadata: not a regular file: ${path}`
     );
   }
-  const pathId = r.leafId;
+  if (!patchMetadataForPathId(durableObject, userId, r.leafId, patch, opts)) {
+    return;
+  }
+  bumpFolderRevision(
+    durableObject,
+    userId,
+    parentFolderIdOf(durableObject, userId, r.leafId, "file"),
+  );
+}
+
+/**
+ * Atomically patch file metadata/tags iff the stable pathId still
+ * points at the expected head version. Returns the observed current
+ * head either way so callers can distinguish an applied patch from a
+ * stale review without doing a read-then-write race in user code.
+ */
+export async function vfsPatchMetadataIfHead(
+  durableObject: UserDO,
+  scope: VFSScope,
+  pathId: string,
+  expectedHeadVersionId: string | null,
+  patch: Record<string, unknown> | null,
+  opts: { addTags?: readonly string[]; removeTags?: readonly string[] } = {}
+): Promise<PatchMetadataIfHeadResult> {
+  const userId = userIdFor(scope);
+  const row = durableObject.sql
+    .exec(
+      `SELECT parent_id, head_version_id, node_kind
+         FROM files
+        WHERE file_id = ? AND user_id = ? AND status = 'complete'`,
+      pathId,
+      userId,
+    )
+    .toArray()[0] as
+    | {
+        parent_id: string | null;
+        head_version_id: string | null;
+        node_kind: string;
+      }
+    | undefined;
+  if (!row) {
+    throw new VFSError(
+      "ENOENT",
+      `patchMetadataIfHead: pathId not found: ${pathId}`
+    );
+  }
+  if (row.node_kind !== "file") {
+    throw new VFSError(
+      "EINVAL",
+      `patchMetadataIfHead: not a regular file: ${pathId}`
+    );
+  }
+
+  const headVersionId = row.head_version_id ?? null;
+  if (headVersionId !== expectedHeadVersionId) {
+    return { patched: false, headVersionId };
+  }
+
+  const mutated = patchMetadataForPathId(
+    durableObject,
+    userId,
+    pathId,
+    patch,
+    opts,
+  );
+  if (mutated) bumpFolderRevision(durableObject, userId, row.parent_id);
+  return { patched: true, headVersionId };
+}
+
+function patchMetadataForPathId(
+  durableObject: UserDO,
+  userId: string,
+  pathId: string,
+  patch: Record<string, unknown> | null,
+  opts: { addTags?: readonly string[]; removeTags?: readonly string[] } = {}
+): boolean {
   if (opts.addTags !== undefined) validateTags(opts.addTags);
   if (opts.removeTags !== undefined) validateTags(opts.removeTags);
 
+  const metadataMutated =
+    patch === null || (patch !== undefined && Object.keys(patch).length > 0);
   if (patch === null) {
     writeMetadata(durableObject, pathId, null);
-  } else if (patch !== undefined) {
+  } else if (metadataMutated) {
     const merged = deepMerge(readMetadata(durableObject, pathId), patch);
     const { encoded } = validateMetadata(merged);
     writeMetadata(durableObject, pathId, encoded);
   }
 
+  const tagsMutated =
+    (opts.addTags !== undefined && opts.addTags.length > 0) ||
+    (opts.removeTags !== undefined && opts.removeTags.length > 0);
   if (opts.addTags && opts.addTags.length > 0) {
     addTagsHelper(durableObject, userId, pathId, opts.addTags);
   }
   if (opts.removeTags && opts.removeTags.length > 0) {
     removeTagsHelper(durableObject, pathId, opts.removeTags);
   }
+
+  if (!metadataMutated && !tagsMutated) return false;
+
+  // Tag-only mutations escape the file-level bust signal because
+  // file_tags is a sibling table; bump files.updated_at so
+  // resolveCacheKey sees a fresh value. writeMetadata already
+  // bumps updated_at internally.
+  if (tagsMutated && !metadataMutated) {
+    durableObject.sql.exec(
+      "UPDATE files SET updated_at=? WHERE file_id=? AND user_id=?",
+      Date.now(),
+      pathId,
+      userId,
+    );
+  }
+  return true;
 }
 
 /**
@@ -179,6 +317,11 @@ export function vfsSetYjsMode(
     Date.now(),
     r.leafId,
     userId
+  );
+  bumpFolderRevision(
+    durableObject,
+    userId,
+    parentFolderIdOf(durableObject, userId, r.leafId, "file"),
   );
 }
 

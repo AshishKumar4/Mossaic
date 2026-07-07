@@ -198,8 +198,17 @@ class BatchedLstatFs implements VFSClient {
   exists(p: string) { return this.inner.exists(p); }
   readlink(p: string) { return this.inner.readlink(p); }
   readManyStat(paths: string[]) { return this.inner.readManyStat(paths); }
+  readManyFile(paths: string[]) { return this.inner.readManyFile(paths); }
+  folderRevision(p: string) { return this.inner.folderRevision(p); }
+  resolveCacheKey(p: string) { return this.inner.resolveCacheKey(p); }
   fileInfo(p: string, opts?: Parameters<VFSClient["fileInfo"]>[1]) {
     return this.inner.fileInfo(p, opts);
+  }
+  fileInfoByPathId(
+    pathId: string,
+    opts?: Parameters<VFSClient["fileInfoByPathId"]>[1]
+  ) {
+    return this.inner.fileInfoByPathId(pathId, opts);
   }
   writeFile(
     p: string,
@@ -298,6 +307,19 @@ class BatchedLstatFs implements VFSClient {
     opts?: Parameters<VFSClient["patchMetadata"]>[2]
   ) {
     return this.inner.patchMetadata(p, patch, opts);
+  }
+  patchMetadataIfHead(
+    pathId: string,
+    expectedHeadVersionId: string | null,
+    patch: Parameters<VFSClient["patchMetadataIfHead"]>[2],
+    opts?: Parameters<VFSClient["patchMetadataIfHead"]>[3]
+  ) {
+    return this.inner.patchMetadataIfHead(
+      pathId,
+      expectedHeadVersionId,
+      patch,
+      opts,
+    );
   }
   copyFile(
     src: string,

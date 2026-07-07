@@ -138,6 +138,28 @@ console.log(handle.tmpId, handle.chunkSize, handle.poolSize);
 // `handle.tmpId` is stable for resumable / progress-tracking use cases.
 ```
 
+### 2.3 Atomic metadata compare-and-patch
+
+Use `patchMetadataIfHead(pathId, expectedHeadVersionId, patch, opts?)` when metadata represents a decision about specific file bytes, such as an output review. The compare and patch happen inside one UserDO turn, so callers do not need a racy read-head / patch-metadata sequence.
+
+```ts
+const beforeReview = await vfs.fileInfo("/outputs/final.json");
+const result = await vfs.patchMetadataIfHead(
+  beforeReview.pathId,
+  beforeReview.headVersionId ?? null,
+  { review: { status: "approved", reviewer: "alice" } },
+  { addTags: ["reviewed"] },
+);
+
+if (!result.patched) {
+  console.log("output changed during review", result.headVersionId);
+}
+```
+
+The result is `{ patched: boolean; headVersionId: string | null }`. `patched: false` means the current head no longer matched `expectedHeadVersionId`; no metadata or tag changes were applied. Use the stable `pathId` from `fileInfo()` or `listFiles()` and the corresponding `headVersionId` to key review decisions by `(pathId, versionId)`.
+
+HTTP fallback exposes the same operation at `POST /api/vfs/patchMetadataIfHead` with JSON body `{ pathId, expectedHeadVersionId, patch, opts? }`.
+
 ---
 
 ## 3. HTTP fallback envelope
@@ -425,6 +447,12 @@ Both honor `Range: bytes=N-M` with:
 - **416 Range Not Satisfiable** + `Content-Range: bytes */total` for out-of-bounds.
 - **200** with `Accept-Ranges: bytes` (advertising support) when no `Range` header is sent.
 
+Security hardening on both routes:
+
+- Responses include `X-Content-Type-Options: nosniff` and `Content-Security-Policy: sandbox; default-src 'none'`.
+- For non-image MIME types, the response is forced to `Content-Type: application/octet-stream` with `Content-Disposition: attachment` (download, not inline render).
+- Inline image allowlist includes raster formats plus `image/svg+xml`.
+
 Range requests bypass the Workers Cache wrapper because the cached full response is the upstream of any range slice; the Worker streams the requested byte slice from the cached or freshly-fetched bytes.
 
 The SDK-level `vfs.createReadStream(path, { start, end })` is a separate primitive &mdash; it slices across one or more 1 MB chunks to produce a memory-bounded `ReadableStream` and is suitable for in-Worker byte processing. The HTTP Range support above is for **browser-direct** seeking on the App routes; SDK consumers should use `createReadStream` for in-Worker workflows.
@@ -505,15 +533,44 @@ The same `includeContentHash: true` knob exists on `listFiles` since both surfac
 
 ---
 
-## 10. Operations checklist for a deploy
+## 10. Wire schema conventions
+
+Runtime boundary DTOs are schema-first. For public request, response, token, and JSON config shapes, define the Zod schema and infer the TypeScript type from it:
+
+```ts
+import { z } from "zod/v4";
+
+export const FooResponseSchema = z.object({ ok: z.boolean() });
+export type FooResponse = z.infer<typeof FooResponseSchema>;
+```
+
+Worker HTTP routes should parse request bodies before reading fields so invalid input goes through the existing VFS JSON error surface:
+
+```ts
+const body = parseRequestBody(FooRequestSchema, await c.req.json(), "foo");
+```
+
+SDK HTTP clients should parse JSON responses instead of narrowing with `as Foo`; failures throw a contextual `TypeError` with the original `ZodError` attached as `cause`:
+
+```ts
+return parseResponse(FooResponseSchema, await res.json(), "foo");
+```
+
+Shared metadata-shaped DTOs should use `JsonObjectSchema` / `JsonValueSchema` from `shared/schemas/json.ts` instead of `Record<string, unknown>` when Zod is responsible for the runtime contract. Domain-specific limits such as metadata byte caps, nesting caps, and tag constraints still live in the existing domain validators unless they are intentionally folded into a schema with `superRefine`.
+
+Object strictness is a domain decision: prefer `.strict()` for new request payloads that should reject unknown fields, allow default stripping where backward-compatible clients may send extras, and use `.passthrough()` only when extras are intentionally preserved.
+
+---
+
+## 11. Operations checklist for a deploy
 
 1. `pnpm typecheck` &mdash; exit 0.
 2. `pnpm ci:check` &mdash; chained typecheck + DTS-strict SDK build + no-Phase-tag lint gate; exit 0.
-3. `pnpm test` &mdash; full suite green (~929 cases across unit, integration, CLI, browser e2e).
-4. `npx wrangler deploy --dry-run` (App mode) &mdash; bindings list shows `MOSSAIC_USER`, `MOSSAIC_SHARD`, `SEARCH_DO`.
-5. `npx wrangler deploy --dry-run -c deployments/service/wrangler.jsonc` (Service mode) &mdash; bindings show `MOSSAIC_USER`, `MOSSAIC_SHARD` only.
+3. `pnpm test` and `pnpm test:cli` &mdash; worker/integration and CLI unit suites green.
+4. `pnpm exec wrangler deploy --dry-run` (App mode) &mdash; bindings list shows `MOSSAIC_USER`, `MOSSAIC_SHARD`, `SEARCH_DO`.
+5. `pnpm exec wrangler deploy --dry-run -c deployments/service/wrangler.jsonc` (Service mode) &mdash; bindings show `MOSSAIC_USER`, `MOSSAIC_SHARD` only.
 6. App-mode contract suite green: `pnpm test tests/integration/app-smoke.test.ts tests/integration/multipart-routes.test.ts` &mdash; these pin the legacy photo-app HTTP wire shape that the SPA still consumes via `stub.appXxx(...)` typed RPCs.
-7. `pnpm verify:proofs` &mdash; Lean proofs green; 226 theorems, 0 axioms, 0 sorrys; no xref drift.
+7. `pnpm verify:proofs` &mdash; imported Lean abstract-model corpus and generated inventory green; read the [verification boundary](./formal-verification-boundary.md) for what this does not prove.
 8. Final grep for the legacy binding-name tokens (whole-word match) returns zero hits outside `local/` (plans), `lean/` (proofs), and audit/history files such as `OPERATIONS.md` and this guide's migration-safety callout.
 
 That is the full contract.

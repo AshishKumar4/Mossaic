@@ -76,7 +76,7 @@ def FileVariant.key (v : FileVariant) : FileId × VariantKind × RendererKind :=
 /-- The variants table state. -/
 structure VariantState where
   variants : List FileVariant
-  deriving Repr
+  deriving DecidableEq, Repr
 
 def VariantState.empty : VariantState := ⟨[]⟩
 
@@ -109,10 +109,10 @@ def stepVariant (s : VariantState) : VariantOp → VariantState
     if exists' then s
     else { s with variants := s.variants ++ [v] }
   | .deleteVariant fid vk rk =>
-    { s with variants := s.variants.filter
-        (fun v => ¬ (v.fileId = fid ∧ v.variantKind = vk ∧ v.rendererKind = rk)) }
+    { s with variants := s.variants.filter (fun v =>
+        !(v.fileId == fid && v.variantKind == vk && v.rendererKind == rk)) }
   | .cascadeFileDelete fid =>
-    { s with variants := s.variants.filter (fun v => v.fileId ≠ fid) }
+    { s with variants := s.variants.filter (fun v => !(v.fileId == fid)) }
 
 -- ─── §1 variant_uniqueness ──────────────────────────────────────────────
 
@@ -176,13 +176,8 @@ theorem cascade_delete_drops_all
       v.fileId ≠ fid := by
   intro v hv
   unfold stepVariant at hv
-  simp only [] at hv
-  -- hv : v ∈ s.variants.filter (fun v => v.fileId ≠ fid)
   rw [List.mem_filter] at hv
-  -- hv : v ∈ s.variants ∧ decide (v.fileId ≠ fid) = true
-  have hsnd : decide (v.fileId ≠ fid) = true := hv.2
-  -- Convert decide-equality back to the underlying proposition.
-  exact of_decide_eq_true hsnd
+  simpa using hv.2
 
 /-- `cascadeFileDelete` does not affect variants of OTHER fileIds. -/
 theorem cascade_delete_preserves_other_files
@@ -194,13 +189,9 @@ theorem cascade_delete_preserves_other_files
     v ∈ (stepVariant s (.cascadeFileDelete fid)).variants := by
   intro hmem
   unfold stepVariant
-  simp only []
   rw [List.mem_filter]
   refine ⟨hmem, ?_⟩
-  -- Goal: decide (v.fileId ≠ fid) = true
-  -- From h_v : v.fileId = otherFid; h_ne : otherFid ≠ fid.
-  have hne : v.fileId ≠ fid := by rw [h_v.1]; exact h_ne
-  exact decide_eq_true hne
+  simp [h_v.1, h_ne]
 
 -- ─── §3 variant_chunk_refcount_transitivity ─────────────────────────────
 

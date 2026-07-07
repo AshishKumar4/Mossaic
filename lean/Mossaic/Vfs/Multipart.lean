@@ -30,8 +30,8 @@ Plan reference:
 What we actually prove:
 
   §1 putChunkMultipart_idempotent
-     Same `(uploadId, idx, hash, bytes)` PUT twice yields the same
-     post-state. Proof: chains 2× `step_preserves_validState`.
+     Same `(uploadId, idx, hash)` PUT twice yields exactly the same
+     abstract shard state as one PUT.
 
   §2 putChunkMultipart_supersedes_safely
      A coarse-grained model: the supersession sequence preserves
@@ -128,16 +128,26 @@ inductive MultipartOp where
   | abort (uploadId : UploadId) (now : TimeMs)
   deriving Repr
 
--- ─── §1 putChunkMultipart_idempotent ────────────────────────────────────
+-- ─── §1 putChunkMultipart idempotence ───────────────────────────────────
 
 /--
-Two consecutive `putChunkMultipart` calls with the same hash + same
-`(uploadId, idx)` preserve `validState`. After the first call inserts
-the chunk + ref, the second call's `INSERT OR IGNORE` on `chunk_refs`
-is a no-op (fix landed in audit Phase 1) and the staging-table
-`INSERT OR REPLACE` rewrites the same row.
+Two consecutive abstract `putChunk` transitions with the same hash and
+`(uploadId, idx)` produce exactly the same state as one transition. This
+models the chunk/ref portion of the retry path; the ShardDO SQL and
+`upload_chunks` staging row remain outside this model.
 -/
 theorem putChunkMultipart_idempotent
+    (s : ShardState) (h : Hash) (uploadId : UploadId)
+    (idx : Nat) (sz : Nat) :
+    step (step s (Op.putChunk h sz uploadId idx))
+      (Op.putChunk h sz uploadId idx) =
+    step s (Op.putChunk h sz uploadId idx) := by
+  apply putChunk_existing_ref_noop
+  exact putChunk_records_ref s h sz uploadId idx
+
+/-- Retrying the same abstract multipart put also preserves `validState`.
+This follows from the general refcount transition invariant. -/
+theorem putChunkMultipart_retry_preserves_validState
     (s : ShardState) (h : Hash) (uploadId : UploadId)
     (idx : Nat) (sz : Nat) :
     validState s →
@@ -146,6 +156,44 @@ theorem putChunkMultipart_idempotent
   intro hv
   apply step_preserves_validState
   exact step_preserves_validState s (Op.putChunk h sz uploadId idx) hv
+
+-- ─── §1b finalize manifest completeness ─────────────────────────────────
+
+/-- The index/hash portion of a staged shard manifest row. Sizes are read
+from the collected server rows after this check and are not client claims. -/
+structure ManifestEntry where
+  index : Nat
+  hash  : Hash
+  deriving DecidableEq, Repr
+
+/-- The modeled finalize gate checks the declared total and requires every
+expected `(index, hash)` pair to appear in the collected shard manifest. -/
+def manifestComplete (totalChunks : Nat) (expected collected : List ManifestEntry) : Bool :=
+  decide (expected.length = totalChunks) &&
+    expected.all (fun entry => collected.contains entry)
+
+/-- A successful gate commits exactly the client-ordered expected manifest;
+failure leaves no committed manifest in this abstraction. -/
+def commitManifest (totalChunks : Nat) (expected collected : List ManifestEntry) :
+    Option (List ManifestEntry) :=
+  if manifestComplete totalChunks expected collected then some expected else none
+
+/-- Successful modeled finalize implies both declared-count agreement and
+index/hash completeness against the server-collected shard rows. -/
+theorem commitManifest_success_is_complete
+    (totalChunks : Nat) (expected collected committed : List ManifestEntry)
+    (h_commit : commitManifest totalChunks expected collected = some committed) :
+    committed = expected ∧
+    expected.length = totalChunks ∧
+    ∀ entry ∈ expected, entry ∈ collected := by
+  unfold commitManifest at h_commit
+  split at h_commit
+  · rename_i h_complete
+    have h_committed : committed = expected := Option.some.inj h_commit.symm
+    subst committed
+    simp [manifestComplete] at h_complete
+    exact ⟨rfl, h_complete.1, h_complete.2⟩
+  · simp at h_commit
 
 -- ─── §2 putChunkMultipart_supersedes_safely (coarse) ────────────────────
 

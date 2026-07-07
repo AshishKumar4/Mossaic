@@ -1,22 +1,29 @@
 {
-  "compilerOptions": {
-    "target": "ES2022",
-    "lib": ["ES2022", "DOM", "DOM.Iterable"],
-    "module": "ESNext",
-    "moduleResolution": "bundler",
-    "jsx": "react-jsx",
-    "strict": true,
-    "esModuleInterop": true,
-    "skipLibCheck": true,
-    "forceConsistentCasingInFileNames": true,
-    "resolveJsonModule": true,
-    "isolatedModules": true,
-    "noEmit": true,
-    "paths": {
-      "@/*": ["./src/*"],
-      "@shared/*": ["./shared/*"],
-      "@app/*": ["./worker/app/*"]
-    }
-  },
-  "include": ["src", "shared", "worker/app/types.ts"]
+	"extends": "./tsconfig.base.json",
+	"compilerOptions": {
+		// React SPA code under `src/`. Extending `base` rather than
+		// an app preset because mossaic doesn't use
+		// vite/client globals (its preview front-end is bundled via the
+		// Cloudflare vite-plugin's worker entrypoint, not a vite SPA).
+		"target": "ES2022",
+		"module": "ESNext",
+		"moduleResolution": "bundler",
+		"lib": ["ES2022", "DOM", "DOM.Iterable"],
+		"jsx": "react-jsx",
+		"esModuleInterop": true,
+		"resolveJsonModule": true,
+		"paths": {
+			"@/*": ["./src/*"],
+			"@shared/*": ["./shared/*"],
+			"@app/*": ["./worker/app/*"]
+		},
+		// TODO(mossaic): re-enable from the standalone base after the surfaced
+		// issues are fixed. Suppressed only to preserve pre-extension behavior.
+		"noUnusedLocals": false,
+		"noUnusedParameters": false,
+		"noFallthroughCasesInSwitch": false,
+		"verbatimModuleSyntax": false,
+		"erasableSyntaxOnly": false
+	},
+	"include": ["src", "shared", "worker/app/types.ts"]
 }

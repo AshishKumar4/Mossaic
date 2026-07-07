@@ -1,5 +1,5 @@
 /-
-Mossaic.Vfs.AtomicWrite — I2: Atomic-write commit linearizability.
+Mossaic.Vfs.AtomicWrite — I2: abstract atomic-visibility properties.
 Mathlib-backed, NO AXIOM, NO SORRY.
 
 Models:
@@ -11,7 +11,10 @@ Models:
 Audit reference:
   /workspace/local/audit-report.md §I2.
 
-Invariant: readFile linearizability under temp-id-then-rename.
+Scope: a hand-written state machine for visibility around beginWrite and
+commitRename. It does not model arbitrary traces, failures, SQL transaction
+semantics, cross-DO calls, JavaScript scheduling, or a refinement from the
+TypeScript implementation, so it is not a full linearizability proof.
 
 The TS code's `writeFile` is NOT a single SQL statement; it's a sequence:
   (W1) Insert `_vfs_tmp_<id>` file row with `status = uploading`.
@@ -20,9 +23,8 @@ The TS code's `writeFile` is NOT a single SQL statement; it's a sequence:
        renames the file_name to the target path, in a single SQL UPDATE
        within the DO single-threaded fetch handler.
 
-Cloudflare DO semantics guarantee that each `fetch`-served method runs
-to completion before the next. So *between* method calls, any concurrent
-`readFile` observes the database in some intermediate state.
+The model treats each `Op` as an atomic transition. Whether an implementation
+operation has that boundary is part of the trusted computing base.
 
 `readFile(path)` filters on `status = 'complete'` AND `file_name = path`,
 so:
@@ -42,8 +44,8 @@ the same id (all or nothing).
 What we prove:
   - `readFile_atomic_during_write` — during (W1)/(W2), readFile returns
     the same as before the write.
-  - `readFile_atomic_at_commit` — after (W3), readFile returns the
-    fresh content (or the same as before if commit failed).
+  - `modeled_write_visibility_boundary` — in the explicit two-transition
+    trace from empty, the file is hidden before commit and visible after it.
   - `readFile_no_torn_state` — readFile never returns a result whose
     chunks are sourced from mixed file_ids.
   - Non-vacuity witnesses.
@@ -178,12 +180,8 @@ theorem readFile_unchanged_under_beginWrite
         (fun f => f.fileName = path ∧ f.status = FileStatus.complete))
         = s.files.find? (fun f => f.fileName = path ∧ f.status = FileStatus.complete) := by
     rw [List.find?_append]
-    -- The single-element list's find? is none because status = uploading ≠ complete.
-    have : ([(⟨tmpId, "_vfs_tmp_" ++ tmpId, FileStatus.uploading⟩ : FileRow)].find?
-              (fun f => f.fileName = path ∧ f.status = FileStatus.complete)) = none := by
-      simp
     cases hf : s.files.find? (fun f => f.fileName = path ∧ f.status = FileStatus.complete) with
-    | none => simp [this]
+    | none => simp
     | some _ => simp
   rw [hfind_eq]
   -- Now we need chunksOf to match too. fileChunks change: appended chunks
@@ -267,15 +265,28 @@ At `commitRename`, the result transitions atomically. -/
 theorem readObserve_no_op (s : UserState) (path path' : String) :
     (step s (.readObserve path)).readFile path' = s.readFile path' := rfl
 
--- ─── Linearizability for the full write sequence ────────────────────────
+-- ─── Explicit modeled trace boundary ────────────────────────────────────
 
 -- Note: a `readFile_changes_only_at_state_change` theorem
 -- (`P ∨ ¬P` shape; pattern 4 vacuous) was removed in Phase 51.
--- The meaningful linearizability claim — that `readFile` flips
--- atomically at `commitRename` and is unchanged under `beginWrite` —
--- is captured by `readFile_unchanged_under_beginWrite` above and the
--- witness theorems below (`witness_full_write_visible`,
--- `witness_during_write_invisible`).
+-- The modeled visibility claim is captured by
+-- `readFile_unchanged_under_beginWrite` and the two-transition theorem below.
+
+/-- In the model's explicit write trace from empty state, the pre-commit
+state is invisible at the target path and the post-commit state exposes all
+provided chunks under one file id. This theorem is limited to these two
+atomic model transitions. -/
+theorem modeled_write_visibility_boundary
+    (tmpId path : FileId) (chunks : List (Nat × Hash)) :
+    let preCommit := step UserState.empty (.beginWrite tmpId chunks)
+    let postCommit := step preCommit (.commitRename tmpId path)
+    preCommit.readFile path = .enoent ∧
+      postCommit.readFile path = .found tmpId (chunks.map Prod.snd) := by
+  simp [step, UserState.empty, UserState.readFile, UserState.findLiveFileId,
+    UserState.chunksOf]
+  induction chunks with
+  | nil => rfl
+  | cons chunk rest ih => simp [ih]
 
 -- ─── Non-vacuity sanity checks ──────────────────────────────────────────
 

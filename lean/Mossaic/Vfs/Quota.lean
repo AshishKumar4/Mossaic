@@ -41,7 +41,6 @@ NO `axiom`. NO `sorry`. Mathlib v4.29.0.
 -/
 
 import Mossaic.Vfs.Common
-import Mathlib.Data.Nat.Defs
 
 namespace Mossaic.Vfs.Quota
 
@@ -63,7 +62,7 @@ def computePoolSize (storageUsedBytes : Nat) : Nat :=
 -- ─── Quota state (mirror quota table) ───────────────────────────────────
 
 /-- A quota row. Mirrors the `quota` table in user-do-core.ts:172-179. -/
-structure Quota where
+structure QuotaState where
   userId       : String
   storageUsed  : Nat
   storageLimit : Nat
@@ -82,7 +81,7 @@ structure Quota where
 
 The TS code has a subtle property: `pool_size` is taken to be `max(old_pool_size,
 BASE_POOL + ⌊storage_used / BYTES_PER_SHARD⌋)`. We model that exactly. -/
-def recordWriteUsage (q : Quota) (deltaBytes deltaFiles : Nat) : Quota :=
+def recordWriteUsage (q : QuotaState) (deltaBytes deltaFiles : Nat) : QuotaState :=
   let newStorage := q.storageUsed + deltaBytes
   let newFiles := q.fileCount + deltaFiles
   let computed := computePoolSize newStorage
@@ -92,7 +91,7 @@ def recordWriteUsage (q : Quota) (deltaBytes deltaFiles : Nat) : Quota :=
 -- ─── §1 pool_size_monotone ──────────────────────────────────────────────
 
 /-- Pool size is non-decreasing under `recordWriteUsage`. -/
-theorem pool_size_monotone (q : Quota) (deltaBytes deltaFiles : Nat) :
+theorem pool_size_monotone (q : QuotaState) (deltaBytes deltaFiles : Nat) :
     (recordWriteUsage q deltaBytes deltaFiles).poolSize ≥ q.poolSize := by
   unfold recordWriteUsage
   exact Nat.le_max_left _ _
@@ -101,7 +100,7 @@ theorem pool_size_monotone (q : Quota) (deltaBytes deltaFiles : Nat) :
 
 /-- After `recordWriteUsage`, the pool size equals max of the old size and
 the deterministic formula. -/
-theorem pool_growth_threshold (q : Quota) (deltaBytes deltaFiles : Nat) :
+theorem pool_growth_threshold (q : QuotaState) (deltaBytes deltaFiles : Nat) :
     (recordWriteUsage q deltaBytes deltaFiles).poolSize =
       Nat.max q.poolSize (computePoolSize (q.storageUsed + deltaBytes)) := by
   unfold recordWriteUsage
@@ -110,7 +109,7 @@ theorem pool_growth_threshold (q : Quota) (deltaBytes deltaFiles : Nat) :
 -- ─── §3 storage_used_monotone ───────────────────────────────────────────
 
 /-- Storage-used is non-decreasing for non-negative deltas. -/
-theorem storage_used_monotone (q : Quota) (deltaBytes deltaFiles : Nat) :
+theorem storage_used_monotone (q : QuotaState) (deltaBytes deltaFiles : Nat) :
     (recordWriteUsage q deltaBytes deltaFiles).storageUsed ≥ q.storageUsed := by
   unfold recordWriteUsage
   simp only []
@@ -118,7 +117,7 @@ theorem storage_used_monotone (q : Quota) (deltaBytes deltaFiles : Nat) :
 
 -- ─── §4 file_count_monotone ─────────────────────────────────────────────
 
-theorem file_count_monotone (q : Quota) (deltaBytes deltaFiles : Nat) :
+theorem file_count_monotone (q : QuotaState) (deltaBytes deltaFiles : Nat) :
     (recordWriteUsage q deltaBytes deltaFiles).fileCount ≥ q.fileCount := by
   unfold recordWriteUsage
   simp only []
@@ -133,9 +132,9 @@ if `q.storageUsed = k * BYTES_PER_SHARD - 1` and we add 1 byte, the
 new pool size is `BASE_POOL + k` whereas the old was `BASE_POOL + k - 1`.
 -/
 theorem pool_growth_at_5GB_boundary (k : Nat) (hk : k ≥ 1) :
-    let q : Quota := { userId := "", storageUsed := k * BYTES_PER_SHARD - 1,
-                       storageLimit := 0, fileCount := 0,
-                       poolSize := BASE_POOL + (k - 1) }
+    let q : QuotaState := { userId := "", storageUsed := k * BYTES_PER_SHARD - 1,
+                            storageLimit := 0, fileCount := 0,
+                            poolSize := BASE_POOL + (k - 1) }
     (recordWriteUsage q 1 0).poolSize = BASE_POOL + k := by
   intro q
   unfold recordWriteUsage computePoolSize
@@ -176,10 +175,10 @@ structure StoredChunkPlacement where
   poolAtWrite : Nat  -- pool size at write time
   deriving DecidableEq, Repr
 
-/--
+/-
 After any number of `recordWriteUsage` calls, the stored shard index of
 a previously-recorded chunk is unchanged. (Trivially true at the type
-level — `recordWriteUsage` operates on `Quota`, not on per-chunk
+level — `recordWriteUsage` operates on `QuotaState`, not on per-chunk
 records.) This formalises the "old chunks stay" promise in
 `helpers.ts:367-372`.
 -/
@@ -210,9 +209,9 @@ theorem stored_shard_within_resized_pool
 the 5 GB boundary. Direct corollary of `pool_growth_at_5GB_boundary`
 with k=1. -/
 theorem witness_pool_grows_at_5GB :
-    let q₀ : Quota := { userId := "u", storageUsed := BYTES_PER_SHARD - 1,
-                        storageLimit := 100 * BYTES_PER_SHARD, fileCount := 0,
-                        poolSize := BASE_POOL }
+    let q₀ : QuotaState := { userId := "u", storageUsed := BYTES_PER_SHARD - 1,
+                             storageLimit := 100 * BYTES_PER_SHARD, fileCount := 0,
+                             poolSize := BASE_POOL }
     (recordWriteUsage q₀ 1 1).poolSize = BASE_POOL + 1 := by
   -- `recordWriteUsage` only inspects `storageUsed`, `fileCount`, and
   -- `poolSize`. The threshold theorem with k=1 gives the result for
@@ -237,12 +236,12 @@ theorem witness_pool_grows_at_5GB :
 /-- Witness: `recordWriteUsage` is non-trivial — it changes the state
 when deltaBytes > 0. -/
 theorem witness_recordWriteUsage_changes_state :
-    let q₀ : Quota := { userId := "u", storageUsed := 0,
-                        storageLimit := BYTES_PER_SHARD, fileCount := 0,
-                        poolSize := BASE_POOL }
+    let q₀ : QuotaState := { userId := "u", storageUsed := 0,
+                             storageLimit := BYTES_PER_SHARD, fileCount := 0,
+                             poolSize := BASE_POOL }
     recordWriteUsage q₀ 100 1 ≠ q₀ := by
   intro q₀ hcontra
-  have h := congrArg Quota.storageUsed hcontra
+  have h := congrArg QuotaState.storageUsed hcontra
   -- h : (recordWriteUsage q₀ 100 1).storageUsed = q₀.storageUsed
   -- But recordWriteUsage adds 100, so new = 100, old = 0, contradiction.
   unfold recordWriteUsage at h
@@ -253,7 +252,7 @@ theorem witness_recordWriteUsage_changes_state :
 /-- Sanity: `pool_size_monotone` is non-vacuous — there exists a
 `recordWriteUsage` call that strictly grows the pool. -/
 theorem pool_size_monotone_nonvacuous :
-    ∃ (q : Quota) (db df : Nat),
+    ∃ (q : QuotaState) (db df : Nat),
       (recordWriteUsage q db df).poolSize > q.poolSize := by
   refine ⟨{ userId := "u", storageUsed := BYTES_PER_SHARD - 1,
             storageLimit := 100 * BYTES_PER_SHARD, fileCount := 0,
@@ -268,8 +267,10 @@ theorem pool_size_monotone_nonvacuous :
   have hdiv : BYTES_PER_SHARD / BYTES_PER_SHARD = 1 := Nat.div_self hbps_pos
   rw [hdiv]
   -- Goal: max BASE_POOL (BASE_POOL + 1) > BASE_POOL
-  rw [Nat.max_eq_right (Nat.le_succ _)]
-  exact Nat.lt_succ_self _
+  have hmax : Nat.max BASE_POOL (BASE_POOL + 1) = BASE_POOL + 1 :=
+    Nat.max_eq_right (by omega)
+  rw [hmax]
+  omega
 
 -- ─── Phase 32 Fix 4: skip-full-shard placement ─────────────────────────
 --
@@ -352,18 +353,13 @@ theorem skip_full_shard_returns_non_full
     | succ k ih =>
       intro i hi
       unfold placeChunkSkipFull.go at hi
-      by_cases hge : i ≥ poolSize
-      · simp [hge] at hi
-      · simp [hge] at hi
-        by_cases hcont : fullShards.contains i = true
-        · simp [hcont] at hi
-          exact ih (i + 1) hi
-        · simp [hcont] at hi
-          -- hi : .shard i = .shard idx ⇒ idx = i.
-          have : idx = i := by
-            have := PlacementResult.shard.injEq.mp hi.symm
-            exact this.symm
-          rw [this]
+      split at hi
+      · cases hi
+      · split at hi
+        · exact ih (i + 1) hi
+        · rename_i _ hcont
+          have hidx : i = idx := PlacementResult.shard.inj hi
+          rw [← hidx]
           exact eq_false_of_ne_true hcont
   exact aux poolSize 0 h
 
@@ -388,17 +384,13 @@ theorem skip_full_shard_in_bounds
     | succ k ih =>
       intro i hi
       unfold placeChunkSkipFull.go at hi
-      by_cases hge : i ≥ poolSize
-      · simp [hge] at hi
-      · simp [hge] at hi
-        by_cases hcont : fullShards.contains i = true
-        · simp [hcont] at hi
-          exact ih (i + 1) hi
-        · simp [hcont] at hi
-          have : idx = i := by
-            have := PlacementResult.shard.injEq.mp hi.symm
-            exact this.symm
-          rw [this]
+      split at hi
+      · cases hi
+      · rename_i hlt
+        split at hi
+        · exact ih (i + 1) hi
+        · have hidx : i = idx := PlacementResult.shard.inj hi
+          rw [← hidx]
           omega
   exact aux poolSize 0 h
 

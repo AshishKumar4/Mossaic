@@ -32,6 +32,7 @@ import {
   edgeCachePut,
 } from "../lib/edge-cache";
 import { parseRange, rangeResponse, rangeNotSatisfiableResponse } from "../lib/http-range";
+import { EDGE_CACHE_KEY_SCHEMA } from "../lib/preview-cache-schema";
 import { userIdFor } from "../objects/user/vfs/helpers";
 import { verifyPreviewToken } from "../lib/preview-token";
 import { VFSConfigError } from "../lib/auth";
@@ -133,6 +134,7 @@ preview.post("/readPreview", async (c) => {
       fileId: ck.fileId,
       updatedAt: ck.updatedAt,
       extraKeyParts: [
+        EDGE_CACHE_KEY_SCHEMA,
         versionPart,
         variantKeyPart,
         formatPart,
@@ -461,6 +463,7 @@ previewVariant.get("/preview-variant/:token", async (c) => {
         // the route ever forwards the request to a render-on-demand
         // path. Keeping them in the key makes the future change
         // structurally cache-safe.
+        EDGE_CACHE_KEY_SCHEMA,
         c.req.query("w") ? `w${c.req.query("w")}` : "wauto",
         c.req.query("h") ? `h${c.req.query("h")}` : "hauto",
       ],

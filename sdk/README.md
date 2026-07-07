@@ -564,7 +564,7 @@ Batched mode preserves the `lstat` contract — successful resolutions return id
 
 DO instances are named `vfs:${ns}:${tenant}[:${sub}]`. Different triples → different DO instances → different SQLite databases. No cross-tenant data is reachable, ever. Cross-tenant chunk dedup is impossible by construction (chunks live on per-tenant `vfs:...:s${idx}` ShardDOs).
 
-> **Formal proofs.** Mossaic ships Lean 4 formal proofs of the refcount well-formedness, tenant isolation, and GC safety invariants. See [`lean/`](../lean/) for theorem names and `lean/README.md` for what is and isn't proved (zero `sorry` in the must-have set; one declared axiom for the numerical refcount equality, documented in `Gc.lean`). Run `pnpm lean:build` to verify.
+> **Formal models.** Mossaic ships Lean 4 proofs about hand-written abstract models of refcounts, tenant-name encoding, GC, and other selected behavior. There is no proved refinement from this SDK or Worker implementation to those models. See the [formal verification boundary](../docs/formal-verification-boundary.md) and generated [theorem inventory](../lean/THEOREM_INVENTORY.md).
 
 ```ts
 // Production
@@ -888,8 +888,8 @@ Mossaic NEVER auto-encrypts. Existing plaintext files remain plaintext until the
 
 ### See also
 
-- [`local/phase-15-plan.md`](../local/phase-15-plan.md) — full design doc (envelope layout, IND-CPA + dedup-oracle theorems, race-rule analysis).
-- [`lean/Mossaic/Vfs/Encryption.lean`](../lean/Mossaic/Vfs/Encryption.lean) — formal proof obligations + the single new `AES_GCM_IND_CPA` axiom.
+- [`docs/encryption-security-claims.md`](../docs/encryption-security-claims.md) — explicit literature assumptions and unverified implementation boundary.
+- [`lean/Mossaic/Vfs/Encryption.lean`](../lean/Mossaic/Vfs/Encryption.lean) — abstract refcount-blindness theorem only; it contains no cryptographic security proof.
 - [`@mossaic/cli`](../cli/README.md) — `mossaic encrypt`, `mossaic decrypt-readback`, `mossaic rotate-key` for command-line use.
 
 ## copy, metadata, tags, indexed listFiles, version marks
@@ -946,7 +946,7 @@ await vfs.copyFile("/photos/hike.jpg", "/album/2026/hike.jpg", {
 });
 ```
 
-A formal Lean theorem (`Mossaic.Vfs.Refcount.copyFile_chunks_length_invariant`) proves a `copyFile` never grows the chunk row set — it only bumps `ref_count`. See `lean/Mossaic/Vfs/Refcount.lean`.
+In the abstract refcount model, `Mossaic.Vfs.Refcount.copyFile_chunks_length_invariant` proves that a `putChunk` whose hash is already present does not grow the modeled chunk list. It is not a refinement proof of the full `copyFile` implementation.
 
 ### `patchMetadata(path, patch, opts)` — partial-update (deep-merge with null-tombstone)
 
@@ -1074,6 +1074,7 @@ The compaction snapshot captures whatever the live `Y.Doc` holds at the moment o
 | `writeFile` (extended opts) | `vfsWriteFile` | `POST /api/vfs/writeFile` |
 | `copyFile` | `vfsCopyFile` | `POST /api/vfs/copy` (alias `copyFile`) |
 | `patchMetadata` | `vfsPatchMetadata` | `PATCH /api/vfs/metadata` (alias `POST /patchMetadata`) |
+| `patchMetadataIfHead` | `vfsPatchMetadataIfHead` | `POST /api/vfs/patchMetadataIfHead` |
 | `listFiles` | `vfsListFiles` | `POST /api/vfs/list` (alias `listFiles`) |
 | `markVersion` | `vfsMarkVersion` | `PUT /api/vfs/version-mark` (alias `POST /markVersion`) |
 | `listVersions` (extended opts: `userVisibleOnly`, `includeMetadata`) | `vfsListVersions` | `POST /api/vfs/listVersions` |
@@ -1301,7 +1302,7 @@ The SDK does not currently expose these as runtime options on `createVFS`; they'
 
 ## Testing locally
 
-The repo ships ~929 tests covering every public surface. Highlights:
+The repo ships extensive unit and integration coverage across the public surfaces. Highlights:
 
 - `tests/integration/igit-smoke.test.ts` &mdash; full isomorphic-git round-trip
 - `tests/integration/consumer-fixture.test.ts` &mdash; pins the 1-subrequest-per-VFS-call architectural promise
@@ -1316,7 +1317,7 @@ The repo ships ~929 tests covering every public surface. Highlights:
 - `tests/integration/versioning-accounting.test.ts` &mdash; storage_used/file_count/inline_bytes_used balance
 - ...plus path-walk, ino, refcount, migration, app-smoke, multipart, encryption, yjs
 
-Run `pnpm test` at the repo root. `pnpm ci:check` runs typecheck + DTS-strict SDK build + the no-Phase-tag lint gate.
+Run `pnpm test` and `pnpm test:cli` at the repo root. `pnpm ci:check` runs the standalone typechecks, SDK/CLI production builds, and the no-Phase-tag lint gate.
 
 ---
 

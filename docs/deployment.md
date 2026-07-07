@@ -135,6 +135,7 @@ Never run the load test against the personal-account deployment.
 
 ## CI gate
 
-`pnpm ci:check` runs `typecheck` &rarr; `build:sdk` &rarr;
-`lint:no-phase-tags`. Run before every deploy. `pnpm verify:proofs`
-re-checks the Lean invariants (224 theorems, 0 axioms, 0 sorrys).
+`pnpm ci:check` runs the full standalone typecheck, SDK/CLI builds, and
+`lint:no-phase-tags`. Run before every deploy. `pnpm verify:proofs` checks the
+imported abstract-model corpus and its generated inventory; it does not prove
+implementation refinement. See the [formal verification boundary](./formal-verification-boundary.md).

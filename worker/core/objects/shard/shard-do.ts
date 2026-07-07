@@ -296,10 +296,9 @@ export class ShardDO extends DurableObject<Env> {
    * `"already_referenced"` on idempotent re-restore.
    *
    * @lean-invariant Mossaic.Vfs.Refcount.restoreChunkRef_atomic
-   *   The chunk_invariant_preserved Lean theorem extends to this
-   *   operation: it bumps ref_count at most by 1, only when a new
-   *   chunk_refs row is inserted. The atomicity guarantee is per
-   *   DO turn, mirroring writeChunkInternal's dedup branch.
+   *   The abstract theorem states that modeled refs and counts update in
+   *   one transition or the state is unchanged. It does not refine this
+   *   SQL/DO implementation.
    */
   async restoreChunkRef(
     chunkHash: string,
@@ -380,11 +379,9 @@ export class ShardDO extends DurableObject<Env> {
   // caller (and tests) can observe which branch fired.
   //
   // @lean-invariant Mossaic.Vfs.Multipart.putChunkMultipart_idempotent
-  //   The Lean state-machine model proves that this operation
-  //   preserves the structural invariant on (chunks, chunk_refs)
-  //   inherited from `writeChunkInternal` and `removeFileRefs`. See
-  //   `lean/Mossaic/Vfs/Multipart.lean :: putChunkMultipart_idempotent`
-  //   and `:: putChunkMultipart_supersedes_safely`.
+  //   Repeating the same abstract chunk/ref transition produces exactly
+  //   the same modeled ShardState. This does not refine the SQL or staging
+  //   implementation; see the formal-verification boundary document.
   async putChunkMultipart(
     chunkHash: string,
     data: Uint8Array,
@@ -543,11 +540,9 @@ export class ShardDO extends DurableObject<Env> {
    * Returns the same shape as the HTTP route's JSON body.
    *
    * @lean-invariant Mossaic.Generated.ShardDO.chunk_invariant_preserved
-   *   The Lean state-machine model proves that this operation preserves
-   *   the structural invariant on (chunks, chunk_refs): chunks are
-   *   unique by hash, chunk_refs are unique by composite key, and every
-   *   chunk_refs row has a backing chunks row. See
-   *   `lean/Mossaic/Vfs/Refcount.lean :: putChunk_preserves_invariant`.
+   *   The Lean state-machine proves these properties for its abstract
+   *   putChunk transition. No refinement from this SQL implementation to
+   *   that transition is currently proved.
    */
   private writeChunkInternal(
     chunkHash: string,
@@ -862,9 +857,8 @@ export class ShardDO extends DurableObject<Env> {
    *   - alarm scheduled if any chunk was marked
    *
    * @lean-invariant Mossaic.Generated.ShardDO.chunk_invariant_preserved
-   *   The Lean state-machine model proves that `deleteChunks` preserves
-   *   the structural invariant on (chunks, chunk_refs). See
-   *   `lean/Mossaic/Vfs/Refcount.lean :: deleteChunks_preserves_invariant`.
+   *   The Lean state-machine proves preservation for its abstract
+   *   deleteChunks transition, not this SQL/async implementation.
    */
   private async removeFileRefs(fileId: string): Promise<{ marked: number }> {
     let marked = 0;
@@ -933,17 +927,14 @@ export class ShardDO extends DurableObject<Env> {
    * the same batch is a no-op (the rows are already deleted).
    *
    * @lean-invariant Mossaic.Generated.ShardDO.alarm_safe
-   *   The Lean model proves that `alarm` preserves `validState` (chunk
-   *   uniqueness, ref uniqueness, ref→chunk existence). The proof is
-   *   conditional on the `numerical_refcount_dangling_axiom` for the
-   *   case where a swept chunk's hash had live refs — operationally
-   *   ruled out by `writeChunkInternal` / `removeFileRefs` invariants.
-   *   See `lean/Mossaic/Vfs/Gc.lean :: alarm_preserves_validState`.
+   *   The abstract alarm transition preserves the modeled validState.
+   *   Cloudflare alarms, SQL, retries, and this implementation are not
+   *   refined by that theorem.
    *
    * @lean-invariant Mossaic.Generated.ShardDO.alarm_only_deletes_zero
-   *   Unconditional: `alarm` only hard-deletes chunks whose `refCount`
-   *   was 0 at the time of the sweep, AND past the grace window. See
-   *   `lean/Mossaic/Vfs/Gc.lean :: alarm_only_deletes_zero_refCount`.
+   *   The abstract transition only deletes modeled chunks satisfying its
+   *   zero-refcount and grace predicates; no implementation refinement is
+   *   claimed.
    */
   async alarm(): Promise<void> {
     this.ensureInit();

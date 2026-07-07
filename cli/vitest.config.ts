@@ -32,12 +32,8 @@ export default defineConfig({
     // even though each test uses its own tenant DO. 4 concurrent
     // suites is a good trade-off for wall-clock vs steady-state load.
     pool: "threads",
-    poolOptions: {
-      threads: {
-        maxThreads: 4,
-        minThreads: 1,
-      },
-    },
+    maxWorkers: 4,
+    minWorkers: 1,
     // Fail-fast off — we want to see all failures in one run.
     bail: 0,
   },

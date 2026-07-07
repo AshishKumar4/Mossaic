@@ -170,6 +170,22 @@ describe("HTTP fallback round-trip via /api/vfs", () => {
     expect(await vfs.exists("/work")).toBe(false);
   });
 
+  it("readManyFile encodes >65 KiB payloads without RangeError", async () => {
+    // Regression: btoa(String.fromCharCode(...b)) spreads the array as
+    // call args and crashes around 65 KiB on V8. Chunked encoding
+    // keeps a 256 KiB file round-tripping.
+    const vfs = await client("default", "http-many-file-big");
+    const big = new Uint8Array(256 * 1024);
+    for (let i = 0; i < big.length; i++) big[i] = i & 0xff;
+    await vfs.writeFile("/big.bin", big);
+    const out = await vfs.readManyFile(["/big.bin"]);
+    expect(out[0]).not.toBeNull();
+    expect(out[0]!.byteLength).toBe(big.byteLength);
+    expect(out[0]![0]).toBe(0);
+    expect(out[0]![255]).toBe(255);
+    expect(out[0]![big.byteLength - 1]).toBe((big.byteLength - 1) & 0xff);
+  });
+
   it("openManifest + readChunk for chunked files", async () => {
     const vfs = await client("default", "http-manifest");
     // Use createMossaicHttpClient → no streams. Use writeFile with

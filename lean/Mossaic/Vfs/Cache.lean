@@ -10,12 +10,12 @@ encoded in the cache key. NO active purges.
 
 Models:
   worker/core/lib/edge-cache.ts (194 LoC):
-    :36-39  (@lean-invariant tag — bust_token_completeness)
+    :36-39  (@lean-invariant tag — bust_state_changes_when_signal_changes)
     :56-62  (EdgeCacheSurfaceTag union: gthumb, gimg, simg, preview, chunk, manifest)
     :64-102 (EdgeCacheOpts — namespace + fileId + updatedAt + extraKeyParts)
     :116-125 (edgeCacheKey — URL shape https://<tag>.mossaic.local/<ns>/<fid>/<u>[/...])
   worker/core/objects/user/vfs/cache-resolve.ts (136 LoC):
-    :24-27  (@lean-invariant tag — bust_token_completeness)
+    :24-27  (@lean-invariant tag — bust_state_changes_when_signal_changes)
     :35-55  (CacheResolveResult — fileId + headVersionId + updatedAt + encryptionMode/keyId)
     :68-136 (vfsResolveCacheKey — single SQL JOIN producing all four bust signals)
 
@@ -24,10 +24,9 @@ Audit reference:
 
 What we prove:
 
-  (C1) bust_token_completeness — for every mutation kind that affects
-       response bytes, AT LEAST ONE of (updatedAt, headVersionId,
-       encryptionMode/keyId) is bumped/changed by the write path.
-       Hence the BustState changes across the mutation.
+  (C1) bust_state_changes_when_signal_changes — given an explicit premise
+       that a mutation supplies a value different from the prior bust
+       signal, the abstract BustState changes.
 
   (C2) cache_key_deterministic — `edgeCacheKey` is a pure function of
        `CacheOpts`, so equal opts always yield equal keys.
@@ -36,11 +35,8 @@ What we prove:
        configurations differing in any single bust component, the
        resulting cache keys are distinct (proved by `decide`).
 
-  (C3) per_user_namespace_isolation — distinct `namespace` components
-       (private `<userId>` vs public `<shareToken>`) yield distinct
-       cache keys at concrete witness opts. Combined with the
-       Tenant.lean DO-namespace partition, cross-tenant leak via
-       cache is structurally impossible.
+  (C3) concrete namespace witness — two fixed `namespace` components
+       yield distinct rendered keys. This is not general injectivity.
 
   (C4) versioned_variant_chunk_hash_determines_bytes — chunks and
        variants are content-addressed; equal hash ⇒ equal bytes
@@ -125,7 +121,7 @@ def edgeCacheKey (opts : CacheOpts) : String :=
 -- `witness_distinct_headVersion`, and `witness_surface_tag_isolation`
 -- below.
 
--- ─── (C1) bust_token_completeness ───────────────────────────────────────
+-- ─── (C1) changed signal changes abstract bust state ────────────────────
 
 /--
 The set of mutation classes that affect a file's cached response bytes.
@@ -145,9 +141,9 @@ inductive Mutation where
   | encryptionRotate (newMode : String) (newKeyId : String)
   deriving Repr
 
-/-- Apply a mutation to a `BustState`. Each mutation kind changes AT
-LEAST ONE of the three bust signals: `updatedAt`, `headVersionId`, or
-the encryption pair. -/
+/-- Apply a mutation to a `BustState`. Each constructor assigns one class of
+bust signal; the theorem below requires an explicit premise that the assigned
+value differs from the prior value. -/
 def BustState.apply (s : BustState) (m : Mutation) : BustState :=
   match m with
   | .commitVersion vid =>
@@ -162,18 +158,13 @@ def BustState.apply (s : BustState) (m : Mutation) : BustState :=
     { s with encryptionMode := some mode, encryptionKeyId := some kid }
 
 /--
-**(C1) bust_token_completeness.**
-For every mutation that meaningfully affects response bytes, the
-post-mutation `BustState` differs from the pre-state in at least one
-bust signal — guaranteeing that any cache key derived from the bust
-state changes across the mutation.
-
-Operationally: this is the schema-level guarantee that backs the
-"never serve a stale response" promise. Combined with (C2)
-deterministic key derivation, no read after a write returns
-pre-write bytes from cache.
+**(C1) bust_state_changes_when_signal_changes.**
+Given a premise that the mutation supplies a value different from the
+current corresponding signal, the abstract post-state differs. The premise
+is material: this theorem does not establish that every TypeScript write
+path changes a signal or that the rendered cache key is globally injective.
 -/
-theorem bust_token_completeness
+theorem bust_state_changes_when_signal_changes
     (s : BustState) (m : Mutation)
     (h_real : match m with
               | .commitVersion vid       => some vid ≠ s.headVersionId
@@ -189,32 +180,32 @@ theorem bust_token_completeness
     have h := congrArg BustState.headVersionId heq
     unfold BustState.apply at h
     simp at h
-    exact h_real h.symm
+    exact h_real h
   | commitNonVersioned u =>
     have h := congrArg BustState.updatedAt heq
     unfold BustState.apply at h
     simp at h
-    exact h_real h.symm
+    exact h_real h
   | metadataMutation u =>
     have h := congrArg BustState.updatedAt heq
     unfold BustState.apply at h
     simp at h
-    exact h_real h.symm
+    exact h_real h
   | archiveOrUnlink u =>
     have h := congrArg BustState.updatedAt heq
     unfold BustState.apply at h
     simp at h
-    exact h_real h.symm
+    exact h_real h
   | encryptionRotate mode kid =>
     have hm := congrArg BustState.encryptionMode heq
     have hk := congrArg BustState.encryptionKeyId heq
     unfold BustState.apply at hm hk
     simp at hm hk
     rcases h_real with hmode | hkid
-    · exact hmode hm.symm
-    · exact hkid hk.symm
+    · exact hmode hm
+    · exact hkid hk
 
-/--
+/-
 **(C1-corollary) commit_version_bumps_state.**
 The specific case of commitVersion under versioning ON: the
 post-state's headVersionId is fresh, so the BustState row that the
@@ -228,7 +219,7 @@ theorem commit_version_bumps_state
   refine ⟨?_, ?_⟩
   · unfold BustState.apply
     rfl
-  · exact bust_token_completeness s (.commitVersion vid) h_fresh
+  · exact bust_state_changes_when_signal_changes s (.commitVersion vid) h_fresh
 
 /--
 **(C1-corollary) metadata_mutation_bumps_updatedAt.**
@@ -243,11 +234,11 @@ theorem metadata_mutation_bumps_updatedAt
   refine ⟨?_, ?_⟩
   · unfold BustState.apply
     rfl
-  · exact bust_token_completeness s (.metadataMutation newU) h_fresh
+  · exact bust_state_changes_when_signal_changes s (.metadataMutation newU) h_fresh
 
 -- ─── (C4) Versioned-variant chunk content-addressing ───────────────────
 
-/--
+/-
 **(C4) versioned_variant_chunk_hash_determines_bytes.**
 Variant rows in `file_variants` (Phase 20) are keyed by
 `(file_id, variant_kind, renderer_kind)` and content-addressed by
@@ -287,12 +278,9 @@ theorem witness_distinct_updatedAt :
   decide
 
 /--
-**(C3 witness) Distinct `namespace` → distinct cache key.**
-Concrete witness covering the cross-tenant isolation property: the
-private (`<userId>`) and public-share (`<shareToken>`) namespaces
-produce different keys at the same `(surfaceTag, fileId, updatedAt)`,
-so a cached private response cannot be served on a share request
-and vice versa.
+**(C3 witness) Two concrete namespaces produce distinct keys.**
+This pins one private/public example only; it does not prove arbitrary string
+encoding injectivity or route-level cache isolation.
 -/
 theorem witness_namespace_isolation :
     let priv : CacheOpts := { surfaceTag := .gimg, namespace_ := "user-alice",
@@ -335,12 +323,10 @@ theorem witness_commitVersion_busts_cache :
                              updatedAt := 100, encryptionMode := none,
                              encryptionKeyId := none }
     s₀.apply (.commitVersion "v1") ≠ s₀ := by
-  intro h
-  have := congrArg BustState.headVersionId h
-  simp [BustState.apply] at this
+  decide
 
 /-- Liveness: at least one mutation strictly changes the bust state. -/
-theorem bust_token_completeness_nonvacuous :
+theorem bust_state_changes_when_signal_changes_nonvacuous :
     ∃ (s : BustState) (m : Mutation), s.apply m ≠ s := by
   refine ⟨{ fileId := "f1", headVersionId := none, updatedAt := 100,
             encryptionMode := none, encryptionKeyId := none },

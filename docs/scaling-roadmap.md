@@ -113,11 +113,11 @@ deferred \u2014 see Phase 32b below.
 
 ### Phase 43 \u2014 Lean catch-up (LANDED)
 
-- Theorem count 172 \u2192 226. Coverage extensions for Cache
-  (preview-variant cache-key bust completeness),
-  ShareToken (HMAC scope-binding), RPC (typed-RPC
-  null-safety), Yjs (compaction monotonicity). Zero
-  `axiom`, zero `sorry`.
+- Historical Lean coverage extensions for Cache
+  (abstract changed-signal state), ShareToken (modeled HMAC
+  scope-binding), RPC (typed-RPC null-safety), and Yjs properties.
+  This is historical accounting; current counts and declaration names
+  come only from `lean/THEOREM_INVENTORY.md`.
 
 ### Phase 42 \u2014 observability infrastructure (LANDED, closes Phase 34 carryover)
 
@@ -225,6 +225,9 @@ build deterministic keys. Cache-key-versioning beats active
 invalidation \u2014 races produce orphaned cache entries that
 expire per their TTL, never serve stale responses.
 
+That operational claim depends on complete TypeScript write-path and caller
+coverage. The Lean cache model does not establish that correspondence.
+
 ### Phase 36 \u2014 versioned accounting consolidation (LANDED)
 
 - `commitVersion` is the single accounting chokepoint for
@@ -244,10 +247,9 @@ expire per their TTL, never serve stale responses.
   motivated this consolidation): a 5 GB versioned upload
   moves `pool_size` 32\u219233. Pre-fix it stayed at 32 forever.
 
-Lean invariant `Mossaic.Vfs.Quota.pool_size_monotonic`
-preserved by `recordWriteUsage`'s `MAX(0, col + ?)` clamp +
-the `newPool > row.pool_size` guard. Negative deltas can
-never shrink `pool_size` regardless of sign or magnitude.
+The abstract Lean theorem `Mossaic.Vfs.Quota.pool_size_monotone` covers the
+modeled non-negative `Nat` write deltas. It does not model SQL signed-delta
+arithmetic or prove TypeScript/SQL implementation correspondence.
 
 ### Phase 32.5 \u2014 quota desync correction (LANDED, superseded by Phase 36)
 

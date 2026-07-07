@@ -60,7 +60,7 @@ theorem magic_length : YJS_SNAPSHOT_MAGIC.length = 4 := rfl
 /-- 4-byte prefix check. Mirrors `hasYjsSnapshotMagic` at yjs.ts:127-133.
 Returns `false` on inputs shorter than 4 bytes. -/
 def hasYjsSnapshotMagic (bs : Bytes) : Bool :=
-  if h : bs.length ≥ 4 then
+  if _h : bs.length ≥ 4 then
     bs.take 4 = YJS_SNAPSHOT_MAGIC
   else
     false
@@ -84,7 +84,7 @@ theorem wrap_length (bs : Bytes) :
 theorem wrap_take_4 (bs : Bytes) :
     (wrapYjsSnapshot bs).take 4 = YJS_SNAPSHOT_MAGIC := by
   unfold wrapYjsSnapshot
-  rw [List.take_append_of_le_length (by rw [magic_length])]
+  rw [List.take_append_of_le_length (by simp [magic_length])]
   -- (magic ++ bs).take 4 = magic.take 4 = magic (since magic.length = 4).
   have : YJS_SNAPSHOT_MAGIC.take 4 = YJS_SNAPSHOT_MAGIC := by decide
   exact this
@@ -101,6 +101,7 @@ theorem wrap_then_detect_roundtrip (bs : Bytes) :
     rw [wrap_length]; omega
   rw [dif_pos hlen]
   rw [wrap_take_4]
+  simp
 
 -- ─── (Y2) Wrap preserves payload ───────────────────────────────────────
 
@@ -112,7 +113,7 @@ round-trip is byte-equivalent.
 theorem wrap_preserves_payload (bs : Bytes) :
     (wrapYjsSnapshot bs).drop 4 = bs := by
   unfold wrapYjsSnapshot
-  rw [List.drop_append_of_le_length (by rw [magic_length])]
+  rw [List.drop_append_of_le_length (by simp [magic_length])]
   -- (magic ++ bs).drop 4 = magic.drop 4 ++ bs = [] ++ bs = bs
   have : YJS_SNAPSHOT_MAGIC.drop 4 = [] := by decide
   rw [this]

@@ -1,71 +1,74 @@
 {
-  "name": "@mossaic/sdk",
-  "version": "0.1.0",
-  "description": "Cloudflare-Worker-native VFS SDK — fs/promises-shaped, isomorphic-git compatible.",
-  "type": "module",
-  "main": "./dist/index.js",
-  "types": "./dist/index.d.ts",
-  "exports": {
-    ".": {
-      "workspace": "./src/index.ts",
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
-    },
-    "./fs": {
-      "workspace": "./src/igit.ts",
-      "types": "./dist/igit.d.ts",
-      "import": "./dist/igit.js"
-    },
-    "./yjs": {
-      "workspace": "./src/yjs.ts",
-      "types": "./dist/yjs.d.ts",
-      "import": "./dist/yjs.js"
-    },
-    "./http": {
-      "workspace": "./src/http-only.ts",
-      "types": "./dist/http-only.d.ts",
-      "import": "./dist/http-only.js"
-    },
-    "./encryption": {
-      "workspace": "./src/encryption.ts",
-      "types": "./dist/encryption.d.ts",
-      "import": "./dist/encryption.js"
-    },
-    "./package.json": "./package.json"
-  },
-  "files": [
-    "dist",
-    "src",
-    "templates",
-    "README.md"
-  ],
-  "sideEffects": false,
-  "scripts": {
-    "build": "tsup",
-    "build:watch": "tsup --watch",
-    "typecheck": "tsc --noEmit -p tsconfig.json"
-  },
-  "peerDependencies": {
-    "isomorphic-git": ">=1.25.0",
-    "yjs": ">=13.6.0",
-    "y-protocols": ">=1.0.6"
-  },
-  "peerDependenciesMeta": {
-    "isomorphic-git": {
-      "optional": true
-    },
-    "yjs": {
-      "optional": true
-    },
-    "y-protocols": {
-      "optional": true
-    }
-  },
-  "devDependencies": {
-    "@cloudflare/workers-types": "^4.20250224.0",
-    "tsup": "^8.0.0",
-    "typescript": "^5.7.0",
-    "y-protocols": "^1.0.7"
-  },
-  "license": "MIT"
+	"name": "@mossaic/sdk",
+	"version": "0.1.0",
+	"description": "Cloudflare-Worker-native VFS SDK — fs/promises-shaped, isomorphic-git compatible.",
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"workspace": "./src/index.ts",
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		},
+		"./fs": {
+			"workspace": "./src/igit.ts",
+			"types": "./dist/igit.d.ts",
+			"import": "./dist/igit.js"
+		},
+		"./yjs": {
+			"workspace": "./src/yjs.ts",
+			"types": "./dist/yjs.d.ts",
+			"import": "./dist/yjs.js"
+		},
+		"./http": {
+			"workspace": "./src/http-only.ts",
+			"types": "./dist/http-only.d.ts",
+			"import": "./dist/http-only.js"
+		},
+		"./encryption": {
+			"workspace": "./src/encryption.ts",
+			"types": "./dist/encryption.d.ts",
+			"import": "./dist/encryption.js"
+		},
+		"./package.json": "./package.json"
+	},
+	"files": [
+		"dist",
+		"src",
+		"templates",
+		"README.md"
+	],
+	"sideEffects": false,
+	"scripts": {
+		"build": "tsdown",
+		"build:watch": "tsdown --watch",
+		"typecheck": "tsc --noEmit -p tsconfig.json"
+	},
+	"peerDependencies": {
+		"isomorphic-git": ">=1.25.0",
+		"y-protocols": ">=1.0.6",
+		"yjs": "13.6.31"
+	},
+	"dependencies": {
+		"zod": "^4.4.3"
+	},
+	"peerDependenciesMeta": {
+		"isomorphic-git": {
+			"optional": true
+		},
+		"yjs": {
+			"optional": true
+		},
+		"y-protocols": {
+			"optional": true
+		}
+	},
+	"devDependencies": {
+		"@cloudflare/workers-types": "^4.20260609.1",
+		"tsdown": "^0.22.1",
+		"typescript": "^6.0.3",
+		"y-protocols": "^1.0.7"
+	},
+	"license": "MIT"
 }

@@ -22,7 +22,7 @@
 
 A horizontally-scalable, content-addressed filesystem that runs entirely on Cloudflare's edge &mdash; no origin servers, no S3, no external databases. Files are split into 1 MB chunks, SHA-256 hashed, distributed across a dynamic pool of Durable Object shards via rendezvous hashing, and transferred in parallel.
 
-Use it for photo libraries, ML datasets, build artifacts, isomorphic-git filesystem layers, attachments, container layers, or **live collaborative documents** (per-file Yjs CRDT mode at $0 idle billing). Critical correctness invariants are formally proved in **Lean 4 with Mathlib** &mdash; **226 theorems, 0 axioms, 0 sorrys**.
+Use it for photo libraries, ML datasets, build artifacts, isomorphic-git filesystem layers, attachments, container layers, or **live collaborative documents** (per-file Yjs CRDT mode at $0 idle billing). The repository includes Lean 4 proofs about hand-written abstract models; these are not a mechanical verification of the TypeScript/SQL implementation. The exact corpus is generated in [`lean/THEOREM_INVENTORY.md`](./lean/THEOREM_INVENTORY.md).
 
 The repo ships **two products**: a runnable photo-library SPA and a reusable npm SDK. They share the same Durable-Object backend, the same chunking and placement primitives, and the same canonical `/api/vfs/*` HTTP surface.
 
@@ -208,25 +208,18 @@ flowchart TD
 
 ---
 
-## Formal verification
+## Formal models and proofs
 
-Critical correctness invariants are machine-checked in **Lean 4 with Mathlib** &mdash; **226 theorems, zero `sorry`, zero project axiom**:
+Lean 4 with Mathlib machine-checks selected properties of Mossaic's abstract models, including modeled refcount transitions, tenant-name encoding, GC, version lists, multipart retry equality and manifest completeness, and a two-transition atomic-write visibility boundary.
 
-- **Refcount well-formedness** over all reachable shard states (`Mossaic.Vfs.Refcount`).
-- **Atomic-write linearizability** of the temp-id-then-rename commit (`Mossaic.Vfs.AtomicWrite`).
-- **Tenant isolation**: `vfsUserDOName` / `vfsShardDOName` injective on valid scopes (`Mossaic.Vfs.Tenant`).
-- **Versioning monotonicity** &mdash; sortedness, restore preserves history, drop never deletes the head (`Mossaic.Vfs.Versioning`).
-- **GC safety**: alarm sweeper only deletes `refCount = 0` chunks (`Mossaic.Vfs.Gc`).
-- **Quota monotonicity**: pool growth never shrinks, regardless of negative-delta arithmetic (`Mossaic.Vfs.Quota`).
-- **Cache bust-token completeness**: cache key includes every column any write path can mutate (`Mossaic.Vfs.Cache`).
-- **Yjs compaction monotonicity**: every checkpoint advances the seq watermark (`Mossaic.Vfs.Yjs`).
+There is currently no extraction or proved refinement from the TypeScript, SQL, Durable Object runtime, or deployed Worker to these models. The proof corpus therefore does not make Mossaic a fully formally verified implementation.
 
 ```bash
 pnpm lean:build        # build all proofs
-pnpm verify:proofs     # build + check no sorry/axiom + xref drift
+pnpm verify:proofs     # build + placeholder/axiom/xref/inventory gates
 ```
 
-See **[`lean/`](./lean/)** for theorem names, the TS&harr;Lean cross-reference protocol, and documented limitations.
+See the generated **[theorem inventory](./lean/THEOREM_INVENTORY.md)** and the **[formal verification boundary](./docs/formal-verification-boundary.md)** for exact guarantees, assumptions, trusted components, and unverified implementation layers.
 
 ---
 
@@ -235,7 +228,8 @@ See **[`lean/`](./lean/)** for theorem names, the TS&harr;Lean cross-reference p
 ```bash
 pnpm install
 pnpm dev          # SPA + worker + DOs via Miniflare on http://localhost:5174
-pnpm test         # 929 tests: unit + integration + cli + browser e2e
+pnpm test         # worker/unit/integration suite
+pnpm test:cli     # CLI unit suite
 pnpm ci:check     # typecheck + build:sdk + lint:no-phase-tags
 ```
 

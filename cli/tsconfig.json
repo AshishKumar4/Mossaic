@@ -1,26 +1,43 @@
 {
-  "compilerOptions": {
-    "target": "ES2022",
-    "module": "ESNext",
-    "moduleResolution": "bundler",
-    "customConditions": ["workspace"],
-    "lib": ["ES2022"],
-    "strict": true,
-    "noUncheckedIndexedAccess": false,
-    "esModuleInterop": true,
-    "skipLibCheck": true,
-    "resolveJsonModule": true,
-    "allowSyntheticDefaultImports": true,
-    "forceConsistentCasingInFileNames": true,
-    "isolatedModules": true,
-    "declaration": true,
-    "outDir": "./dist",
-    "rootDir": ".",
-    "types": ["node"],
-    "paths": {
-      "@shared/*": ["../shared/*"]
-    }
-  },
-  "include": ["src/**/*", "tests/**/*"],
-  "exclude": ["dist", "node_modules"]
+	"extends": "../tsconfig.base.json",
+	"compilerOptions": {
+		// Node CLI — no Workers types, no DOM. Inherits target ES2023,
+		// strict, isolatedModules, skipLibCheck, etc. from the standalone base.
+		"module": "ESNext",
+		"moduleResolution": "bundler",
+		"customConditions": ["workspace"],
+		// Override target/lib back to ES2022 — base sets ES2023, but ES2023's
+		// `Uint8Array<ArrayBufferLike>` doesn't satisfy `BodyInit` in fetch
+		// overloads used by `sdk/src/http.ts` (binary upload paths). TODO:
+		// fix the upstream type mismatch and remove this override.
+		"target": "ES2022",
+		"lib": ["ES2022"],
+		"esModuleInterop": true,
+		"resolveJsonModule": true,
+		"allowSyntheticDefaultImports": true,
+		"types": ["node"],
+		"paths": {
+			"@shared/*": ["../shared/*"]
+		},
+		// TODO(mossaic): re-enable these flags from the standalone base after the
+		// surfaced issues are fixed. Disabled here only to preserve the
+		// pre-extension behavior during the workspace-consolidation MR.
+		// - noUnusedLocals/Parameters: pre-existing dead declarations in
+		//   worker/core/lib/auth.ts (Context) and sdk/src/transfer.ts
+		//   (DownloadTokenResponse).
+		// - noFallthroughCasesInSwitch: pre-existing intentional fallthrough
+		//   in shared/hash.ts (lines 35, 38).
+		// - verbatimModuleSyntax/erasableSyntaxOnly: not yet audited across
+		//   the cli source tree; most likely needs `import type`/`export type`
+		//   touch-ups.
+		"noUnusedLocals": false,
+		"noUnusedParameters": false,
+		"noFallthroughCasesInSwitch": false,
+		"verbatimModuleSyntax": false,
+		"erasableSyntaxOnly": false
+	},
+	"include": ["src/**/*", "tests/**/*"],
+	// Playwright browser tests need DOM types and conflict with Node's
+	// fetch typings. Their typecheck runs under tests/e2e/browser/tsconfig.json.
+	"exclude": ["dist", "node_modules", "tests/e2e/browser"]
 }

@@ -108,22 +108,10 @@ This is the operational guarantee the caller's offset map relies on.
 -/
 theorem batch_index_correspondence
     (s : ShardStore) (hashes : List Hash) (i : Nat) (h : Hash)
-    (h_idx : hashes.get? i = some h) :
-    (getChunksBatch s hashes).get? i = some (s.lookup h) := by
+    (h_idx : hashes[i]? = some h) :
+    (getChunksBatch s hashes)[i]? = some (s.lookup h) := by
   unfold getChunksBatch
-  -- `(l.map f).get? i = (l.get? i).map f` by induction on l (matches
-  -- the helper in Tombstone.lean; we re-derive here to keep modules
-  -- decoupled).
-  induction hashes generalizing i with
-  | nil => simp at h_idx
-  | cons hd tl ih =>
-    cases i with
-    | zero =>
-      simp at h_idx
-      simp [h_idx]
-    | succ k =>
-      simp [List.get?] at h_idx ⊢
-      exact ih h_idx
+  simp [h_idx]
 
 -- ─── (P1) Batch atomicity (deterministic snapshot) ─────────────────────
 
@@ -136,9 +124,9 @@ SQLite reads from a single transaction snapshot.
 -/
 theorem batch_rpc_atomicity
     (s : ShardStore) (hashes : List Hash) (i j : Nat) (h : Hash)
-    (h_i : hashes.get? i = some h)
-    (h_j : hashes.get? j = some h) :
-    (getChunksBatch s hashes).get? i = (getChunksBatch s hashes).get? j := by
+    (h_i : hashes[i]? = some h)
+    (h_j : hashes[j]? = some h) :
+    (getChunksBatch s hashes)[i]? = (getChunksBatch s hashes)[j]? := by
   rw [batch_index_correspondence s hashes i h h_i]
   rw [batch_index_correspondence s hashes j h h_j]
 
@@ -152,9 +140,9 @@ caller can then map exactly which hash failed, per shard-do.ts:760-764.
 -/
 theorem missing_chunk_returns_null
     (s : ShardStore) (hashes : List Hash) (i : Nat) (h : Hash)
-    (h_idx : hashes.get? i = some h)
+    (h_idx : hashes[i]? = some h)
     (h_missing : s.lookup h = none) :
-    (getChunksBatch s hashes).get? i = some none := by
+    (getChunksBatch s hashes)[i]? = some none := by
   rw [batch_index_correspondence s hashes i h h_idx]
   rw [h_missing]
 
@@ -223,14 +211,14 @@ theorem witness_rpc_count_empty :
 the same value at both indices. -/
 theorem witness_atomicity_duplicate_hash :
     let s : ShardStore := { chunks := [("h1", [0x01, 0x02])] }
-    (getChunksBatch s ["h1", "h1"]).get? 0 =
-      (getChunksBatch s ["h1", "h1"]).get? 1 := by
+    (getChunksBatch s ["h1", "h1"])[0]? =
+      (getChunksBatch s ["h1", "h1"])[1]? := by
   decide
 
 /-- Witness for (P4): a missing hash → null entry. -/
 theorem witness_missing_hash_null :
     let s : ShardStore := { chunks := [("h1", [0x01])] }
-    (getChunksBatch s ["h_missing"]).get? 0 = some none := by
+    (getChunksBatch s ["h_missing"])[0]? = some none := by
   decide
 
 /-- Liveness for (P3): there exists a manifest where rpcCount > 1

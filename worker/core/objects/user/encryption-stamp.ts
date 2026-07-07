@@ -18,6 +18,7 @@
  */
 
 import type { UserDOCore as UserDO } from "./user-do-core";
+import { bumpFolderRevision } from "./vfs/helpers";
 import { VFSError } from "@shared/vfs-types";
 import {
   KEY_ID_MAX_BYTES,
@@ -180,7 +181,8 @@ export function enforceModeMonotonic(
 export function stampFileEncryption(
   durableObject: UserDO,
   fileId: string,
-  opts: EncryptionStampOpts | undefined
+  opts: EncryptionStampOpts | undefined,
+  userId?: string,
 ): void {
   const mode = opts?.mode ?? null;
   const keyId = opts?.keyId ?? null;
@@ -191,6 +193,22 @@ export function stampFileEncryption(
     keyId,
     fileId
   );
+  // Encryption mode feeds resolveCacheKey's bust tuple; the
+  // enclosing write path bumps the folder revision, but close
+  // the oracle here too so a direct stamp can't leave folder
+  // caches stale.
+  if (userId !== undefined) {
+    const row = durableObject.sql
+      .exec(
+        "SELECT parent_id FROM files WHERE file_id=? AND user_id=?",
+        fileId,
+        userId,
+      )
+      .toArray()[0] as { parent_id: string | null } | undefined;
+    if (row !== undefined) {
+      bumpFolderRevision(durableObject, userId, row.parent_id);
+    }
+  }
 }
 
 /**

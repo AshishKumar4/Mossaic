@@ -1089,7 +1089,7 @@ async function applyPostCommitSideEffects(
   }
   if (encryption !== undefined) {
     const { stampFileEncryption } = await import("../encryption-stamp");
-    stampFileEncryption(durableObject, pathId, encryption);
+    stampFileEncryption(durableObject, pathId, encryption, userId);
   }
 }
 

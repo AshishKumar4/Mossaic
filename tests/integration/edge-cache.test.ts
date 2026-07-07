@@ -4,6 +4,7 @@ import {
   edgeCacheKey,
   edgeCacheKeyPart,
 } from "../../worker/core/lib/edge-cache";
+import { EDGE_CACHE_KEY_SCHEMA } from "../../worker/core/lib/preview-cache-schema";
 import { vfsUserDOName } from "@core/lib/utils";
 
 /**
@@ -125,9 +126,56 @@ describe("Phase 36 \u2014 edge cache helper", () => {
       waitUntil: () => undefined,
     });
     expect(k.url).toBe(
-      "https://simg.mossaic.local/user-with-dashes-and-numbers-123/01HKZ.../1700000000000"
+      "https://simg.mossaic.local/user-with-dashes-and-numbers-123/01HKZ%2E%2E%2E/1700000000000"
     );
     expect(k.method).toBe("GET");
+  });
+
+  it("EC5b \u2014 extraKeyParts encode slash and dot-segments", () => {
+    const k = edgeCacheKey({
+      surfaceTag: "preview",
+      namespace: "cas",
+      fileId: "f-1",
+      updatedAt: 0,
+      extraKeyParts: ["../victim", "w/../../h"],
+      cacheControl: "public",
+      waitUntil: () => undefined,
+    });
+    // `%2E%2E` prevents WHATWG URL dot-segment removal, and `%2F`
+    // keeps untrusted bytes inside one logical path segment.
+    expect(k.url).toContain("/%2E%2E%2Fvictim/");
+    expect(k.url).toContain("/w%2F%2E%2E%2F%2E%2E%2Fh");
+  });
+
+  it("EC5c \u2014 traversal payload cannot collide with victim key", () => {
+    const victimHash = "a".repeat(64);
+    const attackerHash = "b".repeat(64);
+
+    const victimKey = edgeCacheKey({
+      surfaceTag: "preview",
+      namespace: "cas",
+      fileId: victimHash,
+      updatedAt: 0,
+      extraKeyParts: [EDGE_CACHE_KEY_SCHEMA, "wauto", "hauto"],
+      cacheControl: "public",
+      waitUntil: () => undefined,
+    });
+
+    const attackerKey = edgeCacheKey({
+      surfaceTag: "preview",
+      namespace: "cas",
+      fileId: attackerHash,
+      updatedAt: 0,
+      extraKeyParts: [
+        EDGE_CACHE_KEY_SCHEMA,
+        "w/../../../" + victimHash + "/0/wauto",
+        "hauto",
+      ],
+      cacheControl: "public",
+      waitUntil: () => undefined,
+    });
+
+    expect(attackerKey.url).not.toBe(victimKey.url);
   });
 
   // ── Phase 36b — extra-key-parts + new surfaces ──────────────────────

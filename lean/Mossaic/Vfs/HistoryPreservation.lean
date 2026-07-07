@@ -145,7 +145,6 @@ at the destination. Critical for the "copy preserves history" promise. -/
 theorem copyFile_under_versioning_preserves_dst_history
     (s : VersionState) (dstPathId : PathId) (vid : String) (mtime : TimeMs)
     (dstPrior : Version)
-    (h_dst_prior : dstPrior.pathId = dstPathId)
     (h_in : dstPrior ∈ s.versions) :
     dstPrior ∈ (copyFileVersion s dstPathId vid mtime).versions := by
   unfold copyFileVersion

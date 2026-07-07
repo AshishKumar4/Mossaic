@@ -1,23 +1,25 @@
 {
-  "compilerOptions": {
-    "target": "ES2022",
-    "lib": ["ES2022"],
-    "module": "ESNext",
-    "moduleResolution": "bundler",
-    "strict": true,
-    "esModuleInterop": true,
-    "skipLibCheck": true,
-    "forceConsistentCasingInFileNames": true,
-    "resolveJsonModule": true,
-    "isolatedModules": true,
-    "noEmit": true,
-    "verbatimModuleSyntax": true,
-    "erasableSyntaxOnly": true,
-    "types": ["@cloudflare/workers-types"],
-    "customConditions": ["workspace"],
-    "paths": {
-      "@shared/*": ["../../../shared/*"]
-    }
-  },
-  "include": ["src"]
+	"extends": "../../../tsconfig.base.json",
+	"compilerOptions": {
+		// Phase 14 fixture proving @mossaic/sdk is consumable as TS source via
+		// `workspace:*` with no consumer-side aliases. Uses Workers types via
+		// the SDK's `workspace` export condition.
+		"target": "ES2022",
+		"module": "ESNext",
+		"moduleResolution": "bundler",
+		"lib": ["ES2022"],
+		"esModuleInterop": true,
+		"resolveJsonModule": true,
+		"customConditions": ["workspace"],
+		"types": ["@cloudflare/workers-types"],
+		"paths": {
+			"@shared/*": ["../../../shared/*"]
+		},
+		// TODO(mossaic): re-enable from the standalone base after the surfaced
+		// issues are fixed. Suppressed only to preserve pre-extension behavior.
+		"noUnusedLocals": false,
+		"noUnusedParameters": false,
+		"noFallthroughCasesInSwitch": false
+	},
+	"include": ["src"]
 }

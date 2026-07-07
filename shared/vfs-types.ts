@@ -41,6 +41,103 @@ export interface VFSStatRaw {
   encryption?: { mode: "convergent" | "random"; keyId?: string };
 }
 
+/**
+ * Cache-bust state for a path. One SQL JOIN inside the UserDO; cheaper
+ * than a full read. Routes that wrap heavy reads in `caches.default`
+ * call `vfsResolveCacheKey` and fold the returned fields into the
+ * cache key. SDK consumers building their own read caches should do
+ * the same.
+ *
+ * The shape mirrors `apps/mossaic/worker/core/objects/user/vfs/cache-resolve.ts`
+ * exactly — kept here so consumers don't import across the worker
+ * boundary just for this type.
+ *
+ * @lean-invariant Mossaic.Vfs.Cache.bust_state_changes_when_signal_changes
+ * The abstract theorem proves that a genuinely changed input signal changes
+ * BustState; it does not mechanically verify TypeScript write coverage.
+ */
+export interface CacheResolveResult {
+	/** Stable file_id (immutable for the lifetime of the path). */
+	fileId: string;
+	/**
+	 * Current head version_id, or `null` for versioning-OFF / yjs
+	 * tenants (in which case `updatedAt` is the bust signal).
+	 */
+	headVersionId: string | null;
+	/** `files.updated_at` in ms-since-epoch. Bumped by every meaningful write. */
+	updatedAt: number;
+	/** Per-file encryption stamp. NULL for plaintext. */
+	encryptionMode: string | null;
+	encryptionKeyId: string | null;
+}
+
+/**
+ * Boundary validator for `CacheResolveResult` JSON shipped over the
+ * HTTP fallback. The SDK avoids a zod dep so this is a hand-rolled
+ * structural check — same pattern used by `VFSStat` in `stats.ts`.
+ * Returns the validated value or throws a `TypeError` with a precise
+ * field path. RFC-009: external boundaries must validate before
+ * narrowing to the typed shape.
+ */
+export function parseCacheResolveResult(raw: unknown): CacheResolveResult {
+	if (raw === null || typeof raw !== "object") {
+		throw new TypeError(
+			`CacheResolveResult: expected object, got ${raw === null ? "null" : typeof raw}`,
+		);
+	}
+	const r = raw as Record<string, unknown>;
+	if (typeof r.fileId !== "string" || r.fileId.length === 0) {
+		throw new TypeError("CacheResolveResult.fileId: expected non-empty string");
+	}
+	if (r.headVersionId !== null && typeof r.headVersionId !== "string") {
+		throw new TypeError("CacheResolveResult.headVersionId: expected string|null");
+	}
+	if (typeof r.updatedAt !== "number" || !Number.isFinite(r.updatedAt)) {
+		throw new TypeError("CacheResolveResult.updatedAt: expected finite number");
+	}
+	if (r.encryptionMode !== null && typeof r.encryptionMode !== "string") {
+		throw new TypeError("CacheResolveResult.encryptionMode: expected string|null");
+	}
+	if (r.encryptionKeyId !== null && typeof r.encryptionKeyId !== "string") {
+		throw new TypeError("CacheResolveResult.encryptionKeyId: expected string|null");
+	}
+	return {
+		fileId: r.fileId,
+		headVersionId: r.headVersionId as string | null,
+		updatedAt: r.updatedAt,
+		encryptionMode: r.encryptionMode as string | null,
+		encryptionKeyId: r.encryptionKeyId as string | null,
+	};
+}
+
+// Boundary validator for `readManyFile` HTTP response. Hand-rolled
+// to match `parseCacheResolveResult` (SDK avoids zod dep). RFC-009.
+export function parseReadManyFileBytes(raw: unknown): (Uint8Array | null)[] {
+	if (raw === null || typeof raw !== "object") {
+		throw new TypeError(
+			`readManyFile: expected object, got ${raw === null ? "null" : typeof raw}`,
+		);
+	}
+	const body = raw as Record<string, unknown>;
+	if (!Array.isArray(body.bytes)) {
+		throw new TypeError("readManyFile.bytes: expected array");
+	}
+	return body.bytes.map((entry, i) => {
+		if (entry === null) return null;
+		if (entry === undefined || typeof entry !== "object") {
+			throw new TypeError(`readManyFile.bytes[${i}]: expected object|null`);
+		}
+		const e = entry as Record<string, unknown>;
+		if (typeof e.base64 !== "string") {
+			throw new TypeError(`readManyFile.bytes[${i}].base64: expected string`);
+		}
+		const bin = atob(e.base64);
+		const arr = new Uint8Array(bin.length);
+		for (let j = 0; j < bin.length; j++) arr[j] = bin.charCodeAt(j);
+		return arr;
+	});
+}
+
 /** Public, shard-index-stripped manifest returned by `vfsOpenManifest` for caller-driven multi-invocation reads. */
 export interface OpenManifestResult {
   fileId: string;

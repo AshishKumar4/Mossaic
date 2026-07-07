@@ -14,6 +14,7 @@ import Mossaic.Vfs.Tombstone
 import Mossaic.Vfs.HistoryPreservation
 import Mossaic.Vfs.StreamRouting
 import Mossaic.Vfs.Cache
+import Mossaic.Vfs.Folder
 import Mossaic.Vfs.Yjs
 import Mossaic.Vfs.ShareToken
 import Mossaic.Vfs.RPC

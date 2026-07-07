@@ -4,6 +4,7 @@ import type { EnvApp as Env } from "@shared/types";
 import { authMiddleware } from "@core/lib/auth";
 import { createVFS } from "@mossaic/sdk";
 import { userStub } from "../lib/user-stub";
+import { buildImageResponseHeaders } from "../lib/image-response-security";
 import { edgeCacheServe } from "@core/lib/edge-cache";
 import { serveBytesWithRange } from "@core/lib/http-range";
 
@@ -57,11 +58,11 @@ gallery.get("/thumbnail/:fileId", async (c) => {
  * response.
  *
  * Wraps the origin fetch in `edgeCacheServe`. Cache key is
- * `<surfaceTag>/<userId>/<fileId>/<updated_at>`. The `updated_at`
- * token is bumped by every write that mutates this fileId, so a
- * stale cached response is structurally impossible after a write
- * completes. Auth runs FIRST (authMiddleware on the Hono app); the
- * cache lookup is post-auth.
+ * `<surfaceTag>/<userId>/<fileId>/<updated_at>`. Freshness relies on
+ * every byte-changing write bumping `updated_at`; this implementation
+ * invariant is tested but not formally refined to the Lean cache model.
+ * Auth runs FIRST (authMiddleware on the Hono app); the cache lookup is
+ * post-auth.
  */
 async function serveImage(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -94,16 +95,21 @@ async function serveImage(
     try {
       if (opts.variant === "thumb") {
         const result = await vfs.readPreview(path, { variant: "thumb" });
-        return serveBytesWithRange(result.bytes, rangeHeader, {
-          "Content-Type": result.mimeType,
-          "Cache-Control": `private, max-age=${opts.cacheSeconds}`,
-        });
+        return serveBytesWithRange(
+          result.bytes,
+          rangeHeader,
+          buildImageResponseHeaders(
+            result.mimeType,
+            `private, max-age=${opts.cacheSeconds}`
+          )
+        );
       }
       const bytes = await vfs.readFile(path);
-      return serveBytesWithRange(bytes, rangeHeader, {
-        "Content-Type": mimeType,
-        "Cache-Control": `private, max-age=${opts.cacheSeconds}`,
-      });
+      return serveBytesWithRange(
+        bytes,
+        rangeHeader,
+        buildImageResponseHeaders(mimeType, `private, max-age=${opts.cacheSeconds}`)
+      );
     } catch (err) {
       const code = (err as { code?: string }).code;
       if (code === "ENOENT") {
@@ -127,25 +133,23 @@ async function serveImage(
       try {
         if (opts.variant === "thumb") {
           const result = await vfs.readPreview(path, { variant: "thumb" });
+          const headers = buildImageResponseHeaders(
+            result.mimeType,
+            `private, max-age=${opts.cacheSeconds}`,
+            result.bytes.byteLength
+          );
           return new Response(result.bytes, {
-            headers: {
-              "Content-Type": result.mimeType,
-              "Cache-Control": `private, max-age=${opts.cacheSeconds}`,
-              // Advertise Range support so the client's first
-              // (full-body) GET tells the browser it can seek on
-              // subsequent requests.
-              "Accept-Ranges": "bytes",
-            },
+            headers,
           });
         }
         const bytes = await vfs.readFile(path);
+        const headers = buildImageResponseHeaders(
+          mimeType,
+          `private, max-age=${opts.cacheSeconds}`,
+          bytes.byteLength
+        );
         return new Response(bytes, {
-          headers: {
-            "Content-Type": mimeType,
-            "Content-Length": String(bytes.byteLength),
-            "Cache-Control": `private, max-age=${opts.cacheSeconds}`,
-            "Accept-Ranges": "bytes",
-          },
+          headers,
         });
       } catch (err) {
         const code = (err as { code?: string }).code;

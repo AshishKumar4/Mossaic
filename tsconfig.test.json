@@ -1,25 +1,46 @@
 {
-  "compilerOptions": {
-    "target": "ES2022",
-    "lib": ["ES2022"],
-    "module": "ESNext",
-    "moduleResolution": "bundler",
-    "strict": true,
-    "esModuleInterop": true,
-    "skipLibCheck": true,
-    "forceConsistentCasingInFileNames": true,
-    "resolveJsonModule": true,
-    "isolatedModules": true,
-    "noEmit": true,
-    "types": [
-      "@cloudflare/workers-types",
-      "@cloudflare/vitest-pool-workers"
-    ],
-    "paths": {
-      "@shared/*": ["./shared/*"],
-      "@core/*": ["./worker/core/*"],
-      "@app/*": ["./worker/app/*"]
-    }
-  },
-  "include": ["tests", "shared", "worker"]
+	"extends": "./tsconfig.base.json",
+	"compilerOptions": {
+		// Test code under `tests/` runs inside vitest-pool-workers' miniflare
+		// isolate. Needs both Workers types and the vitest-pool-workers
+		// `cloudflare:test` declarations. Extending `base` rather than
+		// `workers` because mossaic's `worker-configuration.d.ts` lives next
+		// to its worker code, not at this tsconfig's root.
+		"target": "ES2022",
+		"module": "ESNext",
+		"moduleResolution": "bundler",
+		"lib": ["ES2022"],
+		"esModuleInterop": true,
+		"resolveJsonModule": true,
+		// `@cloudflare/vitest-pool-workers/types` (the subpath) is what
+		// loads the `declare module "cloudflare:test"` ambient declaration;
+		// the bare `@cloudflare/vitest-pool-workers` resolves to the pool
+		// API typings in `dist/pool/`, which don't include cloudflare:test.
+		"types": [
+			"@cloudflare/workers-types",
+			"@cloudflare/vitest-pool-workers",
+			"@cloudflare/vitest-pool-workers/types"
+		],
+		// Pre-existing tests use untyped lambdas in
+		// `runInDurableObject((inst, state) => …)` callbacks; the new
+		// vitest-pool-workers types require explicit annotations. Suppressed
+		// here to preserve pre-extension behavior — the test tsconfig was
+		// never wired into mossaic's `tsc -b` reference graph (only
+		// tsconfig.app and tsconfig.worker were), so these errors were
+		// previously latent. TODO: annotate the lambdas, then re-enable.
+		"noImplicitAny": false,
+		"paths": {
+			"@shared/*": ["./shared/*"],
+			"@core/*": ["./worker/core/*"],
+			"@app/*": ["./worker/app/*"]
+		},
+		// TODO(mossaic): re-enable from the standalone base after the surfaced
+		// issues are fixed. Suppressed only to preserve pre-extension behavior.
+		"noUnusedLocals": false,
+		"noUnusedParameters": false,
+		"noFallthroughCasesInSwitch": false,
+		"verbatimModuleSyntax": false,
+		"erasableSyntaxOnly": false
+	},
+	"include": ["tests", "shared", "worker"]
 }

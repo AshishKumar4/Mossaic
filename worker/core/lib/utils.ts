@@ -49,9 +49,8 @@ function validateVfsToken(label: string, value: string): void {
  * allowed class is `:`.
  *
  * @lean-invariant Mossaic.Generated.UserDO.cross_tenant_user_isolation
- *   Lean proves that distinct tenants under valid scope produce distinct
- *   UserDO names. See `lean/Mossaic/Vfs/Tenant.lean :: userName_inj` and
- *   the corollary `cross_tenant_user_isolation`.
+ *   The abstract valid-scope name model is tenant-injective. The theorem
+ *   is not extracted from this TypeScript function or the DO runtime.
  */
 export function vfsUserDOName(
   ns: string,
@@ -78,10 +77,8 @@ export function vfsUserDOName(
  * to be a number.
  *
  * @lean-invariant Mossaic.Generated.UserDO.cross_tenant_shard_isolation
- *   Lean proves that, at any fixed shard index, distinct tenants under
- *   valid scope produce distinct ShardDO names. See
- *   `lean/Mossaic/Vfs/Tenant.lean :: shardName_inj_fixed_idx` and the
- *   corollary `cross_tenant_isolation`.
+ *   At a fixed index, the abstract valid-scope name model is
+ *   tenant-injective. No TypeScript/runtime refinement is proved.
  */
 export function vfsShardDOName(
   ns: string,

@@ -518,12 +518,13 @@ export async function vfsAbortMultipart(
  * unique touched shard for manifest verification + a second fan-out
  * for staging clear.
  *
- * Atomicity: all UserDO-side state changes happen in this one method
- * body (single DO turn = single SQL transaction). On any thrown
- * exception before `commitRename`, the tmp row remains
- * `status='uploading'` and the caller can resume or abort. Step 7
- * (rename) is itself proven atomic by the existing
- * `commitRename_atomic` theorem.
+ * Visibility intent: failures before the commit path leave the temporary row
+ * uploading so callers can resume or abort. Full SQL/cross-DO failure atomicity
+ * and implementation linearizability are not proved by the Lean corpus.
+ *
+ * @lean-invariant Mossaic.Vfs.Multipart.commitManifest_success_is_complete
+ * The abstract gate proves declared-count and collected index/hash
+ * completeness on success. It does not refine this SQL/RPC implementation.
  */
 export async function vfsFinalizeMultipart(
   durableObject: UserDO,

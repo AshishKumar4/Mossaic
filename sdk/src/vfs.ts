@@ -29,10 +29,14 @@ import {
 } from "./streams";
 import { EINVAL, mapServerError } from "./errors";
 import type {
+  CacheResolveResult,
   OpenManifestResult,
   VFSScope,
   VFSStatRaw,
 } from "../../shared/vfs-types";
+import type {
+  PatchMetadataIfHeadResult,
+} from "../../shared/patch-metadata-if-head";
 import { hashChunk } from "../../shared/crypto";
 import { placeChunk } from "../../shared/placement";
 import type {
@@ -43,6 +47,8 @@ import type {
   ReadPreviewResult,
 } from "../../shared/preview-types";
 import type { ShardDO } from "../../worker/core/objects/shard/shard-do";
+
+export type { PatchMetadataIfHeadResult } from "../../shared/patch-metadata-if-head";
 
 /**
  * Public consumer-facing VFS contract. Both the binding `VFS` class
@@ -73,7 +79,34 @@ export interface VFSClient {
   exists(p: string): Promise<boolean>;
   readlink(p: string): Promise<string>;
   readManyStat(paths: string[]): Promise<(VFSStat | null)[]>;
+  /** Batched readFile. Returns `null` per missing path; throws on
+   * non-ENOENT errors. Capped at 256 paths per call (`previewInfoMany`
+   * precedent). Used by Seal-side folder-surface caching to populate
+   * cache entries in one DO turn instead of N. */
+  readManyFile(paths: string[]): Promise<(Uint8Array | null)[]>;
+  /** Folder-surface bust oracle. Returns the parent folder's
+   * `revision` counter — bumped by every mutation that affects the
+   * listing. Cheap (single SQL row). Use as a pre-flight when wrapping
+   * `readdir` / `listChildren` / `listFiles` / `stat` / `fileInfo` /
+   * `readManyStat` in a Workers Cache lookup. */
+  folderRevision(p: string): Promise<{ revision: number }>;
   fileInfo(p: string, opts?: FileInfoOpts): Promise<ListFilesItem>;
+  /** Direct O(1) lookup by pathId/fileId within this client's tenant scope.
+   * Returns the same listing-shape item as `fileInfo(path)`. Throws ENOENT
+   * when the id is absent from this tenant, including ids that exist in some
+   * other tenant. */
+  fileInfoByPathId(pathId: string, opts?: FileInfoOpts): Promise<ListFilesItem>;
+  /**
+   * Cheap cache-bust oracle for `path`. Returns `(fileId,
+   * headVersionId, updatedAt, encryptionMode, encryptionKeyId)` in
+   * one SQL JOIN — about a third of the cost of `vfsReadFile`. Use
+   * as a pre-flight when wrapping `readFile` in a Workers Cache
+   * lookup: same fields back across two calls means the bytes are
+   * unchanged.
+   *
+   * Throws ENOENT for missing paths; EISDIR for directories.
+   */
+  resolveCacheKey(p: string): Promise<CacheResolveResult>;
 
   // Writes
   writeFile(
@@ -123,6 +156,16 @@ export interface VFSClient {
     patch: Record<string, unknown> | null,
     opts?: PatchMetadataOpts
   ): Promise<void>;
+  /**
+   * Stable-id compare-and-patch. Applies metadata/tag changes only
+   * when `pathId`'s current head exactly equals `expectedHeadVersionId`.
+   */
+  patchMetadataIfHead(
+    pathId: string,
+    expectedHeadVersionId: string | null,
+    patch: Record<string, unknown> | null,
+    opts?: PatchMetadataOpts
+  ): Promise<PatchMetadataIfHeadResult>;
   /** same-tenant copyFile (chunk-refcount-aware). */
   copyFile(src: string, dest: string, opts?: CopyFileOpts): Promise<void>;
   /** indexed listFiles with HMAC-signed cursor pagination. */
@@ -387,6 +430,34 @@ export interface UserDOClient {
     scope: VFSScope,
     paths: string[]
   ): Promise<(VFSStatRaw | null)[]>;
+  /** Batched readFile. Returns null per missing path. Cap 256.
+   * @lean-invariant Mossaic.Vfs.Folder.covered_mutation_bumps_revision
+   * Abstract mutation model only; no TypeScript refinement is claimed. */
+  vfsReadManyFile(
+    scope: VFSScope,
+    paths: string[]
+  ): Promise<(Uint8Array | null)[]>;
+  /** Folder-surface bust oracle.
+   * @lean-invariant Mossaic.Vfs.Folder.folder_revision_monotonic */
+  vfsFolderRevision(
+    scope: VFSScope,
+    path: string
+  ): Promise<{ revision: number }>;
+  /**
+   * Cheap pre-flight oracle for cache-key construction. Single SQL
+   * JOIN inside the UserDO; returns `(fileId, headVersionId, updatedAt,
+   * encryptionMode, encryptionKeyId)`. Consumers wrapping reads in
+   * `caches.default` fold every field into the cache key so
+   * callers can version cache entries from the returned state.
+   *
+   * @lean-invariant Mossaic.Vfs.Cache.bust_state_changes_when_signal_changes
+   * Abstract model: a supplied signal change changes BustState. The theorem
+   * does not prove this resolver or every write path matches the model.
+   */
+  vfsResolveCacheKey(
+    scope: VFSScope,
+    path: string
+  ): Promise<CacheResolveResult>;
   vfsReadFile(
     scope: VFSScope,
     path: string,
@@ -451,6 +522,14 @@ export interface UserDOClient {
     patch: Record<string, unknown> | null,
     opts?: PatchMetadataOpts
   ): Promise<void>;
+  /** Stable-id compare-and-patch for metadata/tags. */
+  vfsPatchMetadataIfHead(
+    scope: VFSScope,
+    pathId: string,
+    expectedHeadVersionId: string | null,
+    patch: Record<string, unknown> | null,
+    opts?: PatchMetadataOpts
+  ): Promise<PatchMetadataIfHeadResult>;
   /** same-tenant copyFile. */
   vfsCopyFile(
     scope: VFSScope,
@@ -466,6 +545,7 @@ export interface UserDOClient {
     items: Array<{
       path: string;
       pathId: string;
+      headVersionId?: string;
       stat?: VFSStatRaw;
       metadata?: Record<string, unknown> | null;
       tags: string[];
@@ -480,6 +560,20 @@ export interface UserDOClient {
   ): Promise<{
     path: string;
     pathId: string;
+    headVersionId?: string;
+    stat?: VFSStatRaw;
+    metadata?: Record<string, unknown> | null;
+    tags: string[];
+    contentHash?: string;
+  }>;
+  vfsFileInfoByPathId(
+    scope: VFSScope,
+    pathId: string,
+    opts?: FileInfoOpts
+  ): Promise<{
+    path: string;
+    pathId: string;
+    headVersionId?: string;
     stat?: VFSStatRaw;
     metadata?: Record<string, unknown> | null;
     tags: string[];
@@ -504,6 +598,7 @@ export interface UserDOClient {
           path: string;
           pathId: string;
           name: string;
+          headVersionId?: string;
           stat?: VFSStatRaw;
           metadata?: Record<string, unknown> | null;
           tags: string[];
@@ -1115,6 +1210,8 @@ export interface ListFilesItem {
   path: string;
   /** Stable file_id for this path. */
   pathId: string;
+  /** Current head version id, absent for legacy/versioning-off files. */
+  headVersionId?: string;
   /** Present when `includeStat !== false`. */
   stat?: VFSStat;
   /** Present when `includeMetadata === true` AND the file has metadata. */
@@ -1188,6 +1285,7 @@ export type VFSChild =
       path: string;
       pathId: string;
       name: string;
+      headVersionId?: string;
       stat?: VFSStat;
       metadata?: Record<string, unknown> | null;
       tags: string[];
@@ -1469,6 +1567,30 @@ export class VFS implements VFSClient {
     return raws.map((r) => (r ? new VFSStat(r) : null));
   }
 
+  async readManyFile(paths: string[]): Promise<(Uint8Array | null)[]> {
+    try {
+      return await this.user().vfsReadManyFile(this.scope(), paths);
+    } catch (err) {
+      throw mapServerError(err, { syscall: "open" });
+    }
+  }
+
+  async folderRevision(p: string): Promise<{ revision: number }> {
+    try {
+      return await this.user().vfsFolderRevision(this.scope(), p);
+    } catch (err) {
+      throw mapServerError(err, { path: p, syscall: "stat" });
+    }
+  }
+
+  async resolveCacheKey(p: string): Promise<CacheResolveResult> {
+    try {
+      return await this.user().vfsResolveCacheKey(this.scope(), p);
+    } catch (err) {
+      throw mapServerError(err, { path: p, syscall: "stat" });
+    }
+  }
+
   // ── Writes ────────────────────────────────────────────────────────────
 
   async writeFile(
@@ -1682,6 +1804,25 @@ export class VFS implements VFSClient {
     }
   }
 
+  async patchMetadataIfHead(
+    pathId: string,
+    expectedHeadVersionId: string | null,
+    patch: Record<string, unknown> | null,
+    opts?: PatchMetadataOpts
+  ): Promise<PatchMetadataIfHeadResult> {
+    try {
+      return await this.user().vfsPatchMetadataIfHead(
+        this.scope(),
+        pathId,
+        expectedHeadVersionId,
+        patch,
+        opts,
+      );
+    } catch (err) {
+      throw mapServerError(err, { path: pathId, syscall: "open" });
+    }
+  }
+
   /**
    * same-tenant copyFile.
    *
@@ -1737,6 +1878,7 @@ export class VFS implements VFSClient {
       items: Array<{
         path: string;
         pathId: string;
+        headVersionId?: string;
         stat?: VFSStatRaw;
         metadata?: Record<string, unknown> | null;
         tags: string[];
@@ -1755,6 +1897,7 @@ export class VFS implements VFSClient {
     const items: ListFilesItem[] = raw.items.map((r) => ({
       path: r.path,
       pathId: r.pathId,
+      headVersionId: r.headVersionId,
       stat: r.stat ? new VFSStat(r.stat) : undefined,
       metadata: r.metadata,
       tags: r.tags,
@@ -1769,6 +1912,7 @@ export class VFS implements VFSClient {
       return {
         path: raw.path,
         pathId: raw.pathId,
+        headVersionId: raw.headVersionId,
         stat: raw.stat ? new VFSStat(raw.stat) : undefined,
         metadata: raw.metadata,
         tags: raw.tags,
@@ -1778,6 +1922,32 @@ export class VFS implements VFSClient {
       };
     } catch (err) {
       throw mapServerError(err, { path: p, syscall: "stat" });
+    }
+  }
+
+  async fileInfoByPathId(
+    pathId: string,
+    opts: FileInfoOpts = {}
+  ): Promise<ListFilesItem> {
+    try {
+      const raw = await this.user().vfsFileInfoByPathId(
+        this.scope(),
+        pathId,
+        opts
+      );
+      return {
+        path: raw.path,
+        pathId: raw.pathId,
+        headVersionId: raw.headVersionId,
+        stat: raw.stat ? new VFSStat(raw.stat) : undefined,
+        metadata: raw.metadata,
+        tags: raw.tags,
+        ...(raw.contentHash !== undefined
+          ? { contentHash: raw.contentHash }
+          : {}),
+      };
+    } catch (err) {
+      throw mapServerError(err, { path: pathId, syscall: "stat" });
     }
   }
 
@@ -1813,6 +1983,7 @@ export class VFS implements VFSClient {
             path: string;
             pathId: string;
             name: string;
+            headVersionId?: string;
             stat?: VFSStatRaw;
             metadata?: Record<string, unknown> | null;
             tags: string[];
@@ -1866,6 +2037,7 @@ export class VFS implements VFSClient {
         name: e.name,
         tags: e.tags,
       };
+      if (e.headVersionId !== undefined) out.headVersionId = e.headVersionId;
       if (e.stat) out.stat = new VFSStat(e.stat);
       if (e.metadata !== undefined) out.metadata = e.metadata;
       if (e.contentHash !== undefined) out.contentHash = e.contentHash;

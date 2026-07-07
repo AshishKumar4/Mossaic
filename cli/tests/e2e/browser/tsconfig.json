@@ -1,0 +1,26 @@
+{
+	// Playwright browser tests run in browser context (need DOM types).
+	// Kept separate from the main `tsconfig.json` because adding `DOM` to
+	// the main lib breaks Node's `fetch` typings (DOM's `BodyInit` rejects
+	// Uint8Array, which the CLI's binary upload paths use).
+	//
+	// Editors / `tsc --noEmit -p tests/e2e/browser` pick this up; the
+	// `playwright test` runner handles its own type-checking too.
+	"compilerOptions": {
+		"target": "ES2022",
+		"module": "ESNext",
+		"moduleResolution": "bundler",
+		"customConditions": ["workspace"],
+		"lib": ["ES2022", "DOM"],
+		"strict": true,
+		"esModuleInterop": true,
+		"skipLibCheck": true,
+		"resolveJsonModule": true,
+		"allowSyntheticDefaultImports": true,
+		"forceConsistentCasingInFileNames": true,
+		"isolatedModules": true,
+		"noEmit": true,
+		"types": ["node", "@playwright/test"]
+	},
+	"include": ["**/*.ts"]
+}

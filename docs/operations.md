@@ -19,14 +19,14 @@ wrangler secret put JWT_SECRET
 
 The CI gate is `pnpm ci:check` which chains:
 
-1. `pnpm typecheck` &mdash; full project tsc, exit 0.
-2. `pnpm build:sdk` &mdash; production tsup build with strict DTS generation. This catches structural mismatches (e.g. a new RPC added to the worker but not declared on the SDK's `UserDOClient` interface) that the integration test harness's path-aliased TS resolution skips.
+1. `pnpm typecheck` &mdash; builds the SDK declarations, then checks the app, worker, SDK, CLI/browser tests, and standalone workspace-consumer fixture.
+2. `pnpm build:cli` &mdash; production tsdown CLI build.
 3. `pnpm lint:no-phase-tags` &mdash; refuses any `Phase NN` narration in production code. Tests use `Phase NN` as stable test IDs (excluded). Documentation under `docs/`, `local/`, `lean/`, and `README.md` is also out of scope. The single intentional location for `Phase NN` is `docs/scaling-roadmap.md`.
 
 Also before each deploy:
 
-- [ ] `pnpm test` &mdash; 929 cases pass (unit + integration + cli + browser e2e).
-- [ ] `pnpm verify:proofs` &mdash; 226 Lean theorems, 0 `axiom`, 0 `sorry`; no xref drift.
+- [ ] `pnpm test` and `pnpm test:cli` &mdash; worker/integration and CLI unit suites pass.
+- [ ] `pnpm verify:proofs` &mdash; imported Lean corpus builds; placeholder, project-axiom, xref-name, and generated-inventory gates pass. See the [verification boundary](./formal-verification-boundary.md).
 - [ ] `JWT_SECRET` set on the target environment (`wrangler secret list`).
 - [ ] `wrangler deploy --dry-run` &mdash; bundle clean, migrations match.
 - [ ] Smoke against the deployed worker:

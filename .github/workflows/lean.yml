@@ -6,6 +6,7 @@ on:
       - 'lean/**'
       - 'worker/**'
       - 'shared/**'
+      - 'sdk/**'
       - '.github/workflows/lean.yml'
   push:
     branches: [main]
@@ -13,6 +14,7 @@ on:
       - 'lean/**'
       - 'worker/**'
       - 'shared/**'
+      - 'sdk/**'
       - '.github/workflows/lean.yml'
 
 jobs:
@@ -76,19 +78,14 @@ jobs:
         working-directory: lean
         run: lake build
 
-      - name: Verify zero sorry in must-have proofs
+      - name: Verify zero sorry/axiom declarations in full corpus
         run: bash lean/scripts/check-no-sorry.sh
-
-      - name: Verify zero project axioms
-        run: |
-          if grep -rnE '^axiom|^[[:space:]]+axiom' lean/Mossaic/; then
-            echo "FAIL: project-level axiom declaration found in lean/Mossaic/"
-            exit 1
-          fi
-          echo "OK: zero project axioms."
 
       - name: Verify TS↔Lean cross-references
         run: bash lean/scripts/check-xrefs.sh
+
+      - name: Verify imported theorem inventory
+        run: bash lean/scripts/theorem-inventory.sh --check
 
       - name: Print kernel-axiom dependencies (informational)
         working-directory: lean

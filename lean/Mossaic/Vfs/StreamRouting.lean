@@ -173,8 +173,7 @@ theorem createReadStream_routes_versioned_to_version_chunks
     (h_head : row.headVersionId = some vid)
     (h_inline : row.headInline = none) :
     (routeOpenReadStream row).chunkSource = .versionChunks vid := by
-  unfold routeOpenReadStream
-  rw [h_yjs, h_head, h_inline]
+  simp [routeOpenReadStream, h_yjs, h_head, h_inline]
 
 /-- (R1b) Versioned non-inline path also pins the head version's
 `chunkSize` and `chunkCount` on the handle (NOT the legacy stale columns). -/
@@ -186,9 +185,7 @@ theorem createReadStream_versioned_pins_head_chunkSize
     (routeOpenReadStream row).chunkSize = row.headChunkSize ∧
     (routeOpenReadStream row).chunkCount = row.headChunkCount ∧
     (routeOpenReadStream row).size = row.headSize := by
-  unfold routeOpenReadStream
-  rw [h_yjs, h_head, h_inline]
-  exact ⟨rfl, rfl, rfl⟩
+  simp [routeOpenReadStream, h_yjs, h_head, h_inline]
 
 -- ─── (R2) openManifest routes versioned to version_chunks ──────────────
 
@@ -241,25 +238,6 @@ def isPullSafe (h : ReadHandle) : Bool :=
   -- / yjs / empty), or chunkSize > 0 (the pinned-at-open value).
   decide (h.chunkCount = 0) || decide (h.chunkSize > 0)
 
-/--
-**(R4) empty_file_no_pull_no_nan.**
-For any `routeOpenReadStream` output, the resulting handle is pull-safe:
-either it's inlined (chunkCount = 0) or it has a strictly positive
-chunkSize (pinned from `head_chunk_size` when versioned, or
-`files.chunk_size` when legacy).
-
-We model the contract as: if `chunkCount > 0` then `chunkSize > 0`,
-provided the underlying TS row maintains the invariant
-`chunk_count > 0 ⇒ chunk_size > 0` on its source columns.
-
-This invariant is preserved by every TS write path:
-  - `commitChunkedTier` and `commitVersion(chunked)` both write
-    chunkSize > 0 alongside chunkCount > 0.
-  - The yjs and inline paths set both to 0.
-
-So the precondition is operationally guaranteed; we lift it as an
-explicit hypothesis here because the row-level invariant is a TS
-schema fact, not a Lean theorem in this corpus. -/
 /-- Auxiliary: the constructed handle's `chunkSize` and `chunkCount`
 are EQUAL within each branch — neither inlined nor yjs ever has
 `chunkCount > 0`. This is true by construction of `routeOpenReadStream`:
@@ -269,27 +247,11 @@ theorem inlined_handle_has_zero_chunkCount
     (row : FileMetaRow)
     (h_inlined : (routeOpenReadStream row).chunkSource = .inlined) :
     (routeOpenReadStream row).chunkCount = 0 := by
-  unfold routeOpenReadStream at h_inlined ⊢
-  by_cases hyjs : row.modeYjs = true
-  · simp [hyjs]
-  · have hyjs' : row.modeYjs = false := by
-      cases hh : row.modeYjs with
-      | true => exact absurd hh hyjs
-      | false => rfl
-    match h_ver : row.headVersionId with
-    | some _ =>
-      match h_inline : row.headInline with
-      | some _ => simp [hyjs', h_ver, h_inline]
-      | none =>
-        -- chunkSource is .versionChunks, contradicts h_inlined
-        rw [hyjs', h_ver, h_inline] at h_inlined
-        exact absurd h_inlined (by simp)
-    | none =>
-      match h_li : row.inlineLegacy with
-      | some _ => simp [hyjs', h_ver, h_li]
-      | none =>
-        rw [hyjs', h_ver, h_li] at h_inlined
-        exact absurd h_inlined (by simp)
+  cases hmode : row.modeYjs <;>
+  cases hhead : row.headVersionId <;>
+  cases hinline : row.headInline <;>
+  cases hlegacy : row.inlineLegacy <;>
+  simp_all [routeOpenReadStream]
 
 /--
 **(R4) empty_file_no_pull_no_nan.**
@@ -323,27 +285,20 @@ theorem empty_file_no_pull_no_nan
       cases hh : row.modeYjs with
       | true => exact absurd hh hyjs
       | false => rfl
-    rw [hyjs'] at hcc ⊢
     match h_ver : row.headVersionId with
     | some _ =>
-      rw [h_ver] at hcc ⊢
       match h_inline : row.headInline with
       | some _ =>
-        rw [h_inline] at hcc
-        simp at hcc
+        simp [hyjs', h_ver, h_inline] at hcc
       | none =>
-        rw [h_inline] at hcc ⊢
-        simp at hcc ⊢
+        simp [hyjs', h_ver, h_inline] at hcc ⊢
         exact h_head hcc
     | none =>
-      rw [h_ver] at hcc ⊢
       match h_li : row.inlineLegacy with
       | some _ =>
-        rw [h_li] at hcc
-        simp at hcc
+        simp [hyjs', h_ver, h_li] at hcc
       | none =>
-        rw [h_li] at hcc ⊢
-        simp at hcc ⊢
+        simp [hyjs', h_ver, h_li] at hcc ⊢
         exact h_legacy hcc
 
 -- ─── (R5) yjs_mode_materializes_from_doc_not_chunks ────────────────────

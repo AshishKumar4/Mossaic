@@ -236,36 +236,13 @@ theorem payload_pins_tenancy
     result.fileIds.length > 0 ∧
     result.fileIds.all (fun f => f.length > 0) = true ∧
     result.scope = VFS_SHARE_SCOPE := by
-  unfold verify at h_verify
-  -- The if-condition is the conjunction of all checks; if it returns
-  -- `some payload` then the conjunction held and result = payload.
-  by_cases h : (validHmac secrets.primary token ||
-                  (match secrets.previous with
-                   | none => false
-                   | some prev => validHmac prev token)) = true ∧
-                tokenEmbeds token payload = true ∧
-                payload.scope = VFS_SHARE_SCOPE ∧
-                payload.userId.length > 0 ∧
-                (payload.fileIds.length > 0 &&
-                 payload.fileIds.all (fun f => f.length > 0)) = true ∧
-                payload.jti.length > 0
-  · rw [if_pos h] at h_verify
-    -- result = payload by Option.some.injection
-    have hres : result = payload := Option.some.inj h_verify
-    rw [hres]
-    refine ⟨h.2.2.2.1, ?_, ?_, h.2.2.1⟩
-    · have hbool : (payload.fileIds.length > 0 &&
-                    payload.fileIds.all (fun f => f.length > 0)) = true :=
-        h.2.2.2.2.1
-      rw [Bool.and_eq_true] at hbool
-      exact decide_eq_true_eq.mp hbool.1
-    · have hbool : (payload.fileIds.length > 0 &&
-                    payload.fileIds.all (fun f => f.length > 0)) = true :=
-        h.2.2.2.2.1
-      rw [Bool.and_eq_true] at hbool
-      exact hbool.2
-  · rw [if_neg h] at h_verify
-    exact absurd h_verify (by simp)
+  cases hp : secrets.previous <;>
+  simp [verify, hp, Bool.and_eq_true] at h_verify <;>
+  rw [← h_verify.2] <;>
+  exact ⟨h_verify.1.2.2.2.1,
+         h_verify.1.2.2.2.2.1.1,
+         by simpa using h_verify.1.2.2.2.2.1.2,
+         h_verify.1.2.2.1⟩
 
 -- ─── Non-vacuity sanity checks ──────────────────────────────────────────
 

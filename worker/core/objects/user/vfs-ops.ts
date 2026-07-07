@@ -57,8 +57,10 @@ export {
 export {
   vfsChmod,
   vfsPatchMetadata,
+  vfsPatchMetadataIfHead,
   vfsSetYjsMode,
   isYjsMode,
+  type PatchMetadataIfHeadResult,
 } from "./vfs/metadata";
 
 export { vfsArchive, vfsUnarchive } from "./vfs/archive";

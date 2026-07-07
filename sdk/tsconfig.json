@@ -1,25 +1,33 @@
 {
-  "compilerOptions": {
-    "target": "ES2022",
-    "lib": ["ES2022"],
-    "module": "ESNext",
-    "moduleResolution": "bundler",
-    "strict": true,
-    "esModuleInterop": true,
-    "skipLibCheck": true,
-    "forceConsistentCasingInFileNames": true,
-    "resolveJsonModule": true,
-    "isolatedModules": true,
-    "noEmit": true,
-    "declaration": true,
-    "declarationMap": false,
-    "verbatimModuleSyntax": true,
-    "erasableSyntaxOnly": true,
-    "customConditions": ["workspace"],
-    "types": ["@cloudflare/workers-types"],
-    "paths": {
-      "@shared/*": ["../shared/*"]
-    }
-  },
-  "include": ["src", "src/types", "../shared", "../worker/core"]
+	"extends": "../tsconfig.base.json",
+	"compilerOptions": {
+		// SDK shipped to Workers consumers — needs Workers types but is
+		// vendored as a library, so we extend `base` (not `workers` which
+		// auto-includes the worker-configuration.d.ts of its workspace).
+		"target": "ES2022",
+		"module": "ESNext",
+		"moduleResolution": "bundler",
+		"lib": ["ES2022"],
+		"customConditions": ["workspace"],
+		"esModuleInterop": true,
+		"resolveJsonModule": true,
+		"declaration": true,
+		"declarationMap": false,
+		// tsdown emits .d.ts via rolldown-plugin-dts; with `incremental`
+		// inherited from base and no `tsBuildInfoFile`, TS5074 fires. base keeps
+		// `incremental: true` paired with `noEmit: true` for the typecheck
+		// path, which doesn't apply here.
+		"incremental": false,
+		"types": ["@cloudflare/workers-types"],
+		"paths": {
+			"@shared/*": ["../shared/*"]
+		},
+		// TODO(mossaic): pre-existing tech debt to clean up before re-enabling
+		// these flags from the standalone base. Disabled here only to preserve
+		// pre-extension behavior during the workspace-consolidation MR.
+		"noUnusedLocals": false,
+		"noUnusedParameters": false,
+		"noFallthroughCasesInSwitch": false
+	},
+	"include": ["src", "src/types", "../shared", "../worker/core"]
 }
