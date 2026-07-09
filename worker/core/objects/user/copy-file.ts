@@ -30,13 +30,39 @@ import type { ShardDO } from "../shard/shard-do";
 import { VFSError, type VFSScope } from "../../../../shared/vfs-types";
 import { generateId, vfsShardDOName } from "../../lib/utils";
 import {
-  commitVersion,
+  assertVersionedFileExpectation,
+  commitVersionChecked,
   dropTmpRowAfterVersionCommit,
   insertVersionChunk,
   isVersioningEnabled,
   shardRefId,
+  type VersionedFileExpectation,
 } from "./vfs-versions";
-import { findLiveFile } from "./vfs/helpers";
+import {
+  bumpFolderRevision,
+  recordWriteUsage,
+} from "./vfs/helpers";
+import {
+  bumpTagMtimes,
+  replaceTags,
+  writeMetadata,
+} from "./metadata-tags";
+import {
+  copyEncryptionStamp,
+  projectEncryption,
+  type FileEncryptionRow,
+} from "./encryption-stamp";
+import {
+  abortTempFile,
+  commitRename,
+  disarmChunkCleanupIntents,
+  drainChunkCleanupIntents,
+  stageChunkCleanupIntents,
+} from "./vfs/write-commit";
+import {
+  scheduleStaleUploadSweep,
+  transactionSync,
+} from "./internal-storage";
 
 interface CopyOpts {
   metadataEncoded?: Uint8Array | null | undefined;
@@ -44,6 +70,11 @@ interface CopyOpts {
   versionUserVisible?: boolean;
   versionLabel?: string;
   overwrite: boolean;
+}
+
+interface CopyDestination {
+  fileId: string;
+  headVersionId: string | null;
 }
 
 export async function vfsCopyFile(
@@ -145,7 +176,7 @@ export async function vfsCopyFile(
       metadata: inheritedMetaObj,
       tags: inheritTags,
       version: opts.version,
-    });
+    }, !overwrite);
     return;
   }
 
@@ -153,7 +184,8 @@ export async function vfsCopyFile(
   const srcRow = durableObject.sql
     .exec(
       `SELECT file_id, file_size, file_hash, mime_type, mode,
-              chunk_size, chunk_count, head_version_id, inline_data
+               chunk_size, chunk_count, head_version_id, inline_data,
+               encryption_mode, encryption_key_id, parent_id, file_name
          FROM files
         WHERE file_id = ? AND user_id = ? AND status = 'complete'`,
       srcRes.leafId,
@@ -170,6 +202,10 @@ export async function vfsCopyFile(
         chunk_count: number;
         head_version_id: string | null;
         inline_data: ArrayBuffer | null;
+        encryption_mode: string | null;
+        encryption_key_id: string | null;
+        parent_id: string | null;
+        file_name: string;
       }
     | undefined;
   if (!srcRow) {
@@ -178,25 +214,38 @@ export async function vfsCopyFile(
 
   // Resolve dest's parent — same shape as writeFile's path resolution.
   const destParent = await resolveDestParent(durableObject, userId, dest);
+  const destinationRow = durableObject.sql
+    .exec(
+      `SELECT file_id, head_version_id FROM files
+        WHERE user_id = ? AND IFNULL(parent_id, '') = IFNULL(?, '')
+          AND file_name = ? AND status = 'complete'`,
+      userId,
+      destParent.parentId,
+      destParent.leaf
+    )
+    .toArray()[0] as
+    | { file_id: string; head_version_id: string | null }
+    | undefined;
+  const destination: CopyDestination | undefined = destinationRow
+    ? {
+        fileId: destinationRow.file_id,
+        headVersionId: destinationRow.head_version_id,
+      }
+    : undefined;
+  const sourceExpectation: VersionedFileExpectation = {
+    fileId: srcRow.file_id,
+    userId,
+    parentId: srcRow.parent_id,
+    fileName: srcRow.file_name,
+    headVersionId: srcRow.head_version_id,
+  };
 
   // EEXIST guard — only if overwrite=false.
-  if (!overwrite) {
-    const live = durableObject.sql
-      .exec(
-        `SELECT file_id FROM files
-          WHERE user_id=? AND IFNULL(parent_id,'')=IFNULL(?,'')
-            AND file_name=? AND status='complete'`,
-        userId,
-        destParent.parentId,
-        destParent.leaf
-      )
-      .toArray()[0] as { file_id: string } | undefined;
-    if (live) {
-      throw new VFSError(
-        "EEXIST",
-        `copyFile: dest exists and overwrite=false: ${dest}`
-      );
-    }
+  if (!overwrite && destination) {
+    throw new VFSError(
+      "EEXIST",
+      `copyFile: dest exists and overwrite=false: ${dest}`
+    );
   }
 
   // Inheritance defaults: src metadata + tags ride along when the
@@ -227,7 +276,9 @@ export async function vfsCopyFile(
       destParent.parentId,
       destParent.leaf,
       srcRow,
-      innerOpts
+      innerOpts,
+      sourceExpectation,
+      destination
     );
   }
 
@@ -240,7 +291,9 @@ export async function vfsCopyFile(
       destParent.parentId,
       destParent.leaf,
       srcRow,
-      innerOpts
+      innerOpts,
+      sourceExpectation,
+      destination
     );
   }
 
@@ -252,7 +305,9 @@ export async function vfsCopyFile(
     destParent.parentId,
     destParent.leaf,
     srcRow,
-    innerOpts
+    innerOpts,
+    sourceExpectation,
+    destination
   );
 }
 
@@ -309,10 +364,11 @@ async function copyInline(
     mime_type: string;
     mode: number;
     inline_data: ArrayBuffer | null;
-  },
-  opts: CopyOpts
+  } & FileEncryptionRow,
+  opts: CopyOpts,
+  sourceExpectation: VersionedFileExpectation,
+  destination: CopyDestination | undefined
 ): Promise<void> {
-  const opsMod = await import("./vfs-ops");
   const tmpId = generateId();
   const tmpName = `_vfs_tmp_${tmpId}`;
   const now = Date.now();
@@ -338,7 +394,7 @@ async function copyInline(
     srcRow.mode,
     inlineData
   );
-  await durableObject.scheduleStaleUploadSweep();
+  await scheduleStaleUploadSweep(durableObject);
 
   // Under versioning ON, copy must NOT hard-delete the
   // destination's prior history. The non-versioned source carries
@@ -348,85 +404,113 @@ async function copyInline(
   // bytes are inline so we attach them directly to the version row.
   const versioning = isVersioningEnabled(durableObject, userId);
   if (versioning) {
-    const liveDst = findLiveFile(durableObject, userId, parentId, leaf);
-    let pathId: string;
-    if (liveDst) {
-      pathId = liveDst.file_id;
-    } else {
-      await opsMod.commitRename(
+    const adoptLiveDestination = destination !== undefined && opts.overwrite;
+    const pathId = adoptLiveDestination ? destination.fileId : tmpId;
+    const versionId = generateId();
+    const expectedHead: VersionedFileExpectation = {
+      fileId: pathId,
+      userId,
+      parentId,
+      fileName: leaf,
+      headVersionId: adoptLiveDestination
+        ? destination.headVersionId
+        : null,
+    };
+    const finalizeVersion = (): void => {
+      commitVersionChecked(
+        durableObject,
+        {
+          pathId,
+          versionId,
+          userId,
+          size: srcRow.file_size,
+          mode: srcRow.mode,
+          mtimeMs: now,
+          chunkSize: 0,
+          chunkCount: 0,
+          fileHash: srcRow.file_hash,
+          mimeType: srcRow.mime_type,
+          inlineData,
+          userVisible: opts.versionUserVisible ?? true,
+          label: opts.versionLabel,
+          metadata: opts.metadataEncoded ?? null,
+          encryption: projectEncryption(srcRow),
+        },
+        expectedHead,
+        "copyFile"
+      );
+      applyCopySideEffects(
         durableObject,
         userId,
-        scope,
-        tmpId,
-        parentId,
-        leaf
+        pathId,
+        opts,
+        now,
+        srcRow.file_id
       );
-      pathId = tmpId;
+    };
+    if (adoptLiveDestination) {
+      await scheduleStaleUploadSweep(durableObject);
+      try {
+        transactionSync(durableObject, () => {
+          assertVersionedFileExpectation(
+            durableObject,
+            sourceExpectation,
+            "copyFile"
+          );
+          finalizeVersion();
+          dropTmpRowAfterVersionCommit(durableObject, tmpId, {
+            hasChunks: false,
+          });
+          bumpFolderRevision(durableObject, userId, parentId);
+        });
+      } catch (err) {
+        await abortTempFile(durableObject, userId, scope, tmpId);
+        throw err;
+      }
+    } else {
+      await commitRename(durableObject, userId, scope, tmpId, parentId, leaf, {
+        requireVacantDestination: true,
+        preconditionLocal: () =>
+          assertVersionedFileExpectation(
+            durableObject,
+            sourceExpectation,
+            "copyFile"
+          ),
+        finalizeLocal: finalizeVersion,
+      });
     }
-    const versionId = generateId();
-    commitVersion(durableObject, {
-      pathId,
-      versionId,
-      userId,
-      size: srcRow.file_size,
-      mode: srcRow.mode,
-      mtimeMs: now,
-      chunkSize: 0,
-      chunkCount: 0,
-      fileHash: srcRow.file_hash,
-      mimeType: srcRow.mime_type,
-      inlineData,
-      userVisible: opts.versionUserVisible ?? true,
-      label: opts.versionLabel,
-      metadata: opts.metadataEncoded ?? null,
-    });
-    if (liveDst) {
-      // Drop the tmp row WITHOUT chunk fan-out (no chunks were
-      // written to shards for the inline tier).
-      durableObject.sql.exec(
-        "DELETE FROM file_tags WHERE path_id = ?",
-        tmpId
-      );
-      durableObject.sql.exec(
-        "DELETE FROM files WHERE file_id = ?",
-        tmpId
-      );
-    }
-    // Apply commit-time side effects (metadata + tags) to the
-    // path-stable identity.
-    await applyCopySideEffects(
-      durableObject,
-      userId,
-      pathId,
-      opts,
-      now,
-      srcRow.file_id
-    );
     return;
   }
 
   // Versioning OFF — commitRename hard-deletes any prior live row.
-  await opsMod.commitRename(
-    durableObject,
-    userId,
-    scope,
-    tmpId,
-    parentId,
-    leaf
-  );
-  await applyCopySideEffects(durableObject, userId, tmpId, opts, now, srcRow.file_id);
-  // Record bytes against quota for the non-versioning copy path.
-  // Without this, copyFile would silently understate storage_used
-  // / file_count for non-versioning tenants. Inline tier so also
-  // bump inline_bytes_used.
-  const { recordWriteUsage } = await import("./vfs/helpers");
-  recordWriteUsage(
-    durableObject,
-    userId,
-    srcRow.file_size,
-    1,
-    srcRow.file_size
-  );
+  await commitRename(durableObject, userId, scope, tmpId, parentId, leaf, {
+    requireVacantDestination: destination === undefined,
+    expectedDestination: destination,
+    publicationEncryption: projectEncryption(srcRow) ?? null,
+    preconditionLocal: () =>
+      assertVersionedFileExpectation(
+        durableObject,
+        sourceExpectation,
+        "copyFile"
+      ),
+    finalizeLocal: () => {
+      applyCopySideEffects(
+        durableObject,
+        userId,
+        tmpId,
+        opts,
+        now,
+        srcRow.file_id
+      );
+      recordWriteUsage(
+        durableObject,
+        userId,
+        srcRow.file_size,
+        1,
+        srcRow.file_size
+      );
+    },
+  });
 }
 
 async function copyChunked(
@@ -443,8 +527,12 @@ async function copyChunked(
     mode: number;
     chunk_size: number;
     chunk_count: number;
+    encryption_mode: string | null;
+    encryption_key_id: string | null;
   },
-  opts: CopyOpts
+  opts: CopyOpts,
+  sourceExpectation: VersionedFileExpectation,
+  destination: CopyDestination | undefined
 ): Promise<void> {
   const opsMod = await import("./vfs-ops");
   const tmpId = generateId();
@@ -471,7 +559,7 @@ async function copyChunked(
     now,
     srcRow.mode
   );
-  await durableObject.scheduleStaleUploadSweep();
+  await scheduleStaleUploadSweep(durableObject);
 
   // Read src manifest from file_chunks.
   const srcChunks = durableObject.sql
@@ -502,7 +590,8 @@ async function copyChunked(
       arr.push(c);
       byShard.set(c.shard_index, arr);
     }
-    await Promise.all(
+    await stageChunkCleanupIntents(durableObject, tmpId, byShard.keys());
+    const retainResults = await Promise.allSettled(
       Array.from(byShard.entries()).map(async ([sIdx, chunks]) => {
         const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, sIdx);
         const stub = shardNs.get(shardNs.idFromName(shardName));
@@ -526,26 +615,38 @@ async function copyChunked(
         }
       })
     );
+    const retainFailure = retainResults.find(
+      (result): result is PromiseRejectedResult => result.status === "rejected"
+    );
+    if (retainFailure) throw retainFailure.reason;
   } catch (err) {
     await opsMod.abortTempFile(durableObject, userId, scope, tmpId);
     throw err;
   }
 
-  await opsMod.commitRename(
-    durableObject,
-    userId,
-    scope,
-    tmpId,
-    parentId,
-    leaf
-  );
-  await applyCopySideEffects(durableObject, userId, tmpId, opts, now, srcRow.file_id);
-  // Record bytes against quota for the non-versioning chunked
-  // copy. Without this, copyFile would silently understate
-  // storage_used / file_count for non-versioning chunked copies,
-  // so multi-GB tenants would see their pool stay at 32 forever.
-  const { recordWriteUsage } = await import("./vfs/helpers");
-  recordWriteUsage(durableObject, userId, srcRow.file_size, 1);
+  await commitRename(durableObject, userId, scope, tmpId, parentId, leaf, {
+    requireVacantDestination: destination === undefined,
+    expectedDestination: destination,
+    publicationEncryption: projectEncryption(srcRow) ?? null,
+    preconditionLocal: () =>
+      assertVersionedFileExpectation(
+        durableObject,
+        sourceExpectation,
+        "copyFile"
+      ),
+    finalizeLocal: () => {
+      applyCopySideEffects(
+        durableObject,
+        userId,
+        tmpId,
+        opts,
+        now,
+        srcRow.file_id
+      );
+      recordWriteUsage(durableObject, userId, srcRow.file_size, 1);
+      disarmChunkCleanupIntents(durableObject, tmpId);
+    },
+  });
 }
 
 async function copyVersioned(
@@ -565,7 +666,9 @@ async function copyVersioned(
     head_version_id: string | null;
     inline_data: ArrayBuffer | null;
   },
-  opts: CopyOpts
+  opts: CopyOpts,
+  sourceExpectation: VersionedFileExpectation,
+  destination: CopyDestination | undefined
 ): Promise<void> {
   const opsMod = await import("./vfs-ops");
   const versionsMod = await import("./vfs-versions");
@@ -588,7 +691,7 @@ async function copyVersioned(
     now,
     srcRow.mode
   );
-  await durableObject.scheduleStaleUploadSweep();
+  await scheduleStaleUploadSweep(durableObject);
 
   // Read src head version + its chunks.
   const srcHead = versionsMod.getVersion(
@@ -615,53 +718,82 @@ async function copyVersioned(
   // When destination already has a versioned live row, attach the
   // new version to its `pathId` instead of `tmpId` so prior
   // history survives the copy.
-  const liveDst = findLiveFile(durableObject, userId, parentId, leaf);
-  let pathId: string;
-  if (liveDst) {
-    pathId = liveDst.file_id;
-  } else {
-    // No prior path — promote the tmp row.
-    await opsMod.commitRename(
-      durableObject,
-      userId,
-      scope,
-      tmpId,
-      parentId,
-      leaf
-    );
-    pathId = tmpId;
-  }
+  const adoptLiveDestination = destination !== undefined && opts.overwrite;
+  const pathId = adoptLiveDestination ? destination.fileId : tmpId;
+  const expectedHead: VersionedFileExpectation = {
+    fileId: pathId,
+    userId,
+    parentId,
+    fileName: leaf,
+    headVersionId: adoptLiveDestination ? destination.headVersionId : null,
+  };
 
   if (srcHead.inlineData) {
     // Inline-tier version: just snapshot the bytes.
-    commitVersion(durableObject, {
-      pathId,
-      versionId: newVersionId,
-      userId,
-      size: srcHead.size,
-      mode: srcHead.mode,
-      mtimeMs: now,
-      chunkSize: 0,
-      chunkCount: 0,
-      fileHash: srcHead.fileHash,
-      mimeType: srcHead.mimeType,
-      inlineData: new Uint8Array(srcHead.inlineData),
-      userVisible: opts.versionUserVisible ?? true,
-      label: opts.versionLabel,
-      metadata: opts.metadataEncoded ?? null,
-      // copy preserves the source's encryption mode + keyId.
-      // The bytes are envelope-stream verbatim; the dest must report
-      // the same mode so SDK readFile knows to decrypt.
-      encryption: srcHead.encryption,
-    });
-    if (liveDst) {
-      // Drop the redundant tmp row WITHOUT chunk fan-out (inline
-      // bytes live in the file_versions row, not on shards).
-      dropTmpRowAfterVersionCommit(durableObject, tmpId, {
-        hasChunks: false,
+    const inlineData = new Uint8Array(srcHead.inlineData);
+    const finalizeVersion = (): void => {
+      commitVersionChecked(
+        durableObject,
+        {
+          pathId,
+          versionId: newVersionId,
+          userId,
+          size: srcHead.size,
+          mode: srcHead.mode,
+          mtimeMs: now,
+          chunkSize: 0,
+          chunkCount: 0,
+          fileHash: srcHead.fileHash,
+          mimeType: srcHead.mimeType,
+          inlineData,
+          userVisible: opts.versionUserVisible ?? true,
+          label: opts.versionLabel,
+          metadata: opts.metadataEncoded ?? null,
+          encryption: srcHead.encryption,
+        },
+        expectedHead,
+        "copyFile"
+      );
+      applyCopySideEffects(
+        durableObject,
+        userId,
+        pathId,
+        opts,
+        now,
+        srcRow.file_id
+      );
+    };
+    if (adoptLiveDestination) {
+      await scheduleStaleUploadSweep(durableObject);
+      try {
+        transactionSync(durableObject, () => {
+          assertVersionedFileExpectation(
+            durableObject,
+            sourceExpectation,
+            "copyFile"
+          );
+          finalizeVersion();
+          dropTmpRowAfterVersionCommit(durableObject, tmpId, {
+            hasChunks: false,
+          });
+          bumpFolderRevision(durableObject, userId, parentId);
+        });
+      } catch (err) {
+        await abortTempFile(durableObject, userId, scope, tmpId);
+        throw err;
+      }
+    } else {
+      await commitRename(durableObject, userId, scope, tmpId, parentId, leaf, {
+        requireVacantDestination: true,
+        preconditionLocal: () =>
+          assertVersionedFileExpectation(
+            durableObject,
+            sourceExpectation,
+            "copyFile"
+          ),
+        finalizeLocal: finalizeVersion,
       });
     }
-    await applyCopySideEffects(durableObject, userId, pathId, opts, now, srcRow.file_id);
     return;
   }
 
@@ -692,7 +824,8 @@ async function copyVersioned(
       arr.push(c);
       byShard.set(c.shard_index, arr);
     }
-    await Promise.all(
+    await stageChunkCleanupIntents(durableObject, newRefId, byShard.keys());
+    const retainResults = await Promise.allSettled(
       Array.from(byShard.entries()).map(async ([sIdx, chunks]) => {
         const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, sIdx);
         const stub = shardNs.get(shardNs.idFromName(shardName));
@@ -704,17 +837,20 @@ async function copyVersioned(
             c.chunk_index,
             userId
           );
-          insertVersionChunk(durableObject, newVersionId, c);
         }
       })
     );
+    const retainFailure = retainResults.find(
+      (result): result is PromiseRejectedResult => result.status === "rejected"
+    );
+    if (retainFailure) throw retainFailure.reason;
   } catch (err) {
-    // Best-effort cleanup of any landed refs.
     durableObject.sql.exec(
       "DELETE FROM version_chunks WHERE version_id = ?",
       newVersionId
     );
     await opsMod.abortTempFile(durableObject, userId, scope, tmpId);
+    await drainChunkCleanupIntents(durableObject, scope, newRefId);
     throw err;
   }
 
@@ -724,35 +860,79 @@ async function copyVersioned(
   // stamp that as `shard_ref_id` so a future `dropVersionRows`
   // fan-out keys ShardDO `deleteChunks` correctly when the version
   // is reaped.
-  commitVersion(durableObject, {
-    pathId,
-    versionId: newVersionId,
-    userId,
-    size: srcHead.size,
-    mode: srcHead.mode,
-    mtimeMs: now,
-    chunkSize: srcHead.chunkSize,
-    chunkCount: srcHead.chunkCount,
-    fileHash: srcHead.fileHash,
-    mimeType: srcHead.mimeType,
-    inlineData: null,
-    userVisible: opts.versionUserVisible ?? true,
-    label: opts.versionLabel,
-    metadata: opts.metadataEncoded ?? null,
-    encryption: srcHead.encryption,
-    shardRefId: newRefId,
-  });
-  if (liveDst) {
-    // Drop the redundant tmp row + its file_chunks (which the new
-    // version doesn't reference — chunks are owned via
-    // version_chunks under newVersionId, refed on shards via
-    // newRefId). Skip the shard fan-out: chunks belong to the new
-    // version.
-    dropTmpRowAfterVersionCommit(durableObject, tmpId, {
-      hasChunks: true,
-    });
+  const finalizeVersion = (): void => {
+    for (const chunk of srcChunks) {
+      insertVersionChunk(durableObject, newVersionId, chunk);
+    }
+    commitVersionChecked(
+      durableObject,
+      {
+        pathId,
+        versionId: newVersionId,
+        userId,
+        size: srcHead.size,
+        mode: srcHead.mode,
+        mtimeMs: now,
+        chunkSize: srcHead.chunkSize,
+        chunkCount: srcHead.chunkCount,
+        fileHash: srcHead.fileHash,
+        mimeType: srcHead.mimeType,
+        inlineData: null,
+        userVisible: opts.versionUserVisible ?? true,
+        label: opts.versionLabel,
+        metadata: opts.metadataEncoded ?? null,
+        encryption: srcHead.encryption,
+        shardRefId: newRefId,
+      },
+      expectedHead,
+      "copyFile"
+    );
+    applyCopySideEffects(
+      durableObject,
+      userId,
+      pathId,
+      opts,
+      now,
+      srcRow.file_id
+    );
+    disarmChunkCleanupIntents(durableObject, newRefId);
+  };
+  try {
+    if (adoptLiveDestination) {
+      await scheduleStaleUploadSweep(durableObject);
+      transactionSync(durableObject, () => {
+        assertVersionedFileExpectation(
+          durableObject,
+          sourceExpectation,
+          "copyFile"
+        );
+        finalizeVersion();
+        dropTmpRowAfterVersionCommit(durableObject, tmpId, {
+          hasChunks: true,
+        });
+        bumpFolderRevision(durableObject, userId, parentId);
+      });
+    } else {
+      await commitRename(durableObject, userId, scope, tmpId, parentId, leaf, {
+        requireVacantDestination: true,
+        preconditionLocal: () =>
+          assertVersionedFileExpectation(
+            durableObject,
+            sourceExpectation,
+            "copyFile"
+          ),
+        finalizeLocal: finalizeVersion,
+      });
+    }
+  } catch (err) {
+    durableObject.sql.exec(
+      "DELETE FROM version_chunks WHERE version_id = ?",
+      newVersionId
+    );
+    await opsMod.abortTempFile(durableObject, userId, scope, tmpId);
+    await drainChunkCleanupIntents(durableObject, scope, newRefId);
+    throw err;
   }
-  await applyCopySideEffects(durableObject, userId, pathId, opts, now, srcRow.file_id);
 }
 
 async function preflightChunksAlive(
@@ -760,20 +940,21 @@ async function preflightChunksAlive(
   scope: VFSScope,
   chunks: { chunk_hash: string; shard_index: number }[]
 ): Promise<void> {
-  const byShard = new Map<number, string[]>();
+  const byShard = new Map<number, Set<string>>();
   for (const c of chunks) {
-    const arr = byShard.get(c.shard_index) ?? [];
-    arr.push(c.chunk_hash);
-    byShard.set(c.shard_index, arr);
+    const hashes = byShard.get(c.shard_index) ?? new Set<string>();
+    hashes.add(c.chunk_hash);
+    byShard.set(c.shard_index, hashes);
   }
   await Promise.all(
-    Array.from(byShard.entries()).map(async ([shardIndex, hashes]) => {
+    Array.from(byShard.entries()).map(async ([shardIndex, hashSet]) => {
+      const hashes = [...hashSet];
       const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, shardIndex);
       const stub = shardNs.get(shardNs.idFromName(shardName));
       const { alive } = await stub.chunksAlive(hashes);
-      if (alive.length !== hashes.length) {
-        const aliveSet = new Set(alive);
-        const missing = hashes.filter((h) => !aliveSet.has(h));
+      const aliveSet = new Set(alive);
+      const missing = hashes.filter((hash) => !aliveSet.has(hash));
+      if (missing.length > 0) {
         throw new VFSError(
           "ENOENT",
           `copyFile: source chunks swept on shard ${shardIndex}: ${missing
@@ -785,7 +966,7 @@ async function preflightChunksAlive(
   );
 }
 
-async function applyCopySideEffects(
+function applyCopySideEffects(
   durableObject: UserDO,
   userId: string,
   pathId: string,
@@ -800,18 +981,16 @@ async function applyCopySideEffects(
    * mode so the SDK knows to decrypt on read.
    */
   srcFileId?: string
-): Promise<void> {
-  const tagsMod = await import("./metadata-tags");
+): void {
   if (opts.metadataEncoded !== undefined) {
-    tagsMod.writeMetadata(durableObject, pathId, opts.metadataEncoded);
+    writeMetadata(durableObject, pathId, opts.metadataEncoded);
   }
   if (opts.tags !== undefined) {
-    tagsMod.replaceTags(durableObject, userId, pathId, opts.tags);
+    replaceTags(durableObject, userId, pathId, opts.tags);
   } else {
-    tagsMod.bumpTagMtimes(durableObject, pathId, mtimeMs);
+    bumpTagMtimes(durableObject, pathId, mtimeMs);
   }
   if (srcFileId !== undefined) {
-    const { copyEncryptionStamp } = await import("./encryption-stamp");
     copyEncryptionStamp(durableObject, srcFileId, pathId);
   }
 }

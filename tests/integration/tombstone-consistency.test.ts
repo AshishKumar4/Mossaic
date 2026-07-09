@@ -22,8 +22,8 @@ import { env, runInDurableObject } from "cloudflare:test";
  *   4. write→unlink→exists returns false
  *   5. THE invariant: every listFiles result stats successfully
  *   6. write→unlink→write back → restored, listFiles includes
- *   7. dropVersionRows when only tombstone survives → head NOT
- *      tombstone (NULL'd out instead) — test the prevention fix
+ *   7. dropVersionRows when only tombstone survives preserves the
+ *      tombstone head and deleted-path semantics
  *   8. adminReapTombstonedHeads dryRun=true reports correct count
  *   9. adminReapTombstonedHeads mode=hardDelete drops files row
  *  10. adminReapTombstonedHeads mode=walkBack repoints head at
@@ -174,62 +174,21 @@ describe("Phase 25 — tombstone consistency", () => {
     expect(back).toBe("v2");
   });
 
-  it("7. dropVersionRows leaves head NOT tombstoned (prevention fix)", async () => {
-    // Set up: 1 live version (v1), then unlink → tombstone (v2). Drop
-    // ONLY the live v1; the tombstone v2 survives. Pre-fix, head
-    // would be repointed at the tombstone (the only surviving row),
-    // making stat throw. Post-fix, head_version_id is NULL'd so stat
-    // falls through to the denormalized files-row branch.
+  it("7. dropVersionRows preserves a surviving tombstone head", async () => {
     const tenant = "tc-droprows-no-tomb-head";
     const vfs = createVFS(envFor(), { tenant, versioning: "enabled" });
 
     await vfs.writeFile("/y.txt", enc.encode("alive"));
-    const versionsBeforeUnlink = await vfs.listVersions("/y.txt");
-    expect(versionsBeforeUnlink.length).toBe(1);
-    const liveVersionId = versionsBeforeUnlink[0].id;
-
     await vfs.unlink("/y.txt");
     const afterUnlink = await vfs.listVersions("/y.txt");
     expect(afterUnlink.length).toBe(2);
+    const tombstoneVersionId = afterUnlink[0].id;
 
-    // Drop only the live version, keeping the tombstone.
-    await vfs.dropVersions("/y.txt", { exceptVersions: [] /* drop everything except current head */ });
-    // ^ Above isn't quite right — `dropVersions` always preserves
-    // current head; we need to drop ONLY the non-head live version.
-    // Use the explicit dropVersions API path: drop versions
-    // older-than-now-with-exception-of-the-tombstone-head. The
-    // tombstone IS the current head per vfs-versions:271-283, so
-    // it's auto-protected; dropVersions(olderThan=now+1, keepLast=0)
-    // would drop the live v1 and leave the tombstone alone.
-    // For the test, we use direct SQL in the DO to deterministically
-    // set up the post-state.
-    const stub = userStubFor(tenant);
-    await runInDurableObject(stub, async (_inst, state) => {
-      // Drop just the live version row, leave the tombstone.
-      state.storage.sql.exec(
-        "DELETE FROM file_versions WHERE version_id = ?",
-        liveVersionId
-      );
-      state.storage.sql.exec(
-        "DELETE FROM version_chunks WHERE version_id = ?",
-        liveVersionId
-      );
-      // Now manually invoke the head-reset logic (mirrors the
-      // dropVersionRows fix). After our deletion only the tombstone
-      // remains. Pre-fix the head-reset query had no
-      // `WHERE deleted = 0`; post-fix, no live version → head NULL'd.
-      const { dropVersionRows } = await import(
-        "@core/objects/user/vfs-versions"
-      );
-      // Call dropVersionRows with empty list to trigger only the
-      // empty-state side effects. Since dropVersionRows short-circuits
-      // on length===0, we instead call it with the tombstone version
-      // id to force the post-drop branch... but that would delete
-      // the tombstone too. Cleaner: directly observe head_version_id.
-      void dropVersionRows; // silence unused warning
+    await expect(vfs.dropVersions("/y.txt", {})).resolves.toEqual({
+      dropped: 1,
+      kept: 1,
     });
-
-    // Direct observation: head_version_id should be NULL post-fix.
+    const stub = userStubFor(tenant);
     const headState = await runInDurableObject(stub, async (_inst, state) => {
       const r = state.storage.sql
         .exec(
@@ -238,26 +197,9 @@ describe("Phase 25 — tombstone consistency", () => {
         .toArray()[0] as { head_version_id: string | null } | undefined;
       return r;
     });
-    // Note: we manipulated SQL directly; head_version_id is still
-    // pointing at liveVersionId (now-deleted) — orphan head. The
-    // STAT path falls through helpers.ts:225-226 (head row missing)
-    // to the non-versioned branch — no throw. This is the GOOD post-
-    // fix behaviour even on the orphan-head edge case: stat succeeds
-    // without "head version is a tombstone".
-    expect(headState).toBeDefined();
-    // stat() on the path should NOT throw the tombstone error. It
-    // either succeeds (orphan-head fallback) or throws ENOENT for a
-    // different reason — either way, NOT the systemic-bug throw.
-    try {
-      const s = await vfs.stat("/y.txt");
-      // Falls through: succeeds with denormalized stat. Acceptable.
-      expect(s.isFile()).toBe(true);
-    } catch (err) {
-      // Acceptable: ENOENT, but the message must NOT be the
-      // tombstone systemic-bug message.
-      const msg = err instanceof Error ? err.message : String(err);
-      expect(msg).not.toMatch(/head version is a tombstone/);
-    }
+    expect(headState?.head_version_id).toBe(tombstoneVersionId);
+    await expect(vfs.stat("/y.txt")).rejects.toBeInstanceOf(ENOENT);
+    expect(await vfs.exists("/y.txt")).toBe(false);
   });
 
   it("8. adminReapTombstonedHeads dryRun reports correct count", async () => {

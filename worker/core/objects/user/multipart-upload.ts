@@ -48,21 +48,23 @@ import {
 } from "../../../../shared/multipart";
 import {
   commitRename,
-  hardDeleteFileRow,
-  abortTempFile,
   userIdFor,
   resolveParent,
   poolSizeFor,
   recordWriteUsage,
   folderExists,
-  findLiveFile,
   bumpFolderRevision,
+  disarmChunkCleanupIntents,
+  drainChunkCleanupIntents,
+  stageChunkCleanupIntents,
 } from "./vfs-ops";
+import { hardDeleteFileRowLocal } from "./vfs/write-commit";
 import {
-  commitVersion,
+  commitVersionChecked,
   dropTmpRowAfterVersionCommit,
   insertVersionChunk,
   isVersioningEnabled,
+  type VersionedFileExpectation,
 } from "./vfs-versions";
 import {
   validateLabel,
@@ -76,6 +78,15 @@ import {
   type EncryptionStampOpts,
 } from "./encryption-stamp";
 import { hashChunk } from "../../../../shared/crypto";
+import { readMetadataBytes, replaceTags } from "./metadata-tags";
+import {
+  ChunkCleanupKind,
+  lastSqlChanges,
+  scheduleStaleUploadSweep,
+  stageChunkCleanupIntent,
+  retainMultipartStagingCleanup,
+  transactionSync,
+} from "./internal-storage";
 
 export interface VFSBeginMultipartOpts {
   size: number;
@@ -242,6 +253,7 @@ export async function vfsBeginMultipart(
   const mode = opts.mode ?? 0o644;
   const mimeType = opts.mimeType ?? "application/octet-stream";
   const tmpName = `_vfs_tmp_${tmpId}`;
+  await scheduleStaleUploadSweep(durableObject);
   durableObject.sql.exec(
     `INSERT INTO files (file_id, user_id, parent_id, file_name, file_size, file_hash, mime_type, chunk_size, chunk_count, pool_size, status, created_at, updated_at, mode, node_kind)
      VALUES (?, ?, ?, ?, ?, '', ?, ?, 0, ?, 'uploading', ?, ?, ?, 'file')`,
@@ -257,16 +269,12 @@ export async function vfsBeginMultipart(
     now,
     mode
   );
-  // Stamp encryption columns on the tmp row up-front (they'll carry
-  // through `commitRename`).
-  if (incomingEncryption) {
-    stampFileEncryption(durableObject, tmpId, incomingEncryption);
-  }
-
   // Insert session row — captures every commit-time payload so finalize
   // can apply them without re-validation.
   let metadataBlob: Uint8Array | null = null;
-  if (opts.metadata !== undefined && opts.metadata !== null) {
+  if (opts.metadata === null) {
+    metadataBlob = new Uint8Array(0);
+  } else if (opts.metadata !== undefined) {
     metadataBlob = validateMetadata(opts.metadata).encoded;
   }
   const tagsJson =
@@ -446,10 +454,10 @@ async function resumeMultipart(
  * already 'aborted' is a no-op; aborting a 'finalized' session
  * raises EBUSY (cannot un-finalize).
  *
- * Drops chunk_refs on every shard in the pool by calling the existing
- * `deleteChunks(uploadId)` typed RPC — this re-uses the Lean-proven
- * refcount-decrement path and triggers the existing 30 s soft-mark +
- * alarm sweep for orphan chunks.
+ * The session transition, temp-row deletion, and one durable cleanup intent
+ * per pool shard commit together. The outbox then runs the idempotent
+ * `deleteChunks` + `clearMultipartStaging` protocol and alarm-retries any
+ * unacknowledged shard.
  */
 export async function vfsAbortMultipart(
   durableObject: UserDO,
@@ -467,7 +475,6 @@ export async function vfsAbortMultipart(
   if (!row) {
     throw new VFSError("ENOENT", `abortMultipart: session not found: ${uploadId}`);
   }
-  if (row.status === "aborted") return { ok: true };
   if (row.status === "finalized") {
     throw new VFSError(
       "EBUSY",
@@ -475,40 +482,53 @@ export async function vfsAbortMultipart(
     );
   }
 
-  // Mark aborted FIRST so any concurrent resume/finalize observes the
-  // state change.
-  durableObject.sql.exec(
-    "UPDATE upload_sessions SET status = 'aborted' WHERE upload_id = ?",
-    uploadId
-  );
+  await scheduleStaleUploadSweep(durableObject);
+  transactionSync(durableObject, () => {
+    const current = durableObject.sql
+      .exec(
+        `SELECT status, pool_size FROM upload_sessions
+          WHERE upload_id = ? AND user_id = ?`,
+        uploadId,
+        userId
+      )
+      .toArray()[0] as
+      | { status: string; pool_size: number }
+      | undefined;
+    if (!current) {
+      throw new VFSError(
+        "ENOENT",
+        `abortMultipart: session not found: ${uploadId}`
+      );
+    }
+    if (current.status === "finalized") {
+      throw new VFSError(
+        "EBUSY",
+        "abortMultipart: session is already finalized; cannot un-finalize"
+      );
+    }
+    if (current.status === "aborted") return;
 
-  // Fan out: drop chunk_refs + clear staging on every shard in the
-  // pool. We don't know which shards were touched (no per-chunk
-  // UserDO write), so we visit all of them. Idempotent on each shard.
-  const ns = shardNs(durableObject);
-  const cleanup: Promise<void>[] = [];
-  for (let sIdx = 0; sIdx < row.pool_size; sIdx++) {
-    const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, sIdx);
-    const stub = ns.get(ns.idFromName(shardName));
-    cleanup.push(
-      (async () => {
-        try {
-          await stub.deleteChunks(uploadId);
-          await stub.clearMultipartStaging(uploadId);
-        } catch {
-          // Best-effort; orphans are reaped by the alarm sweeper at
-          // session expiry.
-        }
-      })()
+    const now = Date.now();
+    for (let shardIndex = 0; shardIndex < current.pool_size; shardIndex++) {
+      stageChunkCleanupIntent(
+        durableObject,
+        uploadId,
+        shardIndex,
+        now,
+        now,
+        ChunkCleanupKind.Multipart
+      );
+    }
+    durableObject.sql.exec(
+      `UPDATE upload_sessions SET status = 'aborted'
+        WHERE upload_id = ? AND user_id = ?`,
+      uploadId,
+      userId
     );
-  }
-  await Promise.all(cleanup);
+    hardDeleteFileRowLocal(durableObject, userId, uploadId);
+  });
 
-  // Hard-delete the tmp `files` row. The file_chunks table was never
-  // populated (finalize never ran), so nothing else to clean on
-  // UserDO. Use the existing helper — drops file_chunks (no-op),
-  // file_tags (no-op), then files.
-  await abortTempFile(durableObject, userId, scope, uploadId);
+  await drainChunkCleanupIntents(durableObject, scope, uploadId);
 
   return { ok: true };
 }
@@ -578,6 +598,48 @@ export async function vfsFinalizeMultipart(
     }
   }
 
+  const destinationRow = durableObject.sql
+    .exec(
+      `SELECT file_id, head_version_id FROM files
+        WHERE user_id = ? AND IFNULL(parent_id, '') = IFNULL(?, '')
+          AND file_name = ? AND status = 'complete'`,
+      userId,
+      session.parent_id,
+      session.leaf
+    )
+    .toArray()[0] as
+    | { file_id: string; head_version_id: string | null }
+    | undefined;
+  const assertSessionState = (): void => {
+    const currentSession = durableObject.sql
+      .exec(
+        `SELECT 1 FROM upload_sessions
+          WHERE upload_id = ? AND user_id = ? AND status = 'open'
+            AND created_at = ? AND expires_at = ?`,
+        uploadId,
+        userId,
+        session.created_at,
+        session.expires_at
+      )
+      .toArray();
+    const currentTemp = durableObject.sql
+      .exec(
+        `SELECT 1 FROM files
+          WHERE file_id = ? AND user_id = ? AND status = 'uploading'
+            AND IFNULL(parent_id, '') = IFNULL(?, '')`,
+        uploadId,
+        userId,
+        session.parent_id
+      )
+      .toArray();
+    if (currentSession.length !== 1 || currentTemp.length !== 1) {
+      throw new VFSError(
+        "EBUSY",
+        "finalizeMultipart: session changed during publication"
+      );
+    }
+  };
+
   // 3. Compute touched shards.
   //
   // Multipart placement intentionally does NOT pass `fullShards`
@@ -629,6 +691,7 @@ export async function vfsFinalizeMultipart(
   }
 
   // 5. Cross-check: every idx must exist with matching hash.
+  const manifestRows: ShardMultipartManifestRow[] = [];
   for (let i = 0; i < session.total_chunks; i++) {
     const have = collected.get(i);
     if (!have) {
@@ -643,13 +706,14 @@ export async function vfsFinalizeMultipart(
         `finalizeMultipart: chunk ${i} hash divergence (server=${have.hash}, client=${chunkHashList[i]})`
       );
     }
+    manifestRows.push(have);
   }
 
   // 6. Compute file hash + total size from the collected sizes (which
   //    are already verified against the client list).
   let totalSize = 0;
-  for (let i = 0; i < session.total_chunks; i++) {
-    totalSize += collected.get(i)!.size;
+  for (const row of manifestRows) {
+    totalSize += row.size;
   }
   // file_hash := SHA-256(concat-as-utf8 of chunk_hashes), matches the
   // existing vfsWriteFile / vfsCommitWriteStream formula.
@@ -666,223 +730,345 @@ export async function vfsFinalizeMultipart(
   //   (b) call `commitVersion` to insert the file_versions row and
   //       move `files.head_version_id` ATOMICALLY — the prior
   //       version's row + chunks survive;
-  //   (c) NOT call `commitRename` (whose hard-delete branch would
-  //       silently destroy prior history under versioning).
+  //   (c) reuse an existing path identity without `commitRename`; a
+  //       no-prior-path finalize uses its vacancy-guarded publication hook.
   // The non-versioned branch keeps `commitRename`'s hard-delete
   // supersede — correct semantics for versioning-off tenants.
   const versioning = isVersioningEnabled(durableObject, userId);
   const now = Date.now();
+  const commitTags =
+    session.tags_json === null
+      ? undefined
+      : (JSON.parse(session.tags_json) as string[]);
+  const commitMetadata =
+    session.metadata_blob === null
+      ? undefined
+      : session.metadata_blob.byteLength === 0
+        ? null
+        : new Uint8Array(session.metadata_blob);
   let finalizedFileId = uploadId;
+  const cleanupFailedPublication = async (
+    versionId?: string
+  ): Promise<void> => {
+    let shouldDrain = false;
+    transactionSync(durableObject, () => {
+      if (versionId !== undefined) {
+        durableObject.sql.exec(
+          "DELETE FROM version_chunks WHERE version_id = ?",
+          versionId
+        );
+      }
+      const current = durableObject.sql
+        .exec(
+          `SELECT status, created_at, expires_at FROM upload_sessions
+            WHERE upload_id = ? AND user_id = ?`,
+          uploadId,
+          userId
+        )
+        .toArray()[0] as
+        | { status: string; created_at: number; expires_at: number }
+        | undefined;
+      const sameOpenSession =
+        current?.status === "open" &&
+        current.created_at === session.created_at &&
+        current.expires_at === session.expires_at;
+      if (sameOpenSession) {
+        const now = Date.now();
+        for (let shardIndex = 0; shardIndex < session.pool_size; shardIndex++) {
+          stageChunkCleanupIntent(
+            durableObject,
+            uploadId,
+            shardIndex,
+            now,
+            now,
+            ChunkCleanupKind.Multipart
+          );
+        }
+        durableObject.sql.exec(
+          `UPDATE upload_sessions SET status = 'aborted'
+            WHERE upload_id = ? AND user_id = ? AND status = 'open'
+              AND created_at = ? AND expires_at = ?`,
+          uploadId,
+          userId,
+          session.created_at,
+          session.expires_at
+        );
+        if (lastSqlChanges(durableObject) !== 1) {
+          throw new VFSError(
+            "EBUSY",
+            "finalizeMultipart: session changed during cleanup"
+          );
+        }
+        dropTmpRowAfterVersionCommit(durableObject, uploadId, {
+          hasChunks: true,
+        });
+        shouldDrain = true;
+      } else if (
+        current?.status === "aborted" ||
+        current?.status === "poisoned"
+      ) {
+        const now = Date.now();
+        for (let shardIndex = 0; shardIndex < session.pool_size; shardIndex++) {
+          stageChunkCleanupIntent(
+            durableObject,
+            uploadId,
+            shardIndex,
+            now,
+            now,
+            ChunkCleanupKind.Multipart
+          );
+        }
+        dropTmpRowAfterVersionCommit(durableObject, uploadId, {
+          hasChunks: true,
+        });
+        shouldDrain = true;
+      } else {
+        if (touched.size > 0) {
+          retainMultipartStagingCleanup(durableObject, uploadId, Date.now());
+        }
+      }
+    });
+    if (shouldDrain) {
+      await drainChunkCleanupIntents(durableObject, scope, uploadId);
+    }
+  };
 
   if (versioning) {
     // Locate the pre-existing live row at (parent, leaf), if any. Its
     // file_id is the stable `pathId` for this path's history; the
     // multipart's tmp row will be discarded once the version is
     // committed.
-    const liveRow = findLiveFile(
-      durableObject,
-      userId,
-      session.parent_id,
-      session.leaf
-    );
     let pathId: string;
-    if (liveRow) {
+    if (destinationRow) {
       // Existing path — reuse its identity. The new version attaches
       // to it via `head_version_id`. The multipart tmp row is dropped
       // at the end of this branch (its chunks now belong to the
       // version, refid = uploadId).
-      pathId = liveRow.file_id;
+      pathId = destinationRow.file_id;
     } else {
-      // No prior path: promote the multipart tmp row to the live row
-      // by `commitRename`, making `tmpId` the path's permanent
-      // identity. Chunks were filed under `refId = uploadId = tmpId`
-      // at upload time; `pathId` therefore equals the refId, but the
-      // version below records `shard_ref_id = uploadId` explicitly
-      // so the GC path is uniform with the live-prior case.
-      await commitRename(
-        durableObject,
-        userId,
-        scope,
-        uploadId,
-        session.parent_id,
-        session.leaf
-      );
       pathId = uploadId;
     }
     finalizedFileId = pathId;
-
-    // Apply commit-time metadata + tags to the path's stable row,
-    // before the version is committed (so subsequent reads of the
-    // metadata-from-files denormalization match what the version
-    // captures).
-    if (session.metadata_blob !== null) {
-      durableObject.sql.exec(
-        "UPDATE files SET metadata = ? WHERE file_id = ?",
-        session.metadata_blob,
-        pathId
-      );
-    }
-    if (session.tags_json !== null) {
-      const tags = JSON.parse(session.tags_json) as string[];
-      const { replaceTags } = await import("./metadata-tags");
-      replaceTags(durableObject, userId, pathId, tags);
-    }
-
-    // Insert version_chunks rows for the newly-finalized version.
-    // The version_id is fresh; the chunks themselves already live on
-    // ShardDOs under refId = uploadId, recorded in shard_ref_id below.
-    const versionId = generateId();
-    for (let i = 0; i < session.total_chunks; i++) {
-      const row = collected.get(i)!;
-      insertVersionChunk(durableObject, versionId, {
-        chunk_index: i,
-        chunk_hash: row.hash,
-        chunk_size: row.size,
-        shard_index: idxToShard[i],
-      });
-    }
-
-    // commitVersion: inserts the file_versions row AND atomically
-    // moves files.head_version_id to it. Prior versions / chunks
-    // remain — the data preservation invariant.
-    commitVersion(durableObject, {
-      pathId,
-      versionId,
+    const expectedHead: VersionedFileExpectation = {
+      fileId: pathId,
       userId,
-      size: totalSize,
-      mode: session.mode,
-      mtimeMs: now,
-      chunkSize: session.chunk_size,
-      chunkCount: session.total_chunks,
-      fileHash,
-      mimeType: session.mime_type,
-      inlineData: null,
-      userVisible: session.version_user_visible !== 0,
-      label: session.version_label,
-      shardRefId: uploadId,
-      encryption: session.encryption_mode !== null
-        ? {
-            mode: session.encryption_mode as "convergent" | "random",
-            keyId: session.encryption_key_id ?? undefined,
+      parentId: session.parent_id,
+      fileName: session.leaf,
+      headVersionId: destinationRow?.head_version_id ?? null,
+    };
+    const versionId = generateId();
+    const metadataForVersion =
+      commitMetadata !== undefined
+        ? commitMetadata
+        : destinationRow
+          ? readMetadataBytes(durableObject, pathId)
+          : null;
+    const finalizeVersion = (): void => {
+      for (const [i, row] of manifestRows.entries()) {
+        insertVersionChunk(durableObject, versionId, {
+          chunk_index: i,
+          chunk_hash: row.hash,
+          chunk_size: row.size,
+          shard_index: idxToShard[i],
+        });
+      }
+      if (commitMetadata !== undefined) {
+        durableObject.sql.exec(
+          "UPDATE files SET metadata = ? WHERE file_id = ?",
+          commitMetadata,
+          pathId
+        );
+      }
+      if (commitTags !== undefined) {
+        replaceTags(durableObject, userId, pathId, commitTags);
+      }
+      commitVersionChecked(
+        durableObject,
+        {
+          pathId,
+          versionId,
+          userId,
+          size: totalSize,
+          mode: session.mode,
+          mtimeMs: now,
+          chunkSize: session.chunk_size,
+          chunkCount: session.total_chunks,
+          fileHash,
+          mimeType: session.mime_type,
+          inlineData: null,
+          userVisible: session.version_user_visible !== 0,
+          label: session.version_label,
+          metadata: metadataForVersion,
+          shardRefId: uploadId,
+          encryption:
+            session.encryption_mode !== null
+              ? {
+                  mode: session.encryption_mode as "convergent" | "random",
+                  keyId: session.encryption_key_id ?? undefined,
+                }
+              : undefined,
+        },
+        expectedHead,
+        "finalizeMultipart"
+      );
+      durableObject.sql.exec(
+        `UPDATE upload_sessions SET status = 'finalized'
+          WHERE upload_id = ? AND user_id = ? AND status = 'open'
+            AND created_at = ? AND expires_at = ?`,
+        uploadId,
+        userId,
+        session.created_at,
+        session.expires_at
+      );
+      if (lastSqlChanges(durableObject) !== 1) {
+        throw new VFSError(
+          "EBUSY",
+          "finalizeMultipart: session changed during publication"
+        );
+      }
+      if (touched.size > 0) {
+        retainMultipartStagingCleanup(durableObject, uploadId, Date.now());
+      }
+    };
+
+    let cleanupArmed = false;
+    try {
+      await stageChunkCleanupIntents(durableObject, uploadId, touched);
+      cleanupArmed = true;
+      if (destinationRow) {
+        await scheduleStaleUploadSweep(durableObject);
+        transactionSync(durableObject, () => {
+          assertSessionState();
+          finalizeVersion();
+          dropTmpRowAfterVersionCommit(durableObject, uploadId, {
+            hasChunks: true,
+          });
+          bumpFolderRevision(durableObject, userId, session.parent_id);
+        });
+      } else {
+        await commitRename(
+          durableObject,
+          userId,
+          scope,
+          uploadId,
+          session.parent_id,
+          session.leaf,
+          {
+            requireVacantDestination: true,
+            preconditionLocal: assertSessionState,
+            finalizeLocal: finalizeVersion,
           }
-        : undefined,
-    });
-
-    // When the prior live row was reused as `pathId`, the multipart
-    // tmp `files` row is now redundant. Drop it WITHOUT chunk
-    // fan-out: its chunks are owned by the new version_chunks rows
-    // (and the chunk_refs on shards remain valid under
-    // refId = uploadId). Calling `hardDeleteFileRow` here would
-    // dispatch `deleteChunks(uploadId)` to every shard and reap the
-    // chunks the version we just committed depends on.
-    if (liveRow) {
-      dropTmpRowAfterVersionCommit(durableObject, uploadId, {
-        hasChunks: true,
-      });
-    }
-    // (no-prior-row case: commitRename already promoted the tmp row,
-    //  and the file_chunks / metadata / tags it carried are intact;
-    //  the row IS the path's identity so we keep it.)
-
-    // Versioned multipart finalize advanced head_version_id on an
-    // existing path. commitRename only fires (and self-bumps) in
-    // the no-prior-row branch above; the prior-row branch needs an
-    // explicit bump so listChildren observers see the new head.
-    if (liveRow) {
-      bumpFolderRevision(durableObject, userId, session.parent_id);
+        );
+      }
+    } catch (err) {
+      if (!cleanupArmed) throw err;
+      await cleanupFailedPublication(versionId);
+      throw err;
     }
   } else {
     // Non-versioned tenant — commitRename hard-deletes any prior
     // live row, which is correct semantics for versioning-off (no
     // history to keep).
 
-    // 7. Batch-insert file_chunks rows. SQLite supports multi-row
-    //    VALUES; we go per-row in a tight loop because the DO's bound-
-    //    parameter limit is around 100 in practice, and this stays
-    //    inside one DO turn so it's still atomic.
-    for (let i = 0; i < session.total_chunks; i++) {
-      const row = collected.get(i)!;
-      durableObject.sql.exec(
-        `INSERT INTO file_chunks (file_id, chunk_index, chunk_hash, chunk_size, shard_index)
-         VALUES (?, ?, ?, ?, ?)`,
+    let cleanupArmed = false;
+    try {
+      await stageChunkCleanupIntents(durableObject, uploadId, touched);
+      cleanupArmed = true;
+      await commitRename(
+        durableObject,
+        userId,
+        scope,
         uploadId,
-        i,
-        row.hash,
-        row.size,
-        idxToShard[i]
+        session.parent_id,
+        session.leaf,
+        {
+          requireVacantDestination: destinationRow === undefined,
+          expectedDestination: destinationRow
+            ? {
+                fileId: destinationRow.file_id,
+                headVersionId: destinationRow.head_version_id,
+              }
+            : undefined,
+          publicationEncryption:
+            session.encryption_mode === null
+              ? null
+              : {
+                  mode: session.encryption_mode as "convergent" | "random",
+                  ...(session.encryption_key_id === null
+                    ? {}
+                    : { keyId: session.encryption_key_id }),
+                },
+          preconditionLocal: assertSessionState,
+          finalizeLocal: () => {
+            for (const [i, row] of manifestRows.entries()) {
+              durableObject.sql.exec(
+                `INSERT INTO file_chunks (file_id, chunk_index, chunk_hash, chunk_size, shard_index)
+                 VALUES (?, ?, ?, ?, ?)`,
+                uploadId,
+                i,
+                row.hash,
+                row.size,
+                idxToShard[i]
+              );
+            }
+            durableObject.sql.exec(
+              `UPDATE files
+                  SET file_size = ?, chunk_count = ?, file_hash = ?, updated_at = ?
+                WHERE file_id = ?`,
+              totalSize,
+              session.total_chunks,
+              fileHash,
+              now,
+              uploadId
+            );
+            if (commitMetadata !== undefined) {
+              durableObject.sql.exec(
+                "UPDATE files SET metadata = ? WHERE file_id = ?",
+                commitMetadata,
+                uploadId
+              );
+            }
+            if (commitTags !== undefined) {
+              replaceTags(durableObject, userId, uploadId, commitTags);
+            }
+            if (session.encryption_mode !== null) {
+              stampFileEncryption(durableObject, uploadId, {
+                mode: session.encryption_mode as "convergent" | "random",
+                keyId: session.encryption_key_id ?? undefined,
+              });
+            }
+            recordWriteUsage(durableObject, userId, totalSize, 1);
+            durableObject.sql.exec(
+              `UPDATE upload_sessions SET status = 'finalized'
+                WHERE upload_id = ? AND user_id = ? AND status = 'open'
+                  AND created_at = ? AND expires_at = ?`,
+              uploadId,
+              userId,
+              session.created_at,
+              session.expires_at
+            );
+            if (lastSqlChanges(durableObject) !== 1) {
+              throw new VFSError(
+                "EBUSY",
+                "finalizeMultipart: session changed during publication"
+              );
+            }
+            if (touched.size > 0) {
+              retainMultipartStagingCleanup(durableObject, uploadId, Date.now());
+            }
+          },
+        }
       );
-    }
-
-    // 8. Update tmp `files` row with size/file_hash/chunk_count. mode/
-    //    mime_type were stamped at begin and remain.
-    durableObject.sql.exec(
-      `UPDATE files
-          SET file_size = ?, chunk_count = ?, file_hash = ?, updated_at = ?
-        WHERE file_id = ?`,
-      totalSize,
-      session.total_chunks,
-      fileHash,
-      now,
-      uploadId
-    );
-
-    // 9. Apply commit-time payload (metadata, tags) BEFORE rename.
-    if (session.metadata_blob !== null) {
-      durableObject.sql.exec(
-        "UPDATE files SET metadata = ? WHERE file_id = ?",
-        session.metadata_blob,
-        uploadId
-      );
-    }
-    if (session.tags_json !== null) {
-      const tags = JSON.parse(session.tags_json) as string[];
-      const { replaceTags } = await import("./metadata-tags");
-      replaceTags(durableObject, userId, uploadId, tags);
-    }
-
-    // 10. Atomic supersede via existing commitRename. If a live row
-    //     exists at (parent, leaf), it's hard-deleted (chunks GC'd via
-    //     deleteChunks fan-out inside hardDeleteFileRow).
-    await commitRename(
-      durableObject,
-      userId,
-      scope,
-      uploadId,
-      session.parent_id,
-      session.leaf
-    );
-  }
-
-  // 11. Record bytes against quota + grow pool size if we crossed a
-  //     5 GB boundary. Must run AFTER commitRename succeeds (we own
-  //     the row) but BEFORE marking the session finalized so a
-  //     post-finalize crash doesn't double-count on retry.
-  //
-  // Only fires for the non-versioning branch. commitVersion (the
-  // versioning branch above) self-accounts via recordWriteUsage;
-  // calling here too would double-count bytes + file_count on
-  // every versioning multipart finalize.
-  if (!versioning) {
-    recordWriteUsage(durableObject, userId, totalSize, 1);
-  }
-
-  // 12. Mark session finalized + clear staging across touched shards.
-  durableObject.sql.exec(
-    "UPDATE upload_sessions SET status = 'finalized' WHERE upload_id = ?",
-    uploadId
-  );
-  await Promise.all(
-    Array.from(touched).map(async (sIdx) => {
-      const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, sIdx);
-      const stub = ns.get(ns.idFromName(shardName));
-      try {
-        await stub.clearMultipartStaging(uploadId);
-      } catch {
-        // Best-effort; orphan staging rows are reaped by the alarm
-        // sweeper at session expiry.
+    } catch (err) {
+      if (cleanupArmed) {
+        await cleanupFailedPublication();
       }
-    })
-  );
+      throw err;
+    }
+  }
+
+  // 11. Clear staging across touched shards after local publication commits.
+  await clearMultipartStaging(durableObject, scope, touched, uploadId);
 
   // 13. Reconstruct the absolute path from (parent_id, leaf) so the
   //     route layer can dispatch follow-on side effects
@@ -903,6 +1089,16 @@ export async function vfsFinalizeMultipart(
     mimeType: session.mime_type,
     isEncrypted: session.encryption_mode !== null,
   };
+}
+
+async function clearMultipartStaging(
+  durableObject: UserDO,
+  scope: VFSScope,
+  touched: Iterable<number>,
+  uploadId: string
+): Promise<void> {
+  void touched;
+  await drainChunkCleanupIntents(durableObject, scope, uploadId);
 }
 
 /**
@@ -998,10 +1194,9 @@ export async function vfsGetMultipartStatus(
 }
 
 /**
- * Cap on how many times the alarm sweeper retries
- * `vfsAbortMultipart` on a single session before giving up. After
- * the cap, the row flips to status='poisoned' so future sweeps
- * skip it and the operator can investigate via Logpush.
+ * Cap on local abort failures for one expired session. Remote shard failures
+ * do not consume this budget because their committed outbox intents retry
+ * independently.
  *
  * 5 attempts × ~10 minute alarm cadence = ~50 minutes of retries
  * before declaring the session unrecoverable. Generous given that
@@ -1018,15 +1213,9 @@ export const MULTIPART_MAX_ABORT_ATTEMPTS = 5;
  * `vfsAbortMultipart` — flips status, fans out cleanup, hard-deletes
  * the tmp files row.
  *
- * P1-5 fix — failure handling. Pre-fix, a `vfsAbortMultipart`
- * throw flipped status to 'aborted' immediately and the row was
- * invisible to subsequent sweeps. Chunks staged on the shards
- * stayed refcounted forever — permanent shard storage leak per
- * transient error. Now the catch path BUMPS the `attempts`
- * counter and leaves status='open' so the next sweep retries.
- * Only after MULTIPART_MAX_ABORT_ATTEMPTS does the row flip to
- * 'poisoned' (a NEW status, distinct from 'aborted'/'finalized')
- * so an operator can find it via Logpush + manually reconcile.
+ * A local transaction failure increments `attempts` and leaves the session
+ * open. After the cap, `poisoned` keeps the corrupt session operator-visible.
+ * Once the local transaction commits, shard cleanup is owned by the outbox.
  */
 export async function sweepExpiredMultipartSessions(
   durableObject: UserDO,
@@ -1054,11 +1243,9 @@ export async function sweepExpiredMultipartSessions(
     } catch (err) {
       const nextAttempts = (row.attempts ?? 0) + 1;
       if (nextAttempts >= MULTIPART_MAX_ABORT_ATTEMPTS) {
-        // Give up — flip to the distinct 'poisoned' status so an
-        // operator can find these via Logpush + manually
-        // reconcile (the staged chunks on shards still hold
-        // chunk_refs under the upload_id; an admin script can
-        // call deleteChunks(upload_id) per shard to free them).
+        // Give up on a repeatedly failing local transition and keep the row
+        // operator-visible. No terminal state was committed, so no outbox
+        // intent can safely replace this retry yet.
         durableObject.sql.exec(
           `UPDATE upload_sessions
               SET status = 'poisoned', attempts = ?
@@ -1099,9 +1286,6 @@ export async function sweepExpiredMultipartSessions(
       )
       .toArray()[0] as { n: number }
   ).n;
-
-  // Suppress unused warning for the existing helper signature.
-  void hardDeleteFileRow;
 
   return { swept: stale.length, remaining: stillOpen > 0 };
 }

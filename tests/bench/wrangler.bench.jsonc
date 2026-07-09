@@ -1,0 +1,21 @@
+{
+  "name": "mossaic-storage-bench",
+  "main": "./test-worker.ts",
+  "compatibility_date": "2025-09-06",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": {
+    "bindings": [
+      { "name": "MOSSAIC_USER", "class_name": "BenchmarkUserDO" },
+      { "name": "MOSSAIC_SHARD", "class_name": "BenchmarkShardDO" }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["BenchmarkUserDO", "BenchmarkShardDO"]
+    }
+  ],
+  "vars": {
+    "JWT_SECRET": "benchmark-only-secret"
+  }
+}

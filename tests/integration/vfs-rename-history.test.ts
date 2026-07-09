@@ -264,4 +264,36 @@ describe("Phase 52 P1-2 — vfsRename overwrite preserves dst history under vers
     const aBytes = await vfs.readFile("/A.txt", { encoding: "utf8" });
     expect(aBytes).toBe("b3");
   });
+
+  it("renames a head containing repeated identical chunks", async () => {
+    const tenant = "rename-repeated-version-chunks";
+    const vfs = createVFS(envFor(), { tenant, versioning: "enabled" });
+    const repeated = new Uint8Array(2 * 1024 * 1024).fill(0x72);
+    await vfs.writeFile("/destination.bin", "old destination");
+    await vfs.writeFile("/source.bin", repeated);
+
+    await vfs.rename("/source.bin", "/destination.bin");
+
+    expect(await vfs.exists("/source.bin")).toBe(false);
+    expect(await vfs.readFile("/destination.bin")).toEqual(repeated);
+    const manifest = await runInDurableObject(
+      E.MOSSAIC_USER.get(
+        E.MOSSAIC_USER.idFromName(vfsUserDOName("default", tenant))
+      ),
+      async (_instance, state) => {
+        return state.storage.sql
+          .exec(
+            `SELECT vc.chunk_hash, vc.shard_index
+               FROM files f
+               JOIN version_chunks vc ON vc.version_id = f.head_version_id
+              WHERE f.file_name = 'destination.bin'
+              ORDER BY vc.chunk_index`
+          )
+          .toArray() as { chunk_hash: string; shard_index: number }[];
+      }
+    );
+    expect(manifest).toHaveLength(2);
+    expect(new Set(manifest.map((chunk) => chunk.chunk_hash)).size).toBe(1);
+    expect(new Set(manifest.map((chunk) => chunk.shard_index)).size).toBe(1);
+  });
 });

@@ -260,4 +260,29 @@ describe("SDK manual multipart", () => {
       encryption: { mode: "convergent", keyId: "test-key" },
     })).rejects.toThrow(/EINVAL/);
   });
+
+  it("M11 — finalize applies explicit metadata and tag clears", async () => {
+    const vfs = await clientFor("mp-manual-11");
+    const path = "/manual-clear.bin";
+    await vfs.writeFile(path, new Uint8Array([1]), {
+      metadata: { stale: true },
+      tags: ["stale"],
+    });
+    const data = makeBytes(2_048, 11);
+    const handle = await vfs.beginMultipartUpload(path, {
+      size: data.byteLength,
+      chunkSize: 1_024,
+      metadata: null,
+      tags: [],
+    });
+    const hashes: string[] = [];
+    for (const [index, chunk] of sliceChunks(data, handle.chunkSize).entries()) {
+      hashes.push((await vfs.putMultipartChunk(handle, index, chunk)).chunkHash);
+    }
+    await vfs.finalizeMultipartUpload(handle, hashes);
+
+    const info = await vfs.fileInfo(path, { includeMetadata: true });
+    expect(info.metadata).toBeNull();
+    expect(info.tags).toEqual([]);
+  });
 });

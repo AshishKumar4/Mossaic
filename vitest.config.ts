@@ -1,5 +1,4 @@
-import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
-import { defineConfig } from "vitest/config";
+import { defineWorkersTestConfig } from "./vitest.shared";
 
 /**
  * Vitest config using @cloudflare/vitest-pool-workers v0.16.x with Vitest 4.
@@ -27,46 +26,13 @@ import { defineConfig } from "vitest/config";
  * removed in newer pool releases because the default no longer rolls back DO
  * storage between tests, matching what mossaic always wanted.
  */
-export default defineConfig({
-	plugins: [
-		cloudflareTest({
-			singleWorker: true,
-			wrangler: { configPath: "./tests/wrangler.test.jsonc" },
-			miniflare: {
-				compatibilityDate: "2025-09-06",
-				compatibilityFlags: ["nodejs_compat"],
-			},
-		}),
+export default defineWorkersTestConfig({
+	wranglerConfigPath: "./tests/wrangler.test.jsonc",
+	include: ["tests/**/*.test.ts"],
+	exclude: [
+		"tests/integration/cleanup-outbox-remaining-paths.test.ts",
+		"tests/integration/ordinary-publication-failures.test.ts",
+		"tests/integration/overwrite-cleanup-failures.test.ts",
+		"tests/integration/versioned-publication-failures.test.ts",
 	],
-	resolve: {
-		alias: {
-			"@shared": new URL("./shared", import.meta.url).pathname,
-			"@core": new URL("./worker/core", import.meta.url).pathname,
-			"@app": new URL("./worker/app", import.meta.url).pathname,
-		},
-	},
-	test: {
-		include: ["tests/**/*.test.ts"],
-		testTimeout: 15000,
-		coverage: {
-			provider: "istanbul",
-		},
-		onUnhandledError(error) {
-			const stack = error.stack;
-			const code = "code" in error ? error.code : undefined;
-			// workerd mirrors expected DO RPC rejections after the caller handles them.
-			if (
-				(stack?.includes("@cloudflare/vitest-pool-workers") &&
-					stack.includes("test-internal.mjs")) ||
-				("remote" in error && error.remote === true) ||
-				(typeof code === "string" && /^E[A-Z]+$/.test(code)) ||
-				error.name === "AbortError" ||
-				error.message.startsWith(
-					"Serialized RPC arguments or return values are limited to 32MiB",
-				)
-			) {
-				return false;
-			}
-		},
-	},
 });

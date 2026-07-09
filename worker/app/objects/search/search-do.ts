@@ -26,8 +26,12 @@ export class SearchDO extends DurableObject<Env> {
 
   private ensureInit(): void {
     if (this.initialized) return;
-    this.initialized = true;
 
+    this.ctx.storage.transactionSync(() => this.initializeSchema());
+    this.initialized = true;
+  }
+
+  private initializeSchema(): void {
     ensureMigrationsTable(this.sql);
 
     // Main vectors table with space column for multi-modal support

@@ -16,8 +16,12 @@ export class ShardDO extends DurableObject<Env> {
 
   private ensureInit(): void {
     if (this.initialized) return;
-    this.initialized = true;
 
+    this.ctx.storage.transactionSync(() => this.initializeSchema());
+    this.initialized = true;
+  }
+
+  private initializeSchema(): void {
     ensureMigrationsTable(this.sql);
 
     this.sql.exec(`
@@ -627,8 +631,8 @@ export class ShardDO extends DurableObject<Env> {
   // ── VFS GC RPC surface (sdk-impl-plan §8.2) ────────────────────────────
   //
   // Public DO RPC. Called from UserDO's vfsUnlink / vfsCommitWrite /
-  // vfsRename overwrite path. Drops one (chunk_hash, file_id) ref per
-  // chunk_refs row; decrements `ref_count` on chunks; soft-marks any
+  // vfsRename overwrite path. Drops every ref for the file, decrements
+  // each chunk's `ref_count` by its grouped ref count, and soft-marks any
   // chunk that hits ref_count=0 by setting `deleted_at`. The alarm
   // sweeper (alarm() handler) hard-deletes after a 30s grace window,
   // re-checking ref_count to absorb resurrection races where a
@@ -651,15 +655,15 @@ export class ShardDO extends DurableObject<Env> {
    * 1000.
    *
    * This RPC accepts an array of file_ids and processes them in
-   * a single DO turn (one SQL transaction). The caller groups
+   * a single DO turn. The caller groups
    * file_ids by shard_index FIRST, then issues ONE RPC per shard
    * with the full list — worst case poolSize subrequests
    * regardless of BATCH_LIMIT.
    *
-   * Idempotent per fileId: \`removeFileRefs\` does nothing on a
-   * file_id with no chunk_refs (the SELECT returns 0 rows; the
-   * loop body is a no-op). Total \`marked\` is the sum across
-   * input file_ids.
+   * Idempotent per fileId: a file_id with no chunk_refs produces no
+   * refcount change or new soft mark. Total \`marked\` is the sum across
+   * input file_ids. One alarm ensure covers the bounded synchronous
+   * sequence of per-file transactions.
    *
    * Bounded input: callers should chunk arrays > 1000 into
    * multiple RPCs to stay under any future SQLite parameter
@@ -671,9 +675,12 @@ export class ShardDO extends DurableObject<Env> {
     fileIds: readonly string[]
   ): Promise<{ marked: number }> {
     this.ensureInit();
+    if (fileIds.length === 0) return { marked: 0 };
+
+    await this.scheduleSweep();
     let totalMarked = 0;
     for (const fileId of fileIds) {
-      const r = await this.removeFileRefs(fileId);
+      const r = this.removeFileRefsTransaction(fileId);
       totalMarked += r.marked;
     }
     return { marked: totalMarked };
@@ -846,61 +853,61 @@ export class ShardDO extends DurableObject<Env> {
   }
 
   /**
-   * Drop refs for a fileId. For each ref: delete the chunk_refs row,
-   * decrement ref_count, soft-mark with `deleted_at` if it hit 0. The
-   * alarm handler does the actual hard-delete after a grace period.
+   * Drop all refs for a fileId in one explicit synchronous transaction.
+   * Refcounts are decremented by the grouped number of matching indices,
+   * chunks that first reach zero are soft-marked, and the source refs are
+   * then deleted. The alarm handler does the hard-delete after a grace period.
    *
    * Per-call observable side-effects:
    *   - chunk_refs rows for this fileId removed
    *   - chunks.ref_count decremented
    *   - chunks.deleted_at set on rows that hit 0
-   *   - alarm scheduled if any chunk was marked
+   *   - a future alarm is ensured before any ref deletion commits
    *
    * @lean-invariant Mossaic.Generated.ShardDO.chunk_invariant_preserved
    *   The Lean state-machine proves preservation for its abstract
-   *   deleteChunks transition, not this SQL/async implementation.
+   *   deleteChunks transition, not this SQL implementation.
    */
   private async removeFileRefs(fileId: string): Promise<{ marked: number }> {
-    let marked = 0;
+    await this.scheduleSweep();
+    return this.removeFileRefsTransaction(fileId);
+  }
 
-    const refs = this.sql
-      .exec("SELECT chunk_hash FROM chunk_refs WHERE file_id = ?", fileId)
-      .toArray() as { chunk_hash: string }[];
-
-    for (const { chunk_hash } of refs) {
+  private removeFileRefsTransaction(fileId: string): { marked: number } {
+    const deletedAt = Date.now();
+    return this.ctx.storage.transactionSync(() => {
       this.sql.exec(
-        "DELETE FROM chunk_refs WHERE chunk_hash = ? AND file_id = ?",
-        chunk_hash,
+        `UPDATE chunks
+            SET ref_count = MAX(0, ref_count - (
+              SELECT COUNT(*)
+                FROM chunk_refs
+               WHERE file_id = ? AND chunk_hash = chunks.hash
+            ))
+          WHERE hash IN (
+            SELECT chunk_hash FROM chunk_refs WHERE file_id = ?
+          )`,
+        fileId,
         fileId
       );
 
       this.sql.exec(
-        "UPDATE chunks SET ref_count = MAX(0, ref_count - 1) WHERE hash = ?",
-        chunk_hash
+        `UPDATE chunks
+            SET deleted_at = ?
+          WHERE ref_count = 0
+            AND deleted_at IS NULL
+            AND hash IN (
+              SELECT chunk_hash FROM chunk_refs WHERE file_id = ?
+            )`,
+        deletedAt,
+        fileId
       );
+      const marked = (
+        this.sql.exec("SELECT changes() AS n").toArray()[0] as { n: number }
+      ).n;
 
-      const r = this.sql
-        .exec("SELECT ref_count FROM chunks WHERE hash = ?", chunk_hash)
-        .toArray()[0] as { ref_count: number } | undefined;
-
-      if (r && r.ref_count === 0) {
-        // First-to-zero wins the soft-mark. The `deleted_at IS NULL`
-        // guard means a chunk already marked (e.g. in a prior unlink
-        // that didn't fully sweep yet) keeps its earlier timestamp,
-        // which is fine — the grace window is measured from that.
-        this.sql.exec(
-          "UPDATE chunks SET deleted_at = ? WHERE hash = ? AND deleted_at IS NULL",
-          Date.now(),
-          chunk_hash
-        );
-        marked++;
-      }
-    }
-
-    if (marked > 0) {
-      await this.scheduleSweep();
-    }
-    return { marked };
+      this.sql.exec("DELETE FROM chunk_refs WHERE file_id = ?", fileId);
+      return { marked };
+    });
   }
 
   /**

@@ -72,7 +72,10 @@ describe("Phase 32 Fix 2 — server-authoritative pool size", () => {
     // non-inline payload to exercise the chunked-write code
     // path the test asserts on.
     const data = new Uint8Array(20 * 1024).fill(7);
-    await stub.vfsAppendWriteStream(scope, tamperedHandle, 0, data);
+    await expect(
+      stub.vfsAppendWriteStream(scope, tamperedHandle, 0, data)
+    ).rejects.toThrow(/handle was modified/);
+    await stub.vfsAppendWriteStream(scope, handle, 0, data);
 
     const recordedShard = await runInDurableObject(
       stub,

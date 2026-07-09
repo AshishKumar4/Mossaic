@@ -111,6 +111,40 @@ describe("copyFile inline-tier (C1)", () => {
   });
 });
 
+describe("copyFile initial version publication", () => {
+  it("does not expose a destination row when its initial version insert fails", async () => {
+    const tenant = "copy-initial-version-rollback";
+    const vfs = createVFS(envFor(), { tenant, versioning: "enabled" });
+    const stub = userStub(tenant);
+    await vfs.writeFile("/src.txt", "source");
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec(`
+        CREATE TRIGGER fail_initial_copy_version
+        BEFORE INSERT ON file_versions
+        BEGIN
+          SELECT RAISE(ABORT, 'injected initial copy version failure');
+        END
+      `);
+    });
+
+    await expect(vfs.copyFile("/src.txt", "/dest.txt")).rejects.toThrow(
+      /injected initial copy version failure/
+    );
+
+    const destination = await runInDurableObject(
+      stub,
+      async (_instance, state) => {
+        return state.storage.sql
+          .exec(
+            "SELECT file_id, head_version_id FROM files WHERE file_name = 'dest.txt' AND status = 'complete'"
+          )
+          .toArray();
+      }
+    );
+    expect(destination).toEqual([]);
+  });
+});
+
 describe("copyFile chunked-tier (C2)", () => {
   it("chunked copy bumps refcount by 1 per chunk, no new chunks created", async () => {
     const tenant = "p12-cp-chunked";
@@ -189,6 +223,37 @@ describe("copyFile chunked-tier (C2)", () => {
     // dest readback equals src bytes.
     const destBytes = await vfs.readFile("/big-copy.bin");
     expect(destBytes.byteLength).toBe(big.byteLength);
+  });
+
+  it("copies repeated identical version chunks on one shard", async () => {
+    const tenant = "copy-repeated-version-chunks";
+    const vfs = createVFS(envFor(), { tenant, versioning: "enabled" });
+    const repeated = new Uint8Array(2 * 1024 * 1024).fill(0x52);
+    await vfs.writeFile("/repeated.bin", repeated);
+
+    const sourceManifest = await runInDurableObject(
+      userStub(tenant),
+      async (_instance, state) => {
+        return state.storage.sql
+          .exec(
+            `SELECT vc.chunk_hash, vc.shard_index
+               FROM files f
+               JOIN version_chunks vc ON vc.version_id = f.head_version_id
+              WHERE f.file_name = 'repeated.bin'
+              ORDER BY vc.chunk_index`
+          )
+          .toArray() as { chunk_hash: string; shard_index: number }[];
+      }
+    );
+    expect(sourceManifest).toHaveLength(2);
+    expect(new Set(sourceManifest.map((chunk) => chunk.chunk_hash)).size).toBe(1);
+    expect(new Set(sourceManifest.map((chunk) => chunk.shard_index)).size).toBe(1);
+
+    await vfs.copyFile("/repeated.bin", "/repeated-copy.bin");
+
+    expect(await vfs.readFile("/repeated-copy.bin")).toEqual(repeated);
+    const chunk = sourceManifest[0]!;
+    expect(await chunkRefCount(tenant, chunk.shard_index, chunk.chunk_hash)).toBe(4);
   });
 });
 

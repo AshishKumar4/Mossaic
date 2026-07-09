@@ -1,0 +1,27 @@
+{
+	"extends": "./tsconfig.test.json",
+	"compilerOptions": {
+		"incremental": false
+	},
+	"include": [
+		"tests/test-worker.ts",
+		"tests/integration/copy-file.test.ts",
+		"tests/integration/cleanup-outbox-remaining-paths.test.ts",
+		"tests/integration/internal-rpc-surface.test.ts",
+		"tests/integration/migration.test.ts",
+		"tests/integration/multipart-versioning.test.ts",
+		"tests/integration/ordinary-publication-failures.test.ts",
+		"tests/integration/overwrite-cleanup-failures.test.ts",
+		"tests/integration/refcount.test.ts",
+		"tests/integration/schema-migrations.test.ts",
+		"tests/integration/sdk-multipart-manual.test.ts",
+		"tests/integration/streaming.test.ts",
+		"tests/integration/tombstone-consistency.test.ts",
+		"tests/integration/versioned-publication-failures.test.ts",
+		"tests/integration/vfs-rename-history.test.ts",
+		"tests/integration/vfs-state-machine.test.ts",
+		"tests/unit/vitest-unhandled-errors.test.ts",
+		"tests/types/internal-storage.ts",
+		"vitest-unhandled-errors.ts"
+	]
+}

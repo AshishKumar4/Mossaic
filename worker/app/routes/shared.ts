@@ -51,7 +51,13 @@ shared.get("/:token/photos", async (c) => {
     payload.fileIds.map((fileId) => stub.appGetFile(fileId))
   );
 
-  const photos = [];
+  const photos: Array<{
+    fileId: string;
+    fileName: string;
+    fileSize: number;
+    mimeType: string;
+    createdAt: number;
+  }> = [];
   for (const file of fileResults) {
     if (!file) continue;
     if (file.status !== "complete" || !file.mime_type?.startsWith("image/")) {

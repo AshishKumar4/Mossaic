@@ -1,0 +1,7 @@
+{
+	"extends": "./tsconfig.test.json",
+	"compilerOptions": {
+		"incremental": false
+	},
+	"include": ["tests/bench"]
+}

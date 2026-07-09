@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import type { EnvCore as Env } from "../../../../shared/types";
 import {
+  drainChunkCleanupIntents,
   hardDeleteFileRow,
   vfsAbortWriteStream,
   vfsAppendWriteStream,
@@ -104,6 +105,11 @@ import {
   setVersioningEnabled,
   type VersionRow,
 } from "./vfs-versions";
+import {
+  scheduleAlarmAt,
+  scheduleStaleUploadSweep,
+  transactionSync,
+} from "./internal-storage";
 
 /**
  * P1-7 — hard cap on concurrent Yjs WebSocket clients PER pathId.
@@ -129,6 +135,8 @@ const YJS_WS_WARN_THRESHOLD = 80;
 
 export class UserDOCore extends DurableObject<Env> {
   sql: SqlStorage;
+  state: DurableObjectState;
+  storage: DurableObjectStorage;
   /**
    * Public alias for the protected `env` from the DurableObject base
    * class. vfs-ops needs to dispatch ShardDO subrequests by binding
@@ -152,6 +160,8 @@ export class UserDOCore extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
+    this.state = ctx;
+    this.storage = ctx.storage;
     this.envPublic = env;
   }
 
@@ -182,8 +192,12 @@ export class UserDOCore extends DurableObject<Env> {
    */
   protected ensureInit(): void {
     if (this.initialized) return;
-    this.initialized = true;
 
+    transactionSync(this, () => this.initializeSchema());
+    this.initialized = true;
+  }
+
+  private initializeSchema(): void {
     ensureMigrationsTable(this.sql);
 
     this.sql.exec(`
@@ -552,11 +566,10 @@ export class UserDOCore extends DurableObject<Env> {
 
     // ── Audit H1: stale-upload sweeper bookkeeping ───────────────────────
     //
-    // Plan §7 requires a UserDO `alarm()` that hard-deletes
-    // `_vfs_tmp_*` rows abandoned by a crash mid-write. The alarm
-    // runs without an HTTP/RPC scope, so it cannot synthesize
-    // (ns, tenant, sub) from a request. We persist the DO's scope on
-    // every gated VFS call so the alarm can reconstruct it.
+    // The UserDO alarm hard-deletes abandoned `_vfs_tmp_*` rows and replays
+    // durable chunk-cleanup intents. It runs without an HTTP/RPC scope, so it
+    // cannot synthesize (ns, tenant, sub) from a request. We persist the DO's
+    // scope on every gated VFS call so the alarm can reconstruct routing.
     //
     // `vfs_meta` is a tiny key/value table that survives DO
     // hibernation. We store one row keyed `scope` whose value is a
@@ -576,6 +589,30 @@ export class UserDOCore extends DurableObject<Env> {
       )
     `);
 
+    // Durable outbox for primary file chunk-ref cleanup. CREATE TABLE/INDEX
+    // IF NOT EXISTS makes this additive and safe to replay on existing DOs.
+    // The ref-oriented schema can support additional cleanup producers later
+    // without coupling this tranche to version, Yjs, or variant deletion.
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS chunk_cleanup_intents (
+        ref_id       TEXT NOT NULL,
+        shard_index  INTEGER NOT NULL,
+        cleanup_kind TEXT NOT NULL DEFAULT 'chunks',
+        state        TEXT NOT NULL DEFAULT 'pending',
+        generation   INTEGER NOT NULL DEFAULT 0,
+        provisional  INTEGER NOT NULL DEFAULT 0,
+        created_at   INTEGER NOT NULL,
+        updated_at   INTEGER NOT NULL,
+        next_attempt_at INTEGER NOT NULL DEFAULT 0,
+        attempts     INTEGER NOT NULL DEFAULT 0,
+        last_error   TEXT,
+        PRIMARY KEY (ref_id, shard_index)
+      )
+    `);
+    this.sql.exec(`
+      CREATE INDEX IF NOT EXISTS idx_chunk_cleanup_intents_eligible
+        ON chunk_cleanup_intents(next_attempt_at, created_at, ref_id, shard_index)
+    `);
     // Skip-full-shard placement cache.
     //
     // Persistent per-shard byte-count cache. Refreshed every
@@ -831,6 +868,40 @@ export class UserDOCore extends DurableObject<Env> {
         created_at           INTEGER NOT NULL
       )
     `);
+
+    // Server-owned state for handle-based write streams. Public handles are
+    // round-tripped by callers and therefore cannot be trusted to carry the
+    // destination or commit policy. The tmp id is the only capability-like
+    // lookup key; every other field is reloaded from this row at append and
+    // commit time.
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS write_stream_sessions (
+        tmp_id                TEXT PRIMARY KEY,
+        user_id               TEXT NOT NULL,
+        parent_id             TEXT,
+        leaf                  TEXT NOT NULL,
+        chunk_size            INTEGER NOT NULL,
+        pool_size             INTEGER NOT NULL,
+        metadata_present      INTEGER NOT NULL DEFAULT 0,
+        metadata_blob         BLOB,
+        tags_json             TEXT,
+        version_label         TEXT,
+        version_user_visible  INTEGER,
+        encryption_mode       TEXT,
+        encryption_key_id     TEXT,
+        status                TEXT NOT NULL DEFAULT 'open',
+        inflight_index        INTEGER,
+        inflight_hash         TEXT,
+        inflight_at           INTEGER,
+        expires_at            INTEGER NOT NULL,
+        created_at            INTEGER NOT NULL
+      )
+    `);
+    this.sql.exec(
+      `INSERT OR IGNORE INTO meta_schema (name, applied_at)
+       VALUES ('write_stream_sessions_enabled', ?)`,
+      Date.now()
+    );
     this.sql.exec(`
       CREATE INDEX IF NOT EXISTS idx_upload_sessions_open_expires
         ON upload_sessions(expires_at)
@@ -840,15 +911,9 @@ export class UserDOCore extends DurableObject<Env> {
       CREATE INDEX IF NOT EXISTS idx_upload_sessions_user_status
         ON upload_sessions(user_id, status)
     `);
-    // P1-5 — `attempts` counter for poison-row backoff. Pre-fix,
-    // `sweepExpiredMultipartSessions` flipped status to 'aborted'
-    // on the first vfsAbortMultipart failure, hiding the row from
-    // future sweeps; chunks staged on shards stayed refcounted
-    // forever. Now the catch path bumps `attempts` and leaves
-    // status='open' so the next sweep retries; only after
-    // `MULTIPART_MAX_ABORT_ATTEMPTS` does the row flip to a
-    // distinct `'poisoned'` status (NOT 'aborted') for operator
-    // observability via Logpush.
+    // Local abort failures leave the session open and increment `attempts`.
+    // Remote cleanup failures are tracked independently by the durable
+    // cleanup outbox after the terminal local transaction commits.
     applyMigrationOnce(this.sql, "upload_sessions_add_attempts", () =>
       this.sql.exec(
         "ALTER TABLE upload_sessions ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0"
@@ -1206,82 +1271,74 @@ export class UserDOCore extends DurableObject<Env> {
     }
   }
 
-  /**
-   * Public alias used by the alarm-sweep tests to invoke the
-   * scheduling helper without introspecting private methods.
-   * Production callers reach this via writeFile / beginWriteStream
-   * which schedule the alarm as a side effect of the tmp insert.
-   */
-  scheduleStaleUploadSweep(): Promise<void> {
-    return this.ensureStaleSweepScheduled();
-  }
 
   /**
-   * Ensure an alarm is scheduled within the next ~10 minutes.
-   * Idempotent: leaves an existing earlier alarm in place. Called
-   * from vfs-ops at every tmp-row insert so a crashing tenant gets
-   * its sweep regardless of subsequent traffic.
-   */
-  private async ensureStaleSweepScheduled(): Promise<void> {
-    const cur = await this.ctx.storage.getAlarm();
-    const target = Date.now() + 10 * 60 * 1000; // 10 min cadence
-    if (cur === null || cur > target) {
-      await this.ctx.storage.setAlarm(target);
-    }
-  }
-
-  /**
-   * Audit H1: stale-upload sweeper.
+   * UserDO maintenance alarm: durable chunk cleanup plus stale-upload sweep.
    *
-   * Reaps `_vfs_tmp_<id>` rows older than 1 hour with `status='uploading'`.
-   * For each, runs the same hard-delete path as a synchronous abort:
-   * UserDO metadata first (DELETE file_chunks + DELETE files), then
-   * one ShardDO `deleteChunks` RPC per touched shard. The shard
-   * refcount drops; the per-shard alarm reclaims the chunk blobs
-   * after the 30s grace.
+   * Cleanup intents replay through the scope persisted by `gateVfs`. Stale
+   * `_vfs_tmp_<id>` rows older than one hour use the same transactional
+   * local-delete/outbox path as a synchronous abort. Network awaits occur
+   * only after each local SQL transaction commits.
    *
    * Idempotent: re-running over an already-reaped tmp is a no-op
    * (DELETE matches zero rows; ShardDO `removeFileRefs` finds zero
    * chunk_refs). Cloudflare alarms have at-least-once semantics so
    * idempotence is load-bearing.
    *
-   * Reschedules itself if the LIMIT batch was filled, on the same
-   * 10-minute cadence as a fresh tmp-row insert.
+   * Reschedules after one minute while any bounded maintenance queue still
+   * has work; normal VFS traffic also keeps the ten-minute alarm armed.
    */
   async alarm(): Promise<void> {
     this.ensureInit();
     const scope = this.loadScope();
     if (!scope) {
-      // No VFS call has ever run on this DO ⇒ no tmp rows could exist.
+      // No VFS call has ever run on this DO, so no tmp rows or cleanup intents
+      // could have been created through the supported paths.
       // Be defensive though: an operator might wipe vfs_meta but
       // leave files behind. We still skip — without a scope we
       // cannot route deleteChunks to the right ShardDO instance.
       return;
     }
 
-    const cutoff = Date.now() - 60 * 60 * 1000; // 1h staleness
+    await drainChunkCleanupIntents(this, scope);
+
+    const now = Date.now();
+    const legacyCutoff = now - 60 * 60 * 1000;
     const rows = this.sql
       .exec(
-        `SELECT file_id FROM files
-          WHERE status = 'uploading'
-            AND file_name LIKE '_vfs_tmp_%'
-            AND created_at < ?
+        `SELECT f.file_id FROM files f
+          LEFT JOIN write_stream_sessions ws ON ws.tmp_id = f.file_id
+          LEFT JOIN upload_sessions us ON us.upload_id = f.file_id
+         WHERE f.status = 'uploading'
+           AND f.file_name LIKE '_vfs_tmp_%'
+           AND (
+             (ws.tmp_id IS NOT NULL AND ws.expires_at <= ?)
+             OR (us.upload_id IS NOT NULL AND us.status = 'open' AND us.expires_at <= ?)
+             OR (ws.tmp_id IS NULL AND us.upload_id IS NULL AND f.created_at < ?)
+           )
           LIMIT 200`,
-        cutoff
+        now,
+        now,
+        legacyCutoff
       )
       .toArray() as { file_id: string }[];
 
+    let staleSweepFailed = false;
     for (const { file_id } of rows) {
       // user_id encoding mirrors userIdFor(scope) in vfs-ops.
       const userId =
         scope.sub !== undefined ? `${scope.tenant}::${scope.sub}` : scope.tenant;
       try {
-        await hardDeleteFileRow(this, userId, scope, file_id);
+        await hardDeleteFileRow(this, userId, scope, file_id, {
+          staleAt: now,
+        });
       } catch (err) {
+        staleSweepFailed = true;
         // Surface alarm-handler errors via structured log +
         // counter. A bare `catch {}` would eat every error
-        // including permanent failures (corrupted tmp row, ShardDO
-        // outage). Instead: log via `logError`, bump the
+        // including permanent local failures (for example, a corrupted tmp
+        // row). Remote cleanup failures remain in the durable outbox. Log
+        // other failures via `logError`, bump the
         // `alarm_failures` counter in `vfs_meta`, and CONTINUE —
         // alarms have at-least-once retry; throwing would just get
         // the alarm replayed without progress on the remaining
@@ -1357,10 +1414,55 @@ export class UserDOCore extends DurableObject<Env> {
       this.recordAlarmFailure("audit_log_reap", "", err);
     }
 
-    // Reschedule if the batch was capped, otherwise fall through —
-    // the next gated VFS call will re-arm via ensureStaleSweepScheduled.
-    if (rows.length === 200 || multipartHasMore) {
-      await this.ctx.storage.setAlarm(Date.now() + 60_000);
+    const nextCleanupAttempt = this.sql
+      .exec<{ next_attempt_at: number | null }>(
+        `SELECT MIN(next_attempt_at) AS next_attempt_at
+           FROM chunk_cleanup_intents
+          WHERE state IN ('pending', 'in_flight')`
+      )
+      .toArray()[0]?.next_attempt_at;
+    const nextUploadExpiry = this.sql
+      .exec<{ deadline: number | null }>(
+        `SELECT MIN(deadline) AS deadline FROM (
+           SELECT expires_at AS deadline FROM write_stream_sessions
+           UNION ALL
+           SELECT expires_at AS deadline FROM upload_sessions WHERE status = 'open'
+           UNION ALL
+           SELECT f.created_at + 3600000 AS deadline
+             FROM files f
+             LEFT JOIN write_stream_sessions ws ON ws.tmp_id = f.file_id
+             LEFT JOIN upload_sessions us ON us.upload_id = f.file_id
+            WHERE f.status = 'uploading'
+              AND f.file_name LIKE '_vfs_tmp_%'
+              AND ws.tmp_id IS NULL AND us.upload_id IS NULL
+         )`
+      )
+      .toArray()[0]?.deadline;
+
+    // Reschedule while any bounded maintenance queue still has work.
+    const maintenanceHasMore =
+      rows.length === 200 || staleSweepFailed || multipartHasMore;
+    if (
+      maintenanceHasMore ||
+      (nextCleanupAttempt !== null && nextCleanupAttempt !== undefined) ||
+      (nextUploadExpiry !== null && nextUploadExpiry !== undefined)
+    ) {
+      let target = maintenanceHasMore
+        ? Date.now() + 60_000
+        : Number.POSITIVE_INFINITY;
+      if (nextCleanupAttempt !== null && nextCleanupAttempt !== undefined) {
+        target = Math.min(
+          target,
+          Math.max(Date.now() + 1_000, nextCleanupAttempt)
+        );
+      }
+      if (nextUploadExpiry !== null && nextUploadExpiry !== undefined) {
+        target = Math.min(
+          target,
+          Math.max(Date.now() + 1_000, nextUploadExpiry)
+        );
+      }
+      await scheduleAlarmAt(this, target);
     }
   }
 
@@ -1939,16 +2041,15 @@ export class UserDOCore extends DurableObject<Env> {
 
   // ── VFS RPC surface (write-side) ──────────────────────────────
   //
-  // Atomic writes (temp-id-then-rename), hard delete with chunk GC fan-out,
-  // and the supporting mutating ops. Each method runs inside a single
-  // single-threaded DO invocation, so the supersede + rename sequence in
-  // commitRename is atomic against concurrent reads/writes (sdk-impl-plan
-  // §7). Chunks are reaped via ShardDO.deleteChunks RPC, which soft-marks
-  // and lets the alarm-driven sweeper hard-delete after a 30s grace
-  // (sdk-impl-plan §8.3).
+  // Atomic writes (temp-id-then-rename), hard delete with durable chunk-GC
+  // intents, and supporting mutating ops. `commitRename` uses an explicit
+  // synchronous transaction for its complete local publication; network
+  // awaits happen only while uploading or draining committed cleanup work.
+  // ShardDO.deleteChunks soft-marks chunks, and its alarm sweeper hard-deletes
+  // them after a 30s grace (sdk-impl-plan §8.3).
   //
-  // Inline tier (≤ INLINE_LIMIT) writes never touch ShardDO — the data
-  // lives in files.inline_data and the entire write is one INSERT.
+  // Inline tier (≤ INLINE_LIMIT) writes never touch ShardDO; their temp and
+  // published bytes live in files.inline_data.
 
   /**
    * writeFile() — atomic, last-writer-wins. Inline tier ≤16KB;
@@ -2130,7 +2231,7 @@ export class UserDOCore extends DurableObject<Env> {
     // caller never sends a commit / abort the alarm reclaims after
     // 1h. setAlarm is awaited but the latency is hidden behind the
     // existing await at the call site.
-    await this.ensureStaleSweepScheduled();
+    await scheduleStaleUploadSweep(this);
     return handle;
   }
 
@@ -2212,7 +2313,7 @@ export class UserDOCore extends DurableObject<Env> {
     const r = await vfsBeginMultipart(this, scope, path, opts);
     // Schedule the orphan-session sweep alarm (re-uses the existing
     // stale-write alarm). Idempotent if already scheduled.
-    await this.ensureStaleSweepScheduled();
+    await scheduleStaleUploadSweep(this);
     return r;
   }
 

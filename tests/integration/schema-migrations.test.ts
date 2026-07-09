@@ -5,6 +5,8 @@ import {
   ensureMigrationsTable,
 } from "@core/lib/migrations";
 import type { UserDO } from "@app/objects/user/user-do";
+import type { SearchDO } from "@app/objects/search/search-do";
+import type { ShardDO } from "@core/objects/shard/shard-do";
 import { vfsUserDOName } from "@core/lib/utils";
 
 /**
@@ -20,13 +22,28 @@ import { vfsUserDOName } from "@core/lib/utils";
 
 interface E {
   MOSSAIC_USER: DurableObjectNamespace<UserDO>;
+  MOSSAIC_SHARD: DurableObjectNamespace<ShardDO>;
+  SEARCH_DO: DurableObjectNamespace<SearchDO>;
 }
 const E = env as unknown as E;
 
-function userStub() {
+function userStub(name = "schema-mig") {
   return E.MOSSAIC_USER.get(
-    E.MOSSAIC_USER.idFromName(vfsUserDOName("default", "schema-mig"))
+    E.MOSSAIC_USER.idFromName(vfsUserDOName("default", name))
   );
+}
+
+function shardStub(name: string) {
+  return E.MOSSAIC_SHARD.get(E.MOSSAIC_SHARD.idFromName(name));
+}
+
+function searchStub(name: string) {
+  return E.SEARCH_DO.get(E.SEARCH_DO.idFromName(name));
+}
+
+interface InitializableDO {
+  initialized: boolean;
+  ensureInit(): void;
 }
 
 describe("applyMigrationOnce", () => {
@@ -164,6 +181,131 @@ describe("applyMigrationOnce", () => {
       for (const r of rows) {
         expect(r.name).toMatch(/^[a-z][a-z0-9_]*$/);
       }
+    });
+  });
+});
+
+describe("transactional DO schema initialization", () => {
+  it("rolls back UserDO initialization and retries on the same instance", async () => {
+    const stub = userStub("schema-init-rollback");
+
+    await runInDurableObject(stub, (instance: UserDO, state) => {
+      const sql = state.storage.sql;
+      const internals = instance as unknown as InitializableDO;
+
+      sql.exec("CREATE VIEW quota AS SELECT 'legacy' AS user_id");
+
+      expect(() => internals.ensureInit()).toThrow(/view/i);
+      expect(internals.initialized).toBe(false);
+      expect(
+        sql
+          .exec(
+            "SELECT name FROM sqlite_master WHERE name IN ('meta_schema', 'files', 'file_chunks') ORDER BY name"
+          )
+          .toArray()
+      ).toEqual([]);
+
+      sql.exec("DROP VIEW quota");
+      internals.ensureInit();
+
+      expect(internals.initialized).toBe(true);
+      expect(
+        sql
+          .exec(
+            "SELECT name FROM meta_schema WHERE name = 'quota_add_rate_limit_per_sec'"
+          )
+          .toArray()
+      ).toEqual([{ name: "quota_add_rate_limit_per_sec" }]);
+      expect(
+        sql.exec("PRAGMA table_info(chunk_cleanup_intents)").toArray().length
+      ).toBeGreaterThan(0);
+    });
+  });
+
+  it("rolls back ShardDO initialization and retries on the same instance", async () => {
+    const stub = shardStub("schema-init-rollback:shard");
+
+    await runInDurableObject(stub, (instance: ShardDO, state) => {
+      const sql = state.storage.sql;
+      const internals = instance as unknown as InitializableDO;
+
+      sql.exec("CREATE VIEW chunks AS SELECT 'legacy' AS hash");
+
+      expect(() => internals.ensureInit()).toThrow(/view/i);
+      expect(internals.initialized).toBe(false);
+      expect(
+        sql
+          .exec(
+            "SELECT name FROM sqlite_master WHERE name IN ('meta_schema', 'chunk_refs', 'shard_meta') ORDER BY name"
+          )
+          .toArray()
+      ).toEqual([]);
+
+      sql.exec("DROP VIEW chunks");
+      internals.ensureInit();
+
+      expect(internals.initialized).toBe(true);
+      expect(
+        sql
+          .exec(
+            "SELECT name FROM meta_schema WHERE name = 'chunks_add_deleted_at'"
+          )
+          .toArray()
+      ).toEqual([{ name: "chunks_add_deleted_at" }]);
+
+      internals.initialized = false;
+      expect(() => internals.ensureInit()).not.toThrow();
+      expect(
+        sql
+          .exec(
+            "SELECT name FROM meta_schema WHERE name = 'chunks_add_deleted_at'"
+          )
+          .toArray()
+      ).toEqual([{ name: "chunks_add_deleted_at" }]);
+    });
+  });
+
+  it("rolls back SearchDO initialization and retries on the same instance", async () => {
+    const stub = searchStub("schema-init-rollback:search");
+
+    await runInDurableObject(stub, (instance: SearchDO, state) => {
+      const sql = state.storage.sql;
+      const internals = instance as unknown as InitializableDO;
+
+      sql.exec("CREATE VIEW vectors AS SELECT 'legacy' AS id");
+
+      expect(() => internals.ensureInit()).toThrow(/view/i);
+      expect(internals.initialized).toBe(false);
+      expect(
+        sql
+          .exec(
+            "SELECT name FROM sqlite_master WHERE name IN ('meta_schema', 'vector_metadata', 'search_config') ORDER BY name"
+          )
+          .toArray()
+      ).toEqual([]);
+
+      sql.exec("DROP VIEW vectors");
+      internals.ensureInit();
+
+      expect(internals.initialized).toBe(true);
+      expect(
+        sql.exec("SELECT name FROM meta_schema ORDER BY name").toArray()
+      ).toEqual([
+        { name: "vector_metadata_add_space" },
+        { name: "vectors_add_space" },
+      ]);
+      expect(
+        sql.exec("PRAGMA table_info(vectors)").toArray().map((column) => column.name)
+      ).toContain("space");
+
+      internals.initialized = false;
+      expect(() => internals.ensureInit()).not.toThrow();
+      expect(
+        sql.exec("SELECT name FROM meta_schema ORDER BY name").toArray()
+      ).toEqual([
+        { name: "vector_metadata_add_space" },
+        { name: "vectors_add_space" },
+      ]);
     });
   });
 });

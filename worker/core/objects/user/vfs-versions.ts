@@ -1,4 +1,5 @@
 import type { UserDOCore as UserDO } from "./user-do-core";
+import { enforceModeMonotonic } from "./encryption-stamp";
 import type { ShardDO } from "../shard/shard-do";
 import { VFSError, type VFSScope } from "../../../../shared/vfs-types";
 import { generateId, vfsShardDOName } from "../../lib/utils";
@@ -11,6 +12,13 @@ import {
 } from "./vfs/helpers";
 import { insertAuditLog } from "./vfs/audit-log";
 import { resolvePath } from "./path-walk";
+import {
+  lastSqlChanges,
+  runWithConcurrencyBlocked,
+  scheduleStaleUploadSweep,
+  stageChunkCleanupIntent,
+  transactionSync,
+} from "./internal-storage";
 
 /**
  * Audit H4 — placement function for the versioning path.
@@ -279,57 +287,93 @@ export function shardRefId(pathId: string, versionId: string): string {
  *   least the supplied mtime. SQL, clocks, and this function are not
  *   mechanically refined by that theorem.
  */
+export interface CommitVersionArgs {
+  pathId: string;
+  versionId: string;
+  userId: string;
+  size: number;
+  mode: number;
+  mtimeMs: number;
+  chunkSize: number;
+  chunkCount: number;
+  fileHash: string;
+  mimeType: string;
+  inlineData: Uint8Array | null;
+  deleted?: boolean;
+  userVisible?: boolean;
+  label?: string | null;
+  metadata?: Uint8Array | null;
+  encryption?: { mode: "convergent" | "random"; keyId?: string };
+  shardRefId?: string;
+}
+
+export interface VersionedFileExpectation {
+  fileId: string;
+  userId: string;
+  parentId: string | null;
+  fileName: string;
+  headVersionId: string | null;
+}
+
+export function assertVersionedFileExpectation(
+  durableObject: UserDO,
+  expected: VersionedFileExpectation,
+  operation: string
+): void {
+  const rows = durableObject.sql
+    .exec(
+      `SELECT 1 FROM files
+        WHERE file_id = ? AND user_id = ? AND status = 'complete'
+          AND IFNULL(parent_id, '') = IFNULL(?, '') AND file_name = ?
+          AND head_version_id IS ?`,
+      expected.fileId,
+      expected.userId,
+      expected.parentId,
+      expected.fileName,
+      expected.headVersionId
+    )
+    .toArray();
+  if (rows.length !== 1) {
+    throw new VFSError("EBUSY", `${operation}: file state changed during publication`);
+  }
+}
+
 export function commitVersion(
   durableObject: UserDO,
-  args: {
-    pathId: string;
-    versionId: string;
-    userId: string;
-    size: number;
-    mode: number;
-    mtimeMs: number;
-    chunkSize: number;
-    chunkCount: number;
-    fileHash: string;
-    mimeType: string;
-    inlineData: Uint8Array | null;
-    deleted?: boolean;
-    /**
-     * per-version flags. All optional; defaults preserve
-     * the legacy default behaviour (NULL label, user_visible=0,
-     * NULL metadata).
-     *
-     * - `userVisible`: when truthy, sets `file_versions.user_visible = 1`.
-     *   Used by writeFile (default true), restoreVersion (true), and
-     *   YjsRuntime.compact when called via flush() (true). Opportunistic
-     *   YjsRuntime compactions pass false.
-     * - `label`: optional ≤128-char human label; SDK validates.
-     * - `metadata`: snapshot of `files.metadata` at commit time, as
-     *   already-encoded bytes. NULL preserves the column's NULL.
-     */
-    userVisible?: boolean;
-    label?: string | null;
-    metadata?: Uint8Array | null;
-    /**
-     * per-version encryption stamp. Mirrors the column on
-     * `files`. When set, the columns on both `file_versions` (this
-     * row) and `files` (the head row) are updated. The `data` payload
-     * has already been written; this is metadata only.
-     */
-    encryption?: { mode: "convergent" | "random"; keyId?: string };
-    /**
-     * Multipart × versioning. ShardDO chunk_refs file_id actually
-     * used when chunks were written. Default `null`; the canonical
-     * versioned write path uses the synthetic form
-     * `${pathId}#${versionId}` (computed by `dropVersionRows` on
-     * fan-out) and leaves this NULL. Multipart-finalize-under-
-     * versioning sets it to `uploadId` because that's the refId
-     * the chunk PUT route used during upload — see
-     * `vfsFinalizeMultipart`'s versioned branch.
-     */
-    shardRefId?: string;
-  }
+  args: CommitVersionArgs
 ): void {
+  commitVersionInternal(durableObject, args);
+}
+
+/** Checked publication for operations that crossed an await boundary. */
+export function commitVersionChecked(
+  durableObject: UserDO,
+  args: CommitVersionArgs,
+  expected: VersionedFileExpectation,
+  operation: string
+): void {
+  if (args.pathId !== expected.fileId || args.userId !== expected.userId) {
+    throw new VFSError("EINVAL", `${operation}: invalid version publication expectation`);
+  }
+  enforceModeMonotonic(
+    durableObject,
+    expected.userId,
+    expected.parentId,
+    expected.fileName,
+    args.encryption
+  );
+  commitVersionInternal(durableObject, args, expected, operation);
+}
+
+function commitVersionInternal(
+  durableObject: UserDO,
+  args: CommitVersionArgs,
+  expected?: VersionedFileExpectation,
+  operation = "commitVersion"
+): void {
+  if (expected) {
+    assertVersionedFileExpectation(durableObject, expected, operation);
+  }
   // Single chokepoint for versioned accounting.
   //
   // Read the prior head's state BEFORE the INSERT so we can
@@ -446,19 +490,44 @@ export function commitVersion(
   // the head — readers find them by mtime_ms and then check deleted.
   // also stamp `files.encryption_mode` + `files.encryption_key_id`
   // so non-versioned reads (`stat`, `readFile`) reflect the latest mode.
-  durableObject.sql.exec(
-    `UPDATE files
-        SET head_version_id = ?,
-            updated_at = ?,
-            encryption_mode = ?,
-            encryption_key_id = ?
-      WHERE file_id = ?`,
-    args.versionId,
-    args.mtimeMs,
-    encMode,
-    encKeyId,
-    args.pathId
-  );
+  if (expected) {
+    durableObject.sql.exec(
+      `UPDATE files
+          SET head_version_id = ?,
+              updated_at = ?,
+              encryption_mode = ?,
+              encryption_key_id = ?
+        WHERE file_id = ? AND user_id = ? AND status = 'complete'
+          AND IFNULL(parent_id, '') = IFNULL(?, '') AND file_name = ?
+          AND head_version_id IS ?`,
+      args.versionId,
+      args.mtimeMs,
+      encMode,
+      encKeyId,
+      args.pathId,
+      args.userId,
+      expected.parentId,
+      expected.fileName,
+      expected.headVersionId
+    );
+  } else {
+    durableObject.sql.exec(
+      `UPDATE files
+          SET head_version_id = ?,
+              updated_at = ?,
+              encryption_mode = ?,
+              encryption_key_id = ?
+        WHERE file_id = ?`,
+      args.versionId,
+      args.mtimeMs,
+      encMode,
+      encKeyId,
+      args.pathId
+    );
+  }
+  if (expected && lastSqlChanges(durableObject) !== 1) {
+    throw new VFSError("EBUSY", `${operation}: head changed during publication`);
+  }
 
   // Single recordWriteUsage call covering all three counters.
   // Negative deltas are clamped at zero by the helper's
@@ -736,14 +805,7 @@ export function resolvePathId(
   return r.leafId;
 }
 
-/**
- * Decrement chunk_refs across a set of versions on every shard the
- * versions touched, then DELETE the file_versions + version_chunks
- * rows. The ShardDO alarm sweeper handles blob hard-delete after the
- * 30s grace per.
- *
- * Returns the count of versions reaped.
- */
+/** Atomically remove version metadata and queue its shard refs for cleanup. */
 export async function dropVersionRows(
   durableObject: UserDO,
   scope: VFSScope,
@@ -751,81 +813,63 @@ export async function dropVersionRows(
   pathId: string,
   versionIds: string[]
 ): Promise<number> {
+  await scheduleStaleUploadSweep(durableObject);
   if (versionIds.length === 0) return 0;
-  const env = durableObject.envPublic;
-  const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
+  const { drainChunkCleanupIntents } = await import("./vfs-ops");
+  const result = transactionSync(durableObject, () =>
+    dropVersionRowsLocal(durableObject, userId, pathId, versionIds)
+  );
+  for (const refId of result.refIds) {
+    await drainChunkCleanupIntents(durableObject, scope, refId);
+  }
+  return result.reaped;
+}
 
-  // dropVersionRows owns ALL three counters' negative deltas for
-  // versioning-on tenants. Without symmetric decrements,
-  // storage_used and file_count would drift upward forever (only
-  // inline_bytes_used was decremented historically). The
-  // versioning-on write path increments via commitVersion;
-  // dropVersionRows is the symmetric decrement. Bytes are
-  // accumulated across non-tombstone versions; the file_count
-  // delta fires when the `files` row gets dropped at the end
-  // (path goes ENOENT) AND the path was previously live.
+export interface DropVersionRowsLocalResult {
+  reaped: number;
+  refIds: string[];
+}
+
+/** SQL-only version cleanup. The caller must arm maintenance first. */
+export function dropVersionRowsLocal(
+  durableObject: UserDO,
+  userId: string,
+  pathId: string,
+  versionIds: readonly string[]
+): DropVersionRowsLocalResult {
+  const fileRow = durableObject.sql
+    .exec(
+      "SELECT head_version_id, status FROM files WHERE file_id = ? AND user_id = ?",
+      pathId,
+      userId
+    )
+    .toArray()[0] as
+    | { head_version_id: string | null; status: string }
+    | undefined;
+  const headBefore = fileRow?.head_version_id
+    ? (durableObject.sql
+        .exec(
+          "SELECT deleted FROM file_versions WHERE path_id = ? AND version_id = ?",
+          pathId,
+          fileRow.head_version_id
+        )
+        .toArray()[0] as { deleted: number } | undefined)
+    : undefined;
+  const wasLive = fileRow?.status === "complete" && headBefore?.deleted === 0;
+  const refIds = new Set<string>();
   let bytesReaped = 0;
   let inlineBytesReaped = 0;
-
-  // Snapshot whether the path is currently LIVE (head is
-  // non-tombstone) BEFORE we start dropping. If the `files` row
-  // ends up dropped at the end (liveCount === 0), the path
-  // exits the live-set and we owe a -1 file_count delta. If the
-  // path was already tombstoned, file_count was already
-  // decremented by the commitVersion(deleted=true) that produced
-  // the tombstone \u2014 don't double-decrement.
-  const wasLiveAtStart = (() => {
-    const r = durableObject.sql
-      .exec(
-        `SELECT v.deleted AS d
-           FROM files f
-           LEFT JOIN file_versions v
-             ON v.path_id = f.file_id AND v.version_id = f.head_version_id
-          WHERE f.file_id = ?`,
-        pathId
-      )
-      .toArray()[0] as { d: number | null } | undefined;
-    return !!r && r.d === 0;
-  })();
-
   let reaped = 0;
-  for (const versionId of versionIds) {
-    // Audit C2 structural guard: we MUST NOT decrement ShardDO refs
-    // for a version whose file_versions row still exists. The
-    // (UserDO-side metadata) → (ShardDO refs) order matters: if we
-    // drop refs first and then crash before deleting the metadata,
-    // a subsequent restoreVersion would resolve a stale manifest
-    // pointing at chunks whose refcount may already be 0 / swept,
-    // and the reuse path in restoreVersion would silently corrupt
-    // data. Always delete metadata BEFORE the RPC fan-out.
 
-    // Find unique shards this version's chunks live on.
-    const shardRows = durableObject.sql
+  for (const versionId of new Set(versionIds)) {
+    const version = durableObject.sql
       .exec(
-        "SELECT DISTINCT shard_index FROM version_chunks WHERE version_id = ?",
-        versionId
-      )
-      .toArray() as { shard_index: number }[];
-
-    // Read the per-version `shard_ref_id` BEFORE the delete so
-    // multipart-finalized versions can fan out to the correct
-    // chunk_refs key (uploadId, not the synthetic
-    // `${pathId}#${versionId}`). Falls back to the synthetic form
-    // when the column is NULL — matches every legacy and canonical
-    // versioned-write row.
-    //
-    // Also read size, inline_data, and deleted so we can
-    // accumulate the byte deltas for the post-loop
-    // recordWriteUsage call. Tombstones (`deleted=1`)
-    // contribute 0 (their bytes were never positive-counted by
-    // commitVersion). Live (`deleted=0`) versions contribute
-    // `+size` for storage_used and (if inline) `+inline_data.byteLength`
-    // for inline_bytes_used.
-    const refRow = durableObject.sql
-      .exec(
-        "SELECT shard_ref_id, size, inline_data, deleted FROM file_versions WHERE path_id = ? AND version_id = ?",
+        `SELECT shard_ref_id, size, inline_data, deleted
+           FROM file_versions
+          WHERE path_id = ? AND version_id = ? AND user_id = ?`,
         pathId,
-        versionId
+        versionId,
+        userId
       )
       .toArray()[0] as
       | {
@@ -835,166 +879,127 @@ export async function dropVersionRows(
           deleted: number;
         }
       | undefined;
-    const explicitRefId = refRow?.shard_ref_id ?? null;
-    if (refRow && refRow.deleted === 0) {
-      bytesReaped += refRow.size;
-      if (refRow.inline_data) {
-        inlineBytesReaped += refRow.inline_data.byteLength;
-      }
+    if (!version) continue;
+
+    const shardRows = durableObject.sql
+      .exec(
+        "SELECT DISTINCT shard_index FROM version_chunks WHERE version_id = ?",
+        versionId
+      )
+      .toArray() as { shard_index: number }[];
+    const refId = version.shard_ref_id ?? shardRefId(pathId, versionId);
+    const now = Date.now();
+    for (const { shard_index } of shardRows) {
+      stageChunkCleanupIntent(durableObject, refId, shard_index, now);
+      refIds.add(refId);
     }
 
-    // Drop UserDO-side metadata first (mirrors hardDeleteFileRow).
-    // version_chunks must go before file_versions because some
-    // future GC paths key off file_versions presence.
+    if (version.deleted === 0) {
+      bytesReaped += version.size;
+      inlineBytesReaped += version.inline_data?.byteLength ?? 0;
+    }
     durableObject.sql.exec(
       "DELETE FROM version_chunks WHERE version_id = ?",
       versionId
     );
     durableObject.sql.exec(
-      "DELETE FROM file_versions WHERE path_id = ? AND version_id = ?",
+      `DELETE FROM file_versions
+        WHERE path_id = ? AND version_id = ? AND user_id = ?`,
       pathId,
-      versionId
+      versionId,
+      userId
     );
-
-    // Sanity: re-read and confirm both metadata rows are gone before
-    // we touch any ShardDO. Refusing to drop refs when metadata is
-    // still present is the load-bearing structural invariant —
-    // chunk_refs are reachable from file_versions/version_chunks; if
-    // one side leaks, the other does too. This is belt-and-suspenders
-    // (DO single-thread guarantees no concurrent INSERT can re-create
-    // the rows we just deleted), but it pins the invariant in code.
-    const stillPresent = durableObject.sql
-      .exec(
-        "SELECT 1 FROM file_versions WHERE path_id = ? AND version_id = ? LIMIT 1",
-        pathId,
-        versionId
-      )
-      .toArray();
-    if (stillPresent.length > 0) {
-      throw new VFSError(
-        "EINVAL",
-        `dropVersionRows: file_versions row for ${versionId} still present after delete; refusing to fan out chunk decrement`
-      );
-    }
-
-    // Dispatch deleteChunks RPC per touched shard. Use the explicit
-    // `shard_ref_id` stamped at write time when set (multipart
-    // path); else fall back to the synthetic form used by the
-    // canonical versioned-write path.
-    const shardFileId = explicitRefId ?? shardRefId(pathId, versionId);
-    for (const { shard_index } of shardRows) {
-      const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, shard_index);
-      const stub = shardNs.get(shardNs.idFromName(shardName));
-      await stub.deleteChunks(shardFileId);
+    if (lastSqlChanges(durableObject) !== 1) {
+      throw new VFSError("EBUSY", `dropVersionRows: version ${versionId} changed`);
     }
     reaped++;
   }
 
-  // Single recordWriteUsage call covering all three counters for
-  // the whole batch. Without symmetric decrements,
-  // storage_used + file_count would drift forever for versioning
-  // tenants (only inline_bytes_used was decremented historically).
-  // Symmetric with commitVersion.
-  //
-  // file_count delta: -1 IFF the path was LIVE at the start of
-  // the drop AND the `files` row gets dropped below (liveCount === 0
-  // \u2014 the path goes ENOENT). If the path was already tombstoned
-  // when drop started, file_count was already decremented by the
-  // commitVersion(deleted=true) that wrote the tombstone \u2014 we
-  // must not double-decrement here.
-  const liveCount = (
-    durableObject.sql
+  if (reaped === 0) return { reaped, refIds: [] };
+
+  type RemainingHead = {
+    version_id: string;
+    mtime_ms: number;
+    deleted: number;
+    encryption_mode: string | null;
+    encryption_key_id: string | null;
+  };
+  let headAfter: RemainingHead | undefined;
+  if (fileRow?.head_version_id) {
+    headAfter = durableObject.sql
       .exec(
-        "SELECT COUNT(*) AS n FROM file_versions WHERE path_id = ?",
+        `SELECT version_id, mtime_ms, deleted, encryption_mode, encryption_key_id
+           FROM file_versions WHERE path_id = ? AND version_id = ?`,
+        pathId,
+        fileRow.head_version_id
+      )
+      .toArray()[0] as RemainingHead | undefined;
+  }
+  headAfter ??= durableObject.sql
+    .exec(
+      `SELECT version_id, mtime_ms, deleted, encryption_mode, encryption_key_id
+         FROM file_versions WHERE path_id = ?
+        ORDER BY mtime_ms DESC, version_id DESC LIMIT 1`,
+      pathId
+    )
+    .toArray()[0] as RemainingHead | undefined;
+
+  if (fileRow && !headAfter) {
+    const directShardRows = durableObject.sql
+      .exec(
+        "SELECT DISTINCT shard_index FROM file_chunks WHERE file_id = ?",
         pathId
       )
-      .toArray()[0] as { n: number }
-  ).n;
-  const willDropFilesRow = liveCount === 0;
-  const filesRowDelta = willDropFilesRow && wasLiveAtStart ? -1 : 0;
+      .toArray() as { shard_index: number }[];
+    const now = Date.now();
+    for (const { shard_index } of directShardRows) {
+      stageChunkCleanupIntent(durableObject, pathId, shard_index, now);
+      refIds.add(pathId);
+    }
+    durableObject.sql.exec("DELETE FROM file_chunks WHERE file_id = ?", pathId);
+  }
 
-  if (
-    bytesReaped > 0 ||
-    inlineBytesReaped > 0 ||
-    filesRowDelta !== 0
-  ) {
+  const isLive = fileRow !== undefined && headAfter?.deleted === 0;
+  const fileDelta = Number(isLive) - Number(wasLive);
+  if (bytesReaped !== 0 || inlineBytesReaped !== 0 || fileDelta !== 0) {
     recordWriteUsage(
       durableObject,
       userId,
       -bytesReaped,
-      filesRowDelta,
+      fileDelta,
       -inlineBytesReaped
     );
   }
 
-  // After dropping, if no live version remains AND no tombstone
-  // either, also drop the empty `files` row so the path becomes
-  // ENOENT cleanly.
-  if (willDropFilesRow) {
+  if (fileRow && headAfter) {
+    durableObject.sql.exec(
+      `UPDATE files
+          SET head_version_id = ?, updated_at = ?,
+              encryption_mode = ?, encryption_key_id = ?
+        WHERE file_id = ? AND user_id = ?`,
+      headAfter.version_id,
+      headAfter.mtime_ms,
+      headAfter.encryption_mode,
+      headAfter.encryption_key_id,
+      pathId,
+      userId
+    );
+    if (lastSqlChanges(durableObject) !== 1) {
+      throw new VFSError("EBUSY", "dropVersionRows: failed to repair file head");
+    }
+  } else if (fileRow) {
+    durableObject.sql.exec("DELETE FROM file_tags WHERE path_id = ?", pathId);
     durableObject.sql.exec(
       "DELETE FROM files WHERE file_id = ? AND user_id = ?",
       pathId,
       userId
     );
-  } else {
-    // Reset the head pointer to the (still extant) newest LIVE
-    // version.
-    //
-    // Tombstone-consistency. The query MUST filter on
-    // `WHERE deleted = 0` (not just
-    // `ORDER BY mtime_ms DESC LIMIT 1`). If retention dropped every
-    // live version while a tombstone survived (e.g. operator
-    // dropped older live versions newer than a retention cutoff
-    // that also captured a tombstone in between), without the
-    // filter the head would be repointed at a tombstone — making
-    // subsequent stat() throw the systemic "head version is a
-    // tombstone" error.
-    //
-    // We prefer the newest non-tombstoned version. Two outcomes:
-    //   A. A live version exists → head moves to it; stat() works.
-    //   B. Only tombstones survive → head goes to NULL; stat() falls
-    //      through helpers.ts:225 to the non-versioned branch using
-    //      the denormalized `files` columns (which were updated by
-    //      the original write). Listings filter the row by the new
-    //      tombstone consistency invariant when the most recent
-    //      tombstone is the apparent head — `LEFT JOIN
-    //      file_versions ON head_version_id` returns NULL columns
-    //      and the row is INCLUDED. To keep listings semantically
-    //      consistent we'd want to also drop the `files` row when
-    //      only tombstones remain, but the user has explicitly kept
-    //      these tombstone rows by NOT including them in the drop
-    //      set — they want history preserved. Setting head to NULL
-    //      preserves that history while making stat() succeed
-    //      (returning the denormalized stat as a "no current
-    //      version" placeholder).
-    const headRow = durableObject.sql
-      .exec(
-        `SELECT version_id FROM file_versions
-          WHERE path_id = ? AND deleted = 0
-          ORDER BY mtime_ms DESC
-          LIMIT 1`,
-        pathId
-      )
-      .toArray()[0] as { version_id: string } | undefined;
-    if (headRow) {
-      durableObject.sql.exec(
-        "UPDATE files SET head_version_id = ?, updated_at = ? WHERE file_id = ?",
-        headRow.version_id,
-        Date.now(),
-        pathId
-      );
-    } else {
-      // Only tombstones remain. Clear head_version_id so stat()
-      // takes the non-versioned branch instead of throwing.
-      durableObject.sql.exec(
-        "UPDATE files SET head_version_id = NULL, updated_at = ? WHERE file_id = ?",
-        Date.now(),
-        pathId
-      );
+    if (lastSqlChanges(durableObject) !== 1) {
+      throw new VFSError("EBUSY", "dropVersionRows: failed to drop empty path");
     }
   }
 
-  return reaped;
+  return { reaped, refIds: [...refIds] };
 }
 
 /**
@@ -1021,58 +1026,52 @@ export async function dropVersions(
     exceptVersions?: string[];
   }
 ): Promise<{ dropped: number; kept: number }> {
-  const all = listVersions(durableObject, pathId, { limit: 100_000 });
-  if (all.length === 0) return { dropped: 0, kept: 0 };
-
-  const headRow = durableObject.sql
-    .exec(
-      "SELECT head_version_id FROM files WHERE file_id = ?",
-      pathId
-    )
-    .toArray()[0] as { head_version_id: string | null } | undefined;
-  const headId = headRow?.head_version_id ?? null;
-
-  const exceptSet = new Set(policy.exceptVersions ?? []);
-  const keepLast = policy.keepLast ?? 0;
-  const cutoff = policy.olderThan ?? 0;
-
-  // Build the "keep" set: head + exceptVersions + newest keepLast.
-  const keepSet = new Set<string>();
-  if (headId) keepSet.add(headId);
-  for (const id of exceptSet) keepSet.add(id);
-  // Versions are newest-first in `all`; the first keepLast are kept.
-  for (let i = 0; i < Math.min(keepLast, all.length); i++) {
-    keepSet.add(all[i].versionId);
-  }
-
-  const drop: string[] = [];
-  for (const v of all) {
-    if (keepSet.has(v.versionId)) continue;
-    if (cutoff > 0 && v.mtimeMs >= cutoff) continue;
-    // If neither olderThan nor keepLast was specified, default
-    // semantics are: drop everything not in exceptVersions and not
-    // the head. (Caller-explicit "drop all but X" pattern.)
-    drop.push(v.versionId);
-  }
-
-  const reaped = await dropVersionRows(
-    durableObject,
-    scope,
-    userId,
-    pathId,
-    drop
-  );
-  insertAuditLog(durableObject, {
-    op: "dropVersions",
-    actor: userId,
-    target: pathId,
-    payload: JSON.stringify({
-      dropped: reaped,
-      kept: all.length - reaped,
-      policy,
-    }),
+  await scheduleStaleUploadSweep(durableObject);
+  const { drainChunkCleanupIntents } = await import("./vfs-ops");
+  const result = transactionSync(durableObject, () => {
+    const all = listVersions(durableObject, pathId, { limit: 100_000 });
+    if (all.length === 0) {
+      return { dropped: 0, kept: 0, refIds: [] as string[] };
+    }
+    const headRow = durableObject.sql
+      .exec(
+        "SELECT head_version_id FROM files WHERE file_id = ?",
+        pathId
+      )
+      .toArray()[0] as { head_version_id: string | null } | undefined;
+    const keepSet = new Set(policy.exceptVersions ?? []);
+    if (headRow?.head_version_id) keepSet.add(headRow.head_version_id);
+    const keepLast = policy.keepLast ?? 0;
+    for (let i = 0; i < Math.min(keepLast, all.length); i++) {
+      keepSet.add(all[i].versionId);
+    }
+    const cutoff = policy.olderThan ?? 0;
+    const versionIds = all
+      .filter(
+        (version) =>
+          !keepSet.has(version.versionId) &&
+          (cutoff === 0 || version.mtimeMs < cutoff)
+      )
+      .map((version) => version.versionId);
+    const local = dropVersionRowsLocal(
+      durableObject,
+      userId,
+      pathId,
+      versionIds
+    );
+    const kept = all.length - local.reaped;
+    insertAuditLog(durableObject, {
+      op: "dropVersions",
+      actor: userId,
+      target: pathId,
+      payload: JSON.stringify({ dropped: local.reaped, kept, policy }),
+    });
+    return { dropped: local.reaped, kept, refIds: local.refIds };
   });
-  return { dropped: reaped, kept: all.length - reaped };
+  for (const refId of result.refIds) {
+    await drainChunkCleanupIntents(durableObject, scope, refId);
+  }
+  return { dropped: result.dropped, kept: result.kept };
 }
 
 /**
@@ -1092,6 +1091,32 @@ export async function restoreVersion(
   pathId: string,
   sourceVersionId: string
 ): Promise<{ versionId: string }> {
+  const pathRow = durableObject.sql
+    .exec(
+      `SELECT parent_id, file_name, head_version_id, mode_yjs
+         FROM files
+        WHERE file_id = ? AND user_id = ? AND status = 'complete'`,
+      pathId,
+      userId
+    )
+    .toArray()[0] as
+    | {
+        parent_id: string | null;
+        file_name: string;
+        head_version_id: string | null;
+        mode_yjs: number;
+      }
+    | undefined;
+  if (!pathRow) {
+    throw new VFSError("ENOENT", `restoreVersion: path ${pathId} not found`);
+  }
+  const expectedPath: VersionedFileExpectation = {
+    fileId: pathId,
+    userId,
+    parentId: pathRow.parent_id,
+    fileName: pathRow.file_name,
+    headVersionId: pathRow.head_version_id,
+  };
   const src = getVersion(durableObject, pathId, sourceVersionId);
   if (!src) {
     throw new VFSError("ENOENT", `version ${sourceVersionId} not found`);
@@ -1112,12 +1137,26 @@ export async function restoreVersion(
   // advance head_version_id of an already-live path. Either case
   // warrants a folder-revision bump so listChildren observers
   // re-fetch. Read parent_id of the path's stable row.
-  const parentRow = durableObject.sql
-    .exec("SELECT parent_id, mode_yjs FROM files WHERE file_id = ?", pathId)
-    .toArray()[0] as { parent_id: string | null; mode_yjs: number } | undefined;
-  const parentId = parentRow ? parentRow.parent_id : null;
+  const parentId = pathRow.parent_id;
 
-  if (parentRow?.mode_yjs === 1) {
+  const assertSourceVersion = (): void => {
+    const sourceRows = durableObject.sql
+      .exec(
+        "SELECT 1 FROM file_versions WHERE path_id = ? AND version_id = ? AND user_id = ?",
+        pathId,
+        sourceVersionId,
+        userId
+      )
+      .toArray();
+    if (sourceRows.length !== 1) {
+      throw new VFSError(
+        "EBUSY",
+        `restoreVersion: source version ${sourceVersionId} changed during publication`
+      );
+    }
+  };
+
+  if (pathRow.mode_yjs === 1) {
     if (src.encryption) {
       throw new VFSError("ENOTSUP", "restoreVersion: encrypted Yjs versions require client-side restore");
     }
@@ -1129,27 +1168,84 @@ export async function restoreVersion(
     if (!hasYjsSnapshotMagic(bytes)) {
       throw new VFSError("ENOTSUP", "restoreVersion: Yjs version is not a restorable snapshot");
     }
-    await writeYjsBytes(durableObject, scope, userId, pathId, poolSizeFor(durableObject, userId), bytes);
+    return runWithConcurrencyBlocked(durableObject, async () => {
+      assertVersionedFileExpectation(
+        durableObject,
+        expectedPath,
+        "restoreVersion"
+      );
+      assertSourceVersion();
+      await writeYjsBytes(
+        durableObject,
+        scope,
+        userId,
+        pathId,
+        poolSizeFor(durableObject, userId),
+        bytes
+      );
+      transactionSync(durableObject, () => {
+        assertSourceVersion();
+        commitVersionChecked(
+          durableObject,
+          {
+            pathId,
+            versionId: newVersionId,
+            userId,
+            size: src.size,
+            mode: src.mode,
+            mtimeMs: now,
+            chunkSize: 0,
+            chunkCount: 0,
+            fileHash: src.fileHash,
+            mimeType: src.mimeType,
+            inlineData: bytes,
+            encryption: src.encryption,
+          },
+          expectedPath,
+          "restoreVersion"
+        );
+        bumpFolderRevision(durableObject, userId, parentId);
+      });
+      insertAuditLog(durableObject, {
+        op: "restoreVersion",
+        actor: userId,
+        target: pathId,
+        payload: JSON.stringify({
+          sourceVersionId,
+          newVersionId,
+          tier: "inline",
+        }),
+      });
+      return { versionId: newVersionId };
+    });
   }
 
   if (src.inlineData) {
     // Inline restore: no shard work; just insert + flip head.
-    commitVersion(durableObject, {
-      pathId,
-      versionId: newVersionId,
-      userId,
-      size: src.size,
-      mode: src.mode,
-      mtimeMs: now,
-      chunkSize: 0,
-      chunkCount: 0,
-      fileHash: src.fileHash,
-      mimeType: src.mimeType,
-      inlineData: new Uint8Array(src.inlineData),
-      // restore preserves the source version's encryption mode.
-      encryption: src.encryption,
+    const inlineData = new Uint8Array(src.inlineData);
+    transactionSync(durableObject, () => {
+      assertSourceVersion();
+      commitVersionChecked(
+        durableObject,
+        {
+          pathId,
+          versionId: newVersionId,
+          userId,
+          size: src.size,
+          mode: src.mode,
+          mtimeMs: now,
+          chunkSize: 0,
+          chunkCount: 0,
+          fileHash: src.fileHash,
+          mimeType: src.mimeType,
+          inlineData,
+          encryption: src.encryption,
+        },
+        expectedPath,
+        "restoreVersion"
+      );
+      bumpFolderRevision(durableObject, userId, parentId);
     });
-    bumpFolderRevision(durableObject, userId, parentId);
     insertAuditLog(durableObject, {
       op: "restoreVersion",
       actor: userId,
@@ -1171,6 +1267,11 @@ export async function restoreVersion(
   const env = durableObject.envPublic;
   const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
   const newRefId = shardRefId(pathId, newVersionId);
+  const {
+    disarmChunkCleanupIntents,
+    drainChunkCleanupIntents,
+    stageChunkCleanupIntents,
+  } = await import("./vfs-ops");
 
   const chunks = durableObject.sql
     .exec(
@@ -1221,23 +1322,8 @@ export async function restoreVersion(
     });
     byShard.set(c.shard_index, arr);
   }
-  // Audit C2 + P1-1: each shard's contribution restored atomically
-  // per chunk via `restoreChunkRef`. A swept chunk surfaces as
-  // `ENOENT` thrown from the RPC; we map to VFSError("ENOENT", ...)
-  // matching the prior contract. Partial-failure cleanup: if shard
-  // A succeeds but shard B throws, ref_count for A's chunks has
-  // already been bumped under `newRefId`. Those refs are reachable
-  // via the file_versions row we DON'T insert below (commitVersion
-  // is gated on the loop completing). To make the partial state
-  // observable for cleanup we'd need a compensating delete — for
-  // v1, the alarm sweeper picks up these refs naturally on the
-  // next tick because file_versions has no row for newVersionId
-  // (so `dropVersionRows` doesn't see them) and the shard's
-  // chunk_refs row will outlive the crash. Acceptable: the
-  // refs are user_id-scoped + content-addressed so cross-tenant
-  // exposure is impossible. A future fix can layer a UserDO-side
-  // staging-row that the alarm reaps. Documented; tracked.
-  await Promise.all(
+  await stageChunkCleanupIntents(durableObject, newRefId, byShard.keys());
+  const restoreResults = await Promise.allSettled(
     Array.from(byShard.entries()).map(async ([shardIndex, shardChunks]) => {
       const shardName = vfsShardDOName(
         scope.ns,
@@ -1267,39 +1353,50 @@ export async function restoreVersion(
       }
     })
   );
-
-  // Mirror version_chunks rows AFTER the atomic shard-side ref
-  // bumps. If any shard throws above, this block is skipped and
-  // the partial-state shard refs are flagged in the comment above.
-  for (const c of chunks) {
-    durableObject.sql.exec(
-      `INSERT OR REPLACE INTO version_chunks
-         (version_id, chunk_index, chunk_hash, chunk_size, shard_index)
-       VALUES (?, ?, ?, ?, ?)`,
-      newVersionId,
-      c.chunk_index,
-      c.chunk_hash,
-      c.chunk_size,
-      c.shard_index
-    );
+  const restoreFailure = restoreResults.find(
+    (result): result is PromiseRejectedResult => result.status === "rejected"
+  );
+  if (restoreFailure) {
+    await drainChunkCleanupIntents(durableObject, scope, newRefId);
+    throw restoreFailure.reason;
   }
 
-  commitVersion(durableObject, {
-    pathId,
-    versionId: newVersionId,
-    userId,
-    size: src.size,
-    mode: src.mode,
-    mtimeMs: now,
-    chunkSize: src.chunkSize,
-    chunkCount: src.chunkCount,
-    fileHash: src.fileHash,
-    mimeType: src.mimeType,
-    inlineData: null,
-    // restore preserves the source version's encryption mode.
-    encryption: src.encryption,
-  });
-  bumpFolderRevision(durableObject, userId, parentId);
+  try {
+    transactionSync(durableObject, () => {
+      assertSourceVersion();
+      for (const chunk of chunks) {
+        insertVersionChunk(durableObject, newVersionId, chunk);
+      }
+      commitVersionChecked(
+        durableObject,
+        {
+          pathId,
+          versionId: newVersionId,
+          userId,
+          size: src.size,
+          mode: src.mode,
+          mtimeMs: now,
+          chunkSize: src.chunkSize,
+          chunkCount: src.chunkCount,
+          fileHash: src.fileHash,
+          mimeType: src.mimeType,
+          inlineData: null,
+          encryption: src.encryption,
+        },
+        expectedPath,
+        "restoreVersion"
+      );
+      bumpFolderRevision(durableObject, userId, parentId);
+      disarmChunkCleanupIntents(durableObject, newRefId);
+    });
+  } catch (err) {
+    durableObject.sql.exec(
+      "DELETE FROM version_chunks WHERE version_id = ?",
+      newVersionId
+    );
+    await drainChunkCleanupIntents(durableObject, scope, newRefId);
+    throw err;
+  }
   insertAuditLog(durableObject, {
     op: "restoreVersion",
     actor: userId,
