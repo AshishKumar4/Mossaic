@@ -7,9 +7,19 @@ on:
       - "sdk/**"
       - "worker/**"
       - "shared/**"
+      - "tests/**"
+      - "package.json"
       - "pnpm-lock.yaml"
       - "pnpm-workspace.yaml"
       - "tsconfig.base.json"
+      - "tsconfig.bench.json"
+      - "tsconfig.test.json"
+      - "tsconfig.test.changed.json"
+      - "vitest.config.ts"
+      - "vitest.bench.config.ts"
+      - "vitest.fault.config.ts"
+      - "vitest.shared.ts"
+      - "vitest-unhandled-errors.ts"
       - ".github/workflows/e2e.yml"
   schedule:
     # Nightly run against the live deploy.
@@ -59,6 +69,10 @@ jobs:
         run: pnpm lint:no-phase-tags
       - name: Workspace typecheck
         run: pnpm typecheck
+      - name: Storage benchmark typecheck
+        run: pnpm typecheck:bench
+      - name: Changed worker-test typecheck
+        run: pnpm typecheck:tests:changed
       - name: Production build
         run: pnpm build
       - name: Wrangler dry-run (App mode)
@@ -67,3 +81,5 @@ jobs:
         run: pnpm exec wrangler deploy --dry-run -c deployments/service/wrangler.jsonc
       - name: Vitest (worker integration)
         run: pnpm test
+      - name: Storage benchmarks
+        run: pnpm bench:storage

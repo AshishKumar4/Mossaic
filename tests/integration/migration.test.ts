@@ -77,6 +77,58 @@ describe("UserDO schema migrations", () => {
       expect(idxNames).toContain("uniq_folders_parent_name");
       expect(idxNames).toContain("idx_files_parent");
       expect(idxNames).toContain("idx_folders_parent");
+      expect(
+        idxNames.filter((name) => name.startsWith("idx_chunk_cleanup_intents_"))
+      ).toEqual(["idx_chunk_cleanup_intents_eligible"]);
+
+      const cleanupCols = sql
+        .exec("PRAGMA table_info(chunk_cleanup_intents)")
+        .toArray() as { name: string; notnull: number; pk: number }[];
+      expect(cleanupCols.map((c) => c.name)).toEqual([
+        "ref_id",
+        "shard_index",
+        "cleanup_kind",
+        "state",
+        "generation",
+        "provisional",
+        "created_at",
+        "updated_at",
+        "next_attempt_at",
+        "attempts",
+        "last_error",
+      ]);
+      expect(cleanupCols.filter((c) => c.pk > 0).map((c) => c.name)).toEqual([
+        "ref_id",
+        "shard_index",
+      ]);
+
+      const streamSessionCols = sql
+        .exec("PRAGMA table_info(write_stream_sessions)")
+        .toArray() as { name: string; pk: number }[];
+      expect(streamSessionCols.map((column) => column.name)).toEqual([
+        "tmp_id",
+        "user_id",
+        "parent_id",
+        "leaf",
+        "chunk_size",
+        "pool_size",
+        "metadata_present",
+        "metadata_blob",
+        "tags_json",
+        "version_label",
+        "version_user_visible",
+        "encryption_mode",
+        "encryption_key_id",
+        "status",
+        "inflight_index",
+        "inflight_hash",
+        "inflight_at",
+        "expires_at",
+        "created_at",
+      ]);
+      expect(
+        streamSessionCols.filter((column) => column.pk > 0).map((column) => column.name)
+      ).toEqual(["tmp_id"]);
     });
   });
 

@@ -502,6 +502,127 @@ describe("vfsCreateWriteStream", () => {
 });
 
 describe("handle-based write: begin → append → commit", () => {
+  it("rejects caller-modified routing fields", async () => {
+    const tenant = "wh-tampered-routing";
+    const stub = userStubFor(tenant);
+    const scope = { ns: NS, tenant };
+    const handle = await stub.vfsBeginWriteStream(scope, "/safe.bin");
+    const tampered = { ...handle, leaf: "other.bin" };
+
+    await expect(
+      stub.vfsAppendWriteStream(scope, tampered, 0, new Uint8Array([1]))
+    ).rejects.toThrow(/handle was modified/);
+    await expect(stub.vfsCommitWriteStream(scope, tampered)).rejects.toThrow(
+      /handle was modified/
+    );
+
+    await stub.vfsAppendWriteStream(scope, handle, 0, new Uint8Array([1]));
+    await stub.vfsCommitWriteStream(scope, handle);
+    expect(await stub.vfsExists(scope, "/safe.bin")).toBe(true);
+    expect(await stub.vfsExists(scope, "/other.bin")).toBe(false);
+  });
+
+  it("uses server-owned commit options instead of caller-injected fields", async () => {
+    const tenant = "wh-server-owned-options";
+    const stub = userStubFor(tenant);
+    const scope = { ns: NS, tenant };
+    const handle = await stub.vfsBeginWriteStream(scope, "/safe.bin", {
+      metadata: { source: "server" },
+      tags: ["trusted"],
+    });
+    await stub.vfsAppendWriteStream(scope, handle, 0, new Uint8Array([7]));
+
+    const forged = {
+      ...handle,
+      commitOpts: {
+        metadataEncoded: new TextEncoder().encode(
+          JSON.stringify({ source: "caller" })
+        ),
+        tags: ["bad tag with space"],
+      },
+    };
+    await stub.vfsCommitWriteStream(scope, forged);
+
+    const listing = (await stub.vfsListFiles(scope, {
+      includeMetadata: true,
+    })) as unknown as {
+      items: Array<{
+        path: string;
+        metadata?: Record<string, unknown> | null;
+        tags: string[];
+      }>;
+    };
+    const info = listing.items.find((item) => item.path === "/safe.bin");
+    expect(info?.metadata).toEqual({ source: "server" });
+    expect(info?.tags).toEqual(["trusted"]);
+  });
+
+  it("fences commit and abort while an append reservation is active", async () => {
+    const tenant = "wh-inflight-fence";
+    const stub = userStubFor(tenant);
+    const scope = { ns: NS, tenant };
+    const handle = await stub.vfsBeginWriteStream(scope, "/pending.bin");
+
+    await runInDurableObject(stub, (_instance, state) => {
+      state.storage.sql.exec(
+        `UPDATE write_stream_sessions
+            SET inflight_index = 0, inflight_at = ?
+          WHERE tmp_id = ?`,
+        Date.now(),
+        handle.tmpId
+      );
+    });
+
+    await expect(stub.vfsCommitWriteStream(scope, handle)).rejects.toThrow(
+      /stream is not idle/
+    );
+    await expect(stub.vfsAbortWriteStream(scope, handle)).rejects.toThrow(
+      /stream is not idle/
+    );
+
+    await runInDurableObject(stub, (_instance, state) => {
+      state.storage.sql.exec(
+        `UPDATE write_stream_sessions
+            SET inflight_index = NULL, inflight_at = NULL
+          WHERE tmp_id = ?`,
+        handle.tmpId
+      );
+    });
+    await stub.vfsAbortWriteStream(scope, handle);
+  });
+
+  it("rejects a different payload for an already reserved chunk index", async () => {
+    const tenant = "wh-inflight-hash";
+    const stub = userStubFor(tenant);
+    const scope = { ns: NS, tenant };
+    const handle = await stub.vfsBeginWriteStream(scope, "/pending.bin");
+
+    await runInDurableObject(stub, (_instance, state) => {
+      state.storage.sql.exec(
+        `UPDATE write_stream_sessions
+            SET inflight_index = 0, inflight_hash = ?, inflight_at = ?
+          WHERE tmp_id = ?`,
+        "0".repeat(64),
+        Date.now(),
+        handle.tmpId
+      );
+    });
+
+    await expect(
+      stub.vfsAppendWriteStream(scope, handle, 0, new Uint8Array([9]))
+    ).rejects.toThrow(/another append is in flight/);
+
+    await runInDurableObject(stub, (_instance, state) => {
+      state.storage.sql.exec(
+        `UPDATE write_stream_sessions
+            SET inflight_index = NULL, inflight_hash = NULL, inflight_at = NULL
+          WHERE tmp_id = ?`,
+        handle.tmpId
+      );
+    });
+    await stub.vfsAbortWriteStream(scope, handle);
+  });
+
   it("rejects out-of-order chunk indices", async () => {
     const tenant = "wh-order";
     const stub = userStubFor(tenant);
@@ -800,6 +921,54 @@ describe("createWriteStream applies metadata + tags + version at commit", () => 
     expect(versionRow).toBeDefined();
     expect(versionRow!.label).toBe("initial-stream");
     expect(versionRow!.user_visible).toBe(1);
+  });
+
+  it("rolls back a no-prior-path stream promotion when initial version publication fails", async () => {
+    const tenant = "stream-initial-version-rollback";
+    const stub = userStubFor(tenant);
+    const scope = { ns: NS, tenant };
+    await stub.adminSetVersioning(tenant, true);
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec(`
+        CREATE TRIGGER fail_initial_stream_version
+        BEFORE INSERT ON file_versions
+        BEGIN
+          SELECT RAISE(ABORT, 'injected initial stream version failure');
+        END
+      `);
+    });
+
+    const wrapped = await stub.vfsCreateWriteStream(scope, "/initial.bin");
+    const writer = wrapped.stream.getWriter();
+    await writer.write(new Uint8Array(20 * 1024).fill(0x51));
+    await expect(writer.close()).rejects.toThrow(
+      /injected initial stream version failure/
+    );
+    writer.releaseLock();
+
+    const state = await runInDurableObject(stub, async (_instance, durableState) => {
+      const sql = durableState.storage.sql;
+      return {
+        live: (
+          sql
+            .exec(
+              "SELECT COUNT(*) AS n FROM files WHERE file_name = 'initial.bin' AND status = 'complete'"
+            )
+            .toArray()[0] as { n: number }
+        ).n,
+        versions: (
+          sql.exec("SELECT COUNT(*) AS n FROM file_versions").toArray()[0] as {
+            n: number;
+          }
+        ).n,
+        versionChunks: (
+          sql.exec("SELECT COUNT(*) AS n FROM version_chunks").toArray()[0] as {
+            n: number;
+          }
+        ).n,
+      };
+    });
+    expect(state).toEqual({ live: 0, versions: 0, versionChunks: 0 });
   });
 
   it("createWriteStream rejects oversize metadata at begin (fails fast)", async () => {

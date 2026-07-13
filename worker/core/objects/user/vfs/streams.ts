@@ -11,17 +11,28 @@ import { generateId, vfsShardDOName } from "../../../lib/utils";
 import { placeChunk, POOL_FULL } from "../../../../../shared/placement";
 import { loadFullShards } from "../shard-capacity";
 import {
-  commitVersion,
+  commitVersionChecked,
   dropTmpRowAfterVersionCommit,
   insertVersionChunk,
   isVersioningEnabled,
+  type VersionedFileExpectation,
 } from "../vfs-versions";
 import {
   validateLabel,
   validateMetadata,
   validateTags,
 } from "../../../../../shared/metadata-validate";
-import { replaceTags } from "../metadata-tags";
+import {
+  bumpTagMtimes,
+  readMetadataBytes,
+  replaceTags,
+} from "../metadata-tags";
+import {
+  enforceModeMonotonic,
+  stampFileEncryption,
+  validateEncryptionOpts,
+  type EncryptionStampOpts,
+} from "../encryption-stamp";
 import {
   bumpFolderRevision,
   folderExists,
@@ -29,15 +40,21 @@ import {
   resolveOrThrow,
   resolveParent,
   userIdFor,
-  findLiveFile,
   FILE_HEAD_JOIN,
   assertHeadNotTombstoned,
+  recordWriteUsage,
 } from "./helpers";
 import {
   abortTempFile,
   commitRename,
+  disarmChunkCleanupIntents,
+  stageChunkCleanupIntents,
   type VFSWriteFileOpts,
 } from "./write-commit";
+import {
+  scheduleStaleUploadSweep,
+  transactionSync,
+} from "../internal-storage";
 
 /**
  * Streams + low-level escape hatch.
@@ -80,19 +97,180 @@ export interface VFSWriteHandle {
   chunkSize: number;
   /** server-authoritative pool size for placement */
   poolSize: number;
-  /**
-   * metadata/tags/version snapshot captured at begin-time and
-   * applied at commit-time. Internal-only; not surfaced to SDK consumers
-   * (the SDK's `WriteHandle` interface is a structural subset that omits
-   * this field). Validated at begin so the caller fails fast — commit
-   * just SETs.
-   */
-  commitOpts?: {
-    metadataEncoded?: Uint8Array | null;
-    tags?: readonly string[];
-    versionLabel?: string;
-    versionUserVisible?: boolean;
+  /** Present only on handles created before server-owned stream sessions. */
+  commitOpts?: WriteStreamCommitOptions;
+}
+
+interface WriteStreamCommitOptions {
+  metadataEncoded?: Uint8Array | null;
+  tags?: readonly string[];
+  versionLabel?: string;
+  versionUserVisible?: boolean;
+  encryption?: EncryptionStampOpts;
+}
+
+interface WriteStreamSessionRow extends Record<string, SqlStorageValue> {
+  parent_id: string | null;
+  leaf: string;
+  chunk_size: number;
+  pool_size: number;
+  metadata_present: number;
+  metadata_blob: ArrayBuffer | null;
+  tags_json: string | null;
+  version_label: string | null;
+  version_user_visible: number | null;
+  encryption_mode: string | null;
+  encryption_key_id: string | null;
+  status: string;
+  inflight_index: number | null;
+  inflight_hash: string | null;
+  inflight_at: number | null;
+  expires_at: number;
+}
+
+function readWriteStreamSession(
+  durableObject: UserDO,
+  userId: string,
+  handle: VFSWriteHandle
+): WriteStreamSessionRow {
+  const row = durableObject.sql
+    .exec(
+      `SELECT parent_id, leaf, chunk_size, pool_size, metadata_present,
+              metadata_blob, tags_json, version_label, version_user_visible,
+              encryption_mode, encryption_key_id, status, inflight_index,
+              inflight_hash, inflight_at, expires_at
+         FROM write_stream_sessions
+        WHERE tmp_id = ? AND user_id = ?`,
+      handle.tmpId,
+      userId
+    )
+    .toArray()[0] as WriteStreamSessionRow | undefined;
+  if (row) return row;
+
+  // Compatibility for handles that were opened before the server-owned
+  // session table shipped. Only rows older than the schema marker qualify;
+  // all caller-provided fields are revalidated and immediately persisted.
+  const legacy = durableObject.sql
+    .exec(
+      `SELECT f.parent_id, f.chunk_size, f.pool_size, f.created_at,
+              m.applied_at AS enabled_at
+         FROM files f
+         JOIN meta_schema m ON m.name = 'write_stream_sessions_enabled'
+        WHERE f.file_id = ? AND f.user_id = ? AND f.status = 'uploading'
+          AND f.file_name = ?`,
+      handle.tmpId,
+      userId,
+      `_vfs_tmp_${handle.tmpId}`
+    )
+    .toArray()[0] as
+    | {
+        parent_id: string | null;
+        chunk_size: number;
+        pool_size: number;
+        created_at: number;
+        enabled_at: number;
+      }
+    | undefined;
+  if (!legacy || legacy.created_at >= legacy.enabled_at) {
+    throw new VFSError("ENOENT", "write stream session not found");
+  }
+  if (
+    handle.parentId !== legacy.parent_id ||
+    handle.chunkSize !== legacy.chunk_size ||
+    handle.poolSize !== legacy.pool_size
+  ) {
+    throw new VFSError("EINVAL", "legacy write stream handle was modified");
+  }
+  const opts = handle.commitOpts;
+  if (opts?.metadataEncoded !== undefined && opts.metadataEncoded !== null) {
+    validateMetadata(JSON.parse(new TextDecoder().decode(opts.metadataEncoded)));
+  }
+  if (opts?.tags !== undefined) validateTags(opts.tags);
+  if (opts?.versionLabel !== undefined) validateLabel(opts.versionLabel);
+  validateEncryptionOpts(opts?.encryption);
+  durableObject.sql.exec(
+    `INSERT INTO write_stream_sessions
+       (tmp_id, user_id, parent_id, leaf, chunk_size, pool_size,
+        metadata_present, metadata_blob, tags_json, version_label,
+         version_user_visible, encryption_mode, encryption_key_id,
+         status, inflight_index, inflight_hash, inflight_at, expires_at, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', NULL, NULL, NULL, ?, ?)`,
+    handle.tmpId,
+    userId,
+    handle.parentId,
+    handle.leaf,
+    handle.chunkSize,
+    handle.poolSize,
+    opts?.metadataEncoded === undefined ? 0 : 1,
+    opts?.metadataEncoded ?? null,
+    opts?.tags === undefined ? null : JSON.stringify([...opts.tags]),
+    opts?.versionLabel ?? null,
+    opts?.versionUserVisible === undefined
+      ? null
+      : opts.versionUserVisible
+        ? 1
+        : 0,
+    opts?.encryption?.mode ?? null,
+    opts?.encryption?.keyId ?? null,
+    legacy.created_at + 60 * 60 * 1000,
+    legacy.created_at
+  );
+  return readWriteStreamSession(durableObject, userId, {
+    ...handle,
+    commitOpts: undefined,
+  });
+}
+
+function commitOptionsFromSession(
+  row: WriteStreamSessionRow
+): WriteStreamCommitOptions | undefined {
+  const tags = row.tags_json === null
+    ? undefined
+    : (JSON.parse(row.tags_json) as string[]);
+  const metadataEncoded = row.metadata_present === 0
+    ? undefined
+    : row.metadata_blob === null
+      ? null
+      : new Uint8Array(row.metadata_blob);
+  const encryption = row.encryption_mode === null
+    ? undefined
+    : {
+        mode: row.encryption_mode as "convergent" | "random",
+        ...(row.encryption_key_id === null ? {} : { keyId: row.encryption_key_id }),
+      };
+  if (
+    metadataEncoded === undefined &&
+    tags === undefined &&
+    row.version_label === null &&
+    row.version_user_visible === null &&
+    encryption === undefined
+  ) {
+    return undefined;
+  }
+  return {
+    metadataEncoded,
+    tags,
+    versionLabel: row.version_label ?? undefined,
+    versionUserVisible:
+      row.version_user_visible === null
+        ? undefined
+        : row.version_user_visible !== 0,
+    encryption,
   };
+}
+
+function assertHandleMatchesSession(
+  handle: VFSWriteHandle,
+  session: WriteStreamSessionRow
+): void {
+  if (
+    handle.parentId !== session.parent_id ||
+    handle.leaf !== session.leaf ||
+    handle.chunkSize !== session.chunk_size ||
+    handle.poolSize !== session.pool_size
+  ) {
+    throw new VFSError("EINVAL", "write stream handle was modified");
+  }
 }
 
 /** Opaque read handle returned by vfsOpenReadStream. */
@@ -531,6 +709,14 @@ export function vfsBeginWriteStream(
   if (opts.version?.label !== undefined) {
     validateLabel(opts.version.label);
   }
+  validateEncryptionOpts(opts.encryption);
+  enforceModeMonotonic(
+    durableObject,
+    userId,
+    parentId,
+    leaf,
+    opts.encryption
+  );
 
   const mode = opts.mode ?? 0o644;
   const mimeType = opts.mimeType ?? "application/octet-stream";
@@ -548,44 +734,55 @@ export function vfsBeginWriteStream(
   const { chunkSize: defaultChunkSize } = computeChunkSpec(
     1024 * 1024 * 1024
   ); // 1 GB hint → 2 MB chunks
-  durableObject.sql.exec(
-    `INSERT INTO files (file_id, user_id, parent_id, file_name, file_size, file_hash, mime_type, chunk_size, chunk_count, pool_size, status, created_at, updated_at, mode, node_kind)
-     VALUES (?, ?, ?, ?, 0, '', ?, ?, 0, ?, 'uploading', ?, ?, ?, 'file')`,
-    tmpId,
-    userId,
-    parentId,
-    tmpName,
-    mimeType,
-    defaultChunkSize,
-    poolSize,
-    now,
-    now,
-    mode
-  );
-
-  // Stash the validated commit-time payload on the handle. Cheap to
-  // re-pass through the caller; the SDK's structural `WriteHandle` does
-  // NOT expose this field so consumers cannot tamper with it.
-  const hasCommitOpts =
-    metadataEncoded !== undefined ||
-    opts.tags !== undefined ||
-    opts.version !== undefined;
+  transactionSync(durableObject, () => {
+    durableObject.sql.exec(
+      `INSERT INTO files (file_id, user_id, parent_id, file_name, file_size, file_hash, mime_type, chunk_size, chunk_count, pool_size, status, created_at, updated_at, mode, node_kind)
+       VALUES (?, ?, ?, ?, 0, '', ?, ?, 0, ?, 'uploading', ?, ?, ?, 'file')`,
+      tmpId,
+      userId,
+      parentId,
+      tmpName,
+      mimeType,
+      defaultChunkSize,
+      poolSize,
+      now,
+      now,
+      mode
+    );
+    durableObject.sql.exec(
+      `INSERT INTO write_stream_sessions
+         (tmp_id, user_id, parent_id, leaf, chunk_size, pool_size,
+          metadata_present, metadata_blob, tags_json, version_label,
+           version_user_visible, encryption_mode, encryption_key_id,
+           status, inflight_index, inflight_hash, inflight_at, expires_at, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', NULL, NULL, NULL, ?, ?)`,
+      tmpId,
+      userId,
+      parentId,
+      leaf,
+      defaultChunkSize,
+      poolSize,
+      metadataEncoded === undefined ? 0 : 1,
+      metadataEncoded ?? null,
+      opts.tags === undefined ? null : JSON.stringify([...opts.tags]),
+      opts.version?.label ?? null,
+      opts.version?.userVisible === undefined
+        ? null
+        : opts.version.userVisible
+          ? 1
+          : 0,
+      opts.encryption?.mode ?? null,
+      opts.encryption?.keyId ?? null,
+      now + 60 * 60 * 1000,
+      now
+    );
+  });
   return {
     tmpId,
     parentId,
     leaf,
     chunkSize: defaultChunkSize,
     poolSize,
-    ...(hasCommitOpts
-      ? {
-          commitOpts: {
-            metadataEncoded,
-            tags: opts.tags,
-            versionLabel: opts.version?.label,
-            versionUserVisible: opts.version?.userVisible,
-          },
-        }
-      : {}),
   };
 }
 
@@ -608,6 +805,8 @@ export async function vfsAppendWriteStream(
   data: Uint8Array
 ): Promise<{ bytesWritten: number }> {
   const userId = userIdFor(scope);
+  const session = readWriteStreamSession(durableObject, userId, handle);
+  assertHandleMatchesSession(handle, session);
   // Verify handle still refers to an uploading row owned by this user.
   //
   // Server-authoritative pool size. The chunk PUT below MUST NOT
@@ -661,6 +860,58 @@ export async function vfsAppendWriteStream(
   }
 
   const hash = await hashChunk(data);
+  const reservedRow = transactionSync(durableObject, () => {
+    const currentSession = readWriteStreamSession(durableObject, userId, handle);
+    assertHandleMatchesSession(handle, currentSession);
+    if (
+      currentSession.status !== "open" ||
+      (currentSession.inflight_index !== null &&
+        (currentSession.inflight_index !== chunkIndex ||
+          currentSession.inflight_hash !== hash))
+    ) {
+      throw new VFSError("EBUSY", "appendWriteStream: another append is in flight");
+    }
+    const current = durableObject.sql
+      .exec(
+        `SELECT file_size, chunk_count, status, pool_size
+           FROM files WHERE file_id=? AND user_id=?`,
+        handle.tmpId,
+        userId
+      )
+      .toArray()[0] as
+      | {
+          file_size: number;
+          chunk_count: number;
+          status: string;
+          pool_size: number;
+        }
+      | undefined;
+    if (!current || current.status !== "uploading") {
+      throw new VFSError("ENOENT", "appendWriteStream: stream is not open");
+    }
+    if (current.chunk_count !== chunkIndex) {
+      throw new VFSError(
+        "EINVAL",
+        `appendWriteStream: out-of-order chunkIndex ${chunkIndex}, expected ${current.chunk_count}`
+      );
+    }
+    durableObject.sql.exec(
+      `UPDATE write_stream_sessions
+          SET inflight_index = ?, inflight_hash = ?, inflight_at = ?
+        WHERE tmp_id = ? AND user_id = ?
+          AND status = 'open'
+          AND (inflight_index IS NULL OR
+               (inflight_index = ? AND inflight_hash = ?))`,
+      chunkIndex,
+      hash,
+      Date.now(),
+      handle.tmpId,
+      userId,
+      chunkIndex,
+      hash
+    );
+    return current;
+  });
   // Use server-recorded pool_size (not handle's claim). Honour
   // the skip-full-shard cache so a streaming append never sends
   // bytes to a near-cap shard. Pool growth on all-full is handled
@@ -674,7 +925,7 @@ export async function vfsAppendWriteStream(
     userIdFor(scope),
     handle.tmpId,
     chunkIndex,
-    row.pool_size,
+    reservedRow.pool_size,
     fullShards
   );
   if (sIdx === POOL_FULL) {
@@ -687,26 +938,61 @@ export async function vfsAppendWriteStream(
   const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
   const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, sIdx);
   const stub = shardNs.get(shardNs.idFromName(shardName));
+  await stageChunkCleanupIntents(durableObject, handle.tmpId, [sIdx]);
   await stub.putChunk(hash, data, handle.tmpId, chunkIndex, userId);
 
-  durableObject.sql.exec(
-    `INSERT OR REPLACE INTO file_chunks (file_id, chunk_index, chunk_hash, chunk_size, shard_index)
-     VALUES (?, ?, ?, ?, ?)`,
-    handle.tmpId,
-    chunkIndex,
-    hash,
-    data.byteLength,
-    sIdx
-  );
-  const newSize = row.file_size + data.byteLength;
-  const newCount = row.chunk_count + 1;
-  durableObject.sql.exec(
-    "UPDATE files SET file_size=?, chunk_count=?, updated_at=? WHERE file_id=?",
-    newSize,
-    newCount,
-    Date.now(),
-    handle.tmpId
-  );
+  const newSize = transactionSync(durableObject, () => {
+    const currentSession = readWriteStreamSession(durableObject, userId, handle);
+    if (
+      currentSession.status !== "open" ||
+      currentSession.inflight_index !== chunkIndex ||
+      currentSession.inflight_hash !== hash
+    ) {
+      throw new VFSError("EBUSY", "appendWriteStream: append reservation changed");
+    }
+    const current = durableObject.sql
+      .exec(
+        `SELECT file_size, chunk_count, status FROM files
+          WHERE file_id = ? AND user_id = ?`,
+        handle.tmpId,
+        userId
+      )
+      .toArray()[0] as
+      | { file_size: number; chunk_count: number; status: string }
+      | undefined;
+    if (!current || current.status !== "uploading" || current.chunk_count !== chunkIndex) {
+      throw new VFSError("EBUSY", "appendWriteStream: stream changed during append");
+    }
+    durableObject.sql.exec(
+      `INSERT OR REPLACE INTO file_chunks
+         (file_id, chunk_index, chunk_hash, chunk_size, shard_index)
+       VALUES (?, ?, ?, ?, ?)`,
+      handle.tmpId,
+      chunkIndex,
+      hash,
+      data.byteLength,
+      sIdx
+    );
+    const size = current.file_size + data.byteLength;
+    durableObject.sql.exec(
+      "UPDATE files SET file_size=?, chunk_count=?, updated_at=? WHERE file_id=?",
+      size,
+      current.chunk_count + 1,
+      Date.now(),
+      handle.tmpId
+    );
+    durableObject.sql.exec(
+      `UPDATE write_stream_sessions
+          SET inflight_index = NULL, inflight_hash = NULL, inflight_at = NULL,
+              expires_at = ?
+        WHERE tmp_id = ? AND user_id = ? AND inflight_index = ?`,
+      Date.now() + 60 * 60 * 1000,
+      handle.tmpId,
+      userId,
+      chunkIndex
+    );
+    return size;
+  });
   return { bytesWritten: newSize };
 }
 
@@ -716,14 +1002,8 @@ export async function vfsAppendWriteStream(
  * same supersede protocol as vfsWriteFile. The displaced row (if any)
  * is hard-deleted and its chunks are queued for GC.
  *
- * when the handle carries `commitOpts` (metadata/tags/version
- * captured at begin-time, validated then), apply them to the tmp row
- * BEFORE commitRename. metadata is written to `files.metadata`; tags
- * are recorded via `replaceTags` (which uses path_id == tmpId, and
- * commitRename carries them forward by virtue of the rename being a
- * file-name-only update — file_id stays stable). The `version` opts
- * are wired only when versioning is enabled for the tenant; when
- * disabled they are silently dropped (matches `writeFile`).
+ * Commit options are captured and validated at begin-time, then applied in
+ * the same local publication transaction as the rename or version head.
  */
 export async function vfsCommitWriteStream(
   durableObject: UserDO,
@@ -731,13 +1011,30 @@ export async function vfsCommitWriteStream(
   handle: VFSWriteHandle
 ): Promise<void> {
   const userId = userIdFor(scope);
+  const session = readWriteStreamSession(durableObject, userId, handle);
+  assertHandleMatchesSession(handle, session);
+  if (session.status !== "open" || session.inflight_index !== null) {
+    throw new VFSError("EBUSY", "commitWriteStream: stream is not idle");
+  }
   const row = durableObject.sql
     .exec(
-      "SELECT status FROM files WHERE file_id=? AND user_id=?",
+      `SELECT status, parent_id, file_size, chunk_size, chunk_count,
+              mime_type, mode
+         FROM files WHERE file_id = ? AND user_id = ?`,
       handle.tmpId,
       userId
     )
-    .toArray()[0] as { status: string } | undefined;
+    .toArray()[0] as
+    | {
+        status: string;
+        parent_id: string | null;
+        file_size: number;
+        chunk_size: number;
+        chunk_count: number;
+        mime_type: string;
+        mode: number;
+      }
+    | undefined;
   if (!row) {
     throw new VFSError("ENOENT", "commitWriteStream: handle not found");
   }
@@ -747,6 +1044,70 @@ export async function vfsCommitWriteStream(
       `commitWriteStream: not in uploading state (status=${row.status})`
     );
   }
+  if (row.parent_id !== session.parent_id) {
+    throw new VFSError("EINVAL", "commitWriteStream: session parent changed");
+  }
+  const destinationRow = durableObject.sql
+    .exec(
+      `SELECT file_id, head_version_id FROM files
+        WHERE user_id = ? AND IFNULL(parent_id, '') = IFNULL(?, '')
+          AND file_name = ? AND status = 'complete'`,
+      userId,
+      session.parent_id,
+      session.leaf
+    )
+    .toArray()[0] as
+    | { file_id: string; head_version_id: string | null }
+    | undefined;
+  const co = commitOptionsFromSession(session);
+  if (co?.metadataEncoded !== undefined && co.metadataEncoded !== null) {
+    validateMetadata(JSON.parse(new TextDecoder().decode(co.metadataEncoded)));
+  }
+  if (co?.tags !== undefined) validateTags(co.tags);
+  if (co?.versionLabel !== undefined) validateLabel(co.versionLabel);
+  validateEncryptionOpts(co?.encryption);
+
+  transactionSync(durableObject, () => {
+    const current = readWriteStreamSession(durableObject, userId, handle);
+    if (current.status !== "open" || current.inflight_index !== null) {
+      throw new VFSError("EBUSY", "commitWriteStream: stream is not idle");
+    }
+    durableObject.sql.exec(
+      `UPDATE write_stream_sessions SET status = 'committing'
+        WHERE tmp_id = ? AND user_id = ? AND status = 'open'
+          AND inflight_index IS NULL`,
+      handle.tmpId,
+      userId
+    );
+  });
+  const assertStreamState = (): void => {
+    const rows = durableObject.sql
+      .exec(
+        `SELECT 1 FROM files
+          WHERE file_id = ? AND user_id = ? AND status = 'uploading'
+            AND IFNULL(parent_id, '') = IFNULL(?, '')
+            AND file_size = ? AND chunk_count = ?`,
+        handle.tmpId,
+        userId,
+        session.parent_id,
+        row.file_size,
+        row.chunk_count
+      )
+      .toArray();
+    if (rows.length !== 1) {
+      throw new VFSError(
+        "EBUSY",
+        "commitWriteStream: stream changed during publication"
+      );
+    }
+    const current = readWriteStreamSession(durableObject, userId, handle);
+    if (current.status !== "committing" || current.inflight_index !== null) {
+      throw new VFSError(
+        "EBUSY",
+        "commitWriteStream: session changed during publication"
+      );
+    }
+  };
   const chunkHashes = durableObject.sql
     .exec(
       "SELECT chunk_hash FROM file_chunks WHERE file_id=? ORDER BY chunk_index",
@@ -756,32 +1117,14 @@ export async function vfsCommitWriteStream(
   const fileHash = await hashChunk(
     new TextEncoder().encode(chunkHashes.map((c) => c.chunk_hash).join(""))
   );
-  durableObject.sql.exec(
-    "UPDATE files SET file_hash=? WHERE file_id=?",
-    fileHash,
-    handle.tmpId
-  );
 
-  // apply metadata + tags BEFORE commitRename. The opts
-  // were validated at begin-time so we can write directly.
-  const co = handle.commitOpts;
-  if (co) {
-    if (co.metadataEncoded === null) {
-      durableObject.sql.exec(
-        "UPDATE files SET metadata = NULL WHERE file_id = ?",
-        handle.tmpId
-      );
-    } else if (co.metadataEncoded !== undefined) {
-      durableObject.sql.exec(
-        "UPDATE files SET metadata = ? WHERE file_id = ?",
-        co.metadataEncoded,
-        handle.tmpId
-      );
-    }
-    if (co.tags !== undefined) {
-      replaceTags(durableObject, userId, handle.tmpId, co.tags);
-    }
-  }
+  enforceModeMonotonic(
+    durableObject,
+    userId,
+    session.parent_id,
+    session.leaf,
+    co?.encryption
+  );
 
   // Commit-write-stream × versioning. A naive call to
   // `commitRename` here would, under versioning ON, hard-delete
@@ -795,29 +1138,7 @@ export async function vfsCommitWriteStream(
   const versioning = isVersioningEnabled(durableObject, userId);
 
   if (versioning) {
-    // Find existing path identity, if any.
-    const liveRow = findLiveFile(
-      durableObject,
-      userId,
-      handle.parentId,
-      handle.leaf
-    );
-    let pathId: string;
-    if (liveRow) {
-      pathId = liveRow.file_id;
-    } else {
-      // No prior path — promote the tmp row to live via commitRename
-      // (it has no supersede target to hard-delete in this branch).
-      await commitRename(
-        durableObject,
-        userId,
-        scope,
-        handle.tmpId,
-        handle.parentId,
-        handle.leaf
-      );
-      pathId = handle.tmpId;
-    }
+    const pathId = destinationRow?.file_id ?? handle.tmpId;
 
     // Snapshot the tmp row's final file_chunks into version_chunks
     // for a fresh versionId. The chunks themselves remain on
@@ -834,95 +1155,181 @@ export async function vfsCommitWriteStream(
       chunk_size: number;
       shard_index: number;
     }[];
-    const final = durableObject.sql
-      .exec(
-        "SELECT file_size, chunk_size, chunk_count, mime_type, mode FROM files WHERE file_id=?",
-        handle.tmpId
-      )
-      .toArray()[0] as
-      | {
-          file_size: number;
-          chunk_size: number;
-          chunk_count: number;
-          mime_type: string;
-          mode: number;
-        }
-      | undefined;
-    if (!final) {
-      throw new VFSError(
-        "ENOENT",
-        "commitWriteStream: tmp row vanished mid-commit"
-      );
-    }
     const versionId = generateId();
-    for (const c of tmpChunks) {
-      insertVersionChunk(durableObject, versionId, c);
-    }
-    commitVersion(durableObject, {
-      pathId,
-      versionId,
+    const committedAt = Date.now();
+    const metadataForVersion =
+      co?.metadataEncoded !== undefined
+        ? co.metadataEncoded
+        : destinationRow
+          ? readMetadataBytes(durableObject, pathId)
+          : null;
+    const expectedHead: VersionedFileExpectation = {
+      fileId: pathId,
       userId,
-      size: final.file_size,
-      mode: final.mode,
-      mtimeMs: Date.now(),
-      chunkSize: final.chunk_size,
-      chunkCount: final.chunk_count,
-      fileHash,
-      mimeType: final.mime_type,
-      inlineData: null,
-      userVisible: co?.versionUserVisible ?? true,
-      label: co?.versionLabel ?? null,
-      metadata: co?.metadataEncoded ?? null,
-      shardRefId: handle.tmpId,
-    });
+      parentId: session.parent_id,
+      fileName: session.leaf,
+      headVersionId: destinationRow?.head_version_id ?? null,
+    };
+    const finalizeVersion = (): void => {
+      for (const chunk of tmpChunks) {
+        insertVersionChunk(durableObject, versionId, chunk);
+      }
+      applyStreamCommitSideEffects(
+        durableObject,
+        userId,
+        pathId,
+        co,
+        committedAt,
+        false
+      );
+      commitVersionChecked(
+        durableObject,
+        {
+          pathId,
+          versionId,
+          userId,
+          size: row.file_size,
+          mode: row.mode,
+          mtimeMs: committedAt,
+          chunkSize: row.chunk_size,
+          chunkCount: row.chunk_count,
+          fileHash,
+          mimeType: row.mime_type,
+          inlineData: null,
+          userVisible: co?.versionUserVisible ?? true,
+          label: co?.versionLabel ?? null,
+          metadata: metadataForVersion,
+          encryption: co?.encryption,
+          shardRefId: handle.tmpId,
+        },
+        expectedHead,
+        "commitWriteStream"
+      );
+      if (row.chunk_count > 0) {
+        disarmChunkCleanupIntents(durableObject, handle.tmpId);
+      }
+    };
 
-    // When the prior live row was reused as pathId, drop the now-
-    // redundant tmp files row WITHOUT chunk fan-out (chunks belong
-    // to the new version under refId=tmpId).
-    if (liveRow) {
-      dropTmpRowAfterVersionCommit(durableObject, handle.tmpId, {
-        hasChunks: true,
-      });
-    }
-    // Versioned stream-commit either added a fresh path
-    // (commitRename branch above bumped via the commitRename hook)
-    // OR advanced the head version of an existing path. The latter
-    // case is invisible to commitRename's bump because it didn't
-    // fire — explicit bump here covers it.
-    if (liveRow) {
-      bumpFolderRevision(durableObject, userId, handle.parentId);
+    try {
+      if (destinationRow) {
+        await scheduleStaleUploadSweep(durableObject);
+        transactionSync(durableObject, () => {
+          assertStreamState();
+          finalizeVersion();
+          dropTmpRowAfterVersionCommit(durableObject, handle.tmpId, {
+            hasChunks: true,
+          });
+          durableObject.sql.exec(
+            "DELETE FROM write_stream_sessions WHERE tmp_id = ?",
+            handle.tmpId
+          );
+          bumpFolderRevision(durableObject, userId, session.parent_id);
+        });
+      } else {
+        await commitRename(
+          durableObject,
+          userId,
+          scope,
+          handle.tmpId,
+          session.parent_id,
+          session.leaf,
+          {
+            requireVacantDestination: true,
+            preconditionLocal: assertStreamState,
+            publicationEncryption: co?.encryption ?? null,
+            finalizeLocal: finalizeVersion,
+          }
+        );
+      }
+    } catch (err) {
+      await abortTempFile(durableObject, userId, scope, handle.tmpId);
+      throw err;
     }
     return;
   }
 
-  // Versioning OFF — record bytes against quota AFTER
-  // commitRename succeeds. Without this, any tenant who ever
-  // used createWriteStream would have their storage_used and
-  // file_count silently understated. The versioning branch above
-  // goes through commitVersion which self-accounts; this is the
-  // symmetric increment for the non-versioning branch.
-  //
-  // Read file_size from the now-promoted row. commitRename
-  // either inserted a fresh path or superseded a prior live one;
-  // in both cases the row at handle.tmpId now has the final
-  // file_size (set by the chunk-append loop's UPDATE).
+  // Versioning OFF: side effects and positive accounting publish with the
+  // rename. The versioning branch accounts through commitVersion.
   await commitRename(
     durableObject,
     userId,
     scope,
     handle.tmpId,
-    handle.parentId,
-    handle.leaf
+        session.parent_id,
+        session.leaf,
+    {
+      requireVacantDestination: destinationRow === undefined,
+      expectedDestination: destinationRow
+        ? {
+            fileId: destinationRow.file_id,
+            headVersionId: destinationRow.head_version_id,
+          }
+        : undefined,
+      preconditionLocal: assertStreamState,
+      publicationEncryption: co?.encryption ?? null,
+      finalizeLocal: () => {
+        durableObject.sql.exec(
+          "UPDATE files SET file_hash = ? WHERE file_id = ?",
+          fileHash,
+          handle.tmpId
+        );
+        applyStreamCommitSideEffects(
+          durableObject,
+          userId,
+          handle.tmpId,
+          co,
+          Date.now(),
+          false
+        );
+        const sizeRow = durableObject.sql
+          .exec(
+            "SELECT file_size FROM files WHERE file_id = ?",
+            handle.tmpId
+          )
+          .toArray()[0] as { file_size: number } | undefined;
+        if (sizeRow) {
+          recordWriteUsage(durableObject, userId, sizeRow.file_size, 1);
+        }
+        if (row.chunk_count > 0) {
+          disarmChunkCleanupIntents(durableObject, handle.tmpId);
+        }
+        durableObject.sql.exec(
+          "DELETE FROM write_stream_sessions WHERE tmp_id = ?",
+          handle.tmpId
+        );
+      },
+    }
   );
-  const sizeRow = durableObject.sql
-    .exec(
-      "SELECT file_size FROM files WHERE file_id = ?",
-      handle.tmpId
-    )
-    .toArray()[0] as { file_size: number } | undefined;
-  if (sizeRow) {
-    const { recordWriteUsage } = await import("./helpers");
-    recordWriteUsage(durableObject, userId, sizeRow.file_size, 1);
+}
+
+function applyStreamCommitSideEffects(
+  durableObject: UserDO,
+  userId: string,
+  pathId: string,
+  opts: WriteStreamCommitOptions | undefined,
+  mtimeMs: number,
+  bumpEncryptionRevision: boolean
+): void {
+  if (opts?.metadataEncoded !== undefined) {
+    durableObject.sql.exec(
+      "UPDATE files SET metadata = ?, updated_at = ? WHERE file_id = ?",
+      opts.metadataEncoded,
+      mtimeMs,
+      pathId
+    );
+  }
+  if (opts?.tags !== undefined) {
+    replaceTags(durableObject, userId, pathId, opts.tags);
+  } else {
+    bumpTagMtimes(durableObject, pathId, mtimeMs);
+  }
+  if (opts?.encryption !== undefined) {
+    stampFileEncryption(
+      durableObject,
+      pathId,
+      opts.encryption,
+      bumpEncryptionRevision ? userId : undefined
+    );
   }
 }
 
@@ -937,6 +1344,23 @@ export async function vfsAbortWriteStream(
   handle: VFSWriteHandle
 ): Promise<void> {
   const userId = userIdFor(scope);
+  const session = durableObject.sql
+    .exec(
+      `SELECT parent_id, leaf, chunk_size, pool_size, metadata_present,
+              metadata_blob, tags_json, version_label, version_user_visible,
+              encryption_mode, encryption_key_id, status, inflight_index,
+              inflight_hash, inflight_at, expires_at
+         FROM write_stream_sessions WHERE tmp_id = ? AND user_id = ?`,
+      handle.tmpId,
+      userId
+    )
+    .toArray()[0] as WriteStreamSessionRow | undefined;
+  if (session) {
+    assertHandleMatchesSession(handle, session);
+    if (session.status !== "open" || session.inflight_index !== null) {
+      throw new VFSError("EBUSY", "abortWriteStream: stream is not idle");
+    }
+  }
   await abortTempFile(durableObject, userId, scope, handle.tmpId);
 }
 

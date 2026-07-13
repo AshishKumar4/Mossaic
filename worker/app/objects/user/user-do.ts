@@ -13,6 +13,7 @@ import { listFiles, deleteFile, getFile } from "./files";
 import { createFolder, listFolders, getFolderPath } from "./folders";
 import { getQuota, updateUsage } from "./quota";
 import { UserDOCore } from "@core/objects/user/user-do-core";
+import { scheduleAlarmAt } from "@core/objects/user/internal-storage";
 import { insertAuditLog } from "@core/objects/user/vfs/audit-log";
 import { FILE_HEAD_JOIN } from "@core/objects/user/vfs/helpers";
 import {
@@ -71,8 +72,8 @@ export class UserDO extends UserDOCore {
 
   /**
    * Override Core's alarm to chain through the App-side search-index
-   * reconciler. Core's alarm sweeps tmp upload rows + expired
-   * multipart sessions; the App layer adds a sweep of
+   * reconciler. Core's alarm drains chunk cleanup intents and sweeps tmp
+   * upload rows + expired multipart sessions; the App layer adds a sweep of
    * `indexed_at IS NULL` files to catch cases where the SPA crashed
    * between `multipart/finalize` and the index POST.
    *
@@ -100,11 +101,8 @@ export class UserDO extends UserDOCore {
         // fill, so this is the AT-LEAST cadence; it's safe to
         // also set here because the storage API takes the
         // earlier of competing alarms.
-        const cur = await this.ctx.storage.getAlarm();
         const target = Date.now() + 60_000;
-        if (cur === null || cur > target) {
-          await this.ctx.storage.setAlarm(target);
-        }
+        await scheduleAlarmAt(this, target);
       }
     } catch (err) {
       console.warn(

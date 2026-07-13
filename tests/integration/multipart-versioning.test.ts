@@ -31,12 +31,14 @@ import { listVersionsVia } from "./helpers";
 
 import { signVFSToken } from "@core/lib/auth";
 import { hashChunk } from "@shared/crypto";
-import { vfsUserDOName } from "@core/lib/utils";
+import { vfsShardDOName, vfsUserDOName } from "@core/lib/utils";
 import type { UserDO } from "@app/objects/user/user-do";
+import type { ShardDO } from "@core/objects/shard/shard-do";
+import { placeChunk } from "@shared/placement";
 
 interface E {
   MOSSAIC_USER: DurableObjectNamespace<UserDO>;
-  MOSSAIC_SHARD: DurableObjectNamespace;
+  MOSSAIC_SHARD: DurableObjectNamespace<ShardDO>;
   JWT_SECRET?: string;
 }
 const TEST_ENV = env as unknown as E;
@@ -56,6 +58,7 @@ interface BeginRes {
   uploadId: string;
   chunkSize: number;
   totalChunks: number;
+  poolSize: number;
   sessionToken: string;
 }
 
@@ -247,6 +250,143 @@ describe("multipart × versioning — Phase 27 correct semantics (MV1, MV3)", ()
     // versions so dropVersionRows can fan out the right refId.
     expect(state.shardRefId).not.toBeNull();
     expect(typeof state.shardRefId).toBe("string");
+  });
+
+  it("rolls back no-prior-path promotion, head, and terminal session state together", async () => {
+    const tenant = "mv-initial-version-rollback";
+    const stub = userStub(tenant);
+    await (
+      stub as unknown as {
+        adminSetVersioning(t: string, e: boolean): Promise<unknown>;
+      }
+    ).adminSetVersioning(tenant, true);
+    const payload = makePayload(0xa5);
+    const begin = await beginMP({
+      tenant,
+      path: "/rollback.bin",
+      size: payload.byteLength,
+      chunkSize: 16 * 1024,
+    });
+    const hashes: string[] = [];
+    for (let index = 0; index < begin.totalChunks; index++) {
+      const start = index * begin.chunkSize;
+      hashes.push(
+        await putMP(
+          begin.bearer,
+          begin.uploadId,
+          index,
+          payload.subarray(
+            start,
+            Math.min(start + begin.chunkSize, payload.byteLength)
+          ),
+          begin.sessionToken
+        )
+      );
+    }
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec(`
+        CREATE TRIGGER fail_initial_multipart_version
+        BEFORE INSERT ON file_versions
+        BEGIN
+          SELECT RAISE(ABORT, 'injected initial multipart version failure');
+        END
+      `);
+    });
+
+    await expect(
+      finalizeMP(begin.bearer, begin.uploadId, hashes)
+    ).rejects.toThrow(/injected initial multipart version failure/);
+
+    const local = await runInDurableObject(stub, async (_instance, state) => {
+      const sql = state.storage.sql;
+      return {
+        live: (
+          sql
+            .exec(
+              "SELECT COUNT(*) AS n FROM files WHERE file_name = 'rollback.bin' AND status = 'complete'"
+            )
+            .toArray()[0] as { n: number }
+        ).n,
+        versions: (
+          sql.exec("SELECT COUNT(*) AS n FROM file_versions").toArray()[0] as {
+            n: number;
+          }
+        ).n,
+        versionChunks: (
+          sql.exec("SELECT COUNT(*) AS n FROM version_chunks").toArray()[0] as {
+            n: number;
+          }
+        ).n,
+        tempRows: (
+          sql
+            .exec(
+              "SELECT COUNT(*) AS n FROM files WHERE file_id = ? AND status = 'uploading'",
+              begin.uploadId
+            )
+            .toArray()[0] as { n: number }
+        ).n,
+        cleanupIntents: (
+          sql
+            .exec(
+              "SELECT COUNT(*) AS n FROM chunk_cleanup_intents WHERE ref_id = ?",
+              begin.uploadId
+            )
+            .toArray()[0] as { n: number }
+        ).n,
+        sessionStatus: (
+          sql
+            .exec(
+              "SELECT status FROM upload_sessions WHERE upload_id = ?",
+              begin.uploadId
+            )
+            .toArray()[0] as { status: string }
+        ).status,
+      };
+    });
+    expect(local).toEqual({
+      live: 0,
+      versions: 0,
+      versionChunks: 0,
+      tempRows: 0,
+      cleanupIntents: 0,
+      sessionStatus: "aborted",
+    });
+
+    const touched = new Set<number>();
+    for (let index = 0; index < begin.totalChunks; index++) {
+      touched.add(placeChunk(tenant, begin.uploadId, index, begin.poolSize));
+    }
+    const remainingRefs = await Promise.all(
+      Array.from(touched, async (shardIndex) => {
+        const shard = TEST_ENV.MOSSAIC_SHARD.get(
+          TEST_ENV.MOSSAIC_SHARD.idFromName(
+            vfsShardDOName(NS, tenant, undefined, shardIndex)
+          )
+        );
+        return runInDurableObject(shard, async (_instance, state) => {
+          return (
+            state.storage.sql
+              .exec(
+                "SELECT COUNT(*) AS n FROM chunk_refs WHERE file_id = ?",
+                begin.uploadId
+              )
+              .toArray()[0] as { n: number }
+          ).n;
+        });
+      })
+    );
+    expect(remainingRefs.every((count) => count === 0)).toBe(true);
+
+    await expect(
+      stub.vfsFinalizeMultipart(
+        { ns: NS, tenant },
+        begin.uploadId,
+        hashes
+      )
+    ).rejects.toThrow(/status='aborted'/);
+    await expect(
+      stub.vfsAbortMultipart({ ns: NS, tenant }, begin.uploadId)
+    ).resolves.toEqual({ ok: true });
   });
 
   it("MV3 — listVersions on a multipart-uploaded file under versioning ON returns 1 entry; bytes readable", async () => {

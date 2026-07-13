@@ -37,6 +37,9 @@ export {
 } from "./vfs/reads";
 
 export {
+  drainChunkCleanupIntents,
+  stageChunkCleanupIntents,
+  disarmChunkCleanupIntents,
   hardDeleteFileRow,
   vfsWriteFile,
   commitRename,

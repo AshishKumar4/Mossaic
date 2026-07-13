@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
+import type { ShardDO } from "@core/objects/shard/shard-do";
 
 /**
  * Refcount drift fix tests (sdk-impl-plan §0, §8.1).
@@ -14,7 +15,7 @@ import { env, runInDurableObject } from "cloudflare:test";
  */
 
 interface Env {
-  MOSSAIC_SHARD: DurableObjectNamespace;
+  MOSSAIC_SHARD: DurableObjectNamespace<ShardDO>;
 }
 
 const E = env as unknown as Env;
@@ -22,7 +23,7 @@ const stubFor = (name: string) =>
   E.MOSSAIC_SHARD.get(E.MOSSAIC_SHARD.idFromName(name));
 
 async function putChunk(
-  stub: DurableObjectStub,
+  stub: DurableObjectStub<ShardDO>,
   hash: string,
   fileId: string,
   chunkIndex: number,
@@ -44,7 +45,7 @@ async function putChunk(
 }
 
 async function readRefcount(
-  stub: DurableObjectStub,
+  stub: DurableObjectStub<ShardDO>,
   hash: string
 ): Promise<number> {
   return runInDurableObject(stub, async (_instance, state) => {
@@ -57,7 +58,7 @@ async function readRefcount(
 }
 
 async function readRefRowCount(
-  stub: DurableObjectStub,
+  stub: DurableObjectStub<ShardDO>,
   hash: string
 ): Promise<number> {
   return runInDurableObject(stub, async (_instance, state) => {
@@ -139,6 +140,64 @@ describe("ShardDO chunk refcount", () => {
 
     expect(await readRefcount(stub, hash)).toBe(3);
     expect(await readRefRowCount(stub, hash)).toBe(3);
+  });
+
+  it("deletes grouped duplicate-hash refs exactly once and keeps replay stable", async () => {
+    const stub = stubFor("refcount:delete-duplicate-hash");
+    const hash = "9".repeat(64);
+    const fileId = "duplicate-hash-file";
+
+    await putChunk(stub, hash, fileId, 0, "data");
+    await putChunk(stub, hash, fileId, 1, "data");
+    await putChunk(stub, hash, fileId, 2, "data");
+    await putChunk(stub, hash, "survivor", 0, "data");
+    expect(await readRefcount(stub, hash)).toBe(4);
+
+    expect(await stub.deleteChunks(fileId)).toEqual({ marked: 0 });
+    expect(await readRefcount(stub, hash)).toBe(1);
+    expect(await readRefRowCount(stub, hash)).toBe(1);
+    expect(
+      await runInDurableObject(stub, (_instance, state) =>
+        state.storage.getAlarm()
+      )
+    ).not.toBeNull();
+
+    expect(await stub.deleteChunks(fileId)).toEqual({ marked: 0 });
+    expect(await readRefcount(stub, hash)).toBe(1);
+    expect(await readRefRowCount(stub, hash)).toBe(1);
+  });
+
+  it("rolls back the complete ref deletion when soft-marking fails", async () => {
+    const stub = stubFor("refcount:delete-transaction-rollback");
+    const hash = "8".repeat(64);
+    const fileId = "rollback-file";
+
+    await putChunk(stub, hash, fileId, 0, "data");
+    await putChunk(stub, hash, fileId, 1, "data");
+    await runInDurableObject(stub, (_instance, state) => {
+      state.storage.sql.exec(`
+        CREATE TRIGGER fail_test_chunk_soft_mark
+        BEFORE UPDATE OF deleted_at ON chunks
+        WHEN NEW.deleted_at IS NOT NULL
+        BEGIN
+          SELECT RAISE(ABORT, 'injected chunk soft-mark failure');
+        END
+      `);
+    });
+
+    await expect(stub.deleteChunks(fileId)).rejects.toThrow(
+      /injected chunk soft-mark failure/
+    );
+    expect(await readRefcount(stub, hash)).toBe(2);
+    expect(await readRefRowCount(stub, hash)).toBe(2);
+
+    await runInDurableObject(stub, (_instance, state) => {
+      state.storage.sql.exec("DROP TRIGGER fail_test_chunk_soft_mark");
+    });
+    expect(await stub.deleteChunks(fileId)).toEqual({ marked: 1 });
+    expect(await stub.deleteChunks(fileId)).toEqual({ marked: 0 });
+    expect(await readRefcount(stub, hash)).toBe(0);
+    expect(await readRefRowCount(stub, hash)).toBe(0);
   });
 
   it("resurrection: a soft-marked chunk has deleted_at cleared on dedup PUT", async () => {

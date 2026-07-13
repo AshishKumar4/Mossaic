@@ -7,23 +7,39 @@ import {
 import { generateId, vfsShardDOName } from "../../../lib/utils";
 import { normalizePath, VFSPathError } from "../../../../../shared/vfs-paths";
 import {
+  assertVersionedFileExpectation,
   commitVersion,
-  dropVersionRows,
+  commitVersionChecked,
+  dropVersionRowsLocal,
   insertVersionChunk,
   isVersioningEnabled,
   shardRefId,
+  type VersionedFileExpectation,
 } from "../vfs-versions";
 import {
   bumpFolderRevision,
   folderExists,
   poolSizeFor,
+  recordWriteUsage,
   resolveOrThrow,
   resolveParent,
   userIdFor,
 } from "./helpers";
 import { insertAuditLog } from "./audit-log";
 import { isYjsMode } from "./metadata";
-import { hardDeleteFileRow } from "./write-commit";
+import {
+  disarmChunkCleanupIntents,
+  drainChunkCleanupIntents,
+  hardDeleteFileRow,
+  hardDeleteFileRowLocal,
+  stageChunkCleanupIntents,
+} from "./write-commit";
+import {
+  ChunkCleanupKind,
+  scheduleStaleUploadSweep,
+  stageChunkCleanupIntent,
+  transactionSync,
+} from "../internal-storage";
 
 /**
  * Filesystem namespace mutations.
@@ -95,6 +111,7 @@ export async function vfsUnlink(
     // state. (DO single-thread serializes this anyway; ordering
     // pinned for clarity.)
     if (r.kind === "file" && isYjsMode(durableObject, userId, r.leafId)) {
+      await scheduleStaleUploadSweep(durableObject);
       const { purgeYjs } = await import("../yjs");
       await purgeYjs(durableObject, scope, r.leafId);
     }
@@ -135,6 +152,7 @@ export async function vfsUnlink(
   // wipe the per-path oplog/meta rows BEFORE the files row goes,
   // so we still know `r.leafId`.
   if (r.kind === "file" && isYjsMode(durableObject, userId, r.leafId)) {
+    await scheduleStaleUploadSweep(durableObject);
     const { purgeYjs } = await import("../yjs");
     await purgeYjs(durableObject, scope, r.leafId);
   }
@@ -448,6 +466,7 @@ export async function vfsRename(
   // bumps fire iff src.parent !== dst.parent (cross-folder move);
   // for in-folder rename only one bump fires.
   let srcParent: string | null = null;
+  let srcFileName: string | undefined;
   // Check if dst is the same as src (no-op).
   if (srcR.kind === "file" || srcR.kind === "symlink") {
     const srcRow = durableObject.sql
@@ -457,6 +476,7 @@ export async function vfsRename(
       )
       .toArray()[0] as { parent_id: string | null; file_name: string };
     srcParent = srcRow.parent_id ?? null;
+    srcFileName = srcRow.file_name;
     if (
       srcParent === dstParent &&
       srcRow.file_name === dstLeaf
@@ -598,67 +618,84 @@ export async function vfsRename(
           historyPreserved: true,
         }),
       });
-      bumpRenameParents(durableObject, userId, srcParent, dstParent);
       return;
     }
 
-    // Versioning OFF: hard-delete the displaced row's chunks via
-    // shard fan-out.
+    // Versioning OFF: arm maintenance before the local transition, commit
+    // every namespace/accounting/outbox effect together, then drain remote
+    // cleanup after commit.
+    const expectedSourceName = srcFileName;
+    if (expectedSourceName === undefined) {
+      throw new VFSError("EBUSY", "rename: source changed during preflight");
+    }
+    await scheduleStaleUploadSweep(durableObject);
     const now = Date.now();
-    durableObject.sql.exec(
-      "UPDATE files SET status='deleted', deleted_at=?, updated_at=? WHERE file_id=?",
-      now,
-      now,
-      dstFile.file_id
-    );
     try {
-      durableObject.sql.exec(
-        "UPDATE files SET parent_id=?, file_name=?, updated_at=? WHERE file_id=? AND user_id=?",
-        dstParent,
-        dstLeaf,
-        now,
-        srcR.leafId,
-        userId
-      );
-    } catch (err) {
-      // Rollback: revert the supersede so the original dst row stays
-      // live and the unique-index slot is reoccupied. Wrap in a
-      // defensive try/catch — under DO single-threading the surrounding
-      // sql.exec calls are synchronous, so the index slot can't be
-      // re-claimed by anyone else between supersede and rollback. The
-      // try/catch hardens against future code changes that introduce
-      // an `await` between those statements.
-      try {
+      transactionSync(durableObject, () => {
+        const sourceReady = durableObject.sql
+          .exec(
+            `SELECT 1 FROM files
+              WHERE file_id=? AND user_id=? AND status='complete'
+                AND IFNULL(parent_id,'')=IFNULL(?,'') AND file_name=?`,
+            srcR.leafId,
+            userId,
+            srcParent,
+            expectedSourceName
+          )
+          .toArray();
+        const destinationReady = durableObject.sql
+          .exec(
+            `SELECT 1 FROM files
+              WHERE file_id=? AND user_id=? AND status='complete'
+                AND IFNULL(parent_id,'')=IFNULL(?,'') AND file_name=?`,
+            dstFile.file_id,
+            userId,
+            dstParent,
+            dstLeaf
+          )
+          .toArray();
+        if (sourceReady.length !== 1 || destinationReady.length !== 1) {
+          throw new Error("source or destination changed during rename");
+        }
+
         durableObject.sql.exec(
-          "UPDATE files SET status='complete', deleted_at=NULL, updated_at=? WHERE file_id=?",
+          `UPDATE files SET status='deleted', deleted_at=?, updated_at=?
+            WHERE file_id=? AND user_id=? AND status='complete'`,
           now,
-          dstFile.file_id
+          now,
+          dstFile.file_id,
+          userId
         );
-      } catch {
-        // Rollback failed — accept that the dst row is permanently
-        // soft-deleted. Surface the original error so the caller
-        // knows the rename did not happen.
-      }
+        durableObject.sql.exec(
+          `UPDATE files SET parent_id=?, file_name=?, updated_at=?
+            WHERE file_id=? AND user_id=? AND status='complete'`,
+          dstParent,
+          dstLeaf,
+          now,
+          srcR.leafId,
+          userId
+        );
+        hardDeleteFileRowLocal(durableObject, userId, dstFile.file_id);
+        insertAuditLog(durableObject, {
+          op: "rename",
+          actor: userId,
+          target: srcR.leafId,
+          payload: JSON.stringify({
+            src,
+            dst,
+            replacedFileId: dstFile.file_id,
+            versioning: false,
+          }),
+        });
+        bumpRenameParents(durableObject, userId, srcParent, dstParent);
+      });
+    } catch (err) {
       throw new VFSError(
         "EBUSY",
         `rename: replace failed: ${(err as Error).message}`
       );
     }
-    // Hard-delete the displaced file's contents.
-    await hardDeleteFileRow(durableObject, userId, scope, dstFile.file_id);
-    insertAuditLog(durableObject, {
-      op: "rename",
-      actor: userId,
-      target: srcR.leafId,
-      payload: JSON.stringify({
-        src,
-        dst,
-        replacedFileId: dstFile.file_id,
-        versioning: false,
-      }),
-    });
-    // Bump src + dst parents (de-dup'd when same).
-    bumpRenameParents(durableObject, userId, srcParent, dstParent);
+    await drainChunkCleanupIntents(durableObject, scope, dstFile.file_id);
     return;
   }
   // dst is empty: simple UPDATE.
@@ -746,13 +783,9 @@ function bumpRenameParents(
  *    reaped via best-effort DELETE; the new version_id was never
  *    committed so dst's history is untouched. Throws the original
  *    error to the caller.
- *  - dropVersionRows for source fails (rare — ShardDO transient):
- *    the new version on dstFileId is already committed, dst's
- *    history is correct. Source's `files` row + history rows are
- *    intentionally left intact for a future retry by
- *    adminReapTombstonedHeads / dropVersions / vfsPurge. We do
- *    NOT throw — the rename's user-visible contract ("dst now
- *    holds src's content") is satisfied; the leak is bounded.
+ *  - Source cleanup metadata and destination publication commit in
+ *    one local transaction. Shard cleanup failures remain in the
+ *    durable outbox and do not roll back the visible rename.
  */
 async function renameOverwriteVersioned(
   durableObject: UserDO,
@@ -768,7 +801,8 @@ async function renameOverwriteVersioned(
     .exec(
       `SELECT file_id, file_size, file_hash, mime_type, mode,
               chunk_size, chunk_count, head_version_id, inline_data,
-              node_kind, mode_yjs, encryption_mode, encryption_key_id
+              node_kind, mode_yjs, encryption_mode, encryption_key_id,
+              parent_id, file_name
          FROM files
         WHERE file_id = ? AND user_id = ?`,
       srcFileId,
@@ -789,6 +823,8 @@ async function renameOverwriteVersioned(
         mode_yjs: number;
         encryption_mode: string | null;
         encryption_key_id: string | null;
+        parent_id: string | null;
+        file_name: string;
       }
     | undefined;
   if (!srcRow) {
@@ -804,6 +840,45 @@ async function renameOverwriteVersioned(
       "rename: versioned overwrite only supports regular byte files"
     );
   }
+  const dstRow = durableObject.sql
+    .exec(
+      `SELECT parent_id, file_name, head_version_id FROM files
+        WHERE file_id = ? AND user_id = ? AND status = 'complete'`,
+      dstFileId,
+      userId
+    )
+    .toArray()[0] as
+    | {
+        parent_id: string | null;
+        file_name: string;
+        head_version_id: string | null;
+      }
+    | undefined;
+  if (!dstRow) {
+    throw new VFSError("EBUSY", "rename: destination changed during preflight");
+  }
+  const expectedSource: VersionedFileExpectation = {
+    fileId: srcFileId,
+    userId,
+    parentId: srcRow.parent_id,
+    fileName: srcRow.file_name,
+    headVersionId: srcRow.head_version_id,
+  };
+  const expectedDestination: VersionedFileExpectation = {
+    fileId: dstFileId,
+    userId,
+    parentId: dstRow.parent_id,
+    fileName: dstRow.file_name,
+    headVersionId: dstRow.head_version_id,
+  };
+  const sourceVersionIds = durableObject.sql
+    .exec(
+      "SELECT version_id FROM file_versions WHERE path_id = ? AND user_id = ?",
+      srcFileId,
+      userId
+    )
+    .toArray() as { version_id: string }[];
+  await scheduleStaleUploadSweep(durableObject);
 
   // Resolve the head version row for the src. Versioning-ON
   // semantics: head_version_id IS NOT NULL and points at a
@@ -891,26 +966,63 @@ async function renameOverwriteVersioned(
 
   const newVersionId = generateId();
   const now = Date.now();
+  const publishAndReapSource = async (publish: () => void): Promise<void> => {
+    let sourceRefIds: string[] = [];
+    transactionSync(durableObject, () => {
+      assertVersionedFileExpectation(
+        durableObject,
+        expectedSource,
+        "rename"
+      );
+      publish();
+      if (sourceVersionIds.length > 0) {
+        sourceRefIds = dropVersionRowsLocal(
+          durableObject,
+          userId,
+          srcFileId,
+          sourceVersionIds.map((row) => row.version_id)
+        ).refIds;
+      } else {
+        hardDeleteFileRowLocal(durableObject, userId, srcFileId);
+        sourceRefIds = [srcFileId];
+      }
+      bumpRenameParents(
+        durableObject,
+        userId,
+        srcRow.parent_id,
+        dstRow.parent_id
+      );
+    });
+    for (const refId of sourceRefIds) {
+      await drainChunkCleanupIntents(durableObject, scope, refId);
+    }
+  };
 
   // ── Inline tier ──────────────────────────────────────────────────────
   if (srcHead.inlineData !== null) {
-    commitVersion(durableObject, {
-      pathId: dstFileId,
-      versionId: newVersionId,
-      userId,
-      size: srcHead.size,
-      mode: srcHead.mode,
-      mtimeMs: now,
-      chunkSize: 0,
-      chunkCount: 0,
-      fileHash: srcHead.fileHash,
-      mimeType: srcHead.mimeType,
-      inlineData: new Uint8Array(srcHead.inlineData),
-      userVisible: true,
-      encryption: srcHead.encryption,
+    const inlineData = new Uint8Array(srcHead.inlineData);
+    await publishAndReapSource(() => {
+      commitVersionChecked(
+        durableObject,
+        {
+          pathId: dstFileId,
+          versionId: newVersionId,
+          userId,
+          size: srcHead.size,
+          mode: srcHead.mode,
+          mtimeMs: now,
+          chunkSize: 0,
+          chunkCount: 0,
+          fileHash: srcHead.fileHash,
+          mimeType: srcHead.mimeType,
+          inlineData,
+          userVisible: true,
+          encryption: srcHead.encryption,
+        },
+        expectedDestination,
+        "rename"
+      );
     });
-    // Drop src history + files row (no shard fan-out — inline).
-    await reapSourceVersionedRow(durableObject, scope, userId, srcFileId);
     return;
   }
 
@@ -940,22 +1052,28 @@ async function renameOverwriteVersioned(
   if (srcChunks.length === 0) {
     // Empty file (size 0, no chunks). Just commit an empty version
     // — no shard interaction needed.
-    commitVersion(durableObject, {
-      pathId: dstFileId,
-      versionId: newVersionId,
-      userId,
-      size: srcHead.size,
-      mode: srcHead.mode,
-      mtimeMs: now,
-      chunkSize: srcHead.chunkSize,
-      chunkCount: srcHead.chunkCount,
-      fileHash: srcHead.fileHash,
-      mimeType: srcHead.mimeType,
-      inlineData: null,
-      userVisible: true,
-      encryption: srcHead.encryption,
+    await publishAndReapSource(() => {
+      commitVersionChecked(
+        durableObject,
+        {
+          pathId: dstFileId,
+          versionId: newVersionId,
+          userId,
+          size: srcHead.size,
+          mode: srcHead.mode,
+          mtimeMs: now,
+          chunkSize: srcHead.chunkSize,
+          chunkCount: srcHead.chunkCount,
+          fileHash: srcHead.fileHash,
+          mimeType: srcHead.mimeType,
+          inlineData: null,
+          userVisible: true,
+          encryption: srcHead.encryption,
+        },
+        expectedDestination,
+        "rename"
+      );
     });
-    await reapSourceVersionedRow(durableObject, scope, userId, srcFileId);
     return;
   }
 
@@ -966,14 +1084,15 @@ async function renameOverwriteVersioned(
   const shardNs =
     env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
   {
-    const byShard = new Map<number, string[]>();
+    const byShard = new Map<number, Set<string>>();
     for (const c of srcChunks) {
-      const arr = byShard.get(c.shard_index) ?? [];
-      arr.push(c.chunk_hash);
-      byShard.set(c.shard_index, arr);
+      const hashes = byShard.get(c.shard_index) ?? new Set<string>();
+      hashes.add(c.chunk_hash);
+      byShard.set(c.shard_index, hashes);
     }
     await Promise.all(
-      Array.from(byShard.entries()).map(async ([shardIndex, hashes]) => {
+      Array.from(byShard.entries()).map(async ([shardIndex, hashSet]) => {
+        const hashes = [...hashSet];
         const shardName = vfsShardDOName(
           scope.ns,
           scope.tenant,
@@ -982,9 +1101,9 @@ async function renameOverwriteVersioned(
         );
         const stub = shardNs.get(shardNs.idFromName(shardName));
         const { alive } = await stub.chunksAlive(hashes);
-        if (alive.length !== hashes.length) {
-          const aliveSet = new Set(alive);
-          const missing = hashes.filter((h) => !aliveSet.has(h));
+        const aliveSet = new Set(alive);
+        const missing = hashes.filter((hash) => !aliveSet.has(hash));
+        if (missing.length > 0) {
           throw new VFSError(
             "ENOENT",
             `rename: source chunks swept on shard ${shardIndex}: ${missing
@@ -1007,7 +1126,8 @@ async function renameOverwriteVersioned(
       arr.push(c);
       byShard.set(c.shard_index, arr);
     }
-    await Promise.all(
+    await stageChunkCleanupIntents(durableObject, newRefId, byShard.keys());
+    const retainResults = await Promise.allSettled(
       Array.from(byShard.entries()).map(async ([sIdx, chunks]) => {
         const shardName = vfsShardDOName(
           scope.ns,
@@ -1029,97 +1149,57 @@ async function renameOverwriteVersioned(
             c.chunk_index,
             userId
           );
-          insertVersionChunk(durableObject, newVersionId, c);
         }
       })
     );
+    const retainFailure = retainResults.find(
+      (result): result is PromiseRejectedResult => result.status === "rejected"
+    );
+    if (retainFailure) throw retainFailure.reason;
   } catch (err) {
-    // Best-effort cleanup of any landed version_chunks rows. The
-    // putChunk refbumps that succeeded leak chunk_refs under
-    // newRefId — they'll be reclaimed by the shard's alarm sweep
-    // when the user re-attempts and the failed shard recovers,
-    // OR by adminReapOrphanRefs on the next sweep.
     durableObject.sql.exec(
       "DELETE FROM version_chunks WHERE version_id = ?",
       newVersionId
     );
+    await drainChunkCleanupIntents(durableObject, scope, newRefId);
     throw err;
   }
 
-  commitVersion(durableObject, {
-    pathId: dstFileId,
-    versionId: newVersionId,
-    userId,
-    size: srcHead.size,
-    mode: srcHead.mode,
-    mtimeMs: now,
-    chunkSize: srcHead.chunkSize,
-    chunkCount: srcHead.chunkCount,
-    fileHash: srcHead.fileHash,
-    mimeType: srcHead.mimeType,
-    inlineData: null,
-    userVisible: true,
-    shardRefId: newRefId,
-    encryption: srcHead.encryption,
-  });
-  await reapSourceVersionedRow(durableObject, scope, userId, srcFileId);
-}
-
-/**
- * Reap the source `files` row + every version it owns + decrement
- * ShardDO chunk_refs for every (shard_ref_id) the source's versions
- * accumulated. Called from `renameOverwriteVersioned` after the
- * destination's new version is committed.
- *
- * Versioning-on src: dropVersionRows over EVERY version_id under
- * srcFileId. dropVersionRows handles per-version shard fan-out and
- * drops the `files` row when no versions remain.
- *
- * Versioning-off src (legacy un-versioned row promoted onto a
- * versioning-on tenant): no version_chunks rows; the chunks live in
- * `file_chunks` and ShardDO chunk_refs are keyed by `srcFileId`
- * directly. Use `hardDeleteFileRow` which knows about that shape.
- */
-async function reapSourceVersionedRow(
-  durableObject: UserDO,
-  scope: VFSScope,
-  userId: string,
-  srcFileId: string
-): Promise<void> {
-  const versions = durableObject.sql
-    .exec(
-      "SELECT version_id FROM file_versions WHERE path_id = ? AND user_id = ?",
-      srcFileId,
-      userId
-    )
-    .toArray() as { version_id: string }[];
-  if (versions.length > 0) {
-    await dropVersionRows(
-      durableObject,
-      scope,
-      userId,
-      srcFileId,
-      versions.map((v) => v.version_id)
+  try {
+    await publishAndReapSource(() => {
+      for (const chunk of srcChunks) {
+        insertVersionChunk(durableObject, newVersionId, chunk);
+      }
+      commitVersionChecked(
+        durableObject,
+        {
+          pathId: dstFileId,
+          versionId: newVersionId,
+          userId,
+          size: srcHead.size,
+          mode: srcHead.mode,
+          mtimeMs: now,
+          chunkSize: srcHead.chunkSize,
+          chunkCount: srcHead.chunkCount,
+          fileHash: srcHead.fileHash,
+          mimeType: srcHead.mimeType,
+          inlineData: null,
+          userVisible: true,
+          shardRefId: newRefId,
+          encryption: srcHead.encryption,
+        },
+        expectedDestination,
+        "rename"
+      );
+      disarmChunkCleanupIntents(durableObject, newRefId);
+    });
+  } catch (err) {
+    durableObject.sql.exec(
+      "DELETE FROM version_chunks WHERE version_id = ?",
+      newVersionId
     );
-    // dropVersionRows drops the files row once liveCount === 0.
-    // Defensive: if a non-versioning legacy row ALSO had file_chunks
-    // (a cross-mode edge case from a tenant that toggled versioning
-    // mid-stream), reap them too.
-    const stillHasFiles = durableObject.sql
-      .exec(
-        "SELECT 1 FROM files WHERE file_id = ? AND user_id = ?",
-        srcFileId,
-        userId
-      )
-      .toArray();
-    if (stillHasFiles.length > 0) {
-      await hardDeleteFileRow(durableObject, userId, scope, srcFileId);
-    }
-  } else {
-    // No version rows — legacy un-versioned src row. Use the
-    // canonical hardDeleteFileRow path which handles file_chunks
-    // + ShardDO refs keyed by srcFileId.
-    await hardDeleteFileRow(durableObject, userId, scope, srcFileId);
+    await drainChunkCleanupIntents(durableObject, scope, newRefId);
+    throw err;
   }
 }
 
@@ -1232,6 +1312,9 @@ export async function vfsRemoveRecursive(
   const BATCH_LIMIT = versioning
     ? BATCH_LIMIT_VERSIONING
     : BATCH_LIMIT_NON_VERSIONING;
+  if (!versioning) {
+    await scheduleStaleUploadSweep(durableObject);
+  }
   const rootR = resolveOrThrow(durableObject, userId, path, /*follow*/ false);
   if (rootR.kind !== "dir") {
     throw new VFSError("ENOTDIR", `removeRecursive: not a directory: ${path}`);
@@ -1344,17 +1427,16 @@ export async function vfsRemoveRecursive(
         f.file_id
       );
     }
-  } else if (fileRows.length > 0) {
+  } else {
     // Batch the shard fan-out.
     //
     // 1. Read each file's accounting tuple BEFORE delete (needed
     //    for inline-bytes decrement).
     // 2. Collect (file_id, shard_index) pairs across all files in
     //    the batch.
-    // 3. Drop UserDO-side metadata (file_chunks / file_tags /
-    //    files) for ALL files at once via SQL IN (...) clauses.
-    // 4. Group file_ids by shard_index; ONE deleteManyChunks RPC
-    //    per shard. Worst case poolSize subrequests = 32.
+    // 3. Stage every route, then drop metadata and accounting in one
+    //    transaction.
+    // 4. Drain outbox rows as one deleteManyChunks RPC per shard.
     const fileIds = fileRows.map((r) => r.file_id);
     const placeholdersFiles = fileIds.map(() => "?").join(",");
 
@@ -1364,47 +1446,33 @@ export async function vfsRemoveRecursive(
     // inline_bytes_used. Without this, only inline bytes would be
     // decremented; storage_used / file_count would drift upward
     // every rmrf invocation.
-    const accountingRows = durableObject.sql
-      .exec(
-        `SELECT file_id, status, file_size, inline_data FROM files
-          WHERE file_id IN (${placeholdersFiles})`,
-        ...fileIds
-      )
-      .toArray() as {
+    let accountingRows: Array<{
       file_id: string;
       status: string;
       file_size: number;
       inline_data: ArrayBuffer | null;
-    }[];
-
-    // Group (file_id, shard_index) pairs.
-    const shardRows = durableObject.sql
-      .exec(
-        `SELECT DISTINCT shard_index, file_id FROM file_chunks
-          WHERE file_id IN (${placeholdersFiles})`,
-        ...fileIds
-      )
-      .toArray() as { shard_index: number; file_id: string }[];
-    const byShard = new Map<number, string[]>();
-    for (const r of shardRows) {
-      const arr = byShard.get(r.shard_index) ?? [];
-      arr.push(r.file_id);
-      byShard.set(r.shard_index, arr);
+    }> = [];
+    if (fileIds.length > 0) {
+      accountingRows = durableObject.sql
+        .exec(
+          `SELECT file_id, status, file_size, inline_data FROM files
+            WHERE file_id IN (${placeholdersFiles})`,
+          ...fileIds
+        )
+        .toArray() as typeof accountingRows;
     }
 
-    // Drop metadata for ALL files in the batch in one transaction.
-    durableObject.sql.exec(
-      `DELETE FROM file_chunks WHERE file_id IN (${placeholdersFiles})`,
-      ...fileIds
-    );
-    durableObject.sql.exec(
-      `DELETE FROM file_tags WHERE path_id IN (${placeholdersFiles})`,
-      ...fileIds
-    );
-    durableObject.sql.exec(
-      `DELETE FROM files WHERE file_id IN (${placeholdersFiles})`,
-      ...fileIds
-    );
+    // Group (file_id, shard_index) pairs.
+    let shardRows: Array<{ shard_index: number; file_id: string }> = [];
+    if (fileIds.length > 0) {
+      shardRows = durableObject.sql
+        .exec(
+          `SELECT DISTINCT shard_index, file_id FROM file_chunks
+            WHERE file_id IN (${placeholdersFiles})`,
+          ...fileIds
+        )
+        .toArray() as typeof shardRows;
+    }
 
     // Quota-desync correction — single negative recordWriteUsage
     // covering storage_used, file_count, and inline_bytes_used for
@@ -1427,29 +1495,75 @@ export async function vfsRemoveRecursive(
         inlineDelta -= r.inline_data.byteLength;
       }
     }
-    if (bytesDelta !== 0 || filesDelta !== 0 || inlineDelta !== 0) {
-      const { recordWriteUsage } = await import("./helpers");
-      recordWriteUsage(
-        durableObject,
-        userId,
-        bytesDelta,
-        filesDelta,
-        inlineDelta
-      );
-    }
+    const done = fileRows.length < BATCH_LIMIT;
+    const now = Date.now();
+    transactionSync(durableObject, () => {
+      for (const row of shardRows) {
+        stageChunkCleanupIntent(
+          durableObject,
+          row.file_id,
+          row.shard_index,
+          now,
+          now,
+          ChunkCleanupKind.Bulk
+        );
+      }
 
-    // Fan out: ONE deleteManyChunks per touched shard.
-    const env = durableObject.envPublic;
-    const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<
-      import("../../shard/shard-do").ShardDO
-    >;
-    const fanout: Promise<unknown>[] = [];
-    for (const [sIdx, ids] of byShard) {
-      const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, sIdx);
-      const stub = shardNs.get(shardNs.idFromName(shardName));
-      fanout.push(stub.deleteManyChunks(ids));
-    }
-    await Promise.all(fanout);
+      if (fileIds.length > 0) {
+        durableObject.sql.exec(
+          `DELETE FROM file_chunks WHERE file_id IN (${placeholdersFiles})`,
+          ...fileIds
+        );
+        durableObject.sql.exec(
+          `DELETE FROM file_tags WHERE path_id IN (${placeholdersFiles})`,
+          ...fileIds
+        );
+        durableObject.sql.exec(
+          `DELETE FROM files WHERE file_id IN (${placeholdersFiles})`,
+          ...fileIds
+        );
+      }
+
+      if (bytesDelta !== 0 || filesDelta !== 0 || inlineDelta !== 0) {
+        recordWriteUsage(
+          durableObject,
+          userId,
+          bytesDelta,
+          filesDelta,
+          inlineDelta
+        );
+      }
+      for (const parentId of touchedParents) {
+        bumpFolderRevision(durableObject, userId, parentId);
+      }
+
+      if (done) {
+        for (let index = allFolders.length - 1; index >= 0; index--) {
+          durableObject.sql.exec(
+            "DELETE FROM folders WHERE folder_id=? AND user_id=?",
+            allFolders[index],
+            userId
+          );
+        }
+        bumpFolderRevision(durableObject, userId, rmrfRootParentId);
+      }
+
+      insertAuditLog(durableObject, {
+        op: "removeRecursive",
+        actor: userId,
+        target: rootR.leafId,
+        payload: JSON.stringify({
+          path,
+          filesProcessed: fileRows.length,
+          ...(done ? { foldersReaped: allFolders.length } : {}),
+          versioning: false,
+          done,
+        }),
+      });
+    });
+
+    await drainChunkCleanupIntents(durableObject, scope, fileIds);
+    return done ? { done: true } : { done: false, cursor: "" };
   }
 
   // Bump revision on every folder that lost direct
