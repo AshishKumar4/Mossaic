@@ -122,6 +122,9 @@ describe("SDK manual multipart", () => {
 
     // After abort, the path must NOT exist.
     await expect(vfs.readFile("/manual-abort.bin")).rejects.toThrow();
+    await expect(vfs.putMultipartChunk(handle, 0, chunks[0])).rejects.toThrow(
+      /EBUSY/
+    );
   });
 
   it("M3 — abort is idempotent for already-finalised sessions", async () => {
@@ -137,6 +140,7 @@ describe("SDK manual multipart", () => {
     // Now abort the already-finalised session — should report not-aborted.
     const aborted = await vfs.abortMultipartUpload(handle);
     expect(aborted.aborted).toBe(false);
+    await expect(vfs.putMultipartChunk(handle, 0, data)).rejects.toThrow(/EBUSY/);
   });
 
   it("M4 — accepts ArrayBuffer chunks", async () => {

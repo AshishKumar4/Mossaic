@@ -1040,10 +1040,17 @@ export async function dropVersions(
       )
       .toArray()[0] as { head_version_id: string | null } | undefined;
     const keepSet = new Set(policy.exceptVersions ?? []);
-    if (headRow?.head_version_id) keepSet.add(headRow.head_version_id);
-    const keepLast = policy.keepLast ?? 0;
-    for (let i = 0; i < Math.min(keepLast, all.length); i++) {
-      keepSet.add(all[i].versionId);
+    const headVersionId = headRow?.head_version_id;
+    if (headVersionId) keepSet.add(headVersionId);
+    let remainingNewest = Math.max(
+      0,
+      (policy.keepLast ?? 0) - (headVersionId ? 1 : 0)
+    );
+    for (const version of all) {
+      if (remainingNewest === 0) break;
+      if (keepSet.has(version.versionId)) continue;
+      keepSet.add(version.versionId);
+      remainingNewest--;
     }
     const cutoff = policy.olderThan ?? 0;
     const versionIds = all

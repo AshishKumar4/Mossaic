@@ -396,7 +396,8 @@ mp.put("/:uploadId/chunk/:idx", async (c) => {
         bytes,
         uploadId,
         idx,
-        userId
+        userId,
+        sessionTokenHeader
       );
     } catch (err) {
       // Network / shard transient → 503; map shard `EINVAL` (cold-path
@@ -404,6 +405,12 @@ mp.put("/:uploadId/chunk/:idx", async (c) => {
       const msg = (err as Error)?.message ?? String(err);
       if (msg.startsWith("EINVAL")) {
         return c.json({ code: "EINVAL", message: msg }, 400);
+      }
+      if (msg.startsWith("EBUSY")) {
+        return c.json({ code: "EBUSY", message: msg }, 409);
+      }
+      if (msg.startsWith("EACCES")) {
+        return c.json({ code: "EACCES", message: msg }, 403);
       }
       return c.json(
         { code: "EMOSSAIC_UNAVAILABLE", message: msg },

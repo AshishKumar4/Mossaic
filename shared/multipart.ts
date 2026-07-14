@@ -40,6 +40,10 @@ export const MULTIPART_MAX_OPEN_SESSIONS_PER_TENANT = 64;
 export interface MultipartSessionTokenPayload {
   scope: typeof VFS_MP_SCOPE;
   uploadId: string;
+  /** Random per-session capability used by ShardDO terminal fences. */
+  fenceId?: string;
+  /** Canonical tenant user id bound into the session capability. */
+  userId?: string;
   ns: string;
   tn: string;
   sub?: string;

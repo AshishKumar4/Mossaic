@@ -532,6 +532,54 @@ describe("multipart routes", () => {
     // state and refuses. Either ENOENT or EBUSY is acceptable; both
     // surface to the right HTTP status family.
     expect([404, 409]).toContain(f.status);
+
+    const latePut = await SELF.fetch(
+      `https://test/api/vfs/multipart/${begin.uploadId}/chunk/0`,
+      {
+        method: "PUT",
+        headers: {
+          Authorization: `Bearer ${begin.bearer}`,
+          "Content-Type": "application/octet-stream",
+          "X-Session-Token": begin.sessionToken,
+        },
+        body: chunkOf(7, 100),
+      }
+    );
+    expect(latePut.status).toBe(409);
+    expect(await latePut.json()).toMatchObject({ code: "EBUSY" });
+  });
+
+  it("rejects chunk PUTs after finalize publishes", async () => {
+    const begin = await beginMP({
+      tenant: "mp-final-put-fence",
+      path: "/fenced.bin",
+      size: 100,
+      chunkSize: 100,
+    });
+    const first = await putMP(
+      begin.bearer,
+      begin.uploadId,
+      0,
+      chunkOf(1, 100),
+      begin.sessionToken
+    );
+    const finalized = await finalizeMP(begin.bearer, begin.uploadId, [first.hash]);
+    expect(finalized.size).toBe(100);
+
+    const latePut = await SELF.fetch(
+      `https://test/api/vfs/multipart/${begin.uploadId}/chunk/0`,
+      {
+        method: "PUT",
+        headers: {
+          Authorization: `Bearer ${begin.bearer}`,
+          "Content-Type": "application/octet-stream",
+          "X-Session-Token": begin.sessionToken,
+        },
+        body: chunkOf(2, 100),
+      }
+    );
+    expect(latePut.status).toBe(409);
+    expect(await latePut.json()).toMatchObject({ code: "EBUSY" });
   });
 
   it("abort is idempotent — second abort returns ok", async () => {
