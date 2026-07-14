@@ -4,6 +4,7 @@ import {
   applyMigrationOnce,
   ensureMigrationsTable,
 } from "../../lib/migrations";
+import { verifyVFSMultipartToken } from "../../lib/auth";
 
 export class ShardDO extends DurableObject<Env> {
   sql: SqlStorage;
@@ -99,6 +100,14 @@ export class ShardDO extends DurableObject<Env> {
     this.sql.exec(`
       CREATE INDEX IF NOT EXISTS idx_upload_chunks_user
         ON upload_chunks(user_id, upload_id)
+    `);
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS multipart_fences (
+        upload_id  TEXT PRIMARY KEY,
+        fence_id   TEXT NOT NULL,
+        state      TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      )
     `);
   }
 
@@ -391,12 +400,41 @@ export class ShardDO extends DurableObject<Env> {
     data: Uint8Array,
     uploadId: string,
     chunkIndex: number,
-    userId: string
+    userId: string,
+    sessionToken: string
   ): Promise<{
     status: "created" | "deduplicated" | "superseded";
     bytesStored: number;
   }> {
     this.ensureInit();
+
+    const payload = await verifyVFSMultipartToken(this.env, sessionToken);
+    if (
+      payload === null ||
+      payload.uploadId !== uploadId ||
+      payload.userId !== userId ||
+      payload.fenceId === undefined ||
+      chunkIndex < 0 ||
+      chunkIndex >= payload.totalChunks
+    ) {
+      throw new Error("EACCES: invalid multipart session capability");
+    }
+    const fenceId = payload.fenceId;
+
+    const priorBeforeFence = this.sql
+      .exec(
+        "SELECT chunk_hash FROM upload_chunks WHERE upload_id = ? AND chunk_index = ?",
+        uploadId,
+        chunkIndex
+      )
+      .toArray()[0] as { chunk_hash: string } | undefined;
+    if (priorBeforeFence && priorBeforeFence.chunk_hash !== chunkHash) {
+      await this.scheduleSweep();
+    }
+
+    // This is the final fence check. There are no awaits after it, so a
+    // terminal fence cannot interleave before the staging/ref mutation.
+    this.assertMultipartFenceOpen(uploadId, fenceId);
 
     // Supersession check — does a prior staging row exist with a
     // different hash? If so, drop the prior `(oldHash, uploadId,
@@ -440,7 +478,6 @@ export class ShardDO extends DurableObject<Env> {
             Date.now(),
             prior.chunk_hash
           );
-          await this.scheduleSweep();
         }
       }
       supersededOldRef = true;
@@ -474,6 +511,76 @@ export class ShardDO extends DurableObject<Env> {
       ? "superseded"
       : writeResult.status;
     return { status, bytesStored: writeResult.bytesStored };
+  }
+
+  async fenceMultipart(
+    uploadId: string,
+    fenceId: string,
+    state: "finalizing" | "aborting"
+  ): Promise<void> {
+    this.ensureInit();
+    this.ctx.storage.transactionSync(() => {
+      const current = this.sql
+        .exec(
+          "SELECT fence_id, state FROM multipart_fences WHERE upload_id = ?",
+          uploadId
+        )
+        .toArray()[0] as { fence_id: string; state: string } | undefined;
+      if (current && current.fence_id !== fenceId) {
+        throw new Error("EACCES: multipart fence capability mismatch");
+      }
+      if (
+        current &&
+        current.state !== "open" &&
+        current.state !== state &&
+        !(current.state === "finalizing" && state === "aborting")
+      ) {
+        throw new Error(
+          `EBUSY: multipart upload already fenced as ${current.state}`
+        );
+      }
+      this.sql.exec(
+        `INSERT INTO multipart_fences (upload_id, fence_id, state, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(upload_id) DO UPDATE SET
+           state = excluded.state,
+           updated_at = excluded.updated_at`,
+        uploadId,
+        fenceId,
+        state,
+        Date.now()
+      );
+    });
+  }
+
+  private assertMultipartFenceOpen(
+    uploadId: string,
+    fenceId: string | undefined
+  ): void {
+    const current = this.sql
+      .exec(
+        "SELECT fence_id, state FROM multipart_fences WHERE upload_id = ?",
+        uploadId
+      )
+      .toArray()[0] as { fence_id: string; state: string } | undefined;
+    if (current) {
+      if (current.state !== "open") {
+        throw new Error(`EBUSY: multipart upload is ${current.state}`);
+      }
+      if (fenceId === undefined || current.fence_id !== fenceId) {
+        throw new Error("EACCES: multipart fence capability mismatch");
+      }
+      return;
+    }
+    if (fenceId !== undefined) {
+      this.sql.exec(
+        `INSERT INTO multipart_fences (upload_id, fence_id, state, updated_at)
+         VALUES (?, ?, 'open', ?)`,
+        uploadId,
+        fenceId,
+        Date.now()
+      );
+    }
   }
 
   /**

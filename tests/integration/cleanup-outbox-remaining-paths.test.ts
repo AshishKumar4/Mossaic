@@ -20,6 +20,9 @@ interface UserFaultControls {
 }
 
 interface ShardFaultControls {
+  testConfigurePutChunkBlock(): Promise<void>;
+  testWaitForPutChunkBlocked(): Promise<void>;
+  testReleasePutChunkBlock(): Promise<void>;
   testConfigureDeleteChunksFailure(
     fileId: string,
     phase: "before" | "after",
@@ -98,7 +101,8 @@ async function seedMultipart(
     data,
     begin.uploadId,
     0,
-    tenant
+    tenant,
+    begin.sessionToken
   );
   if (expired) {
     await runInDurableObject(user, async (_instance, state) => {
@@ -400,6 +404,48 @@ describe("multipart cleanup outbox", () => {
     await makeCleanupEligible(fixture.user);
     expect(await runDurableObjectAlarm(fixture.user)).toBe(true);
     expect(await readMultipartState(fixture)).toMatchObject({
+      status: "aborted",
+      refs: 0,
+      staging: 0,
+      intents: [],
+    });
+  });
+
+  it("fences an in-flight PUT before abort cleanup", async () => {
+    const tenant = "multipart-abort-inflight-fence";
+    const user = userStub(tenant);
+    const scope = { ns: NS, tenant } as const;
+    const data = new Uint8Array([8, 6, 7, 5, 3, 0, 9]);
+    const begin = await user.vfsBeginMultipart(scope, "/inflight.bin", {
+      size: data.byteLength,
+      chunkSize: data.byteLength,
+    });
+    const shardIndex = placeChunk(tenant, begin.uploadId, 0, begin.poolSize);
+    const shard = shardStub(tenant, shardIndex);
+    await shard.testConfigurePutChunkBlock();
+    const put = shard.putChunkMultipart(
+      await hashChunk(data),
+      data,
+      begin.uploadId,
+      0,
+      tenant,
+      begin.sessionToken
+    );
+    await shard.testWaitForPutChunkBlocked();
+
+    await expect(user.vfsAbortMultipart(scope, begin.uploadId)).resolves.toEqual({
+      ok: true,
+    });
+    await shard.testReleasePutChunkBlock();
+    await expect(put).rejects.toThrow(/EBUSY: multipart upload is aborting/);
+
+    const state = await readMultipartState({
+      tenant,
+      user,
+      shard,
+      uploadId: begin.uploadId,
+    });
+    expect(state).toMatchObject({
       status: "aborted",
       refs: 0,
       staging: 0,

@@ -400,6 +400,34 @@ export class FaultInjectingShardDO extends ShardDO {
     return result;
   }
 
+  override async putChunkMultipart(
+    chunkHash: string,
+    data: Uint8Array,
+    uploadId: string,
+    chunkIndex: number,
+    userId: string,
+    sessionToken: string
+  ): Promise<{
+    status: "created" | "deduplicated" | "superseded";
+    bytesStored: number;
+  }> {
+    const block = this.putChunkBlock;
+    if (block && !block.claimed) {
+      block.claimed = true;
+      block.markEntered();
+      await block.release;
+      if (this.putChunkBlock === block) this.putChunkBlock = undefined;
+    }
+    return super.putChunkMultipart(
+      chunkHash,
+      data,
+      uploadId,
+      chunkIndex,
+      userId,
+      sessionToken
+    );
+  }
+
   override async restoreChunkRef(
     chunkHash: string,
     newRefId: string,

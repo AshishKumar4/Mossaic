@@ -336,6 +336,8 @@ export async function signVFSMultipartToken(
     chunkSize: payload.chunkSize,
     totalSize: payload.totalSize,
   };
+  if (payload.fenceId !== undefined) claims.fenceId = payload.fenceId;
+  if (payload.userId !== undefined) claims.userId = payload.userId;
   if (payload.sub !== undefined) claims.sub = payload.sub;
   const token = await signScopedJwt(getSecret(env), claims, expiresAtMs);
   return { token, expiresAtMs };
@@ -396,9 +398,19 @@ export async function verifyVFSMultipartToken(
         : undefined;
     const iat = typeof payload.iat === "number" ? payload.iat : 0;
     const exp = typeof payload.exp === "number" ? payload.exp : 0;
+    const fenceId =
+      typeof payload.fenceId === "string" && payload.fenceId.length > 0
+        ? payload.fenceId
+        : undefined;
+    const userId =
+      typeof payload.userId === "string" && payload.userId.length > 0
+        ? payload.userId
+        : undefined;
     return {
       scope: VFS_MP_SCOPE,
       uploadId: payload.uploadId,
+      fenceId,
+      userId,
       ns: payload.ns,
       tn: payload.tn,
       sub,

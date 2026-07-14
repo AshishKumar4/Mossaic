@@ -103,6 +103,7 @@ export interface VFSBeginMultipartOpts {
 
 interface UploadSessionRow {
   upload_id: string;
+  fence_id: string | null;
   user_id: string;
   parent_id: string | null;
   leaf: string;
@@ -126,6 +127,29 @@ interface UploadSessionRow {
 function shardNs(durableObject: UserDO): DurableObjectNamespace<ShardDO> {
   return durableObject.envPublic
     .MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
+}
+
+async function fenceMultipartShards(
+  durableObject: UserDO,
+  scope: VFSScope,
+  session: UploadSessionRow,
+  state: "finalizing" | "aborting"
+): Promise<void> {
+  if (session.fence_id === null) return;
+  const ns = shardNs(durableObject);
+  await Promise.all(
+    Array.from({ length: session.pool_size }, async (_, shardIndex) => {
+      const shardName = vfsShardDOName(
+        scope.ns,
+        scope.tenant,
+        scope.sub,
+        shardIndex
+      );
+      await ns
+        .get(ns.idFromName(shardName))
+        .fenceMultipart(session.upload_id, session.fence_id!, state);
+    })
+  );
 }
 
 /**
@@ -239,6 +263,7 @@ export async function vfsBeginMultipart(
   void serverChunkCount; // unused but documents the parallel spec
 
   const tmpId = generateId();
+  const fenceId = generateId();
   const poolSize = poolSizeFor(durableObject, userId);
   const now = Date.now();
   const ttl =
@@ -281,10 +306,11 @@ export async function vfsBeginMultipart(
     opts.tags !== undefined ? JSON.stringify([...opts.tags]) : null;
   durableObject.sql.exec(
     `INSERT INTO upload_sessions
-       (upload_id, user_id, parent_id, leaf, total_size, total_chunks, chunk_size, pool_size, expires_at, status,
-        encryption_mode, encryption_key_id, metadata_blob, tags_json, version_label, version_user_visible, mode, mime_type, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (upload_id, fence_id, user_id, parent_id, leaf, total_size, total_chunks, chunk_size, pool_size, expires_at, status,
+         encryption_mode, encryption_key_id, metadata_blob, tags_json, version_label, version_user_visible, mode, mime_type, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     tmpId,
+    fenceId,
     userId,
     parentId,
     leaf,
@@ -313,6 +339,8 @@ export async function vfsBeginMultipart(
     durableObject.envPublic,
     {
       uploadId: tmpId,
+      fenceId,
+      userId,
       ns: scope.ns,
       tn: scope.tenant,
       sub: scope.sub,
@@ -415,10 +443,13 @@ async function resumeMultipart(
       ? opts.ttlMs
       : MULTIPART_DEFAULT_TTL_MS;
   const expiresAt = Date.now() + ttl;
+  const fenceId = row.fence_id ?? generateId();
   const { token } = await signVFSMultipartToken(
     durableObject.envPublic,
     {
       uploadId,
+      fenceId,
+      userId,
       ns: scope.ns,
       tn: scope.tenant,
       sub: scope.sub,
@@ -431,8 +462,9 @@ async function resumeMultipart(
   );
   // Update the session row's expires_at to reflect the new token.
   durableObject.sql.exec(
-    "UPDATE upload_sessions SET expires_at = ? WHERE upload_id = ?",
+    "UPDATE upload_sessions SET expires_at = ?, fence_id = ? WHERE upload_id = ?",
     expiresAt,
+    fenceId,
     uploadId
   );
 
@@ -462,7 +494,8 @@ async function resumeMultipart(
 export async function vfsAbortMultipart(
   durableObject: UserDO,
   scope: VFSScope,
-  uploadId: string
+  uploadId: string,
+  allowFinalizing = false
 ): Promise<{ ok: true }> {
   const userId = userIdFor(scope);
   const row = durableObject.sql
@@ -480,6 +513,10 @@ export async function vfsAbortMultipart(
       "EBUSY",
       `abortMultipart: session is already finalized; cannot un-finalize`
     );
+  }
+  if (row.status === "aborted") return { ok: true };
+  if (row.status === "finalizing" && !allowFinalizing) {
+    throw new VFSError("EBUSY", "abortMultipart: finalize is in progress");
   }
 
   await scheduleStaleUploadSweep(durableObject);
@@ -507,6 +544,35 @@ export async function vfsAbortMultipart(
       );
     }
     if (current.status === "aborted") return;
+    if (current.status === "finalizing" && !allowFinalizing) {
+      throw new VFSError("EBUSY", "abortMultipart: finalize is in progress");
+    }
+
+    durableObject.sql.exec(
+      `UPDATE upload_sessions SET status = 'aborting'
+        WHERE upload_id = ? AND user_id = ? AND status IN ('open', 'finalizing')`,
+      uploadId,
+      userId
+    );
+  });
+
+  await fenceMultipartShards(durableObject, scope, row, "aborting");
+
+  transactionSync(durableObject, () => {
+    const current = durableObject.sql
+      .exec(
+        `SELECT status, pool_size FROM upload_sessions
+          WHERE upload_id = ? AND user_id = ?`,
+        uploadId,
+        userId
+      )
+      .toArray()[0] as
+      | { status: string; pool_size: number }
+      | undefined;
+    if (!current || current.status === "aborted") return;
+    if (current.status !== "aborting") {
+      throw new VFSError("EBUSY", "abortMultipart: session changed while fencing");
+    }
 
     const now = Date.now();
     for (let shardIndex = 0; shardIndex < current.pool_size; shardIndex++) {
@@ -521,7 +587,7 @@ export async function vfsAbortMultipart(
     }
     durableObject.sql.exec(
       `UPDATE upload_sessions SET status = 'aborted'
-        WHERE upload_id = ? AND user_id = ?`,
+        WHERE upload_id = ? AND user_id = ? AND status = 'aborting'`,
       uploadId,
       userId
     );
@@ -568,7 +634,7 @@ export async function vfsFinalizeMultipart(
       `finalizeMultipart: session not found: ${uploadId}`
     );
   }
-  if (session.status !== "open") {
+  if (session.status !== "open" && session.status !== "finalizing") {
     throw new VFSError(
       "EBUSY",
       `finalizeMultipart: session status='${session.status}'`
@@ -614,7 +680,7 @@ export async function vfsFinalizeMultipart(
     const currentSession = durableObject.sql
       .exec(
         `SELECT 1 FROM upload_sessions
-          WHERE upload_id = ? AND user_id = ? AND status = 'open'
+          WHERE upload_id = ? AND user_id = ? AND status = 'finalizing'
             AND created_at = ? AND expires_at = ?`,
         uploadId,
         userId,
@@ -709,6 +775,63 @@ export async function vfsFinalizeMultipart(
     manifestRows.push(have);
   }
 
+  if (session.status === "open") {
+    transactionSync(durableObject, () => {
+      durableObject.sql.exec(
+        `UPDATE upload_sessions SET status = 'finalizing'
+          WHERE upload_id = ? AND user_id = ? AND status = 'open'
+            AND created_at = ? AND expires_at = ?`,
+        uploadId,
+        userId,
+        session.created_at,
+        session.expires_at
+      );
+      if (lastSqlChanges(durableObject) !== 1) {
+        throw new VFSError(
+          "EBUSY",
+          "finalizeMultipart: session changed before fencing"
+        );
+      }
+    });
+  }
+
+  await fenceMultipartShards(durableObject, scope, session, "finalizing");
+
+  // Re-read after every shard acknowledges the fence. PUTs that completed
+  // before their shard fenced are included; later PUTs are rejected.
+  collected.clear();
+  collectErrors.length = 0;
+  await Promise.all(
+    Array.from(touched).map(async (sIdx) => {
+      const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, sIdx);
+      const stub = ns.get(ns.idFromName(shardName));
+      try {
+        const res = await stub.getMultipartManifest(uploadId);
+        for (const row of res.rows) collected.set(row.idx, row);
+      } catch (err) {
+        collectErrors.push(err);
+      }
+    })
+  );
+  if (collectErrors.length > 0) {
+    throw new VFSError(
+      "EBUSY",
+      `finalizeMultipart: post-fence manifest collect failed on ${collectErrors.length} shard(s)`
+    );
+  }
+  manifestRows.length = 0;
+  for (let i = 0; i < session.total_chunks; i++) {
+    const have = collected.get(i);
+    if (!have || have.hash !== chunkHashList[i]) {
+      await vfsAbortMultipart(durableObject, scope, uploadId, true);
+      throw new VFSError(
+        have ? "EBADF" : "ENOENT",
+        `finalizeMultipart: post-fence chunk ${i} is missing or changed`
+      );
+    }
+    manifestRows.push(have);
+  }
+
   // 6. Compute file hash + total size from the collected sizes (which
   //    are already verified against the client list).
   let totalSize = 0;
@@ -769,7 +892,7 @@ export async function vfsFinalizeMultipart(
         | { status: string; created_at: number; expires_at: number }
         | undefined;
       const sameOpenSession =
-        current?.status === "open" &&
+        current?.status === "finalizing" &&
         current.created_at === session.created_at &&
         current.expires_at === session.expires_at;
       if (sameOpenSession) {
@@ -786,7 +909,7 @@ export async function vfsFinalizeMultipart(
         }
         durableObject.sql.exec(
           `UPDATE upload_sessions SET status = 'aborted'
-            WHERE upload_id = ? AND user_id = ? AND status = 'open'
+            WHERE upload_id = ? AND user_id = ? AND status = 'finalizing'
               AND created_at = ? AND expires_at = ?`,
           uploadId,
           userId,
@@ -913,7 +1036,7 @@ export async function vfsFinalizeMultipart(
       );
       durableObject.sql.exec(
         `UPDATE upload_sessions SET status = 'finalized'
-          WHERE upload_id = ? AND user_id = ? AND status = 'open'
+          WHERE upload_id = ? AND user_id = ? AND status = 'finalizing'
             AND created_at = ? AND expires_at = ?`,
         uploadId,
         userId,
@@ -1040,7 +1163,7 @@ export async function vfsFinalizeMultipart(
             recordWriteUsage(durableObject, userId, totalSize, 1);
             durableObject.sql.exec(
               `UPDATE upload_sessions SET status = 'finalized'
-                WHERE upload_id = ? AND user_id = ? AND status = 'open'
+                WHERE upload_id = ? AND user_id = ? AND status = 'finalizing'
                   AND created_at = ? AND expires_at = ?`,
               uploadId,
               userId,
@@ -1225,7 +1348,7 @@ export async function sweepExpiredMultipartSessions(
   const stale = durableObject.sql
     .exec(
       `SELECT upload_id, user_id, attempts FROM upload_sessions
-        WHERE status = 'open' AND expires_at < ?
+        WHERE status IN ('open', 'finalizing', 'aborting') AND expires_at < ?
         ORDER BY expires_at ASC
         LIMIT 32`,
       now
@@ -1239,7 +1362,7 @@ export async function sweepExpiredMultipartSessions(
   for (const row of stale) {
     try {
       const scope = scopeForUser(row.user_id);
-      await vfsAbortMultipart(durableObject, scope, row.upload_id);
+      await vfsAbortMultipart(durableObject, scope, row.upload_id, true);
     } catch (err) {
       const nextAttempts = (row.attempts ?? 0) + 1;
       if (nextAttempts >= MULTIPART_MAX_ABORT_ATTEMPTS) {
@@ -1281,7 +1404,7 @@ export async function sweepExpiredMultipartSessions(
   const stillOpen = (
     durableObject.sql
       .exec(
-        "SELECT COUNT(*) AS n FROM upload_sessions WHERE status = 'open' AND expires_at < ?",
+        "SELECT COUNT(*) AS n FROM upload_sessions WHERE status IN ('open', 'finalizing', 'aborting') AND expires_at < ?",
         now
       )
       .toArray()[0] as { n: number }

@@ -908,6 +908,11 @@ export class UserDOCore extends DurableObject<Env> {
         WHERE status = 'open'
     `);
     this.sql.exec(`
+      CREATE INDEX IF NOT EXISTS idx_upload_sessions_active_expires
+        ON upload_sessions(expires_at)
+        WHERE status IN ('open', 'finalizing', 'aborting')
+    `);
+    this.sql.exec(`
       CREATE INDEX IF NOT EXISTS idx_upload_sessions_user_status
         ON upload_sessions(user_id, status)
     `);
@@ -918,6 +923,9 @@ export class UserDOCore extends DurableObject<Env> {
       this.sql.exec(
         "ALTER TABLE upload_sessions ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0"
       )
+    );
+    applyMigrationOnce(this.sql, "upload_sessions_add_fence_id", () =>
+      this.sql.exec("ALTER TABLE upload_sessions ADD COLUMN fence_id TEXT")
     );
 
     // ── Universal preview pipeline ───────────────────────────────────────
@@ -1313,7 +1321,7 @@ export class UserDOCore extends DurableObject<Env> {
            AND f.file_name LIKE '_vfs_tmp_%'
            AND (
              (ws.tmp_id IS NOT NULL AND ws.expires_at <= ?)
-             OR (us.upload_id IS NOT NULL AND us.status = 'open' AND us.expires_at <= ?)
+             OR (us.upload_id IS NOT NULL AND us.status IN ('open', 'finalizing', 'aborting') AND us.expires_at <= ?)
              OR (ws.tmp_id IS NULL AND us.upload_id IS NULL AND f.created_at < ?)
            )
           LIMIT 200`,
@@ -1426,7 +1434,7 @@ export class UserDOCore extends DurableObject<Env> {
         `SELECT MIN(deadline) AS deadline FROM (
            SELECT expires_at AS deadline FROM write_stream_sessions
            UNION ALL
-           SELECT expires_at AS deadline FROM upload_sessions WHERE status = 'open'
+            SELECT expires_at AS deadline FROM upload_sessions WHERE status IN ('open', 'finalizing', 'aborting')
            UNION ALL
            SELECT f.created_at + 3600000 AS deadline
              FROM files f

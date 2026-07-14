@@ -706,7 +706,8 @@ async function vfsWriteFileVersioned(
     versionLabel?: string;
     /** Encryption stamp for this version. */
     encryption?: { mode: "convergent" | "random"; keyId?: string };
-  } = {}
+  } = {},
+  retryInitialPublicationConflict = true
 ): Promise<void> {
   const existing = durableObject.sql
     .exec(
@@ -965,6 +966,30 @@ async function vfsWriteFileVersioned(
     }
     if (refId !== undefined) {
       await drainChunkCleanupIntents(durableObject, scope, refId);
+    }
+
+    if (
+      retryInitialPublicationConflict &&
+      !requireVacantDestination &&
+      tmpId !== undefined &&
+      err instanceof VFSError &&
+      err.code === "EBUSY" &&
+      err.message.includes("destination appeared during commit")
+    ) {
+      return vfsWriteFileVersioned(
+        durableObject,
+        scope,
+        userId,
+        parentId,
+        leaf,
+        data,
+        mode,
+        mimeType,
+        now,
+        false,
+        meta,
+        false
+      );
     }
     throw err;
   }

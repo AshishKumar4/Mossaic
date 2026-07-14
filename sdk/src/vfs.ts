@@ -2169,7 +2169,14 @@ export class VFS implements VFSClient {
     const shardNs = this.env.MOSSAIC_SHARD as DurableObjectNamespace<ShardDO>;
     const stub = shardNs.get(shardNs.idFromName(vfsShardDOName(scope.ns, scope.tenant, scope.sub, shardIndex)));
     try {
-      const result = await stub.putChunkMultipart(hash, bytes, handle.uploadId, index, userId);
+      const result = await stub.putChunkMultipart(
+        hash,
+        bytes,
+        handle.uploadId,
+        index,
+        userId,
+        handle.sessionToken
+      );
       return { chunkHash: hash, accepted: true, status: result.status };
     } catch (err) {
       throw mapServerError(err, { syscall: "open" });

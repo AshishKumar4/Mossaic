@@ -105,6 +105,26 @@ describe("concurrent ops — parallel writes (K1)", () => {
     expect(["AAA", "BBB"]).toContain(v1);
     expect(v0).not.toBe(v1);
   });
+
+  it("K1c — repeated initial version races preserve both writes", async () => {
+    const vfs = createVFS(envFor(), {
+      tenant: "concur-write-on-repeated",
+      versioning: "enabled",
+    });
+
+    for (let i = 0; i < 10; i++) {
+      const path = `/race-${i}.txt`;
+      const results = await Promise.allSettled([
+        vfs.writeFile(path, `left-${i}`),
+        vfs.writeFile(path, `right-${i}`),
+      ]);
+      expect(results.map((result) => result.status)).toEqual([
+        "fulfilled",
+        "fulfilled",
+      ]);
+      expect(await vfs.listVersions(path)).toHaveLength(2);
+    }
+  });
 });
 
 describe("concurrent ops — read during write (K2)", () => {
