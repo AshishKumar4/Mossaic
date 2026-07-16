@@ -1,0 +1,39 @@
+shared/vfs-types.ts
+  s_486ad7a22bc605::t_6fbe5aa1a69a07 153-202
+tests/integration/multipart-hash-pages.test.ts
+  s_4b593a5878b94e::t_6cc2cc50d4b845 1-1320
+tests/integration/versioned-publication-failures.test.ts
+  s_cd499ea12d2b3c::t_1f261bd9073838 11-12,50,498,502-503,647-711
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "cc49cc74b26d8b7b71d759c580b5d6f259cebce6",
+  "prompts": {},
+  "sessions": {
+    "s_486ad7a22bc605": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0c2f97a9affeoRq9E8N5cKE0X8",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ashish Kumar Singh <ashishsingh@cloudflare.com>"
+    },
+    "s_4b593a5878b94e": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0931300e9ffepZkD5pMwVOHyww",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ashish Kumar Singh <ashishsingh@cloudflare.com>"
+    },
+    "s_cd499ea12d2b3c": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_096ab086cffe3Jvx0xOqTAl2ew",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ashish Kumar Singh <ashishsingh@cloudflare.com>"
+    }
+  }
+}
