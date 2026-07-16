@@ -62,6 +62,12 @@ import { hashChunk } from "../../../../shared/crypto";
 import { vfsShardDOName } from "../../lib/utils";
 import { placeChunkForVersion } from "./vfs-versions";
 import { VFS_MODE_YJS_BIT } from "../../../../shared/constants";
+import {
+  scheduleStaleUploadSweep,
+  stageChunkCleanupIntent,
+  transactionSync,
+} from "./internal-storage";
+import { drainChunkCleanupIntents } from "./vfs/write-commit";
 
 // Re-exported so existing internal imports of VFS_MODE_YJS_BIT from
 // this module keep working.
@@ -80,6 +86,7 @@ export { VFS_MODE_YJS_BIT };
  */
 export const COMPACT_OP_THRESHOLD = 50;
 export const COMPACT_INTERVAL_MS = 60_000;
+export const YJS_CLEANUP_PAGE_SIZE = 256;
 
 /** Synthetic shard ref key for a single op or checkpoint. */
 export function yjsShardRefId(pathId: string, seq: number): string {
@@ -382,37 +389,119 @@ async function dropOpsBefore(
   durableObject: UserDO,
   scope: VFSScope,
   pathId: string,
-  cutoffSeq: number
+  cutoffSeq: number,
+  purge = false
 ): Promise<{ dropped: number }> {
+  await scheduleStaleUploadSweep(durableObject);
+  durableObject.sql.exec(
+    `INSERT INTO yjs_cleanup_operations
+       (path_id, cutoff_seq, cursor_seq, purge, dropped, updated_at)
+     VALUES (?, ?, -1, ?, 0, ?)
+     ON CONFLICT(path_id) DO UPDATE SET
+       cutoff_seq = MAX(yjs_cleanup_operations.cutoff_seq, excluded.cutoff_seq),
+       purge = MAX(yjs_cleanup_operations.purge, excluded.purge),
+       updated_at = excluded.updated_at`,
+    pathId,
+    cutoffSeq,
+    purge ? 1 : 0,
+    Date.now()
+  );
+  const operation = durableObject.sql
+    .exec<{
+      cutoff_seq: number;
+      cursor_seq: number;
+      purge: number;
+    } & Record<string, SqlStorageValue>>(
+      `SELECT cutoff_seq, cursor_seq, purge FROM yjs_cleanup_operations
+        WHERE path_id = ?`,
+      pathId
+    )
+    .toArray()[0];
+  if (operation === undefined) throw new Error("missing Yjs cleanup operation");
   const rows = durableObject.sql
     .exec(
-      "SELECT seq, shard_index FROM yjs_oplog WHERE path_id = ? AND seq < ?",
+      `SELECT seq, shard_index FROM yjs_oplog
+        WHERE path_id = ? AND seq > ? AND seq < ?
+        ORDER BY seq LIMIT ?`,
       pathId,
-      cutoffSeq
+      operation.cursor_seq,
+      operation.cutoff_seq,
+      YJS_CLEANUP_PAGE_SIZE
     )
     .toArray() as { seq: number; shard_index: number }[];
-  if (rows.length === 0) return { dropped: 0 };
-
-  durableObject.sql.exec(
-    "DELETE FROM yjs_oplog WHERE path_id = ? AND seq < ?",
-    pathId,
-    cutoffSeq
-  );
-
-  const env = durableObject.envPublic;
-  const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
-  for (const { seq, shard_index } of rows) {
-    const refId = yjsShardRefId(pathId, seq);
-    const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, shard_index);
-    const stub = shardNs.get(shardNs.idFromName(shardName));
-    try {
-      await stub.deleteChunks(refId);
-    } catch {
-      // Best-effort during compaction GC. The underlying chunk_refs
-      // row is gone; the alarm sweeper handles refcount=0 reclaim.
+  const now = Date.now();
+  const refIds = rows.map(({ seq }) => yjsShardRefId(pathId, seq));
+  const done = rows.length < YJS_CLEANUP_PAGE_SIZE;
+  transactionSync(durableObject, () => {
+    for (let index = 0; index < rows.length; index++) {
+      stageChunkCleanupIntent(
+        durableObject,
+        refIds[index]!,
+        rows[index]!.shard_index,
+        now
+      );
     }
+    for (const row of rows) {
+      durableObject.sql.exec(
+        "DELETE FROM yjs_oplog WHERE path_id = ? AND seq = ?",
+        pathId,
+        row.seq
+      );
+    }
+    if (done) {
+      durableObject.sql.exec(
+        "DELETE FROM yjs_cleanup_operations WHERE path_id = ?",
+        pathId
+      );
+      if (operation.purge !== 0) {
+        durableObject.sql.exec("DELETE FROM yjs_meta WHERE path_id = ?", pathId);
+      }
+    } else {
+      durableObject.sql.exec(
+        `UPDATE yjs_cleanup_operations
+            SET cursor_seq = ?, dropped = dropped + ?, updated_at = ?
+          WHERE path_id = ?`,
+        rows.at(-1)?.seq ?? operation.cursor_seq,
+        rows.length,
+        now,
+        pathId
+      );
+    }
+  });
+  if (refIds.length > 0) {
+    await drainChunkCleanupIntents(durableObject, scope);
   }
   return { dropped: rows.length };
+}
+
+export async function resumeYjsCleanup(
+  durableObject: UserDO,
+  scope: VFSScope
+): Promise<boolean> {
+  const operation = durableObject.sql
+    .exec<{
+      path_id: string;
+      cutoff_seq: number;
+      purge: number;
+    } & Record<string, SqlStorageValue>>(
+      `SELECT path_id, cutoff_seq, purge FROM yjs_cleanup_operations
+        ORDER BY updated_at, path_id LIMIT 1`
+    )
+    .toArray()[0];
+  if (operation !== undefined) {
+    await dropOpsBefore(
+      durableObject,
+      scope,
+      operation.path_id,
+      operation.cutoff_seq,
+      operation.purge !== 0
+    );
+  }
+  return (
+    durableObject.sql
+      .exec("SELECT 1 FROM yjs_cleanup_operations LIMIT 1")
+      .toArray().length > 0
+  );
 }
 
 /**
@@ -1438,7 +1527,6 @@ export async function purgeYjs(
     .exec("SELECT next_seq FROM yjs_meta WHERE path_id = ?", pathId)
     .toArray()[0] as { next_seq: number } | undefined;
   if (meta) {
-    await dropOpsBefore(durableObject, scope, pathId, meta.next_seq);
-    durableObject.sql.exec("DELETE FROM yjs_meta WHERE path_id = ?", pathId);
+    await dropOpsBefore(durableObject, scope, pathId, meta.next_seq, true);
   }
 }

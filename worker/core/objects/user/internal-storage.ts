@@ -96,25 +96,57 @@ export function stageChunkCleanupIntent(
   }
   durableObject.sql.exec(
     `INSERT INTO chunk_cleanup_intents
-       (ref_id, shard_index, cleanup_kind, state, generation, provisional,
+       (ref_id, shard_index, cleanup_kind, state, generation,
+        cleanup_generation, cleanup_cursor, cleanup_phase, provisional,
         created_at, updated_at, next_attempt_at, attempts, last_error)
-     VALUES (?, ?, ?, 'pending', 0, ?, ?, ?, ?, 0, NULL)
-     ON CONFLICT(ref_id, shard_index) DO UPDATE SET
+     VALUES (?, ?, ?, 'pending', 0, ?, 0, ?, ?, ?, ?, ?, 0, NULL)
+      ON CONFLICT(ref_id, shard_index) DO UPDATE SET
        cleanup_kind = CASE
-         WHEN chunk_cleanup_intents.cleanup_kind = 'multipart'
-           OR excluded.cleanup_kind = 'multipart' THEN 'multipart'
-         WHEN chunk_cleanup_intents.cleanup_kind = 'bulk'
-           OR excluded.cleanup_kind = 'bulk' THEN 'bulk'
-         ELSE 'chunks'
+          WHEN chunk_cleanup_intents.cleanup_kind = 'multipart'
+            OR excluded.cleanup_kind = 'multipart' THEN 'multipart'
+          WHEN (chunk_cleanup_intents.cleanup_kind = 'chunks'
+                  AND excluded.cleanup_kind = 'multipart_staging')
+            OR (chunk_cleanup_intents.cleanup_kind = 'multipart_staging'
+                  AND excluded.cleanup_kind = 'chunks') THEN 'multipart'
+          WHEN chunk_cleanup_intents.cleanup_kind = 'multipart_staging'
+            OR excluded.cleanup_kind = 'multipart_staging'
+            THEN 'multipart_staging'
+          WHEN chunk_cleanup_intents.cleanup_kind = 'bulk'
+            OR excluded.cleanup_kind = 'bulk' THEN 'bulk'
+          ELSE 'chunks'
        END,
        state = 'pending',
        generation = chunk_cleanup_intents.generation + 1,
+       cleanup_generation = CASE
+         WHEN (chunk_cleanup_intents.cleanup_kind = 'chunks'
+                 AND excluded.cleanup_kind = 'multipart_staging')
+           OR (chunk_cleanup_intents.cleanup_kind = 'multipart_staging'
+                 AND excluded.cleanup_kind = 'chunks')
+           THEN excluded.cleanup_generation
+         ELSE chunk_cleanup_intents.cleanup_generation
+       END,
+       cleanup_cursor = CASE
+         WHEN (chunk_cleanup_intents.cleanup_kind = 'chunks'
+                 AND excluded.cleanup_kind = 'multipart_staging')
+           OR (chunk_cleanup_intents.cleanup_kind = 'multipart_staging'
+                 AND excluded.cleanup_kind = 'chunks') THEN 0
+         ELSE chunk_cleanup_intents.cleanup_cursor
+       END,
+       cleanup_phase = CASE
+         WHEN (chunk_cleanup_intents.cleanup_kind = 'chunks'
+                 AND excluded.cleanup_kind = 'multipart_staging')
+           OR (chunk_cleanup_intents.cleanup_kind = 'multipart_staging'
+                 AND excluded.cleanup_kind = 'chunks') THEN 'chunks'
+         ELSE chunk_cleanup_intents.cleanup_phase
+       END,
        provisional = excluded.provisional,
        updated_at = excluded.updated_at,
        next_attempt_at = MIN(chunk_cleanup_intents.next_attempt_at, excluded.next_attempt_at)`,
     refId,
     shardIndex,
     cleanupKind,
+    crypto.randomUUID(),
+    cleanupKind === ChunkCleanupKind.MultipartStaging ? "staging" : "chunks",
     provisional ? 1 : 0,
     now,
     now,
@@ -128,37 +160,4 @@ export function lastSqlChanges(durableObject: StorageCapability): number {
       n: number;
     }
   ).n;
-}
-
-/** Convert pre-publication multipart rollback intents into staging-only work. */
-export function retainMultipartStagingCleanup(
-  durableObject: StorageCapability,
-  uploadId: string,
-  now: number
-): void {
-  const guards = durableObject.sql
-    .exec(
-      `SELECT state, provisional FROM chunk_cleanup_intents
-        WHERE ref_id = ?`,
-      uploadId
-    )
-    .toArray() as { state: string; provisional: number }[];
-  if (
-    guards.length === 0 ||
-    guards.some((guard) => guard.state !== "pending" || guard.provisional === 0)
-  ) {
-    throw new Error("multipart cleanup guard unavailable for publication");
-  }
-  durableObject.sql.exec(
-    `UPDATE chunk_cleanup_intents
-        SET cleanup_kind = ?, state = 'pending', generation = generation + 1,
-            provisional = 0,
-            updated_at = ?, next_attempt_at = ?,
-            attempts = 0, last_error = NULL
-      WHERE ref_id = ?`,
-    ChunkCleanupKind.MultipartStaging,
-    now,
-    now,
-    uploadId
-  );
 }

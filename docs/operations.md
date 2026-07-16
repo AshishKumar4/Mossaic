@@ -8,7 +8,7 @@ Concise operator reference. For the API surface see [`docs/integration-guide.md`
 
 | Secret | Purpose |
 |---|---|
-| `JWT_SECRET` | HS256 signing for session JWTs, VFS Bearer tokens, multipart upload tokens, download tokens, share tokens, signed preview-variant tokens, and the `listFiles` HMAC pagination cursor. **No dev fallback in source** &mdash; without it every `/api/vfs/*` route returns `503 EMOSSAIC_UNAVAILABLE`. |
+| `JWT_SECRET` | HS256 signing for session JWTs, VFS Bearer tokens, multipart upload/status-continuation tokens, download tokens, share tokens, signed preview-variant tokens, and the `listFiles` HMAC pagination cursor. **No dev fallback in source** &mdash; without it every `/api/vfs/*` route returns `503 EMOSSAIC_UNAVAILABLE`. |
 | `JWT_SECRET_PREVIOUS` *(optional)* | Set during a graceful rotation window (see below). All token verifiers honor this slot &mdash; tokens minted under the old secret remain valid through the rotation window. |
 
 ```bash
@@ -254,7 +254,7 @@ A permanent error in the alarm path of a specific tenant. Logpush by `event = "a
 
 ## Graceful `JWT_SECRET` rotation (zero-downtime)
 
-All token verifiers &mdash; `verifyJWT`, `verifyVFSToken`, `verifyVFSMultipartToken`, `verifyVFSDownloadToken`, `verifyShareToken`, `verifyPreviewToken` &mdash; accept tokens signed with **either** `env.JWT_SECRET` (current) or `env.JWT_SECRET_PREVIOUS` (rotation-window-only). Signing always uses `env.JWT_SECRET`. This lets you rotate without invalidating any outstanding session JWT, VFS-Bearer token, in-flight multipart upload session, pre-minted download URL, share link, or signed preview URL.
+All token verifiers &mdash; `verifyJWT`, `verifyVFSToken`, `verifyVFSMultipartToken`, `verifyVFSMultipartStatusCursor`, `verifyVFSDownloadToken`, `verifyShareToken`, `verifyPreviewToken` &mdash; accept tokens signed with **either** `env.JWT_SECRET` (current) or `env.JWT_SECRET_PREVIOUS` (rotation-window-only). Signing always uses `env.JWT_SECRET`. This lets you rotate without invalidating any outstanding session JWT, VFS-Bearer token, in-flight multipart upload session, status continuation, pre-minted download URL, share link, or signed preview URL.
 
 1. **Generate the new secret**:
    ```bash

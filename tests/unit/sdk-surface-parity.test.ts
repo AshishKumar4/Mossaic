@@ -21,6 +21,7 @@ describe("SDK surface parity — `@mossaic/sdk` vs `@mossaic/sdk/http`", () => {
       "EISDIR",
       "ENOTDIR",
       "EFBIG",
+      "CompletionBudgetExceededError",
       "ELOOP",
       "EBUSY",
       "EINVAL",
@@ -55,10 +56,12 @@ describe("SDK surface parity — `@mossaic/sdk` vs `@mossaic/sdk/http`", () => {
     expect(sdk.parallelDownload).toBe(sdkHttp.parallelDownload);
     expect(sdk.parallelDownloadStream).toBe(sdkHttp.parallelDownloadStream);
     expect(sdk.beginUpload).toBe(sdkHttp.beginUpload);
+    expect(sdk.beginUploadPage).toBe(sdkHttp.beginUploadPage);
     expect(sdk.putChunk).toBe(sdkHttp.putChunk);
     expect(sdk.finalizeUpload).toBe(sdkHttp.finalizeUpload);
     expect(sdk.abortUpload).toBe(sdkHttp.abortUpload);
     expect(sdk.statusUpload).toBe(sdkHttp.statusUpload);
+    expect(sdk.statusUploadPage).toBe(sdkHttp.statusUploadPage);
     expect(sdk.deriveClientChunkSpec).toBe(sdkHttp.deriveClientChunkSpec);
     expect(sdk.THROUGHPUT_MATH).toBe(sdkHttp.THROUGHPUT_MATH);
   });
@@ -69,11 +72,36 @@ describe("SDK surface parity — `@mossaic/sdk` vs `@mossaic/sdk/http`", () => {
     expect(sdk.hashChunk).toBe(sdkHttp.hashChunk);
     expect(sdk.computeFileHash).toBe(sdkHttp.computeFileHash);
     expect(sdk.computeChunkSpec).toBe(sdkHttp.computeChunkSpec);
+    expect(sdk.MULTIPART_OPERATION_RPC_BUDGET).toBe(
+      sdkHttp.MULTIPART_OPERATION_RPC_BUDGET
+    );
+    expect(sdk.DEFAULT_COMPLETION_REQUEST_BUDGET).toBe(
+      sdkHttp.DEFAULT_COMPLETION_REQUEST_BUDGET
+    );
+    expect(sdk.MULTIPART_OPERATION_RETRY_BUDGET).toBe(
+      sdkHttp.MULTIPART_OPERATION_RETRY_BUDGET
+    );
   });
 
   it("HTTP client surface — createMossaicHttpClient + HttpVFS shared", () => {
     expect(sdk.createMossaicHttpClient).toBe(sdkHttp.createMossaicHttpClient);
     expect(sdk.HttpVFS).toBe(sdkHttp.HttpVFS);
+  });
+
+  it("binding and HTTP clients expose the same bounded operation methods", () => {
+    const methods = [
+      "resumeMultipartUploadPage",
+      "startFinalizeMultipartUpload",
+      "stepFinalizeMultipartUpload",
+      "startAbortMultipartUpload",
+      "stepAbortMultipartUpload",
+      "startDropVersions",
+      "stepDropVersions",
+    ] as const;
+    for (const method of methods) {
+      expect(typeof sdk.VFS.prototype[method]).toBe("function");
+      expect(typeof sdk.HttpVFS.prototype[method]).toBe("function");
+    }
   });
 
   it("token issuance helpers shared", () => {

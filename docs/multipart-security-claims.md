@@ -102,6 +102,27 @@ The encryption metadata is propagated through
 re-stamped onto `files` / `file_versions` at finalize, mirroring the
 `vfsWriteFile` path's stamping at commit time.
 
+## Claim 5 — Placement-version consistency
+
+**Statement:** Every chunk in one multipart session is routed and verified with
+the same placement algorithm and pool size. Protocol v2 sessions use jump
+consistent hash with fixed hash work; sessions and tokens created before
+placement versioning retain the exact rendezvous result.
+
+**Argument:** `pool_size` and `placement_version` are persisted in
+`upload_sessions` and copied into the signed `vfs-mp` token. HTTP PUT and the
+binding SDK read those signed claims. Resume remints from the persisted row,
+while status and finalize read that row directly. All four paths call
+`placeMultipartChunk` from `shared/placement.ts`. A missing token claim resolves
+to placement v1, and the schema migration defaults existing rows to v1.
+Changing either signed claim invalidates the HMAC; unsupported signed versions
+are rejected by token verification.
+
+**Why not formalised in Lean:** the current multipart model does not model hash
+functions, JWT claims, schema migration, or cross-runtime placement parity.
+Golden vectors, distribution tests, HTTP/binding integration tests, migration
+tests, tamper tests, and the placement benchmark cover the executable boundary.
+
 ## What IS formalised in Lean
 
 `Mossaic.Vfs.Multipart` includes these relevant abstract-model theorems:

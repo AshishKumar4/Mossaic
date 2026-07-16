@@ -8,7 +8,7 @@
  * truth.
  *
  * Design invariants (preserved from server-side plan §1):
- *   1. UserDO touched only at session boundaries (`begin` + `finalize`).
+ *   1. UserDO is touched only for session control and bounded finalize pages.
  *   2. Per-chunk PUT does ONE ShardDO RPC; no UserDO involvement.
  *  3. encryption composes per-chunk: each plaintext chunk is
  *      sealed independently and the envelope is what the server hashes.
@@ -27,6 +27,10 @@
 
 import type { HttpVFS } from "./http";
 import { EINVAL, mapServerError, MossaicUnavailableError } from "./errors";
+import type {
+  MultipartOperationProgress,
+} from "./vfs";
+import { validateMultipartStatusPage } from "./multipart-protocol";
 
 /**
  * Public client alias. The transfer engine is a method
@@ -39,7 +43,7 @@ import type {
   MultipartBeginResponse,
   MultipartFinalizeResponse,
   MultipartPutChunkResponse,
-  MultipartStatusResponse,
+  MultipartStatusPageResponse,
   DownloadTokenResponse,
 } from "@shared/multipart";
 import { hashChunk } from "@shared/crypto";
@@ -183,9 +187,10 @@ export interface ParallelDownloadOpts {
 /**
  * Mint a multipart upload session. One round-trip; caller then
  * spawns parallel `putChunk` calls bounded by their own concurrency
- * budget (typically 32–64) and finalises with `finalizeUpload`.
+ * budget (typically 32–64) and finalises with `finalizeUpload`, which stages
+ * hash pages and advances the durable finalize state until publication.
  */
-export async function beginUpload(
+export async function beginUploadPage(
   client: MossaicHttpClient,
   path: string,
   opts: BeginUploadOpts
@@ -204,7 +209,94 @@ export async function beginUpload(
     ...(opts.ttlMs !== undefined ? { ttlMs: opts.ttlMs } : {}),
   };
   try {
-    return await client.multipartBegin(body, opts.signal);
+    return await client.multipartBeginPage(body, opts.signal);
+  } catch (err) {
+    throw mapServerError(err, { path, syscall: "open" });
+  }
+}
+
+async function collectTransferStatusPages(
+  first: MultipartStatusPageResponse,
+  fetchPage: (continuation: string) => Promise<MultipartStatusPageResponse>,
+  onPage?: (page: MultipartStatusPageResponse, pagesRead: number) => void,
+  signal?: AbortSignal
+): Promise<MultipartStatusPageResponse> {
+  const landed: number[] = [];
+  const landedSet = new Set<number>();
+  const continuations = new Set<string>();
+  let bytesUploaded = 0;
+  let page = first;
+  let pagesRead = 0;
+  for (;;) {
+    signal?.throwIfAborted();
+    validateMultipartStatusPage(page);
+    if (page.total !== first.total) {
+      throw new MossaicUnavailableError({
+        message: "invalid multipart response: status total changed between pages",
+      });
+    }
+    for (const index of page.landed) {
+      if (landedSet.has(index)) {
+        throw new MossaicUnavailableError({
+          message: "invalid multipart response: duplicate landed index",
+        });
+      }
+      landedSet.add(index);
+      landed.push(index);
+    }
+    bytesUploaded += page.bytesUploaded;
+    pagesRead++;
+    onPage?.(page, pagesRead);
+    signal?.throwIfAborted();
+    if (page.continuation === undefined) {
+      landed.sort((left, right) => left - right);
+      return {
+        landed,
+        total: first.total,
+        bytesUploaded,
+        expiresAtMs: page.expiresAtMs,
+      };
+    }
+    if (continuations.has(page.continuation)) {
+      throw new MossaicUnavailableError({
+        message: "invalid multipart response: continuation cycle detected",
+      });
+    }
+    continuations.add(page.continuation);
+    signal?.throwIfAborted();
+    page = await fetchPage(page.continuation);
+  }
+}
+
+/** Complete begin/resume by explicitly following bounded status pages. */
+export async function beginUpload(
+  client: MossaicHttpClient,
+  path: string,
+  opts: BeginUploadOpts
+): Promise<BeginUploadResult> {
+  const first = await beginUploadPage(client, path, opts);
+  if (first.continuation === undefined) return first;
+  try {
+    const status = await collectTransferStatusPages(
+      {
+        landed: first.landed,
+        total: first.totalChunks,
+        bytesUploaded: 0,
+        expiresAtMs: first.expiresAtMs,
+        continuation: first.continuation,
+      },
+      (continuation) =>
+        client.multipartStatusPage(
+          first.uploadId,
+          first.sessionToken,
+          continuation,
+          opts.signal
+        ),
+      undefined,
+      opts.signal
+    );
+    const { continuation: _continuation, ...complete } = first;
+    return { ...complete, landed: status.landed };
   } catch (err) {
     throw mapServerError(err, { path, syscall: "open" });
   }
@@ -232,10 +324,31 @@ export async function finalizeUpload(
   client: MossaicHttpClient,
   session: BeginUploadResult,
   chunkHashList: readonly string[],
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onProgress?: (progress: MultipartOperationProgress) => void
 ): Promise<MultipartFinalizeResponse> {
   try {
-    return await client.multipartFinalize(session.uploadId, chunkHashList, signal);
+    let result = await client.multipartFinalizeBounded(
+      session.uploadId,
+      chunkHashList,
+      signal,
+      session.protocolVersion,
+      session.capabilities,
+      undefined,
+      onProgress
+    );
+    while ("operation" in result) {
+      result = await client.multipartFinalizeBounded(
+        session.uploadId,
+        chunkHashList,
+        signal,
+        session.protocolVersion,
+        session.capabilities,
+        result.operation,
+        onProgress
+      );
+    }
+    return result;
   } catch (err) {
     throw mapServerError(err, {
       syscall: "open",
@@ -247,10 +360,29 @@ export async function finalizeUpload(
 export async function abortUpload(
   client: MossaicHttpClient,
   session: BeginUploadResult,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onProgress?: (progress: MultipartOperationProgress) => void
 ): Promise<{ ok: true }> {
   try {
-    return await client.multipartAbort(session.uploadId, signal);
+    let result = await client.multipartAbortBounded(
+      session.uploadId,
+      signal,
+      session.protocolVersion,
+      session.capabilities,
+      undefined,
+      onProgress
+    );
+    while ("operation" in result) {
+      result = await client.multipartAbortBounded(
+        session.uploadId,
+        signal,
+        session.protocolVersion,
+        session.capabilities,
+        result.operation,
+        onProgress
+      );
+    }
+    return result;
   } catch (err) {
     throw mapServerError(err, { syscall: "open" });
   }
@@ -259,10 +391,55 @@ export async function abortUpload(
 /** Read landed[] for resume / progress. */
 export async function statusUpload(
   client: MossaicHttpClient,
-  session: BeginUploadResult
-): Promise<MultipartStatusResponse> {
+  session: BeginUploadResult,
+  continuation?: string,
+  signal?: AbortSignal,
+  onProgress?: (progress: MultipartOperationProgress) => void
+): Promise<MultipartStatusPageResponse> {
   try {
-    return await client.multipartStatus(session.uploadId, session.sessionToken);
+    const first = await client.multipartStatusPage(
+      session.uploadId,
+      session.sessionToken,
+      continuation,
+      signal
+    );
+    return await collectTransferStatusPages(
+      first,
+      (next) =>
+        client.multipartStatusPage(
+          session.uploadId,
+          session.sessionToken,
+          next,
+          signal
+        ),
+      (page) =>
+        onProgress?.({
+          operation: "status",
+          phase: page.continuation === undefined ? "done" : "paged",
+          requestsUsed: 1,
+          requestBudget: 1,
+        }),
+      signal
+    );
+  } catch (err) {
+    throw mapServerError(err, { syscall: "open" });
+  }
+}
+
+/** Read one bounded landed/status page. */
+export async function statusUploadPage(
+  client: MossaicHttpClient,
+  session: BeginUploadResult,
+  continuation?: string,
+  signal?: AbortSignal
+): Promise<MultipartStatusPageResponse> {
+  try {
+    return await client.multipartStatusPage(
+      session.uploadId,
+      session.sessionToken,
+      continuation,
+      signal
+    );
   } catch (err) {
     throw mapServerError(err, { syscall: "open" });
   }
@@ -905,7 +1082,12 @@ export async function parallelUpload(
 
   // Finalize. The server cross-checks our hash list against shard
   // staging — any divergence throws EBADF.
-  const f = await finalizeUpload(client, session, chunkHashList, opts.signal);
+  const f = await finalizeUpload(
+    client,
+    session,
+    chunkHashList,
+    opts.signal
+  );
   if (f.size !== bytesAccepted) {
     throw new EINVAL({ syscall: "parallelUpload", path });
   }

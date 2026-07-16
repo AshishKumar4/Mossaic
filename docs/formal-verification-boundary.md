@@ -49,8 +49,9 @@ The following are outside the current formal result:
   modeled.
 - JavaScript behavior, promises, exceptions, typed-array behavior, serialization,
   and library correctness are not modeled.
-- Rendezvous placement hashing and its distribution or collision behavior are
-  not modeled. The quota model uses simpler abstract postconditions.
+- Rendezvous and jump-consistent placement hashing, version selection, and
+  distribution or collision behavior are not modeled. The quota model uses
+  simpler abstract postconditions.
 - SHA-256, HMAC, JWT, HKDF, AES-GCM, Web Crypto, and `jose` correctness and
   security are not proved. Opaque token predicates in Lean are model inputs,
   not cryptographic proofs.

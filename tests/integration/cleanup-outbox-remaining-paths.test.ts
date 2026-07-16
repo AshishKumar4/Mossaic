@@ -12,12 +12,7 @@ import { hashChunk } from "@shared/crypto";
 import { placeChunk } from "@shared/placement";
 import type {
   ClearMultipartStagingFailurePhase,
-  DeleteManyChunksFailurePhase,
 } from "../test-worker";
-
-interface UserFaultControls {
-  testEvict(): Promise<void>;
-}
 
 interface ShardFaultControls {
   testConfigurePutChunkBlock(): Promise<void>;
@@ -34,14 +29,13 @@ interface ShardFaultControls {
     remaining: number | null
   ): Promise<void>;
   testClearClearMultipartStagingFailure(): Promise<void>;
-  testConfigureDeleteManyChunksFailure(
-    phase: DeleteManyChunksFailurePhase,
+  testConfigureAnyDeleteChunksFailure(
+    phase: "before" | "after",
     remaining: number | null
   ): Promise<void>;
-  testClearDeleteManyChunksFailure(): Promise<void>;
 }
 
-type TestUserDO = UserDO & UserFaultControls;
+type TestUserDO = UserDO;
 type TestShardDO = ShardDO & ShardFaultControls;
 
 interface TestEnv {
@@ -456,12 +450,11 @@ describe("multipart cleanup outbox", () => {
 
 describe.each([
   { phase: "before" as const, expectedRefs: 3 },
-  { phase: "mid" as const, expectedRefs: 2 },
   { phase: "after" as const, expectedRefs: 0 },
 ])("non-versioned rmrf cleanup outbox ($phase)", ({ phase, expectedRefs }) => {
-  it("preserves grouped routing until alarm replay acknowledges the batch", async () => {
+  it("preserves paged routing until alarm replay acknowledges every file", async () => {
     const fixture = await seedRmrf(`rmrf-${phase}`);
-    await fixture.shard.testConfigureDeleteManyChunksFailure(phase, 1);
+    await fixture.shard.testConfigureAnyDeleteChunksFailure(phase, null);
 
     await expect(
       fixture.user.vfsRemoveRecursive(
@@ -490,15 +483,7 @@ describe.each([
     ).toBe(true);
 
     await makeCleanupEligible(fixture.user);
-    if (phase === "mid") {
-      await expect(fixture.user.testEvict()).rejects.toThrow(
-        /injected UserDO eviction/
-      );
-      await expect(runDurableObjectAlarm(fixture.user)).rejects.toThrow(
-        /injected UserDO eviction/
-      );
-      fixture.user = userStub(fixture.tenant);
-    }
+    await fixture.shard.testClearDeleteChunksFailure();
     expect(await runDurableObjectAlarm(fixture.user)).toBe(true);
     expect(await readRmrfState(fixture)).toMatchObject({
       files: 0,
