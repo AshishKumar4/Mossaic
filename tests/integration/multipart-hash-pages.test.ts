@@ -1,5 +1,5 @@
 import { env, runInDurableObject } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import type { UserDO } from "@app/objects/user/user-do";
 import type { ShardDO } from "@core/objects/shard/shard-do";
@@ -22,6 +22,11 @@ interface TestEnv {
   MOSSAIC_USER: DurableObjectNamespace<UserDO>;
   MOSSAIC_SHARD: DurableObjectNamespace<ShardDO>;
 }
+
+// Each case uses a fresh tenant, so finalize/abort cold-start every shard in
+// the frozen pool and run schema init per ShardDO. That fan-out costs seconds
+// under workerd and exceeds the shared 15s default on slower CI runners.
+vi.setConfig({ testTimeout: 60_000 });
 
 const E = env as unknown as TestEnv;
 const AUTH_ENV = env as unknown as EnvCore;
