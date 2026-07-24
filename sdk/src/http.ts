@@ -24,7 +24,14 @@
  */
 
 import { VFSStat } from "./stats";
-import { mapServerError, MossaicUnavailableError, EINVAL } from "./errors";
+import {
+  CompletionBudgetExceededError,
+  EINVAL,
+  MossaicUnavailableError,
+  VFSFsError,
+  isLikelyUnavailable,
+  mapServerError,
+} from "./errors";
 import type {
   CacheResolveResult,
   OpenManifestResult,
@@ -53,19 +60,80 @@ import type {
   ListFilesPage,
   VersionInfo,
   DropVersionsPolicy,
+  DropVersionsOptions,
+  DropVersionsResult,
+  BoundedDropVersionsResult,
+  DropVersionsOperationHandle,
   PatchMetadataIfHeadResult,
   BeginMultipartUploadOpts,
   MultipartUploadHandle,
   PutMultipartChunkResult,
   FinalizeMultipartUploadResult,
+  BoundedFinalizeMultipartUploadResult,
   AbortMultipartUploadResult,
+  BoundedAbortMultipartUploadResult,
+  FinalizeMultipartUploadOpts,
+  AbortMultipartUploadOpts,
+  MultipartFinalizeOperationHandle,
+  MultipartAbortOperationHandle,
+  MultipartRequestOpts,
+  MultipartOperationRequestOpts,
+  MultipartStatusPageOpts,
+  MultipartStatusOpts,
+  MultipartUploadStatus,
+  MultipartUploadStatusPage,
+  ResumeMultipartUploadOpts,
+  ResumeMultipartUploadResult,
+  VFSBoundedOperationsClient,
 } from "./vfs";
+import { createDropVersionsOperationId } from "./vfs";
 export { hashChunk } from "../../shared/crypto";
+import {
+  MULTIPART_PAGED_CONTROL_CAPABILITY,
+  MULTIPART_PROTOCOL_VERSION,
+} from "../../shared/multipart";
+import {
+  driveDropVersions,
+  driveMultipartAbort,
+  driveMultipartFinalize,
+  parseMultipartAbortResponse,
+  parseMultipartAbortProgress,
+  parseMultipartBeginResponse,
+  parseMultipartFinalizeProgress,
+  parseMultipartFinalizeResponse,
+  parseMultipartHashPageResponse,
+  parseMultipartPutChunkResponse,
+  parseMultipartStatusPageResponse,
+  collectMultipartStatusPages,
+  DEFAULT_COMPLETION_REQUEST_BUDGET,
+  multipartAbortRequestUpperBound,
+  multipartFinalizeRequestUpperBound,
+  multipartStatusPageUpperBound,
+  usesPagedMultipartProtocol,
+} from "./multipart-protocol";
 
 const HTTP_MULTIPART_TIMEOUT_MS = 10 * 60_000;
+const DROP_VERSIONS_STEP_UNSUPPORTED = new Error(
+  "dropVersionsStep is unsupported"
+);
 
-interface MultipartRequestOpts {
-  signal?: AbortSignal;
+function completionBudgetExceeded<Checkpoint>(
+  syscall: string,
+  boundedApis: string,
+  path?: string,
+  checkpoint?: Checkpoint
+): CompletionBudgetExceededError<Checkpoint> {
+  const message =
+    `EFBIG: ${syscall} can exceed the ${DEFAULT_COMPLETION_REQUEST_BUDGET}-request completion budget; ` +
+    `use ${boundedApis}`;
+  if (checkpoint !== undefined) {
+    return path === undefined
+      ? new CompletionBudgetExceededError({ syscall, message, checkpoint })
+      : new CompletionBudgetExceededError({ syscall, path, message, checkpoint });
+  }
+  return path === undefined
+    ? new CompletionBudgetExceededError({ syscall, message })
+    : new CompletionBudgetExceededError({ syscall, path, message });
 }
 
 interface ListFilesItemWire {
@@ -144,7 +212,7 @@ export interface CreateMossaicHttpClientOptions {
  * token; the server extracts it via verifyVFSToken. This makes
  * cross-tenant impersonation impossible by construction.
  */
-export class HttpVFS implements VFSClient {
+export class HttpVFS implements VFSClient, VFSBoundedOperationsClient {
   readonly promises: HttpVFS;
   private readonly fetcher: typeof fetch;
   private readonly base: string;
@@ -196,7 +264,9 @@ export class HttpVFS implements VFSClient {
     body: object | Uint8Array,
     syscall: string,
     path: string | undefined,
-    expect: "json" | "octet-stream"
+    expect: "json" | "octet-stream",
+    allowNotFound = false,
+    signal?: AbortSignal
   ): Promise<Response> {
     const url = `${this.base}/api/vfs/${method}`;
     const apiKey = await this.getApiKey();
@@ -213,14 +283,20 @@ export class HttpVFS implements VFSClient {
     }
     let res: Response;
     try {
-      res = await this.fetcher(url, { method: "POST", headers, body: payload });
+      res = await this.fetcher(url, {
+        method: "POST",
+        headers,
+        body: payload,
+        signal,
+      });
     } catch (err) {
+      if (signal?.aborted) throw err;
       // Network-level failure (DNS, TCP RST, etc.) → MossaicUnavailable.
       throw new MossaicUnavailableError({
         message: `HTTP fetch to ${url} failed: ${(err as Error).message}`,
       });
     }
-    if (res.ok) return res;
+    if (res.ok || (allowNotFound && res.status === 404)) return res;
     // Non-2xx: parse JSON body { code, message } and remap to typed error.
     let payloadJson: { code?: string; message?: string };
     try {
@@ -593,7 +669,7 @@ export class HttpVFS implements VFSClient {
       ...(opts.resumeFrom !== undefined ? { resumeFrom: opts.resumeFrom } : {}),
       ...(opts.ttlMs !== undefined ? { ttlMs: opts.ttlMs } : {}),
     };
-    const res = await this.multipartBegin(body, signalWithTimeout(opts.signal));
+    const res = await this.multipartBeginPage(body, signalWithTimeout(opts.signal));
     return {
       uploadId: res.uploadId,
       path: p,
@@ -602,7 +678,133 @@ export class HttpVFS implements VFSClient {
       poolSize: res.poolSize,
       sessionToken: res.sessionToken,
       expiresAtMs: res.expiresAtMs,
+      size: opts.size,
+      ...(res.capabilities !== undefined
+        ? { capabilities: res.capabilities }
+        : res.protocolVersion === MULTIPART_PROTOCOL_VERSION
+          ? { capabilities: [MULTIPART_PAGED_CONTROL_CAPABILITY] }
+          : {}),
+      ...(res.protocolVersion === undefined
+        ? {}
+        : { protocolVersion: res.protocolVersion }),
     };
+  }
+
+  async resumeMultipartUploadPage(
+    handle: MultipartUploadHandle,
+    opts: ResumeMultipartUploadOpts = {}
+  ): Promise<ResumeMultipartUploadResult> {
+    const size = handle.size ?? opts.size;
+    if (size === undefined) {
+      throw new EINVAL({
+        syscall: "resumeMultipartUpload",
+        path: handle.path,
+      });
+    }
+    const response = await this.multipartBeginPage(
+      {
+        path: handle.path,
+        size,
+        chunkSize: handle.chunkSize,
+        resumeFrom: handle.uploadId,
+        ttlMs: opts.ttlMs,
+      },
+      signalWithTimeout(opts.signal)
+    );
+    opts.onProgress?.({
+      operation: "resume",
+      phase: response.continuation === undefined ? "done" : "paged",
+      requestsUsed: 1,
+      requestBudget: DEFAULT_COMPLETION_REQUEST_BUDGET,
+      completed: response.landed.length,
+      total: response.totalChunks,
+    });
+    opts.signal?.throwIfAborted();
+    const resumedHandle: MultipartUploadHandle = {
+      uploadId: response.uploadId,
+      path: handle.path,
+      chunkSize: response.chunkSize,
+      expectedChunks: response.totalChunks,
+      poolSize: response.poolSize,
+      sessionToken: response.sessionToken,
+      expiresAtMs: response.expiresAtMs,
+      size,
+      ...(response.capabilities !== undefined
+        ? { capabilities: response.capabilities }
+        : response.protocolVersion === MULTIPART_PROTOCOL_VERSION
+          ? { capabilities: [MULTIPART_PAGED_CONTROL_CAPABILITY] }
+          : {}),
+      ...(response.protocolVersion === undefined
+        ? {}
+        : { protocolVersion: response.protocolVersion }),
+    };
+    return {
+      handle: resumedHandle,
+      landed: response.landed,
+      ...(response.continuation === undefined
+        ? {}
+        : { continuation: response.continuation }),
+    };
+  }
+
+  async resumeMultipartUpload(
+    handle: MultipartUploadHandle,
+    opts: ResumeMultipartUploadOpts = {}
+  ): Promise<ResumeMultipartUploadResult> {
+    opts.signal?.throwIfAborted();
+    if (
+      multipartStatusPageUpperBound(handle.expectedChunks, handle.poolSize) >
+      DEFAULT_COMPLETION_REQUEST_BUDGET
+    ) {
+      throw completionBudgetExceeded(
+        "resumeMultipartUpload",
+        "resumeMultipartUploadPage() followed by getMultipartUploadStatusPage() continuations",
+        handle.path
+      );
+    }
+    const signal = signalWithTimeout(opts.signal);
+    const first = await this.resumeMultipartUploadPage(handle, {
+      size: opts.size,
+      ttlMs: opts.ttlMs,
+      signal,
+    });
+    const status = await collectMultipartStatusPages(
+      {
+        landed: first.landed,
+        total: first.handle.expectedChunks,
+        bytesUploaded: 0,
+        expiresAtMs: first.handle.expiresAtMs,
+        ...(first.continuation === undefined
+          ? {}
+          : { continuation: first.continuation }),
+      },
+      (continuation) =>
+        this.multipartStatusPage(
+          first.handle.uploadId,
+          first.handle.sessionToken,
+          continuation,
+          signal
+        ),
+      DEFAULT_COMPLETION_REQUEST_BUDGET,
+      (page, requestsUsed, landedRead) =>
+        opts.onProgress?.({
+          operation: "resume",
+          phase: page.continuation === undefined ? "done" : "paged",
+          requestsUsed,
+          requestBudget: DEFAULT_COMPLETION_REQUEST_BUDGET,
+          completed: landedRead,
+          total: page.total,
+        }),
+      signal
+    );
+    if (status.continuation !== undefined) {
+      throw completionBudgetExceeded(
+        "resumeMultipartUpload",
+        "resumeMultipartUploadPage() followed by getMultipartUploadStatusPage() continuations",
+        handle.path
+      );
+    }
+    return { handle: first.handle, landed: status.landed };
   }
 
   async putMultipartChunk(
@@ -629,30 +831,114 @@ export class HttpVFS implements VFSClient {
   async finalizeMultipartUpload(
     handle: MultipartUploadHandle,
     chunkHashList: readonly string[],
-    opts?: MultipartRequestOpts
+    opts: FinalizeMultipartUploadOpts = {}
   ): Promise<FinalizeMultipartUploadResult> {
-    const r = await this.multipartFinalize(handle.uploadId, chunkHashList, signalWithTimeout(opts?.signal));
-    return {
-      path: r.path,
-      pathId: r.fileId,
-      // Server's MultipartFinalizeResponse does not yet surface
-      // `versionId` (only `fileId`). Until it does, we expose an
-      // empty string — callers that need the version row should
-      // follow up with `listVersions(path)`. Documented on the type.
-      versionId: "",
-      size: r.size,
-      fileHash: r.fileHash,
-      isEncrypted: r.isEncrypted,
-    };
+    opts.signal?.throwIfAborted();
+    if (
+      usesPagedMultipartProtocol(handle.protocolVersion, handle.capabilities) &&
+      multipartFinalizeRequestUpperBound(
+        chunkHashList.length,
+        handle.poolSize
+      ) > DEFAULT_COMPLETION_REQUEST_BUDGET
+    ) {
+      throw completionBudgetExceeded(
+        "finalizeMultipartUpload",
+        "startFinalizeMultipartUpload() and stepFinalizeMultipartUpload()",
+        handle.path
+      );
+    }
+    const r = await this.multipartFinalizeBounded(
+      handle.uploadId,
+      chunkHashList,
+      signalWithTimeout(opts.signal),
+      handle.protocolVersion,
+      handle.capabilities,
+      undefined,
+      opts.onProgress
+    );
+    if ("operation" in r) {
+      throw completionBudgetExceeded(
+        "finalizeMultipartUpload",
+        "startFinalizeMultipartUpload() and stepFinalizeMultipartUpload()",
+        handle.path,
+        r.operation
+      );
+    }
+    return multipartFinalizeResult(r);
+  }
+
+  async startFinalizeMultipartUpload(
+    handle: MultipartUploadHandle,
+    chunkHashList: readonly string[],
+    opts: MultipartOperationRequestOpts = {}
+  ): Promise<BoundedFinalizeMultipartUploadResult> {
+    const result = await this.multipartFinalizeBounded(
+      handle.uploadId,
+      chunkHashList,
+      signalWithTimeout(opts.signal),
+      handle.protocolVersion,
+      handle.capabilities,
+      undefined,
+      opts.onProgress
+    );
+    return "operation" in result ? result : multipartFinalizeResult(result);
+  }
+
+  async stepFinalizeMultipartUpload(
+    handle: MultipartUploadHandle,
+    chunkHashList: readonly string[],
+    operation: MultipartFinalizeOperationHandle,
+    opts: MultipartOperationRequestOpts = {}
+  ): Promise<BoundedFinalizeMultipartUploadResult> {
+    const result = await this.multipartFinalizeBounded(
+      handle.uploadId,
+      chunkHashList,
+      signalWithTimeout(opts.signal),
+      handle.protocolVersion,
+      handle.capabilities,
+      operation,
+      opts.onProgress
+    );
+    return "operation" in result ? result : multipartFinalizeResult(result);
   }
 
   async abortMultipartUpload(
     handle: MultipartUploadHandle,
-    opts?: MultipartRequestOpts
+    opts: AbortMultipartUploadOpts = {}
   ): Promise<AbortMultipartUploadResult> {
     try {
-      const r = await this.multipartAbort(handle.uploadId, signalWithTimeout(opts?.signal));
-      return { aborted: r.ok === true };
+      opts.signal?.throwIfAborted();
+      if (
+        usesPagedMultipartProtocol(handle.protocolVersion, handle.capabilities) &&
+        multipartAbortRequestUpperBound(
+          handle.expectedChunks,
+          handle.poolSize
+        ) > DEFAULT_COMPLETION_REQUEST_BUDGET
+      ) {
+        throw completionBudgetExceeded(
+          "abortMultipartUpload",
+          "startAbortMultipartUpload() and stepAbortMultipartUpload()",
+          handle.path
+        );
+      }
+      const signal = signalWithTimeout(opts.signal);
+      const result = await this.multipartAbortBounded(
+        handle.uploadId,
+        signal,
+        handle.protocolVersion,
+        handle.capabilities,
+        undefined,
+        opts.onProgress
+      );
+      if ("operation" in result) {
+        throw completionBudgetExceeded(
+          "abortMultipartUpload",
+          "startAbortMultipartUpload() and stepAbortMultipartUpload()",
+          handle.path,
+          result.operation
+        );
+      }
+      return { aborted: true };
     } catch (err) {
       // Server raises ENOENT for an unknown / already-aborted session
       // and EBUSY for a session that has already finalized (cannot
@@ -666,6 +952,79 @@ export class HttpVFS implements VFSClient {
       }
       throw err;
     }
+  }
+
+  async startAbortMultipartUpload(
+    handle: MultipartUploadHandle,
+    opts: MultipartOperationRequestOpts = {}
+  ): Promise<BoundedAbortMultipartUploadResult> {
+    return this.runBoundedAbortMultipartUpload(handle, undefined, opts);
+  }
+
+  async stepAbortMultipartUpload(
+    handle: MultipartUploadHandle,
+    operation: MultipartAbortOperationHandle,
+    opts: MultipartOperationRequestOpts = {}
+  ): Promise<BoundedAbortMultipartUploadResult> {
+    return this.runBoundedAbortMultipartUpload(handle, operation, opts);
+  }
+
+  private async runBoundedAbortMultipartUpload(
+    handle: MultipartUploadHandle,
+    operation: MultipartAbortOperationHandle | undefined,
+    opts: MultipartOperationRequestOpts
+  ): Promise<BoundedAbortMultipartUploadResult> {
+    try {
+      const result = await this.multipartAbortBounded(
+        handle.uploadId,
+        signalWithTimeout(opts.signal),
+        handle.protocolVersion,
+        handle.capabilities,
+        operation,
+        opts.onProgress
+      );
+      return "operation" in result ? result : { aborted: true };
+    } catch (err) {
+      const code = err instanceof VFSFsError ? err.code : undefined;
+      if (code === "ENOENT" || code === "EBUSY") return { aborted: false };
+      throw err;
+    }
+  }
+
+  async getMultipartUploadStatusPage(
+    handle: MultipartUploadHandle,
+    opts?: MultipartStatusPageOpts
+  ): Promise<MultipartUploadStatusPage> {
+    return this.multipartStatusPage(
+      handle.uploadId,
+      handle.sessionToken,
+      opts?.continuation,
+      signalWithTimeout(opts?.signal)
+    );
+  }
+
+  async getMultipartUploadStatus(
+    handle: MultipartUploadHandle,
+    opts: MultipartStatusOpts = {}
+  ): Promise<MultipartUploadStatus> {
+    opts.signal?.throwIfAborted();
+    if (
+      multipartStatusPageUpperBound(handle.expectedChunks, handle.poolSize) >
+      DEFAULT_COMPLETION_REQUEST_BUDGET
+    ) {
+      throw completionBudgetExceeded(
+        "getMultipartUploadStatus",
+        "getMultipartUploadStatusPage() and its continuation",
+        handle.path
+      );
+    }
+    return this.multipartStatus(
+      handle.uploadId,
+      handle.sessionToken,
+      signalWithTimeout(opts.signal),
+      opts.continuation,
+      opts.onProgress
+    );
   }
 
   // ── Low-level escape hatch ────────────────────────────────────────────
@@ -871,16 +1230,117 @@ export class HttpVFS implements VFSClient {
 
   async dropVersions(
     p: string,
-    policy: DropVersionsPolicy
-  ): Promise<{ dropped: number; kept: number }> {
-    const res = await this.post(
-      "dropVersions",
-      { path: p, policy },
-      "dropVersions",
+    policy: DropVersionsPolicy,
+    opts: DropVersionsOptions = {}
+  ): Promise<DropVersionsResult> {
+    opts.signal?.throwIfAborted();
+    const result = await this.runDropVersions(
       p,
-      "json"
+      policy,
+      {
+        kind: "drop-versions",
+        operationId: createDropVersionsOperationId(),
+      },
+      opts,
+      DEFAULT_COMPLETION_REQUEST_BUDGET
     );
-    return (await res.json()) as { dropped: number; kept: number };
+    if ("operation" in result) {
+      throw completionBudgetExceeded(
+        "dropVersions",
+        "startDropVersions() and stepDropVersions()",
+        p,
+        result.operation
+      );
+    }
+    return result;
+  }
+
+  async startDropVersions(
+    p: string,
+    policy: DropVersionsPolicy,
+    opts: DropVersionsOptions = {}
+  ): Promise<BoundedDropVersionsResult> {
+    return this.runDropVersions(
+      p,
+      policy,
+      {
+        kind: "drop-versions",
+        operationId: createDropVersionsOperationId(),
+      },
+      opts,
+      DEFAULT_COMPLETION_REQUEST_BUDGET
+    );
+  }
+
+  async stepDropVersions(
+    p: string,
+    policy: DropVersionsPolicy,
+    operation: DropVersionsOperationHandle,
+    opts: DropVersionsOptions = {}
+  ): Promise<BoundedDropVersionsResult> {
+    return this.runDropVersions(
+      p,
+      policy,
+      operation,
+      opts,
+      DEFAULT_COMPLETION_REQUEST_BUDGET
+    );
+  }
+
+  private async runDropVersions(
+    p: string,
+    policy: DropVersionsPolicy,
+    operation: DropVersionsOperationHandle,
+    opts: DropVersionsOptions,
+    requestBudget: number
+  ): Promise<BoundedDropVersionsResult> {
+    if (
+      operation.kind !== "drop-versions" ||
+      typeof operation.operationId !== "string" ||
+      operation.operationId.length === 0
+    ) {
+      throw new EINVAL({ syscall: "dropVersions", path: p });
+    }
+    try {
+      const result = await driveDropVersions({
+        state: operation,
+        requestBudget,
+        signal: opts.signal,
+        isRetryable: isLikelyUnavailable,
+        onProgress: opts.onProgress,
+        dropVersionsStep: async () => {
+          const response = await this.post(
+            "dropVersionsStep",
+            { path: p, policy, operationId: operation.operationId },
+            "dropVersions",
+            p,
+            "json",
+            true,
+            opts.signal
+          );
+          if (response.status === 404) throw DROP_VERSIONS_STEP_UNSUPPORTED;
+          return response.json();
+        },
+        dropVersionsLegacy: async () => {
+          const response = await this.post(
+            "dropVersions",
+            { path: p, policy },
+            "dropVersions",
+            p,
+            "json",
+            false,
+            opts.signal
+          );
+          return response.json();
+        },
+        isStepUnsupported: (error) =>
+          error === DROP_VERSIONS_STEP_UNSUPPORTED,
+      });
+      return result.done ? result.result : { operation: result.state };
+    } catch (error) {
+      if (opts.signal?.aborted) throw error;
+      throw mapServerError(error, { path: p, syscall: "dropVersions" });
+    }
   }
 
   // ── ──────────────────────────────────────────────────────────
@@ -1117,6 +1577,46 @@ export class HttpVFS implements VFSClient {
     body: import("../../shared/multipart").MultipartBeginRequest,
     signal?: AbortSignal
   ): Promise<import("../../shared/multipart").MultipartBeginResponse> {
+    const first = await this.multipartBeginPage(body, signal);
+    if (first.continuation === undefined) return first;
+    const status = await collectMultipartStatusPages(
+      {
+        landed: first.landed,
+        total: first.totalChunks,
+        bytesUploaded: 0,
+        expiresAtMs: first.expiresAtMs,
+        continuation: first.continuation,
+      },
+      (continuation) =>
+        this.multipartStatusPage(
+          first.uploadId,
+          first.sessionToken,
+          continuation,
+          signal
+        ),
+      DEFAULT_COMPLETION_REQUEST_BUDGET,
+      undefined,
+      signal
+    );
+    if (status.continuation !== undefined) {
+      throw completionBudgetExceeded(
+        "multipartBegin",
+        "multipartBeginPage() followed by multipartStatusPage() continuations",
+        body.path
+      );
+    }
+    const { continuation: _continuation, ...complete } = first;
+    return {
+      ...complete,
+      landed: status.landed,
+    };
+  }
+
+  async multipartBeginPage(
+    body: import("../../shared/multipart").MultipartBeginRequest,
+    signal?: AbortSignal
+  ): Promise<import("../../shared/multipart").MultipartBeginResponse> {
+    signal?.throwIfAborted();
     const url = `${this.base}/api/vfs/multipart/begin`;
     const apiKey = await this.getApiKey();
     const res = await this.fetcher(url, {
@@ -1125,13 +1625,18 @@ export class HttpVFS implements VFSClient {
         Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify({
+        ...body,
+        capabilities: [MULTIPART_PAGED_CONTROL_CAPABILITY],
+        protocolVersion: MULTIPART_PROTOCOL_VERSION,
+      }),
       signal,
     });
+    signal?.throwIfAborted();
     if (!res.ok) {
       await this.throwHttp(res, "open", body.path);
     }
-    return (await res.json()) as import("../../shared/multipart").MultipartBeginResponse;
+    return parseMultipartBeginResponse(await res.json());
   }
 
   async multipartPutChunk(
@@ -1141,6 +1646,7 @@ export class HttpVFS implements VFSClient {
     sessionToken: string,
     signal?: AbortSignal
   ): Promise<import("../../shared/multipart").MultipartPutChunkResponse> {
+    signal?.throwIfAborted();
     const url = `${this.base}/api/vfs/multipart/${encodeURIComponent(uploadId)}/chunk/${idx}`;
     const apiKey = await this.getApiKey();
     const res = await this.fetcher(url, {
@@ -1154,17 +1660,122 @@ export class HttpVFS implements VFSClient {
       body: bytes,
       signal,
     });
+    signal?.throwIfAborted();
     if (!res.ok) {
       await this.throwHttp(res, "open", undefined);
     }
-    return (await res.json()) as import("../../shared/multipart").MultipartPutChunkResponse;
+    return parseMultipartPutChunkResponse(await res.json());
   }
 
   async multipartFinalize(
     uploadId: string,
     chunkHashList: readonly string[],
+    signal?: AbortSignal,
+    protocolVersion?: number,
+    capabilities?: readonly string[],
+    onProgress?: MultipartOperationRequestOpts["onProgress"]
+  ): Promise<import("../../shared/multipart").MultipartFinalizeResponse> {
+    const result = await this.runMultipartFinalizeProtocol(
+      uploadId,
+      chunkHashList,
+      signal,
+      protocolVersion,
+      capabilities,
+      undefined,
+      onProgress,
+      DEFAULT_COMPLETION_REQUEST_BUDGET
+    );
+    if ("operation" in result) {
+      throw completionBudgetExceeded(
+        "multipartFinalize",
+        "multipartFinalizeBounded() and its returned operation",
+        undefined,
+        result.operation
+      );
+    }
+    return result;
+  }
+
+  async multipartFinalizeBounded(
+    uploadId: string,
+    chunkHashList: readonly string[],
+    signal?: AbortSignal,
+    protocolVersion?: number,
+    capabilities?: readonly string[],
+    operation?: MultipartFinalizeOperationHandle,
+    onProgress?: MultipartOperationRequestOpts["onProgress"]
+  ): Promise<
+    | import("../../shared/multipart").MultipartFinalizeResponse
+    | { operation: MultipartFinalizeOperationHandle }
+  > {
+    return this.runMultipartFinalizeProtocol(
+      uploadId,
+      chunkHashList,
+      signal,
+      protocolVersion,
+      capabilities,
+      operation,
+      onProgress,
+      DEFAULT_COMPLETION_REQUEST_BUDGET
+    );
+  }
+
+  private async runMultipartFinalizeProtocol(
+    uploadId: string,
+    chunkHashList: readonly string[],
+    signal: AbortSignal | undefined,
+    protocolVersion: number | undefined,
+    capabilities: readonly string[] | undefined,
+    operation: MultipartFinalizeOperationHandle | undefined,
+    onProgress: MultipartOperationRequestOpts["onProgress"],
+    requestBudget: number
+  ): Promise<
+    | import("../../shared/multipart").MultipartFinalizeResponse
+    | { operation: MultipartFinalizeOperationHandle }
+  > {
+    signal?.throwIfAborted();
+    if (!usesPagedMultipartProtocol(protocolVersion, capabilities)) {
+      if (operation !== undefined) {
+        throw new EINVAL({ syscall: "finalizeMultipartUpload" });
+      }
+      return this.multipartFinalizeLegacy(uploadId, chunkHashList, signal);
+    }
+    if (
+      operation !== undefined &&
+      (operation.kind !== "multipart-finalize" ||
+        operation.uploadId !== uploadId ||
+        !Number.isSafeInteger(operation.nextHashIndex) ||
+        operation.nextHashIndex < 0 ||
+        operation.nextHashIndex > chunkHashList.length)
+    ) {
+      throw new EINVAL({ syscall: "finalizeMultipartUpload" });
+    }
+    const result = await driveMultipartFinalize({
+      uploadId,
+      chunkHashList,
+      state: operation,
+      requestBudget,
+      signal,
+      isRetryable: isLikelyUnavailable,
+      onProgress,
+      stageHashes: (startIndex, hashes) =>
+        this.multipartStageHashes(
+          uploadId,
+          startIndex,
+          hashes,
+          signal
+        ),
+      finalizeStep: () => this.multipartFinalizeStep(uploadId, signal),
+    });
+    return result.done ? result.result : { operation: result.state };
+  }
+
+  private async multipartFinalizeLegacy(
+    uploadId: string,
+    chunkHashList: readonly string[],
     signal?: AbortSignal
   ): Promise<import("../../shared/multipart").MultipartFinalizeResponse> {
+    signal?.throwIfAborted();
     const url = `${this.base}/api/vfs/multipart/finalize`;
     const apiKey = await this.getApiKey();
     const res = await this.fetcher(url, {
@@ -1176,16 +1787,64 @@ export class HttpVFS implements VFSClient {
       body: JSON.stringify({ uploadId, chunkHashList }),
       signal,
     });
+    signal?.throwIfAborted();
+    if (!res.ok) await this.throwHttp(res, "open", undefined);
+    return parseMultipartFinalizeResponse(await res.json());
+  }
+
+  async multipartStageHashes(
+    uploadId: string,
+    startIndex: number,
+    hashes: readonly string[],
+    signal?: AbortSignal
+  ): Promise<import("../../shared/multipart").MultipartHashPageResponse> {
+    signal?.throwIfAborted();
+    const url = `${this.base}/api/vfs/multipart/hash-page`;
+    const apiKey = await this.getApiKey();
+    const res = await this.fetcher(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ uploadId, startIndex, hashes }),
+      signal,
+    });
+    signal?.throwIfAborted();
     if (!res.ok) {
       await this.throwHttp(res, "open", undefined);
     }
-    return (await res.json()) as import("../../shared/multipart").MultipartFinalizeResponse;
+    return parseMultipartHashPageResponse(await res.json());
+  }
+
+  async multipartFinalizeStep(
+    uploadId: string,
+    signal?: AbortSignal
+  ): Promise<import("../../shared/multipart").MultipartFinalizeProgress> {
+    signal?.throwIfAborted();
+    const url = `${this.base}/api/vfs/multipart/finalize-step`;
+    const apiKey = await this.getApiKey();
+    const res = await this.fetcher(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ uploadId }),
+      signal,
+    });
+    signal?.throwIfAborted();
+    if (!res.ok) {
+      await this.throwHttp(res, "open", undefined);
+    }
+    return parseMultipartFinalizeProgress(await res.json());
   }
 
   async multipartAbort(
     uploadId: string,
     signal?: AbortSignal
   ): Promise<{ ok: true }> {
+    signal?.throwIfAborted();
     const url = `${this.base}/api/vfs/multipart/abort`;
     const apiKey = await this.getApiKey();
     const res = await this.fetcher(url, {
@@ -1197,17 +1856,164 @@ export class HttpVFS implements VFSClient {
       body: JSON.stringify({ uploadId }),
       signal,
     });
+    signal?.throwIfAborted();
     if (!res.ok) {
       await this.throwHttp(res, "open", undefined);
     }
-    return (await res.json()) as { ok: true };
+    return parseMultipartAbortResponse(await res.json());
+  }
+
+  async multipartAbortStep(
+    uploadId: string,
+    signal?: AbortSignal
+  ): Promise<import("../../shared/multipart").MultipartAbortProgress> {
+    signal?.throwIfAborted();
+    const url = `${this.base}/api/vfs/multipart/abort-step`;
+    const apiKey = await this.getApiKey();
+    const res = await this.fetcher(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ uploadId }),
+      signal,
+    });
+    signal?.throwIfAborted();
+    if (!res.ok) {
+      await this.throwHttp(res, "open", undefined);
+    }
+    return parseMultipartAbortProgress(await res.json());
+  }
+
+  async multipartAbortOperation(
+    uploadId: string,
+    signal?: AbortSignal,
+    protocolVersion?: number,
+    capabilities?: readonly string[],
+    onProgress?: MultipartOperationRequestOpts["onProgress"]
+  ): Promise<{ ok: true }> {
+    const result = await this.runMultipartAbortProtocol(
+      uploadId,
+      signal,
+      protocolVersion,
+      capabilities,
+      undefined,
+      onProgress,
+      DEFAULT_COMPLETION_REQUEST_BUDGET
+    );
+    if ("operation" in result) {
+      throw completionBudgetExceeded(
+        "multipartAbortOperation",
+        "multipartAbortBounded() and its returned operation",
+        undefined,
+        result.operation
+      );
+    }
+    return result;
+  }
+
+  async multipartAbortBounded(
+    uploadId: string,
+    signal?: AbortSignal,
+    protocolVersion?: number,
+    capabilities?: readonly string[],
+    operation?: MultipartAbortOperationHandle,
+    onProgress?: MultipartOperationRequestOpts["onProgress"]
+  ): Promise<{ ok: true } | { operation: MultipartAbortOperationHandle }> {
+    return this.runMultipartAbortProtocol(
+      uploadId,
+      signal,
+      protocolVersion,
+      capabilities,
+      operation,
+      onProgress,
+      DEFAULT_COMPLETION_REQUEST_BUDGET
+    );
+  }
+
+  private async runMultipartAbortProtocol(
+    uploadId: string,
+    signal: AbortSignal | undefined,
+    protocolVersion: number | undefined,
+    capabilities: readonly string[] | undefined,
+    operation: MultipartAbortOperationHandle | undefined,
+    onProgress: MultipartOperationRequestOpts["onProgress"],
+    requestBudget: number
+  ): Promise<{ ok: true } | { operation: MultipartAbortOperationHandle }> {
+    if (!usesPagedMultipartProtocol(protocolVersion, capabilities)) {
+      if (operation !== undefined) {
+        throw new EINVAL({ syscall: "abortMultipartUpload" });
+      }
+      return this.multipartAbort(uploadId, signal);
+    }
+    if (
+      operation !== undefined &&
+      (operation.kind !== "multipart-abort" || operation.uploadId !== uploadId)
+    ) {
+      throw new EINVAL({ syscall: "abortMultipartUpload" });
+    }
+    const result = await driveMultipartAbort({
+      uploadId,
+      state: operation,
+      requestBudget,
+      signal,
+      isRetryable: isLikelyUnavailable,
+      onProgress,
+      abortStep: () => this.multipartAbortStep(uploadId, signal),
+    });
+    return result.done ? result.result : { operation: result.state };
   }
 
   async multipartStatus(
     uploadId: string,
-    sessionToken: string
-  ): Promise<import("../../shared/multipart").MultipartStatusResponse> {
-    const url = `${this.base}/api/vfs/multipart/${encodeURIComponent(uploadId)}/status`;
+    sessionToken: string,
+    signal?: AbortSignal,
+    continuation?: string,
+    onProgress?: MultipartOperationRequestOpts["onProgress"]
+  ): Promise<import("../../shared/multipart").MultipartStatusPageResponse> {
+    const first = await this.multipartStatusPage(
+      uploadId,
+      sessionToken,
+      continuation,
+      signal
+    );
+    const status = await collectMultipartStatusPages(
+      first,
+      (next) => this.multipartStatusPage(uploadId, sessionToken, next, signal),
+      DEFAULT_COMPLETION_REQUEST_BUDGET,
+      (page, requestsUsed, landedRead) =>
+        onProgress?.({
+          operation: "status",
+          phase: page.continuation === undefined ? "done" : "paged",
+          requestsUsed,
+          requestBudget: DEFAULT_COMPLETION_REQUEST_BUDGET,
+          completed: landedRead,
+          total: page.total,
+        }),
+      signal
+    );
+    if (status.continuation !== undefined) {
+      throw completionBudgetExceeded(
+        "multipartStatus",
+        "multipartStatusPage() and its continuation"
+      );
+    }
+    return status;
+  }
+
+  async multipartStatusPage(
+    uploadId: string,
+    sessionToken: string,
+    continuation?: string,
+    signal?: AbortSignal
+  ): Promise<import("../../shared/multipart").MultipartStatusPageResponse> {
+    signal?.throwIfAborted();
+    const query =
+      continuation === undefined
+        ? ""
+        : `?continuation=${encodeURIComponent(continuation)}`;
+    const url = `${this.base}/api/vfs/multipart/${encodeURIComponent(uploadId)}/status${query}`;
     const apiKey = await this.getApiKey();
     const res = await this.fetcher(url, {
       method: "GET",
@@ -1215,11 +2021,13 @@ export class HttpVFS implements VFSClient {
         Authorization: `Bearer ${apiKey}`,
         "X-Session-Token": sessionToken,
       },
+      signal,
     });
+    signal?.throwIfAborted();
     if (!res.ok) {
       await this.throwHttp(res, "open", undefined);
     }
-    return (await res.json()) as import("../../shared/multipart").MultipartStatusResponse;
+    return parseMultipartStatusPageResponse(await res.json());
   }
 
   async multipartDownloadToken(
@@ -1326,6 +2134,19 @@ export function createMossaicHttpClient(
 // compile. No additional static assertion needed.
 
 // ── Helpers for the manual-multipart surface ────────────────────────────
+
+function multipartFinalizeResult(
+  result: import("../../shared/multipart").MultipartFinalizeResponse
+): FinalizeMultipartUploadResult {
+  return {
+    path: result.path,
+    pathId: result.fileId,
+    versionId: result.versionId,
+    size: result.size,
+    fileHash: result.fileHash,
+    isEncrypted: result.isEncrypted,
+  };
+}
 
 /**
  * Normalise a chunk argument to a Uint8Array view over an ArrayBuffer

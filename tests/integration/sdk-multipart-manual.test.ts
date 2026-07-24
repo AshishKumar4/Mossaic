@@ -18,12 +18,18 @@ import { SELF, env } from "cloudflare:test";
 
 import {
   createMossaicHttpClient,
+  createVFS,
+  EFBIG,
+  type MossaicEnv,
   type MultipartUploadHandle,
 } from "../../sdk/src/index";
 import { hashChunk } from "@shared/crypto";
+import { MULTIPART_PAGED_CONTROL_CAPABILITY } from "@shared/multipart";
 import { signVFSToken } from "@core/lib/auth";
 
 interface E {
+  MOSSAIC_USER: MossaicEnv["MOSSAIC_USER"];
+  MOSSAIC_SHARD: MossaicEnv["MOSSAIC_SHARD"];
   JWT_SECRET?: string;
 }
 const TEST_ENV = env as unknown as E;
@@ -51,6 +57,16 @@ async function clientFor(tenant: string) {
     apiKey,
     fetcher: selfFetcher,
   });
+}
+
+function bindingClientFor(tenant: string) {
+  return createVFS(
+    {
+      MOSSAIC_USER: TEST_ENV.MOSSAIC_USER,
+      MOSSAIC_SHARD: TEST_ENV.MOSSAIC_SHARD,
+    },
+    { tenant }
+  );
 }
 
 /** LCG-derived deterministic bytes; suitable for content roundtrip checks. */
@@ -95,6 +111,7 @@ describe("SDK manual multipart", () => {
     }
 
     const result = await vfs.finalizeMultipartUpload(handle, hashes);
+    expect(result).not.toHaveProperty("operation");
     expect(result.size).toBe(7000);
     expect(result.path).toBe("/manual-rt.bin");
     expect(result.pathId).toMatch(/^[a-z0-9]+$/);
@@ -118,6 +135,7 @@ describe("SDK manual multipart", () => {
     expect(r.accepted).toBe(true);
 
     const aborted = await vfs.abortMultipartUpload(handle);
+    expect(aborted).not.toHaveProperty("operation");
     expect(aborted.aborted).toBe(true);
 
     // After abort, the path must NOT exist.
@@ -139,6 +157,7 @@ describe("SDK manual multipart", () => {
 
     // Now abort the already-finalised session — should report not-aborted.
     const aborted = await vfs.abortMultipartUpload(handle);
+    expect(aborted).not.toHaveProperty("operation");
     expect(aborted.aborted).toBe(false);
     await expect(vfs.putMultipartChunk(handle, 0, data)).rejects.toThrow(/EBUSY/);
   });
@@ -288,5 +307,142 @@ describe("SDK manual multipart", () => {
     const info = await vfs.fileInfo(path, { includeMetadata: true });
     expect(info.metadata).toBeNull();
     expect(info.tags).toEqual([]);
+  });
+
+  it("M12 — binding finalize completes overwrite preparation", async () => {
+    const vfs = bindingClientFor("mp-manual-12");
+    const path = "/manual-binding-overwrite.bin";
+    await vfs.writeFile(path, new Uint8Array([1]), {
+      metadata: { stale: true },
+      tags: ["stale"],
+    });
+    const data = makeBytes(2_048, 12);
+    const handle = await vfs.beginMultipartUpload(path, {
+      size: data.byteLength,
+      chunkSize: 1_024,
+      metadata: null,
+      tags: [],
+    });
+    const hashes: string[] = [];
+    for (const [index, chunk] of sliceChunks(data, handle.chunkSize).entries()) {
+      hashes.push((await vfs.putMultipartChunk(handle, index, chunk)).chunkHash);
+    }
+
+    await expect(vfs.finalizeMultipartUpload(handle, hashes)).resolves.toMatchObject({
+      path,
+      size: data.byteLength,
+    });
+    await expect(vfs.fileInfo(path, { includeMetadata: true })).resolves.toMatchObject({
+      metadata: null,
+      tags: [],
+    });
+  });
+
+  it("M13 — binding and HTTP bounded operations have matching shapes and cancellation", async () => {
+    const clients = [
+      bindingClientFor("mp-manual-13-binding"),
+      await clientFor("mp-manual-13-http"),
+    ];
+
+    for (const [index, vfs] of clients.entries()) {
+      const data = makeBytes(2_048, 13 + index);
+      const path = `/manual-parity-${index}.bin`;
+      const handle = await vfs.beginMultipartUpload(path, {
+        size: data.byteLength,
+        chunkSize: 1_024,
+      });
+      const hashes: string[] = [];
+      for (const [chunkIndex, chunk] of sliceChunks(
+        data,
+        handle.chunkSize,
+      ).entries()) {
+        hashes.push(
+          (await vfs.putMultipartChunk(handle, chunkIndex, chunk)).chunkHash,
+        );
+      }
+
+      const finalized = await vfs.startFinalizeMultipartUpload(handle, hashes);
+      expect(finalized).toMatchObject({ path, size: data.byteLength });
+      expect(finalized).not.toHaveProperty("operation");
+
+      const cancellable = await vfs.beginMultipartUpload(
+        `/manual-cancel-${index}.bin`,
+        { size: data.byteLength, chunkSize: 1_024 },
+      );
+      const controller = new AbortController();
+      await expect(
+        vfs.startAbortMultipartUpload(cancellable, {
+          signal: controller.signal,
+          onProgress: () =>
+            controller.abort(new DOMException("cancelled", "AbortError")),
+        }),
+      ).rejects.toMatchObject({ name: "AbortError" });
+      await expect(vfs.abortMultipartUpload(cancellable)).resolves.toEqual({
+        aborted: true,
+      });
+    }
+  });
+
+  it("M14 — binding defaults reject over-budget handles before an RPC", async () => {
+    let requests = 0;
+    const overBudgetEnv: MossaicEnv = {
+      MOSSAIC_USER: {
+        idFromName: (name) => TEST_ENV.MOSSAIC_USER.idFromName(name),
+        get: () => ({
+          vfsStageMultipartHashes: async () => {
+            requests++;
+            return { staged: 0, total: 0 };
+          },
+          vfsAbortMultipartStep: async () => {
+            requests++;
+            return { done: true };
+          },
+          vfsGetMultipartStatus: async () => {
+            requests++;
+            return {
+              landed: [],
+              total: 0,
+              bytesUploaded: 0,
+              expiresAtMs: Date.now() + 60_000,
+            };
+          },
+          vfsBeginMultipart: async () => {
+            requests++;
+            throw new Error("unexpected resume RPC");
+          },
+        }),
+      },
+      MOSSAIC_SHARD: TEST_ENV.MOSSAIC_SHARD,
+    };
+    const vfs = createVFS(overBudgetEnv, { tenant: "mp-manual-14" });
+    const handle = (expectedChunks: number): MultipartUploadHandle => ({
+      uploadId: `binding-${expectedChunks}`,
+      path: "/binding-boundary.bin",
+      chunkSize: 1,
+      expectedChunks,
+      poolSize: 1,
+      sessionToken: "session-token",
+      expiresAtMs: Date.now() + 60_000,
+      size: expectedChunks,
+      capabilities: [MULTIPART_PAGED_CONTROL_CAPABILITY],
+    });
+
+    const finalizeError = await vfs
+      .finalizeMultipartUpload(
+        handle(1_025),
+        Array.from({ length: 1_025 }, () => "a".repeat(64)),
+      )
+      .catch((error: Error) => error);
+    expect(finalizeError).toBeInstanceOf(EFBIG);
+    await expect(vfs.abortMultipartUpload(handle(3_329))).rejects.toBeInstanceOf(
+      EFBIG,
+    );
+    await expect(
+      vfs.getMultipartUploadStatus(handle(4_096)),
+    ).rejects.toBeInstanceOf(EFBIG);
+    await expect(vfs.resumeMultipartUpload(handle(4_096))).rejects.toBeInstanceOf(
+      EFBIG,
+    );
+    expect(requests).toBe(0);
   });
 });

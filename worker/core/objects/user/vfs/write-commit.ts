@@ -99,6 +99,9 @@ interface CleanupIntentRow extends Record<string, SqlStorageValue> {
   cleanup_kind: ChunkCleanupKind;
   attempts: number;
   generation: number;
+  cleanup_generation: string;
+  cleanup_cursor: number;
+  cleanup_phase: string;
   provisional: number;
 }
 
@@ -395,10 +398,16 @@ export async function drainChunkCleanupIntents(
       `UPDATE chunk_cleanup_intents
           SET state = 'pending', generation = generation + 1,
               updated_at = ?, next_attempt_at = ?
-        WHERE state = 'in_flight' AND next_attempt_at <= ?`,
+        WHERE rowid IN (
+          SELECT rowid FROM chunk_cleanup_intents
+           WHERE state = 'in_flight' AND next_attempt_at <= ?
+           ORDER BY next_attempt_at, created_at, ref_id, shard_index
+           LIMIT ?
+        )`,
       eligibleAt,
       eligibleAt,
-      eligibleAt
+      eligibleAt,
+      CLEANUP_BATCH_LIMIT
     );
   });
   if (refId !== undefined) {
@@ -408,13 +417,23 @@ export async function drainChunkCleanupIntents(
       transactionSync(durableObject, () => {
         durableObject.sql.exec(
           `UPDATE chunk_cleanup_intents SET provisional = 0
-            WHERE state = 'pending' AND ref_id IN (${placeholders})`,
-          ...abandonedRefIds
+            WHERE rowid IN (
+              SELECT rowid FROM chunk_cleanup_intents
+               WHERE state = 'pending' AND ref_id IN (${placeholders})
+               ORDER BY created_at, ref_id, shard_index LIMIT ?
+            )`,
+          ...abandonedRefIds,
+          CLEANUP_BATCH_LIMIT
         );
         durableObject.sql.exec(
           `DELETE FROM chunk_cleanup_intents
-            WHERE state = 'cleaned' AND ref_id IN (${placeholders})`,
-          ...abandonedRefIds
+            WHERE rowid IN (
+              SELECT rowid FROM chunk_cleanup_intents
+               WHERE state = 'cleaned' AND ref_id IN (${placeholders})
+               ORDER BY created_at, ref_id, shard_index LIMIT ?
+            )`,
+          ...abandonedRefIds,
+          CLEANUP_BATCH_LIMIT
         );
       });
     }
@@ -423,7 +442,8 @@ export async function drainChunkCleanupIntents(
   if (refId === undefined) {
     rows = durableObject.sql
       .exec<CleanupIntentRow>(
-        `SELECT ref_id, shard_index, cleanup_kind, attempts, generation, provisional
+        `SELECT ref_id, shard_index, cleanup_kind, attempts, generation,
+                cleanup_generation, cleanup_cursor, cleanup_phase, provisional
            FROM chunk_cleanup_intents
           WHERE state = 'pending' AND next_attempt_at <= ?
            ORDER BY next_attempt_at, created_at, ref_id, shard_index
@@ -435,7 +455,8 @@ export async function drainChunkCleanupIntents(
   } else if (typeof refId === "string") {
     rows = durableObject.sql
       .exec<CleanupIntentRow>(
-        `SELECT ref_id, shard_index, cleanup_kind, attempts, generation, provisional
+        `SELECT ref_id, shard_index, cleanup_kind, attempts, generation,
+                cleanup_generation, cleanup_cursor, cleanup_phase, provisional
            FROM chunk_cleanup_intents
           WHERE ref_id = ? AND state = 'pending'
           ORDER BY created_at, shard_index
@@ -450,7 +471,8 @@ export async function drainChunkCleanupIntents(
     const placeholders = refId.map(() => "?").join(",");
     rows = durableObject.sql
       .exec<CleanupIntentRow>(
-        `SELECT ref_id, shard_index, cleanup_kind, attempts, generation, provisional
+        `SELECT ref_id, shard_index, cleanup_kind, attempts, generation,
+                cleanup_generation, cleanup_cursor, cleanup_phase, provisional
            FROM chunk_cleanup_intents
           WHERE ref_id IN (${placeholders}) AND state = 'pending'
           ORDER BY created_at, ref_id, shard_index
@@ -464,24 +486,18 @@ export async function drainChunkCleanupIntents(
   const env = durableObject.envPublic;
   const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
 
-  const units: CleanupIntentRow[][] = [];
-  const bulkByShard = new Map<number, CleanupIntentRow[]>();
-  for (const row of rows) {
-    if (row.cleanup_kind !== ChunkCleanupKind.Bulk) {
-      units.push([row]);
-      continue;
-    }
-    const group = bulkByShard.get(row.shard_index) ?? [];
-    group.push(row);
-    bulkByShard.set(row.shard_index, group);
-  }
-  units.push(...bulkByShard.values());
-
   let cursor = 0;
   let retrySchedulingNeeded = rows.length === CLEANUP_BATCH_LIMIT;
-  async function drainOne(unit: CleanupIntentRow[]): Promise<void> {
-    const claimed = transactionSync(durableObject, () => {
-      for (const row of unit) {
+  async function drainOne(row: CleanupIntentRow): Promise<void> {
+    const shardName = vfsShardDOName(
+      scope.ns,
+      scope.tenant,
+      scope.sub,
+      row.shard_index
+    );
+    const stub = shardNs.get(shardNs.idFromName(shardName));
+    for (let phaseCalls = 0; phaseCalls < 2; phaseCalls++) {
+      const claimed = transactionSync(durableObject, () => {
         const current = durableObject.sql
           .exec(
             `SELECT state, generation FROM chunk_cleanup_intents
@@ -499,8 +515,33 @@ export async function drainChunkCleanupIntents(
         ) {
           return false;
         }
-      }
-      for (const row of unit) {
+        if (row.cleanup_generation === "") {
+          row.cleanup_generation = crypto.randomUUID();
+          durableObject.sql.exec(
+            `UPDATE chunk_cleanup_intents SET cleanup_generation = ?
+              WHERE ref_id = ? AND shard_index = ?
+                AND state = 'pending' AND generation = ?
+                AND cleanup_generation = ''`,
+            row.cleanup_generation,
+            row.ref_id,
+            row.shard_index,
+            row.generation
+          );
+        }
+        if (
+          row.cleanup_kind === ChunkCleanupKind.MultipartStaging &&
+          row.cleanup_phase !== "staging"
+        ) {
+          row.cleanup_phase = "staging";
+          durableObject.sql.exec(
+            `UPDATE chunk_cleanup_intents SET cleanup_phase = 'staging'
+              WHERE ref_id = ? AND shard_index = ?
+                AND state = 'pending' AND generation = ?`,
+            row.ref_id,
+            row.shard_index,
+            row.generation
+          );
+        }
         durableObject.sql.exec(
           `UPDATE chunk_cleanup_intents
               SET state = 'in_flight', generation = generation + 1,
@@ -514,44 +555,33 @@ export async function drainChunkCleanupIntents(
           row.generation
         );
         row.generation++;
-      }
-      return true;
-    });
-    if (!claimed) return;
+        return true;
+      });
+      if (!claimed) return;
 
-    const first = unit[0]!;
-    const shardName = vfsShardDOName(
-      scope.ns,
-      scope.tenant,
-      scope.sub,
-      first.shard_index
-    );
-    const stub = shardNs.get(shardNs.idFromName(shardName));
-    try {
-      if (first.cleanup_kind === ChunkCleanupKind.Bulk) {
-        await stub.deleteManyChunks(unit.map((row) => row.ref_id));
-      } else if (
-        first.cleanup_kind === ChunkCleanupKind.MultipartStaging
-      ) {
-        await stub.clearMultipartStaging(first.ref_id);
-      } else {
-        await stub.deleteChunks(first.ref_id);
-        if (first.cleanup_kind === ChunkCleanupKind.Multipart) {
-          await stub.clearMultipartStaging(first.ref_id);
-        }
-      }
-    } catch (err) {
-      retrySchedulingNeeded = true;
-      const failedAt = Date.now();
-      transactionSync(durableObject, () => {
-        for (const row of unit) {
+      let result: { cursor: number; done: boolean };
+      try {
+        result =
+          row.cleanup_phase === "staging"
+            ? await stub.clearMultipartStagingPage(
+                row.ref_id,
+                row.cleanup_cursor,
+                row.cleanup_generation
+              )
+            : await stub.deleteChunksPage(
+                row.ref_id,
+                row.cleanup_cursor,
+                row.cleanup_generation
+              );
+      } catch (err) {
+        retrySchedulingNeeded = true;
+        const failedAt = Date.now();
+        transactionSync(durableObject, () => {
           durableObject.sql.exec(
             `UPDATE chunk_cleanup_intents
                 SET state = 'pending', generation = generation + 1,
-                    attempts = attempts + 1,
-                    updated_at = ?,
-                    next_attempt_at = ?,
-                    last_error = ?
+                    attempts = attempts + 1, updated_at = ?,
+                    next_attempt_at = ?, last_error = ?
               WHERE ref_id = ? AND shard_index = ?
                 AND state = 'in_flight' AND generation = ?`,
             failedAt,
@@ -561,19 +591,67 @@ export async function drainChunkCleanupIntents(
             row.shard_index,
             row.generation
           );
-        }
-      });
-      return;
-    }
-    transactionSync(durableObject, () => {
-      for (const row of unit) {
+        });
+        return;
+      }
+
+      if (!result.done) {
+        retrySchedulingNeeded = true;
+        const progressedAt = Date.now();
+        transactionSync(durableObject, () => {
+          durableObject.sql.exec(
+            `UPDATE chunk_cleanup_intents
+                SET state = 'pending', generation = generation + 1,
+                    cleanup_cursor = ?, updated_at = ?, next_attempt_at = ?,
+                    last_error = NULL
+              WHERE ref_id = ? AND shard_index = ?
+                AND state = 'in_flight' AND generation = ?`,
+            result.cursor,
+            progressedAt,
+            progressedAt,
+            row.ref_id,
+            row.shard_index,
+            row.generation
+          );
+        });
+        return;
+      }
+
+      if (
+        row.cleanup_kind === ChunkCleanupKind.Multipart &&
+        row.cleanup_phase === "chunks"
+      ) {
+        const progressedAt = Date.now();
+        transactionSync(durableObject, () => {
+          durableObject.sql.exec(
+            `UPDATE chunk_cleanup_intents
+                SET state = 'pending', generation = generation + 1,
+                    cleanup_phase = 'staging', cleanup_cursor = 0,
+                    updated_at = ?, next_attempt_at = ?, last_error = NULL
+              WHERE ref_id = ? AND shard_index = ?
+                AND state = 'in_flight' AND generation = ?`,
+            progressedAt,
+            progressedAt,
+            row.ref_id,
+            row.shard_index,
+            row.generation
+          );
+        });
+        row.generation++;
+        row.cleanup_phase = "staging";
+        row.cleanup_cursor = 0;
+        continue;
+      }
+
+      transactionSync(durableObject, () => {
         if (row.provisional !== 0) {
           durableObject.sql.exec(
             `UPDATE chunk_cleanup_intents
                 SET state = 'cleaned', generation = generation + 1,
-                    updated_at = ?, last_error = NULL
+                    cleanup_cursor = ?, updated_at = ?, last_error = NULL
               WHERE ref_id = ? AND shard_index = ?
                 AND state = 'in_flight' AND generation = ?`,
+            result.cursor,
             Date.now(),
             row.ref_id,
             row.shard_index,
@@ -589,21 +667,22 @@ export async function drainChunkCleanupIntents(
             row.generation
           );
         }
-      }
-    });
+      });
+      return;
+    }
   }
 
   async function lane(): Promise<void> {
     while (true) {
-      const unit = units[cursor++];
-      if (unit === undefined) return;
-      await drainOne(unit);
+      const row = rows[cursor++];
+      if (row === undefined) return;
+      await drainOne(row);
     }
   }
 
   await Promise.all(
     Array.from(
-      { length: Math.min(CLEANUP_CONCURRENCY, units.length) },
+      { length: Math.min(CLEANUP_CONCURRENCY, rows.length) },
       () => lane()
     )
   );

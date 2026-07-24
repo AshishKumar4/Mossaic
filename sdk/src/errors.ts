@@ -127,8 +127,24 @@ export class ENOTDIR extends VFSFsError {
   }
 }
 export class EFBIG extends VFSFsError {
-  constructor(opts: { syscall?: string; path?: string } = {}) {
+  constructor(opts: { syscall?: string; path?: string; message?: string } = {}) {
     super("EFBIG", opts);
+  }
+}
+
+/** EFBIG raised when a completion call reaches its request budget. */
+export class CompletionBudgetExceededError<Checkpoint = never> extends EFBIG {
+  readonly checkpoint?: Checkpoint;
+
+  constructor(opts: {
+    syscall: string;
+    path?: string;
+    message: string;
+    checkpoint?: Checkpoint;
+  }) {
+    super(opts);
+    this.name = "CompletionBudgetExceededError";
+    this.checkpoint = opts.checkpoint;
   }
 }
 export class ELOOP extends VFSFsError {

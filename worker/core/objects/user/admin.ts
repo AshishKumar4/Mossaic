@@ -13,16 +13,14 @@
  *   2. Within each group: keep the row with the largest updated_at
  *      (last writer wins; ties broken by file_id lexicographic, which
  *      is monotonic-ish since generateId is timestamp-prefixed).
- *   3. For each loser: hard-delete its files row + file_chunks rows,
- *      then dispatch ShardDO.deleteChunks(file_id) for every shard
- *      the file's chunks lived on. The shard sweeper takes it from
- *      there.
+ *   3. For each loser: hard-delete its files row + file_chunks rows and
+ *      stage durable paged shard cleanup through the standard outbox.
  *   4. Attempt to (re-)create the UNIQUE partial index. Returns the
  *      number of rows reconciled and whether the index was created.
  *
  * Concurrency: the routine runs as one DO RPC method. DOs serialise
- * synchronous code, but each `await this.shardStub.deleteChunks(...)`
- * temporarily releases the input lock, so a concurrent VFS write
+ * synchronous code, but each cleanup drain temporarily releases the input
+ * lock, so a concurrent VFS write
  * CAN interleave with the dedupe pass. This is acceptable because:
  *   - In-flight writes use status='uploading' + a `_vfs_tmp_<id>`
  *     name; they never participate in an organic-name dupe group.
@@ -45,9 +43,8 @@
  */
 
 import type { UserDOCore as UserDO } from "./user-do-core";
-import type { ShardDO } from "../shard/shard-do";
-import { vfsShardDOName } from "../../lib/utils";
 import type { VFSScope } from "../../../../shared/vfs-types";
+import { hardDeleteFileRow } from "./vfs/write-commit";
 
 export interface DedupeResult {
   /** Number of duplicate file rows hard-deleted. */
@@ -232,27 +229,5 @@ async function hardDeleteLoser(
   scope: VFSScope,
   fileId: string
 ): Promise<void> {
-  const shardRows = durableObject.sql
-    .exec(
-      "SELECT DISTINCT shard_index FROM file_chunks WHERE file_id = ?",
-      fileId
-    )
-    .toArray() as { shard_index: number }[];
-
-  durableObject.sql.exec("DELETE FROM file_chunks WHERE file_id = ?", fileId);
-  durableObject.sql.exec("DELETE FROM files WHERE file_id = ?", fileId);
-
-  const env = durableObject.envPublic;
-  const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
-  for (const { shard_index } of shardRows) {
-    const shardName = vfsShardDOName(
-      scope.ns,
-      scope.tenant,
-      scope.sub,
-      shard_index
-    );
-    const stub = shardNs.get(shardNs.idFromName(shardName));
-    await stub.deleteChunks(fileId);
-  }
-  void userId; // retained in signature for symmetry with peer admin helpers
+  await hardDeleteFileRow(durableObject, userId, scope, fileId);
 }

@@ -1,7 +1,11 @@
 import type { UserDOCore as UserDO } from "./user-do-core";
 import { enforceModeMonotonic } from "./encryption-stamp";
 import type { ShardDO } from "../shard/shard-do";
-import { VFSError, type VFSScope } from "../../../../shared/vfs-types";
+import {
+  VFSError,
+  type DropVersionsStepResult,
+  type VFSScope,
+} from "../../../../shared/vfs-types";
 import { generateId, vfsShardDOName } from "../../lib/utils";
 import { placeChunk } from "../../../../shared/placement";
 import {
@@ -496,7 +500,8 @@ function commitVersionInternal(
           SET head_version_id = ?,
               updated_at = ?,
               encryption_mode = ?,
-              encryption_key_id = ?
+              encryption_key_id = ?,
+              version_generation = version_generation + 1
         WHERE file_id = ? AND user_id = ? AND status = 'complete'
           AND IFNULL(parent_id, '') = IFNULL(?, '') AND file_name = ?
           AND head_version_id IS ?`,
@@ -516,7 +521,8 @@ function commitVersionInternal(
           SET head_version_id = ?,
               updated_at = ?,
               encryption_mode = ?,
-              encryption_key_id = ?
+              encryption_key_id = ?,
+              version_generation = version_generation + 1
         WHERE file_id = ?`,
       args.versionId,
       args.mtimeMs,
@@ -1008,77 +1014,847 @@ export function dropVersionRowsLocal(
  *   - keepLast: keep the N newest versions; drop the rest
  *   - exceptVersions: explicit allowlist that survives any other
  *     filter
- *   - all three may combine; the surviving set = intersection of the
- *     keep predicates.
+ *   - all three may combine; each keep rule is additive.
  *
  * The CURRENT head version is never dropped — even if filters say
  * to. (S3 has the same invariant: you can't delete the current
  * version through a retention policy.)
  */
+export const DROP_VERSIONS_BATCH_LIMIT = 128;
+export const DROP_VERSIONS_MANIFEST_LIMIT = 200;
+export const DROP_VERSIONS_CLEANUP_INTENT_LIMIT = 128;
+export const DROP_VERSIONS_KEEP_LAST_MAX = 100_000;
+export const DROP_VERSIONS_EXCEPT_MAX = 1_000;
+const RETENTION_OPERATION_ID_MAX = 128;
+const RETENTION_VERSION_ID_MAX = 128;
+const RUNNING_RETENTION_TTL_MS = 24 * 60 * 60 * 1000;
+const COMPLETED_RETENTION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const RETENTION_OPERATION_PRUNE_LIMIT = 32;
+const RETENTION_RUNNING_MAX = 64;
+const RETENTION_TOTAL_MAX = 128;
+const RETENTION_ID_PATTERN = /^[A-Za-z0-9._:-]+$/;
+
+export interface DropVersionsPolicy {
+  olderThan?: number;
+  keepLast?: number;
+  exceptVersions?: string[];
+}
+
+interface RetentionOperationRow extends Record<string, SqlStorageValue> {
+  operation_id: string;
+  user_id: string;
+  requested_path: string;
+  path_id: string;
+  policy_json: string;
+  plan_generation: number;
+  plan_head_version_id: string | null;
+  cursor_mtime_ms: number | null;
+  cursor_version_id: string | null;
+  remaining_keep: number;
+  dropped: number;
+  kept: number;
+  status: string;
+  pending_version_id: string | null;
+  pending_mtime_ms: number | null;
+  pending_ref_id: string | null;
+  pending_metadata_deleted: number;
+  manifest_cursor: number | null;
+}
+
+interface RetentionVersionRow extends Record<string, SqlStorageValue> {
+  version_id: string;
+  mtime_ms: number;
+}
+
+interface RetentionKeepDecision {
+  keep: boolean;
+  consumesKeepSlot: boolean;
+}
+
+interface RetentionManifestRow extends Record<string, SqlStorageValue> {
+  chunk_index: number;
+  shard_index: number;
+}
+
+function validateRetentionId(value: unknown, label: string): string {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > RETENTION_VERSION_ID_MAX ||
+    !RETENTION_ID_PATTERN.test(value)
+  ) {
+    throw new VFSError("EINVAL", `dropVersions: invalid ${label}`);
+  }
+  return value;
+}
+
+export function validateDropVersionsPolicy(policy: unknown): DropVersionsPolicy {
+  if (policy === null || typeof policy !== "object" || Array.isArray(policy)) {
+    throw new VFSError("EINVAL", "dropVersions: policy must be an object");
+  }
+  const input = policy as Record<string, unknown>;
+  const normalized: DropVersionsPolicy = {};
+  if (input.olderThan !== undefined) {
+    if (typeof input.olderThan !== "number" || !Number.isFinite(input.olderThan)) {
+      throw new VFSError("EINVAL", "dropVersions: olderThan must be finite");
+    }
+    normalized.olderThan = input.olderThan;
+  }
+  if (input.keepLast !== undefined) {
+    if (
+      typeof input.keepLast !== "number" ||
+      !Number.isInteger(input.keepLast) ||
+      input.keepLast < 0 ||
+      input.keepLast > DROP_VERSIONS_KEEP_LAST_MAX
+    ) {
+      throw new VFSError(
+        "EINVAL",
+        `dropVersions: keepLast must be an integer from 0 to ${DROP_VERSIONS_KEEP_LAST_MAX}`
+      );
+    }
+    normalized.keepLast = input.keepLast;
+  }
+  if (input.exceptVersions !== undefined) {
+    if (!Array.isArray(input.exceptVersions)) {
+      throw new VFSError("EINVAL", "dropVersions: exceptVersions must be an array");
+    }
+    if (input.exceptVersions.length > DROP_VERSIONS_EXCEPT_MAX) {
+      throw new VFSError(
+        "EINVAL",
+        `dropVersions: exceptVersions exceeds ${DROP_VERSIONS_EXCEPT_MAX}`
+      );
+    }
+    normalized.exceptVersions = input.exceptVersions.map((versionId) =>
+      validateRetentionId(versionId, "exceptVersions id")
+    );
+  }
+  return normalized;
+}
+
+export function assertLegacyDropVersionsBounded(
+  durableObject: UserDO,
+  userId: string,
+  path: string,
+  untrustedPolicy: DropVersionsPolicy
+): void {
+  const policy = validateDropVersionsPolicy(untrustedPolicy);
+  if (durableObject.maintainVersionRetentionOrder()) {
+    throw new VFSError(
+      "EFBIG",
+      "dropVersions: history requires the paged retention capability"
+    );
+  }
+  const pathId = resolvePathId(durableObject, userId, path);
+  if (!pathId) {
+    throw new VFSError("ENOENT", `dropVersions: path not found: ${path}`);
+  }
+  const head = durableObject.sql
+    .exec(
+      "SELECT head_version_id FROM files WHERE file_id = ? AND user_id = ?",
+      pathId,
+      userId
+    )
+    .toArray()[0] as { head_version_id: string | null } | undefined;
+  if (!head) {
+    throw new VFSError("ENOENT", `dropVersions: path not found: ${path}`);
+  }
+  const versions = durableObject.sql
+    .exec<RetentionVersionRow>(
+      `SELECT version_id, mtime_ms FROM version_retention_order
+        WHERE path_id = ?
+        ORDER BY mtime_ms DESC, version_id DESC LIMIT ?`,
+      pathId,
+      DROP_VERSIONS_BATCH_LIMIT
+    )
+    .toArray();
+  if (versions.length >= DROP_VERSIONS_BATCH_LIMIT) {
+    throw new VFSError(
+      "EFBIG",
+      "dropVersions: history requires the paged retention capability"
+    );
+  }
+
+  const keepSet = new Set(policy.exceptVersions ?? []);
+  let remainingKeep = retentionRemainingKeep(policy, head.head_version_id);
+  const droppedVersionIds: string[] = [];
+  for (const version of versions) {
+    const decision = retentionKeepDecision(
+      policy,
+      head.head_version_id,
+      keepSet,
+      version,
+      remainingKeep
+    );
+    if (decision.keep) {
+      if (decision.consumesKeepSlot) remainingKeep--;
+    } else {
+      droppedVersionIds.push(version.version_id);
+    }
+  }
+  if (droppedVersionIds.length === 0) return;
+
+  const manifestThreshold = Math.ceil(DROP_VERSIONS_MANIFEST_LIMIT / 2);
+  const manifestOverflow = durableObject.sql
+    .exec(
+      `SELECT 1 FROM version_chunks
+        WHERE version_id IN (
+          SELECT CAST(value AS TEXT) FROM json_each(?)
+        )
+        LIMIT 1 OFFSET ?`,
+      JSON.stringify(droppedVersionIds),
+      manifestThreshold - 1
+    )
+    .toArray();
+  if (manifestOverflow.length > 0) {
+    throw new VFSError(
+      "EFBIG",
+      "dropVersions: manifests require the paged retention capability"
+    );
+  }
+}
+
+function retentionRemainingKeep(
+  policy: DropVersionsPolicy,
+  headVersionId: string | null
+): number {
+  return Math.max(0, (policy.keepLast ?? 0) - (headVersionId ? 1 : 0));
+}
+
+function retentionKeepDecision(
+  policy: DropVersionsPolicy,
+  headVersionId: string | null,
+  keepSet: ReadonlySet<string>,
+  version: RetentionVersionRow,
+  remainingKeep: number
+): RetentionKeepDecision {
+  const explicitlyKept =
+    version.version_id === headVersionId || keepSet.has(version.version_id);
+  const consumesKeepSlot = !explicitlyKept && remainingKeep > 0;
+  const keepForAge =
+    policy.olderThan !== undefined && version.mtime_ms >= policy.olderThan;
+  return {
+    keep: explicitlyKept || consumesKeepSlot || keepForAge,
+    consumesKeepSlot,
+  };
+}
+
+function readRetentionOperation(
+  durableObject: UserDO,
+  operationId: string
+): RetentionOperationRow | undefined {
+  return durableObject.sql
+    .exec<RetentionOperationRow>(
+      `SELECT operation_id, user_id, requested_path, path_id, policy_json,
+              plan_generation, plan_head_version_id, cursor_mtime_ms,
+              cursor_version_id, remaining_keep, dropped, kept, status,
+              pending_version_id, pending_mtime_ms, pending_ref_id,
+              pending_metadata_deleted, manifest_cursor
+         FROM version_retention_operations
+        WHERE operation_id = ?`,
+      operationId
+    )
+    .toArray()[0];
+}
+
+function persistRetentionOperation(
+  durableObject: UserDO,
+  operation: RetentionOperationRow,
+  now: number
+): void {
+  durableObject.sql.exec(
+    `UPDATE version_retention_operations
+        SET plan_generation = ?, plan_head_version_id = ?,
+            cursor_mtime_ms = ?, cursor_version_id = ?, remaining_keep = ?,
+            dropped = ?, kept = ?, status = ?, pending_version_id = ?,
+            pending_mtime_ms = ?, pending_ref_id = ?,
+            pending_metadata_deleted = ?, manifest_cursor = ?, updated_at = ?
+      WHERE operation_id = ?`,
+    operation.plan_generation,
+    operation.plan_head_version_id,
+    operation.cursor_mtime_ms,
+    operation.cursor_version_id,
+    operation.remaining_keep,
+    operation.dropped,
+    operation.kept,
+    operation.status,
+    operation.pending_version_id,
+    operation.pending_mtime_ms,
+    operation.pending_ref_id,
+    operation.pending_metadata_deleted,
+    operation.manifest_cursor,
+    now,
+    operation.operation_id
+  );
+}
+
+function maintainRetentionOperations(
+  durableObject: UserDO,
+  userId: string,
+  now: number
+): void {
+  durableObject.sql.exec(
+    `DELETE FROM version_retention_operations
+      WHERE operation_id IN (
+        SELECT operation_id FROM version_retention_operations
+         WHERE user_id = ? AND status = 'done' AND updated_at < ?
+         ORDER BY updated_at LIMIT ?
+      )`,
+    userId,
+    now - COMPLETED_RETENTION_TTL_MS,
+    RETENTION_OPERATION_PRUNE_LIMIT
+  );
+  durableObject.sql.exec(
+    `UPDATE version_retention_operations SET status = 'expiring', updated_at = ?
+      WHERE operation_id IN (
+        SELECT operation_id FROM version_retention_operations
+         WHERE user_id = ? AND status = 'running'
+           AND pending_metadata_deleted = 0 AND updated_at < ?
+         ORDER BY updated_at LIMIT ?
+      )`,
+    now,
+    userId,
+    now - RUNNING_RETENTION_TTL_MS,
+    RETENTION_OPERATION_PRUNE_LIMIT
+  );
+  durableObject.sql.exec(
+    `DELETE FROM version_retention_cleanup_routes
+      WHERE rowid IN (
+        SELECT r.rowid FROM version_retention_cleanup_routes r
+        JOIN version_retention_operations o ON o.operation_id = r.operation_id
+        WHERE o.user_id = ? AND o.status = 'expiring'
+        ORDER BY o.updated_at, r.operation_id, r.version_id, r.shard_index
+        LIMIT ?
+      )`,
+    userId,
+    DROP_VERSIONS_MANIFEST_LIMIT
+  );
+  durableObject.sql.exec(
+    `DELETE FROM version_retention_operations
+      WHERE operation_id IN (
+        SELECT o.operation_id FROM version_retention_operations o
+         WHERE o.user_id = ? AND o.status = 'expiring'
+           AND NOT EXISTS (
+             SELECT 1 FROM version_retention_cleanup_routes r
+              WHERE r.operation_id = o.operation_id
+           )
+         ORDER BY o.updated_at LIMIT ?
+      )`,
+    userId,
+    RETENTION_OPERATION_PRUNE_LIMIT
+  );
+  durableObject.sql.exec(
+    `DELETE FROM version_retention_operations
+      WHERE operation_id IN (
+        SELECT operation_id FROM version_retention_operations
+         WHERE user_id = ? AND status = 'done'
+         ORDER BY updated_at DESC
+         LIMIT -1 OFFSET ?
+      )
+      AND operation_id IN (
+        SELECT operation_id FROM version_retention_operations
+         WHERE user_id = ? AND status = 'done'
+         ORDER BY updated_at LIMIT ?
+      )`,
+    userId,
+    RETENTION_TOTAL_MAX,
+    userId,
+    RETENTION_OPERATION_PRUNE_LIMIT
+  );
+}
+
+function assertRetentionCapacity(durableObject: UserDO, userId: string): void {
+  const counts = durableObject.sql
+    .exec(
+      `SELECT COUNT(*) AS total,
+              SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END) AS running
+         FROM version_retention_operations WHERE user_id = ?`,
+      userId
+    )
+    .toArray()[0] as { total: number; running: number | null };
+  if (counts.total >= RETENTION_TOTAL_MAX || (counts.running ?? 0) >= RETENTION_RUNNING_MAX) {
+    throw new VFSError("EBUSY", "dropVersions: too many retained operations");
+  }
+}
+
+function nextRetentionVersion(
+  durableObject: UserDO,
+  operation: RetentionOperationRow
+): RetentionVersionRow | undefined {
+  if (operation.cursor_mtime_ms === null) {
+    return durableObject.sql
+      .exec<RetentionVersionRow>(
+        `SELECT version_id, mtime_ms FROM version_retention_order
+          WHERE path_id = ?
+          ORDER BY mtime_ms DESC, version_id DESC LIMIT 1`,
+        operation.path_id
+      )
+      .toArray()[0];
+  }
+  if (operation.cursor_version_id === null) {
+    throw new VFSError("EBUSY", "dropVersions: invalid retention cursor");
+  }
+  return durableObject.sql
+    .exec<RetentionVersionRow>(
+      `SELECT version_id, mtime_ms FROM version_retention_order
+        WHERE path_id = ?
+          AND (mtime_ms, version_id) < (?, ?)
+        ORDER BY mtime_ms DESC, version_id DESC LIMIT 1`,
+      operation.path_id,
+      operation.cursor_mtime_ms,
+      operation.cursor_version_id
+    )
+    .toArray()[0];
+}
+
+function dropRetentionVersionMetadata(
+  durableObject: UserDO,
+  operation: RetentionOperationRow
+): "dropped" | "missing" | "head" {
+  const version = durableObject.sql
+    .exec(
+      `SELECT v.size, v.deleted, LENGTH(v.inline_data) AS inline_bytes,
+              f.head_version_id
+         FROM file_versions v
+         JOIN files f ON f.file_id = v.path_id AND f.user_id = v.user_id
+        WHERE v.path_id = ? AND v.version_id = ? AND v.user_id = ?`,
+      operation.path_id,
+      operation.pending_version_id,
+      operation.user_id
+    )
+    .toArray()[0] as
+    | {
+        size: number;
+        deleted: number;
+        inline_bytes: number | null;
+        head_version_id: string | null;
+      }
+    | undefined;
+  if (!version) return "missing";
+  if (version.head_version_id === operation.pending_version_id) return "head";
+  durableObject.sql.exec(
+    `DELETE FROM file_versions
+      WHERE path_id = ? AND version_id = ? AND user_id = ?`,
+    operation.path_id,
+    operation.pending_version_id,
+    operation.user_id
+  );
+  if (lastSqlChanges(durableObject) !== 1) {
+    throw new VFSError("EBUSY", "dropVersions: version changed during retention");
+  }
+  if (version.deleted === 0) {
+    recordWriteUsage(
+      durableObject,
+      operation.user_id,
+      -version.size,
+      0,
+      -(version.inline_bytes ?? 0)
+    );
+  }
+  return "dropped";
+}
+
+/** Process one persistent, idempotent retention step. */
 export async function dropVersions(
   durableObject: UserDO,
   scope: VFSScope,
   userId: string,
-  pathId: string,
-  policy: {
-    olderThan?: number;
-    keepLast?: number;
-    exceptVersions?: string[];
+  path: string,
+  untrustedPolicy: DropVersionsPolicy,
+  untrustedOperationId: string
+): Promise<DropVersionsStepResult> {
+  const operationId = validateRetentionId(untrustedOperationId, "operation id");
+  if (operationId.length > RETENTION_OPERATION_ID_MAX) {
+    throw new VFSError("EINVAL", "dropVersions: invalid operation id");
   }
-): Promise<{ dropped: number; kept: number }> {
+  const policy = validateDropVersionsPolicy(untrustedPolicy);
+  const policyJson = JSON.stringify(policy);
+
+  if (transactionSync(durableObject, () => durableObject.maintainVersionRetentionOrder())) {
+    await scheduleStaleUploadSweep(durableObject);
+    return { done: false };
+  }
+
   await scheduleStaleUploadSweep(durableObject);
   const { drainChunkCleanupIntents } = await import("./vfs-ops");
   const result = transactionSync(durableObject, () => {
-    const all = listVersions(durableObject, pathId, { limit: 100_000 });
-    if (all.length === 0) {
-      return { dropped: 0, kept: 0, refIds: [] as string[] };
+    const now = Date.now();
+    let operation = readRetentionOperation(durableObject, operationId);
+    if (!operation) {
+      maintainRetentionOperations(durableObject, userId, now);
+      assertRetentionCapacity(durableObject, userId);
+      const pathId = resolvePathId(durableObject, userId, path);
+      if (!pathId) {
+        throw new VFSError("ENOENT", `dropVersions: path not found: ${path}`);
+      }
+      const file = durableObject.sql
+        .exec(
+          `SELECT head_version_id, version_generation
+             FROM files WHERE file_id = ? AND user_id = ?`,
+          pathId,
+          userId
+        )
+        .toArray()[0] as
+        | { head_version_id: string | null; version_generation: number }
+        | undefined;
+      if (!file) {
+        throw new VFSError("ENOENT", `dropVersions: path not found: ${path}`);
+      }
+      durableObject.sql.exec(
+        `INSERT INTO version_retention_operations
+           (operation_id, user_id, requested_path, path_id, policy_json,
+            plan_generation, plan_head_version_id, cursor_mtime_ms,
+            cursor_version_id, remaining_keep, dropped, kept, status,
+            pending_version_id, pending_mtime_ms, pending_ref_id,
+            pending_metadata_deleted, manifest_cursor, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, 0, 0, 'running',
+                 NULL, NULL, NULL, 0, NULL, ?, ?)`,
+        operationId,
+        userId,
+        path,
+        pathId,
+        policyJson,
+        file.version_generation,
+        file.head_version_id,
+        retentionRemainingKeep(policy, file.head_version_id),
+        now,
+        now
+      );
+      operation = readRetentionOperation(durableObject, operationId);
+      if (!operation) {
+        throw new VFSError("EBUSY", "dropVersions: operation was not persisted");
+      }
     }
-    const headRow = durableObject.sql
+
+    if (
+      operation.user_id !== userId ||
+      operation.requested_path !== path ||
+      operation.policy_json !== policyJson
+    ) {
+      throw new VFSError("EINVAL", "dropVersions: operation parameters changed");
+    }
+    if (operation.status === "done") {
+      return {
+        step: {
+          done: true,
+          dropped: operation.dropped,
+          kept: operation.kept,
+        } satisfies DropVersionsStepResult,
+        refIds: [] as string[],
+      };
+    }
+    if (operation.status !== "running") {
+      throw new VFSError("EINVAL", "dropVersions: operation expired");
+    }
+
+    const file = durableObject.sql
       .exec(
-        "SELECT head_version_id FROM files WHERE file_id = ?",
-        pathId
+        `SELECT head_version_id, version_generation
+           FROM files WHERE file_id = ? AND user_id = ?`,
+        operation.path_id,
+        userId
       )
-      .toArray()[0] as { head_version_id: string | null } | undefined;
-    const keepSet = new Set(policy.exceptVersions ?? []);
-    const headVersionId = headRow?.head_version_id;
-    if (headVersionId) keepSet.add(headVersionId);
-    let remainingNewest = Math.max(
-      0,
-      (policy.keepLast ?? 0) - (headVersionId ? 1 : 0)
-    );
-    for (const version of all) {
-      if (remainingNewest === 0) break;
-      if (keepSet.has(version.versionId)) continue;
-      keepSet.add(version.versionId);
-      remainingNewest--;
+      .toArray()[0] as
+      | { head_version_id: string | null; version_generation: number }
+      | undefined;
+    if (!file) {
+      throw new VFSError("EBUSY", "dropVersions: path changed during retention");
     }
-    const cutoff = policy.olderThan ?? 0;
-    const versionIds = all
-      .filter(
-        (version) =>
-          !keepSet.has(version.versionId) &&
-          (cutoff === 0 || version.mtimeMs < cutoff)
-      )
-      .map((version) => version.versionId);
-    const local = dropVersionRowsLocal(
-      durableObject,
-      userId,
-      pathId,
-      versionIds
-    );
-    const kept = all.length - local.reaped;
-    insertAuditLog(durableObject, {
-      op: "dropVersions",
-      actor: userId,
-      target: pathId,
-      payload: JSON.stringify({ dropped: local.reaped, kept, policy }),
-    });
-    return { dropped: local.reaped, kept, refIds: local.refIds };
+
+    let manifestBudget = DROP_VERSIONS_MANIFEST_LIMIT;
+    let cleanupBudget = DROP_VERSIONS_CLEANUP_INTENT_LIMIT;
+    let versionsProcessed = 0;
+    const refIds = new Set<string>();
+    const keepSet = new Set(policy.exceptVersions ?? []);
+
+    while (true) {
+      if (operation.pending_version_id !== null) {
+        if (operation.pending_mtime_ms === null || operation.pending_ref_id === null) {
+          throw new VFSError("EBUSY", "dropVersions: invalid pending version");
+        }
+
+        if (operation.pending_metadata_deleted === 0) {
+          if (manifestBudget === 0) {
+            persistRetentionOperation(durableObject, operation, now);
+            return { step: { done: false } as const, refIds: [...refIds] };
+          }
+          const scanLimit = manifestBudget;
+          const manifestRows = durableObject.sql
+            .exec<RetentionManifestRow>(
+              `SELECT chunk_index, shard_index FROM version_chunks
+                WHERE version_id = ? AND chunk_index > ?
+                ORDER BY chunk_index LIMIT ?`,
+              operation.pending_version_id,
+              operation.manifest_cursor ?? -1,
+              scanLimit
+            )
+            .toArray();
+          for (const row of manifestRows) {
+            durableObject.sql.exec(
+              `INSERT OR IGNORE INTO version_retention_cleanup_routes
+                 (operation_id, version_id, ref_id, shard_index)
+               VALUES (?, ?, ?, ?)`,
+              operation.operation_id,
+              operation.pending_version_id,
+              operation.pending_ref_id,
+              row.shard_index
+            );
+          }
+          manifestBudget -= manifestRows.length;
+          if (manifestRows.length > 0) {
+            operation.manifest_cursor = manifestRows.at(-1)?.chunk_index ?? null;
+          }
+          if (manifestRows.length === scanLimit) {
+            persistRetentionOperation(durableObject, operation, now);
+            return { step: { done: false } as const, refIds: [...refIds] };
+          }
+
+          const metadataResult = dropRetentionVersionMetadata(
+            durableObject,
+            operation
+          );
+          if (metadataResult === "head") {
+            operation.pending_metadata_deleted = 2;
+          } else {
+            operation.pending_metadata_deleted = 1;
+            if (metadataResult === "dropped") operation.dropped++;
+          }
+          operation.manifest_cursor = null;
+        }
+
+        if (operation.pending_metadata_deleted === 1) {
+          if (manifestBudget > 0) {
+            const manifestRows = durableObject.sql
+              .exec<RetentionManifestRow>(
+                `SELECT chunk_index, shard_index FROM version_chunks
+                  WHERE version_id = ? ORDER BY chunk_index LIMIT ?`,
+                operation.pending_version_id,
+                manifestBudget
+              )
+              .toArray();
+            for (const row of manifestRows) {
+              durableObject.sql.exec(
+                `DELETE FROM version_chunks
+                  WHERE version_id = ? AND chunk_index = ?`,
+                operation.pending_version_id,
+                row.chunk_index
+              );
+            }
+            manifestBudget -= manifestRows.length;
+            if (manifestRows.length > 0 && manifestBudget === 0) {
+              persistRetentionOperation(durableObject, operation, now);
+              return { step: { done: false } as const, refIds: [...refIds] };
+            }
+          }
+
+          if (cleanupBudget > 0) {
+            const routes = durableObject.sql
+              .exec<RetentionManifestRow>(
+                `SELECT 0 AS chunk_index, shard_index
+                   FROM version_retention_cleanup_routes
+                  WHERE operation_id = ? AND version_id = ?
+                  ORDER BY shard_index LIMIT ?`,
+                operation.operation_id,
+                operation.pending_version_id,
+                cleanupBudget
+              )
+              .toArray();
+            for (const route of routes) {
+              stageChunkCleanupIntent(
+                durableObject,
+                operation.pending_ref_id,
+                route.shard_index,
+                now
+              );
+              durableObject.sql.exec(
+                `DELETE FROM version_retention_cleanup_routes
+                  WHERE operation_id = ? AND version_id = ? AND shard_index = ?`,
+                operation.operation_id,
+                operation.pending_version_id,
+                route.shard_index
+              );
+            }
+            cleanupBudget -= routes.length;
+            if (routes.length > 0) refIds.add(operation.pending_ref_id);
+          }
+        } else {
+          const routes = durableObject.sql
+            .exec<RetentionManifestRow>(
+              `SELECT 0 AS chunk_index, shard_index
+                 FROM version_retention_cleanup_routes
+                WHERE operation_id = ? AND version_id = ?
+                ORDER BY shard_index LIMIT ?`,
+              operation.operation_id,
+              operation.pending_version_id,
+              cleanupBudget
+            )
+            .toArray();
+          for (const route of routes) {
+            durableObject.sql.exec(
+              `DELETE FROM version_retention_cleanup_routes
+                WHERE operation_id = ? AND version_id = ? AND shard_index = ?`,
+              operation.operation_id,
+              operation.pending_version_id,
+              route.shard_index
+            );
+          }
+          cleanupBudget -= routes.length;
+        }
+
+        const routesRemain = durableObject.sql
+          .exec(
+            `SELECT 1 FROM version_retention_cleanup_routes
+              WHERE operation_id = ? AND version_id = ? LIMIT 1`,
+            operation.operation_id,
+            operation.pending_version_id
+          )
+          .toArray().length > 0;
+        const manifestRemains = operation.pending_metadata_deleted === 1 &&
+          durableObject.sql
+            .exec(
+              "SELECT 1 FROM version_chunks WHERE version_id = ? LIMIT 1",
+              operation.pending_version_id
+            )
+            .toArray().length > 0;
+        if (routesRemain || manifestRemains) {
+          persistRetentionOperation(durableObject, operation, now);
+          return { step: { done: false } as const, refIds: [...refIds] };
+        }
+
+        operation.cursor_mtime_ms = operation.pending_mtime_ms;
+        operation.cursor_version_id = operation.pending_version_id;
+        operation.pending_version_id = null;
+        operation.pending_mtime_ms = null;
+        operation.pending_ref_id = null;
+        operation.pending_metadata_deleted = 0;
+        operation.manifest_cursor = null;
+        if (file.head_version_id !== operation.plan_head_version_id) {
+          continue;
+        }
+      }
+
+      if (
+        operation.plan_generation !== file.version_generation ||
+        operation.plan_head_version_id !== file.head_version_id
+      ) {
+        operation.plan_generation = file.version_generation;
+        operation.plan_head_version_id = file.head_version_id;
+        operation.cursor_mtime_ms = null;
+        operation.cursor_version_id = null;
+        operation.remaining_keep = retentionRemainingKeep(
+          policy,
+          file.head_version_id
+        );
+        operation.kept = 0;
+      }
+
+      if (versionsProcessed >= DROP_VERSIONS_BATCH_LIMIT) {
+        persistRetentionOperation(durableObject, operation, now);
+        return { step: { done: false } as const, refIds: [...refIds] };
+      }
+      const version = nextRetentionVersion(durableObject, operation);
+      if (!version) {
+        operation.status = "done";
+        if (operation.dropped + operation.kept > 0) {
+          insertAuditLog(durableObject, {
+            op: "dropVersions",
+            actor: userId,
+            target: operation.path_id,
+            payload: JSON.stringify({
+              dropped: operation.dropped,
+              kept: operation.kept,
+              policy,
+            }),
+          });
+        }
+        persistRetentionOperation(durableObject, operation, now);
+        return {
+          step: {
+            done: true,
+            dropped: operation.dropped,
+            kept: operation.kept,
+          } as const,
+          refIds: [...refIds],
+        };
+      }
+
+      versionsProcessed++;
+      const decision = retentionKeepDecision(
+        policy,
+        file.head_version_id,
+        keepSet,
+        version,
+        operation.remaining_keep
+      );
+      if (decision.keep) {
+        if (decision.consumesKeepSlot) operation.remaining_keep--;
+        operation.kept++;
+        operation.cursor_mtime_ms = version.mtime_ms;
+        operation.cursor_version_id = version.version_id;
+        continue;
+      }
+
+      const refRow = durableObject.sql
+        .exec(
+          "SELECT shard_ref_id FROM file_versions WHERE path_id = ? AND version_id = ?",
+          operation.path_id,
+          version.version_id
+        )
+        .toArray()[0] as { shard_ref_id: string | null } | undefined;
+      if (!refRow) continue;
+      operation.pending_version_id = version.version_id;
+      operation.pending_mtime_ms = version.mtime_ms;
+      operation.pending_ref_id =
+        refRow.shard_ref_id ?? shardRefId(operation.path_id, version.version_id);
+      operation.pending_metadata_deleted = 0;
+      operation.manifest_cursor = null;
+    }
   });
-  for (const refId of result.refIds) {
-    await drainChunkCleanupIntents(durableObject, scope, refId);
+
+  if (result.refIds.length > 0) {
+    await drainChunkCleanupIntents(durableObject, scope, result.refIds);
   }
-  return { dropped: result.dropped, kept: result.kept };
+  return result.step;
+}
+
+export async function resumeVersionRetentionOperations(
+  durableObject: UserDO,
+  scope: VFSScope
+): Promise<boolean> {
+  const userId = userIdFor(scope);
+  const operation = transactionSync(durableObject, () => {
+    maintainRetentionOperations(durableObject, userId, Date.now());
+    return durableObject.sql
+      .exec<{
+        operation_id: string;
+        requested_path: string;
+        policy_json: string;
+      } & Record<string, SqlStorageValue>>(
+        `SELECT operation_id, requested_path, policy_json
+           FROM version_retention_operations
+          WHERE user_id = ? AND status = 'running'
+          ORDER BY updated_at LIMIT 1`,
+        userId
+      )
+      .toArray()[0];
+  });
+  if (operation) {
+    const policy = validateDropVersionsPolicy(JSON.parse(operation.policy_json));
+    await dropVersions(
+      durableObject,
+      scope,
+      userId,
+      operation.requested_path,
+      policy,
+      operation.operation_id
+    );
+  }
+  return durableObject.sql
+    .exec(
+      `SELECT 1 FROM version_retention_operations
+        WHERE user_id = ? AND status IN ('running', 'expiring') LIMIT 1`,
+      userId
+    )
+    .toArray().length > 0;
 }
 
 /**

@@ -39,6 +39,10 @@ export type PutChunkFailurePhase = "before" | "after";
 
 export class FaultInjectingUserDO extends UserDO {
   private maintenanceAlarmFailuresRemaining = 0;
+  private stageHashResponseLossesRemaining = 0;
+  private finalizeStepResponseLossesRemaining = 0;
+  private finalizeResponseLossesRemaining = 0;
+  private multipartStatusResponseLossesRemaining = 0;
 
   constructor(ctx: DurableObjectState, env: EnvCore) {
     super(ctx, env);
@@ -71,6 +75,93 @@ export class FaultInjectingUserDO extends UserDO {
     this.state.abort("injected UserDO eviction");
   }
 
+  async testConfigureStageHashResponseLoss(remaining: number): Promise<void> {
+    this.stageHashResponseLossesRemaining = remaining;
+  }
+
+  async testConfigureFinalizeStepResponseLoss(remaining: number): Promise<void> {
+    this.finalizeStepResponseLossesRemaining = remaining;
+  }
+
+  async testConfigureFinalizeResponseLoss(remaining: number): Promise<void> {
+    this.finalizeResponseLossesRemaining = remaining;
+  }
+
+  async testConfigureMultipartStatusResponseLoss(remaining: number): Promise<void> {
+    this.multipartStatusResponseLossesRemaining = remaining;
+  }
+
+  override async vfsFinalizeMultipart(
+    scope: VFSScope,
+    uploadId: string,
+    chunkHashList: readonly string[]
+  ): Promise<import("../shared/multipart").MultipartFinalizeResponse> {
+    const result = await super.vfsFinalizeMultipart(
+      scope,
+      uploadId,
+      chunkHashList
+    );
+    if (this.finalizeResponseLossesRemaining > 0) {
+      this.finalizeResponseLossesRemaining--;
+      throw new Error(
+        "injected multipart legacy finalize response loss after mutation"
+      );
+    }
+    return result;
+  }
+
+  override async vfsStageMultipartHashes(
+    scope: VFSScope,
+    uploadId: string,
+    startIndex: number,
+    hashes: readonly string[]
+  ): Promise<{ staged: number; total: number }> {
+    const result = await super.vfsStageMultipartHashes(
+      scope,
+      uploadId,
+      startIndex,
+      hashes
+    );
+    if (this.stageHashResponseLossesRemaining > 0) {
+      this.stageHashResponseLossesRemaining--;
+      throw new Error("injected hash-page response loss after mutation");
+    }
+    return result;
+  }
+
+  override async vfsFinalizeMultipartStep(
+    scope: VFSScope,
+    uploadId: string
+  ): Promise<import("../shared/multipart").MultipartFinalizeProgress> {
+    const result = await super.vfsFinalizeMultipartStep(scope, uploadId);
+    if (this.finalizeStepResponseLossesRemaining > 0) {
+      this.finalizeStepResponseLossesRemaining--;
+      throw new Error("injected finalize-step response loss after mutation");
+    }
+    return result;
+  }
+
+  override async vfsGetMultipartStatus(
+    scope: VFSScope,
+    uploadId: string,
+    continuation?: string
+  ): Promise<
+    import("../shared/multipart").MultipartStatusPageResponse & {
+      status: string;
+    }
+  > {
+    const result = await super.vfsGetMultipartStatus(
+      scope,
+      uploadId,
+      continuation
+    );
+    if (this.multipartStatusResponseLossesRemaining > 0) {
+      this.multipartStatusResponseLossesRemaining--;
+      throw new Error("injected multipart status response loss");
+    }
+    return result;
+  }
+
   async testDropVersionRows(
     scope: VFSScope,
     userId: string,
@@ -85,6 +176,11 @@ export class FaultInjectingUserDO extends UserDO {
 }
 
 export class FaultInjectingShardDO extends ShardDO {
+  private putChunkMultipartResponseLossesRemaining = 0;
+  private scheduleSweepFailuresRemaining = 0;
+  private fenceMultipartFailures:
+    | { uploadId: string; remaining: number }
+    | undefined;
   private putChunkFailure:
     | {
         phase: PutChunkFailurePhase;
@@ -166,6 +262,23 @@ export class FaultInjectingShardDO extends ShardDO {
 
   async testClearPutChunkFailure(): Promise<void> {
     this.putChunkFailure = undefined;
+  }
+
+  async testConfigurePutChunkMultipartResponseLoss(
+    remaining: number
+  ): Promise<void> {
+    this.putChunkMultipartResponseLossesRemaining = remaining;
+  }
+
+  async testConfigureScheduleSweepFailure(remaining: number): Promise<void> {
+    this.scheduleSweepFailuresRemaining = remaining;
+  }
+
+  async testConfigureFenceMultipartFailure(
+    uploadId: string,
+    remaining: number
+  ): Promise<void> {
+    this.fenceMultipartFailures = { uploadId, remaining };
   }
 
   async testConfigurePutChunkBlock(): Promise<void> {
@@ -359,6 +472,14 @@ export class FaultInjectingShardDO extends ShardDO {
     probe.unblock();
   }
 
+  protected override async scheduleSweep(): Promise<void> {
+    if (this.scheduleSweepFailuresRemaining > 0) {
+      this.scheduleSweepFailuresRemaining--;
+      throw new Error("injected shard sweep scheduling failure");
+    }
+    await super.scheduleSweep();
+  }
+
   override async putChunk(
     chunkHash: string,
     data: Uint8Array,
@@ -418,7 +539,7 @@ export class FaultInjectingShardDO extends ShardDO {
       await block.release;
       if (this.putChunkBlock === block) this.putChunkBlock = undefined;
     }
-    return super.putChunkMultipart(
+    const result = await super.putChunkMultipart(
       chunkHash,
       data,
       uploadId,
@@ -426,6 +547,31 @@ export class FaultInjectingShardDO extends ShardDO {
       userId,
       sessionToken
     );
+    if (this.putChunkMultipartResponseLossesRemaining > 0) {
+      this.putChunkMultipartResponseLossesRemaining--;
+      throw new Error(
+        `injected putChunkMultipart response loss after mutation: ${uploadId}`
+      );
+    }
+    return result;
+  }
+
+  override async fenceMultipart(
+    uploadId: string,
+    fenceId: string,
+    state: "finalizing" | "aborting",
+    expiresAt: number
+  ): Promise<void> {
+    const failure = this.fenceMultipartFailures;
+    if (
+      failure?.uploadId === uploadId &&
+      failure.remaining > 0
+    ) {
+      failure.remaining--;
+      if (failure.remaining === 0) this.fenceMultipartFailures = undefined;
+      throw new Error(`injected multipart fence failure: ${uploadId}`);
+    }
+    return super.fenceMultipart(uploadId, fenceId, state, expiresAt);
   }
 
   override async restoreChunkRef(
@@ -446,8 +592,24 @@ export class FaultInjectingShardDO extends ShardDO {
   }
 
   override async getMultipartManifest(
-    uploadId: string
+    uploadId: string,
+    afterIndex?: number,
+    limit?: number
   ): Promise<{ rows: Array<{ idx: number; hash: string; size: number }> }> {
+    await this.applyMultipartManifestBlock(uploadId);
+    return super.getMultipartManifest(uploadId, afterIndex, limit);
+  }
+
+  override async getMultipartManifestRange(
+    uploadId: string,
+    startIndex: number,
+    endIndex: number
+  ): Promise<{ rows: Array<{ idx: number; hash: string; size: number }> }> {
+    await this.applyMultipartManifestBlock(uploadId);
+    return super.getMultipartManifestRange(uploadId, startIndex, endIndex);
+  }
+
+  private async applyMultipartManifestBlock(uploadId: string): Promise<void> {
     const block = this.multipartManifestBlock;
     if (block?.uploadId === uploadId) {
       block.markEntered();
@@ -456,10 +618,32 @@ export class FaultInjectingShardDO extends ShardDO {
         this.multipartManifestBlock = undefined;
       }
     }
-    return super.getMultipartManifest(uploadId);
   }
 
   override async deleteChunks(fileId: string): Promise<{ marked: number }> {
+    await this.beforeDeleteChunks(fileId);
+    const result = await super.deleteChunks(fileId);
+    this.afterDeleteChunks(fileId);
+    return result;
+  }
+
+  override async deleteChunksPage(
+    fileId: string,
+    cursor: number,
+    generation: string | number
+  ): Promise<{
+    cursor: number;
+    done: boolean;
+    processed: number;
+    marked: number;
+  }> {
+    await this.beforeDeleteChunks(fileId);
+    const result = await super.deleteChunksPage(fileId, cursor, generation);
+    this.afterDeleteChunks(fileId);
+    return result;
+  }
+
+  private async beforeDeleteChunks(fileId: string): Promise<void> {
     const probe = this.deleteChunksConcurrencyProbe;
     if (probe) {
       probe.active++;
@@ -487,13 +671,17 @@ export class FaultInjectingShardDO extends ShardDO {
       this.consumeDeleteChunksFailure(failure);
       throw new Error(`injected deleteChunks failure before mutation: ${fileId}`);
     }
+  }
 
-    const result = await super.deleteChunks(fileId);
+  private afterDeleteChunks(fileId: string): void {
+    const failure = this.deleteChunksFailure;
+    const shouldFail =
+      (failure?.fileId === fileId || failure?.fileId === "*") &&
+      (failure.remaining === null || failure.remaining > 0);
     if (shouldFail && failure.phase === "after") {
       this.consumeDeleteChunksFailure(failure);
       throw new Error(`injected deleteChunks response loss after mutation: ${fileId}`);
     }
-    return result;
   }
 
   override async deleteManyChunks(
@@ -525,6 +713,28 @@ export class FaultInjectingShardDO extends ShardDO {
   override async clearMultipartStaging(
     uploadId: string
   ): Promise<{ dropped: number }> {
+    this.beforeClearMultipartStaging(uploadId);
+    const result = await super.clearMultipartStaging(uploadId);
+    this.afterClearMultipartStaging(uploadId);
+    return result;
+  }
+
+  override async clearMultipartStagingPage(
+    uploadId: string,
+    cursor: number,
+    generation: string | number
+  ): Promise<{ cursor: number; done: boolean; dropped: number }> {
+    this.beforeClearMultipartStaging(uploadId);
+    const result = await super.clearMultipartStagingPage(
+      uploadId,
+      cursor,
+      generation
+    );
+    this.afterClearMultipartStaging(uploadId);
+    return result;
+  }
+
+  private beforeClearMultipartStaging(uploadId: string): void {
     const failure = this.clearMultipartStagingFailure;
     const shouldFail =
       failure !== undefined &&
@@ -535,15 +745,19 @@ export class FaultInjectingShardDO extends ShardDO {
         `injected clearMultipartStaging failure before mutation: ${uploadId}`
       );
     }
+  }
 
-    const result = await super.clearMultipartStaging(uploadId);
+  private afterClearMultipartStaging(uploadId: string): void {
+    const failure = this.clearMultipartStagingFailure;
+    const shouldFail =
+      failure !== undefined &&
+      (failure.remaining === null || failure.remaining > 0);
     if (shouldFail && failure.phase === "after") {
       this.consumeClearMultipartStagingFailure(failure);
       throw new Error(
         `injected clearMultipartStaging response loss after mutation: ${uploadId}`
       );
     }
-    return result;
   }
 
   private consumeDeleteChunksFailure(
