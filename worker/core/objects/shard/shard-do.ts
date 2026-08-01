@@ -1,10 +1,8 @@
 import { DurableObject } from "cloudflare:workers";
 import type { EnvCore as Env } from "../../../../shared/types";
-import {
-  applyMigrationOnce,
-  ensureMigrationsTable,
-} from "../../lib/migrations";
+import { ensureMigrationsTable } from "../../lib/migrations";
 import { verifyVFSMultipartToken } from "../../lib/auth";
+import { SHARD_SCHEMA_STEPS } from "./schema";
 
 export class ShardDO extends DurableObject<Env> {
   sql: SqlStorage;
@@ -24,91 +22,9 @@ export class ShardDO extends DurableObject<Env> {
 
   private initializeSchema(): void {
     ensureMigrationsTable(this.sql);
-
-    this.sql.exec(`
-      CREATE TABLE IF NOT EXISTS chunks (
-        hash          TEXT PRIMARY KEY,
-        data          BLOB NOT NULL,
-        size          INTEGER NOT NULL,
-        ref_count     INTEGER NOT NULL DEFAULT 1,
-        created_at    INTEGER NOT NULL
-      )
-    `);
-
-    this.sql.exec(`
-      CREATE TABLE IF NOT EXISTS chunk_refs (
-        chunk_hash    TEXT NOT NULL,
-        file_id       TEXT NOT NULL,
-        chunk_index   INTEGER NOT NULL,
-        user_id       TEXT NOT NULL,
-        PRIMARY KEY (chunk_hash, file_id, chunk_index)
-      )
-    `);
-
-    this.sql.exec(`
-      CREATE TABLE IF NOT EXISTS shard_meta (
-        key           TEXT PRIMARY KEY,
-        value         INTEGER NOT NULL
-      )
-    `);
-
-    // ── VFS GC bookkeeping (sdk-impl-plan §3.2, §8.3) ──────────────────────
-    // deleted_at marks chunks pending hard-delete. Set when ref_count first
-    // hits 0; the alarm sweeper hard-deletes after a grace
-    // period. NULL = live.
-    applyMigrationOnce(this.sql, "chunks_add_deleted_at", () =>
-      this.sql.exec("ALTER TABLE chunks ADD COLUMN deleted_at INTEGER")
-    );
-    this.sql.exec(`
-      CREATE INDEX IF NOT EXISTS idx_chunks_deleted
-        ON chunks(deleted_at)
-        WHERE deleted_at IS NOT NULL
-    `);
-    this.sql.exec(`
-      CREATE INDEX IF NOT EXISTS idx_chunk_refs_file
-        ON chunk_refs(file_id)
-    `);
-
-    // ── multipart staging table ───────────────────────────────
-    //
-    // Records `(upload_id, chunk_index)` → `chunk_hash` for each chunk
-    // landed during a multipart upload. The chunk bytes themselves
-    // live in `chunks` and are referenced through `chunk_refs` exactly
-    // as for a non-multipart write — the staging table is metadata
-    // only, used by UserDO's finalize to verify that every chunk in
-    // the client's hash list actually landed and matches.
-    //
-    // Written in the same DO turn as `chunk_refs` by `putChunkMultipart`,
-    // so each per-chunk PUT costs zero extra subrequests.
-    //
-    // PRIMARY KEY (upload_id, chunk_index) makes re-PUT idempotent —
-    // a retry under the same hash is `INSERT OR REPLACE` no-op; a
-    // retry with different bytes overwrites and `putChunkMultipart`
-    // takes the supersession branch (drops old ref, registers new
-    // chunk, replaces this row).
-    this.sql.exec(`
-      CREATE TABLE IF NOT EXISTS upload_chunks (
-        upload_id    TEXT NOT NULL,
-        chunk_index  INTEGER NOT NULL,
-        chunk_hash   TEXT NOT NULL,
-        chunk_size   INTEGER NOT NULL,
-        user_id      TEXT NOT NULL,
-        created_at   INTEGER NOT NULL,
-        PRIMARY KEY (upload_id, chunk_index)
-      )
-    `);
-    this.sql.exec(`
-      CREATE INDEX IF NOT EXISTS idx_upload_chunks_user
-        ON upload_chunks(user_id, upload_id)
-    `);
-    this.sql.exec(`
-      CREATE TABLE IF NOT EXISTS multipart_fences (
-        upload_id  TEXT PRIMARY KEY,
-        fence_id   TEXT NOT NULL,
-        state      TEXT NOT NULL,
-        updated_at INTEGER NOT NULL
-      )
-    `);
+    for (const applySchemaStep of SHARD_SCHEMA_STEPS) {
+      applySchemaStep(this.sql);
+    }
   }
 
   async fetch(request: Request): Promise<Response> {

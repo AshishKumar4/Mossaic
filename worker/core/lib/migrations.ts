@@ -28,6 +28,13 @@
 import type { SqlStorage } from "@cloudflare/workers-types";
 
 /**
+ * One step of a DO's schema registry: applies its own `CREATE TABLE` /
+ * `CREATE INDEX` DDL plus any named migrations it owns. Steps run in
+ * registry order inside the DO's `ensureInit` transaction.
+ */
+export type SchemaStep = (sql: SqlStorage) => void;
+
+/**
  * Initialise the `meta_schema` registry table. Idempotent;
  * `CREATE TABLE IF NOT EXISTS` is a no-op when the table already
  * exists. Call once per DO `ensureInit()`, before any
