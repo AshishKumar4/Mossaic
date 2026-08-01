@@ -1,3 +1,5 @@
+import { applyMigrationOnce } from "../../../lib/migrations";
+
 export function applyMultipartStaging(sql: SqlStorage): void {
   // ── multipart staging table ───────────────────────────────
   //
@@ -38,5 +40,30 @@ export function applyMultipartStaging(sql: SqlStorage): void {
         state      TEXT NOT NULL,
         updated_at INTEGER NOT NULL
       )
+    `);
+
+  // ── fence lifecycle ───────────────────────────────────────
+  //
+  // `expires_at` is the last instant at which a session token for this
+  // upload can still be presented — the maximum `exp` this shard has
+  // observed for the upload. It is what makes a fence row reclaimable:
+  // until it passes (plus a grace margin) the row is the only thing
+  // that rejects a straggler PUT against a finalizing, aborting, or
+  // expired upload, so deleting it would let the straggler re-open the
+  // fence and commit refs into a torn-down upload.
+  //
+  // Rows written before this column existed carry NULL and are never
+  // reclaimed on that basis; `ShardDO.backfillMultipartFenceExpiry`
+  // derives a safe deadline for them first.
+  applyMigrationOnce(sql, "multipart_fences_add_expires_at", () =>
+    sql.exec("ALTER TABLE multipart_fences ADD COLUMN expires_at INTEGER")
+  );
+  // Serves all three fence-lifecycle reads: the due-ordered reclaim
+  // scan, the earliest-deadline probe, and the backfill's hunt for
+  // NULL deadlines (SQLite sorts NULLs first, so that one is an index
+  // seek rather than a table scan).
+  sql.exec(`
+      CREATE INDEX IF NOT EXISTS idx_multipart_fences_expires
+        ON multipart_fences(expires_at)
     `);
 }

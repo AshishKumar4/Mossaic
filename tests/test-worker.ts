@@ -85,6 +85,8 @@ export class FaultInjectingUserDO extends UserDO {
 }
 
 export class FaultInjectingShardDO extends ShardDO {
+  private putChunkMultipartResponseLossesRemaining = 0;
+  private scheduleSweepFailuresRemaining = 0;
   private putChunkFailure:
     | {
         phase: PutChunkFailurePhase;
@@ -250,6 +252,16 @@ export class FaultInjectingShardDO extends ShardDO {
     const block = this.multipartManifestBlock;
     if (!block) throw new Error("multipart manifest block is not configured");
     block.unblock();
+  }
+
+  async testConfigurePutChunkMultipartResponseLoss(
+    remaining: number
+  ): Promise<void> {
+    this.putChunkMultipartResponseLossesRemaining = remaining;
+  }
+
+  async testConfigureScheduleSweepFailure(remaining: number): Promise<void> {
+    this.scheduleSweepFailuresRemaining = remaining;
   }
 
   async testConfigureDeleteChunksFailure(
@@ -418,7 +430,7 @@ export class FaultInjectingShardDO extends ShardDO {
       await block.release;
       if (this.putChunkBlock === block) this.putChunkBlock = undefined;
     }
-    return super.putChunkMultipart(
+    const result = await super.putChunkMultipart(
       chunkHash,
       data,
       uploadId,
@@ -426,6 +438,21 @@ export class FaultInjectingShardDO extends ShardDO {
       userId,
       sessionToken
     );
+    if (this.putChunkMultipartResponseLossesRemaining > 0) {
+      this.putChunkMultipartResponseLossesRemaining--;
+      throw new Error(
+        `injected putChunkMultipart response loss after mutation: ${uploadId}`
+      );
+    }
+    return result;
+  }
+
+  protected override async scheduleSweep(): Promise<void> {
+    if (this.scheduleSweepFailuresRemaining > 0) {
+      this.scheduleSweepFailuresRemaining--;
+      throw new Error("injected shard sweep scheduling failure");
+    }
+    await super.scheduleSweep();
   }
 
   override async restoreChunkRef(

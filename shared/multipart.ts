@@ -26,6 +26,9 @@ export const DOWNLOAD_TOKEN_DEFAULT_TTL_MS = 60 * 60 * 1000;
 /** Hard ceiling on session TTL; prevents a misbehaving caller from minting eternal tokens. */
 export const MULTIPART_MAX_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
+/** Terminal fences outlive the longest token by this safety margin. */
+export const MULTIPART_FENCE_GC_GRACE_MS = 60 * 60 * 1000;
+
 /** Hard ceiling on the per-chunk size accepted by the multipart PUT route. */
 export const MULTIPART_MAX_CHUNK_BYTES = 4 * 1024 * 1024; // 2× MAX_BLOB_SIZE; defensive
 

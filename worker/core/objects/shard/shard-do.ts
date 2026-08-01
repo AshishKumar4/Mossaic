@@ -1,8 +1,17 @@
 import { DurableObject } from "cloudflare:workers";
 import type { EnvCore as Env } from "../../../../shared/types";
+import {
+  MULTIPART_FENCE_GC_GRACE_MS,
+  MULTIPART_MAX_TTL_MS,
+} from "../../../../shared/multipart";
 import { ensureMigrationsTable } from "../../lib/migrations";
+import { sqlRowsChanged } from "../../lib/paged-operation";
+import { pruneOldestRows } from "../../lib/row-retention";
 import { verifyVFSMultipartToken } from "../../lib/auth";
 import { SHARD_SCHEMA_STEPS } from "./schema";
+
+/** Fence rows one invocation may backfill or reclaim. */
+export const MULTIPART_FENCE_PAGE_LIMIT = 256;
 
 export class ShardDO extends DurableObject<Env> {
   sql: SqlStorage;
@@ -16,14 +25,121 @@ export class ShardDO extends DurableObject<Env> {
   private ensureInit(): void {
     if (this.initialized) return;
 
-    this.ctx.storage.transactionSync(() => this.initializeSchema());
+    const backfillPending = this.ctx.storage.transactionSync(() => {
+      this.initializeSchema();
+      return this.backfillMultipartFenceExpiry();
+    });
     this.initialized = true;
+    // A cold start is the one moment every fence row is visible to us,
+    // whatever wrote it: rows backfilled just now have no alarm behind
+    // them, and neither do open fences whose upload was abandoned
+    // before finalize or abort. Arming here is what keeps them from
+    // being stranded.
+    const deadline = this.nextFenceDeadline(backfillPending);
+    if (deadline !== null) this.ctx.waitUntil(this.armAlarmAt(deadline));
   }
 
   private initializeSchema(): void {
     ensureMigrationsTable(this.sql);
     for (const applySchemaStep of SHARD_SCHEMA_STEPS) {
       applySchemaStep(this.sql);
+    }
+  }
+
+  /**
+   * Give fence rows written before `expires_at` existed a deadline.
+   *
+   * A legacy row's only timestamp is `updated_at`, and the longest-lived
+   * token that could have been minted against it expires at most
+   * `MULTIPART_MAX_TTL_MS` later, so that sum is the earliest instant at
+   * which reclaiming the row is provably safe. The reclaim pass then
+   * adds its usual grace on top.
+   *
+   * Bounded per invocation, and resumable without a cursor: the rows
+   * still owed a deadline are exactly the ones whose `expires_at` is
+   * NULL, so an interrupted backfill resumes from its own data.
+   *
+   * Returns true when legacy rows remain.
+   */
+  private backfillMultipartFenceExpiry(): boolean {
+    this.sql.exec(
+      `UPDATE multipart_fences
+          SET expires_at = updated_at + ?
+        WHERE upload_id IN (
+          SELECT upload_id FROM multipart_fences
+           WHERE expires_at IS NULL
+           LIMIT ?
+        )`,
+      MULTIPART_MAX_TTL_MS,
+      MULTIPART_FENCE_PAGE_LIMIT
+    );
+    return (
+      this.sql
+        .exec(
+          "SELECT 1 AS one FROM multipart_fences WHERE expires_at IS NULL LIMIT 1"
+        )
+        .toArray().length > 0
+    );
+  }
+
+  /**
+   * Reclaim fence rows whose upload can no longer be written to.
+   *
+   * A row may only go away once every token that could carry a straggler
+   * PUT for it has expired — `expires_at` plus the grace margin. Rows
+   * still awaiting a backfilled deadline are not eligible: their upload
+   * may well be in flight, and dropping the fence would let a straggler
+   * re-open it and commit refs the finalize or abort no longer covers.
+   *
+   * Returns how many rows went away, so a saturated page can ask for
+   * another invocation.
+   */
+  private reclaimExpiredFences(now: number): number {
+    return pruneOldestRows(
+      { storage: this.ctx.storage, sql: this.sql },
+      {
+        table: "multipart_fences",
+        keyColumn: "upload_id",
+        timestamp: "expires_at",
+        terminal: "expires_at IS NOT NULL",
+        olderThan: now - MULTIPART_FENCE_GC_GRACE_MS,
+        limit: MULTIPART_FENCE_PAGE_LIMIT,
+      }
+    );
+  }
+
+  /** When the fence row expiring at `expiresAt` becomes reclaimable. */
+  private fenceGcDeadline(expiresAt: number): number {
+    // Floored a second out: a deadline already in the past would have
+    // the alarm fire straight back into a page it just ran.
+    return Math.max(
+      Date.now() + 1_000,
+      expiresAt + MULTIPART_FENCE_GC_GRACE_MS
+    );
+  }
+
+  /** Earliest fence deadline still owed, or null when none is. */
+  private nextFenceDeadline(backfillPending: boolean): number | null {
+    if (backfillPending) return Date.now() + 1_000;
+    // MIN ignores NULLs, so a table holding nothing but legacy rows
+    // reports no deadline — the backfill above owns those.
+    const earliest = this.sql
+      .exec<{ expires_at: number | null }>(
+        "SELECT MIN(expires_at) AS expires_at FROM multipart_fences"
+      )
+      .toArray()[0]?.expires_at;
+    if (earliest === null || earliest === undefined) return null;
+    return this.fenceGcDeadline(earliest);
+  }
+
+  /**
+   * Pull the alarm in to `target`, never push it out — a DO has one
+   * alarm, and whatever set it sooner is owed sooner.
+   */
+  private async armAlarmAt(target: number): Promise<void> {
+    const current = await this.ctx.storage.getAlarm();
+    if (current === null || current > target) {
+      await this.ctx.storage.setAlarm(target);
     }
   }
 
@@ -307,6 +423,12 @@ export class ShardDO extends DurableObject<Env> {
   // Returns one of "created" / "deduplicated" / "superseded" so the
   // caller (and tests) can observe which branch fired.
   //
+  // Supersession drops a ref, moves two refcounts, registers a chunk and
+  // replaces a staging row. Those four are one fact about the upload, so
+  // they commit as one transaction: a failure part-way through leaves
+  // the prior chunk referenced and staged exactly as it was, and the
+  // client's retry supersedes it from a state that still adds up.
+  //
   // @lean-invariant Mossaic.Vfs.Multipart.putChunkMultipart_idempotent
   //   Repeating the same abstract chunk/ref transition produces exactly
   //   the same modeled ShardState. This does not refine the SQL or staging
@@ -348,10 +470,48 @@ export class ShardDO extends DurableObject<Env> {
       await this.scheduleSweep();
     }
 
-    // This is the final fence check. There are no awaits after it, so a
-    // terminal fence cannot interleave before the staging/ref mutation.
-    this.assertMultipartFenceOpen(uploadId, fenceId);
+    const sessionExpiresAt = payload.exp * 1000;
+    const committed = this.ctx.storage.transactionSync(() => {
+      // This is the final fence check. It runs in the same transaction
+      // as the mutation below, so a terminal fence cannot interleave
+      // between them and a rolled-back put leaves no fence behind.
+      const fenceCreated = this.assertMultipartFenceOpen(
+        uploadId,
+        fenceId,
+        sessionExpiresAt
+      );
+      return {
+        fenceCreated,
+        result: this.putChunkMultipartInternal(
+          chunkHash,
+          data,
+          uploadId,
+          chunkIndex,
+          userId
+        ),
+      };
+    });
 
+    // The upload that just opened this fence may never reach finalize or
+    // abort, and a shard that stays warm would then hold the row until
+    // its next cold start. Arming here gives every fence row a deadline
+    // from the moment it exists.
+    if (committed.fenceCreated) {
+      await this.armAlarmAt(this.fenceGcDeadline(sessionExpiresAt));
+    }
+    return committed.result;
+  }
+
+  private putChunkMultipartInternal(
+    chunkHash: string,
+    data: Uint8Array,
+    uploadId: string,
+    chunkIndex: number,
+    userId: string
+  ): {
+    status: "created" | "deduplicated" | "superseded";
+    bytesStored: number;
+  } {
     // Supersession check — does a prior staging row exist with a
     // different hash? If so, drop the prior `(oldHash, uploadId,
     // chunkIndex)` chunk_refs row and decrement the prior chunk's
@@ -374,12 +534,7 @@ export class ShardDO extends DurableObject<Env> {
         uploadId,
         chunkIndex
       );
-      const decremented =
-        (
-          this.sql.exec("SELECT changes() AS n").toArray()[0] as {
-            n: number;
-          }
-        ).n > 0;
+      const decremented = sqlRowsChanged(this.sql) > 0;
       if (decremented) {
         this.sql.exec(
           "UPDATE chunks SET ref_count = MAX(0, ref_count - 1) WHERE hash = ?",
@@ -429,10 +584,19 @@ export class ShardDO extends DurableObject<Env> {
     return { status, bytesStored: writeResult.bytesStored };
   }
 
+  /**
+   * Move an upload's fence to a terminal state.
+   *
+   * `expiresAt` is the session's expiry, which the row keeps as its
+   * reclaim deadline. It only ever moves forward: a resumed session
+   * mints a fresh token, and the fence has to outlive the longest-lived
+   * one this shard has seen.
+   */
   async fenceMultipart(
     uploadId: string,
     fenceId: string,
-    state: "finalizing" | "aborting"
+    state: "finalizing" | "aborting",
+    expiresAt: number
   ): Promise<void> {
     this.ensureInit();
     this.ctx.storage.transactionSync(() => {
@@ -456,29 +620,42 @@ export class ShardDO extends DurableObject<Env> {
         );
       }
       this.sql.exec(
-        `INSERT INTO multipart_fences (upload_id, fence_id, state, updated_at)
-         VALUES (?, ?, ?, ?)
+        `INSERT INTO multipart_fences (upload_id, fence_id, state, updated_at, expires_at)
+         VALUES (?, ?, ?, ?, ?)
          ON CONFLICT(upload_id) DO UPDATE SET
            state = excluded.state,
-           updated_at = excluded.updated_at`,
+           updated_at = excluded.updated_at,
+           expires_at = MAX(
+             COALESCE(multipart_fences.expires_at, 0), excluded.expires_at
+           )`,
         uploadId,
         fenceId,
         state,
-        Date.now()
+        Date.now(),
+        expiresAt
       );
     });
+    await this.armAlarmAt(this.fenceGcDeadline(expiresAt));
   }
 
+  /**
+   * Reject a chunk PUT the fence no longer admits, opening the fence on
+   * first use. Returns whether this call created the row, so the caller
+   * can give a brand-new fence its reclaim deadline.
+   */
   private assertMultipartFenceOpen(
     uploadId: string,
-    fenceId: string | undefined
-  ): void {
+    fenceId: string | undefined,
+    expiresAt: number
+  ): boolean {
     const current = this.sql
       .exec(
-        "SELECT fence_id, state FROM multipart_fences WHERE upload_id = ?",
+        "SELECT fence_id, state, expires_at FROM multipart_fences WHERE upload_id = ?",
         uploadId
       )
-      .toArray()[0] as { fence_id: string; state: string } | undefined;
+      .toArray()[0] as
+      | { fence_id: string; state: string; expires_at: number | null }
+      | undefined;
     if (current) {
       if (current.state !== "open") {
         throw new Error(`EBUSY: multipart upload is ${current.state}`);
@@ -486,17 +663,29 @@ export class ShardDO extends DurableObject<Env> {
       if (fenceId === undefined || current.fence_id !== fenceId) {
         throw new Error("EACCES: multipart fence capability mismatch");
       }
-      return;
+      // Only a token that outlives the recorded deadline moves it, so
+      // the ordinary chunk PUT writes nothing here.
+      if ((current.expires_at ?? 0) < expiresAt) {
+        this.sql.exec(
+          `UPDATE multipart_fences SET expires_at = ?, updated_at = ?
+            WHERE upload_id = ?`,
+          expiresAt,
+          Date.now(),
+          uploadId
+        );
+      }
+      return false;
     }
-    if (fenceId !== undefined) {
-      this.sql.exec(
-        `INSERT INTO multipart_fences (upload_id, fence_id, state, updated_at)
-         VALUES (?, ?, 'open', ?)`,
-        uploadId,
-        fenceId,
-        Date.now()
-      );
-    }
+    if (fenceId === undefined) return false;
+    this.sql.exec(
+      `INSERT INTO multipart_fences (upload_id, fence_id, state, updated_at, expires_at)
+       VALUES (?, ?, 'open', ?, ?)`,
+      uploadId,
+      fenceId,
+      Date.now(),
+      expiresAt
+    );
+    return true;
   }
 
   /**
@@ -937,12 +1126,8 @@ export class ShardDO extends DurableObject<Env> {
    * Ensure an alarm is scheduled for the next sweep. If one is already
    * set sooner than our target, leave it alone — single alarm per DO.
    */
-  private async scheduleSweep(): Promise<void> {
-    const cur = await this.ctx.storage.getAlarm();
-    const next = Date.now() + 5 * 60 * 1000; // 5 min default cadence
-    if (cur === null || cur > next) {
-      await this.ctx.storage.setAlarm(next);
-    }
+  protected async scheduleSweep(): Promise<void> {
+    await this.armAlarmAt(Date.now() + 5 * 60 * 1000); // 5 min cadence
   }
 
   /**
@@ -951,7 +1136,13 @@ export class ShardDO extends DurableObject<Env> {
    * via a concurrent dedup PUT, with the deleted_at clear handled in
    * the PUT path) need the un-mark belt-and-suspenders here too.
    *
-   * Reschedules itself if more rows remain past this batch's LIMIT 500.
+   * Also carries the multipart fence lifecycle: one backfill page for
+   * rows still owed a deadline, then one reclaim page for rows whose
+   * deadline has passed.
+   *
+   * Reschedules itself if more rows remain past this batch's LIMIT 500,
+   * and otherwise at the earliest fence deadline still owed — a DO has
+   * one alarm, so every handler ends by re-establishing it.
    * Cloudflare alarms have at-least-once semantics with exponential
    * backoff retry on throw, so this handler is idempotent — re-running
    * the same batch is a no-op (the rows are already deleted).
@@ -968,7 +1159,11 @@ export class ShardDO extends DurableObject<Env> {
    */
   async alarm(): Promise<void> {
     this.ensureInit();
-    const cutoff = Date.now() - 30_000; // 30s grace
+    const backfillPending = this.ctx.storage.transactionSync(() =>
+      this.backfillMultipartFenceExpiry()
+    );
+    const now = Date.now();
+    const cutoff = now - 30_000; // 30s grace
     const rows = this.sql
       .exec(
         "SELECT hash, size FROM chunks WHERE deleted_at IS NOT NULL AND deleted_at < ? LIMIT 500",
@@ -999,13 +1194,20 @@ export class ShardDO extends DurableObject<Env> {
     }
     if (freed > 0) this.updateCapacity(-freed);
 
+    const reclaimedFences = this.reclaimExpiredFences(now);
+
     // Reschedule if the sweep was capped at LIMIT 500.
     const more = this.sql
       .exec("SELECT 1 FROM chunks WHERE deleted_at IS NOT NULL LIMIT 1")
       .toArray();
     if (more.length > 0) {
       await this.ctx.storage.setAlarm(Date.now() + 60_000);
+      return;
     }
+    const deadline = this.nextFenceDeadline(
+      backfillPending || reclaimedFences === MULTIPART_FENCE_PAGE_LIMIT
+    );
+    if (deadline !== null) await this.ctx.storage.setAlarm(deadline);
   }
 
   private getStats(): {

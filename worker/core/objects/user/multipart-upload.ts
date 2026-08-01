@@ -135,7 +135,8 @@ async function fenceMultipartShards(
   session: UploadSessionRow,
   state: "finalizing" | "aborting"
 ): Promise<void> {
-  if (session.fence_id === null) return;
+  const fenceId = session.fence_id;
+  if (fenceId === null) return;
   const ns = shardNs(durableObject);
   await Promise.all(
     Array.from({ length: session.pool_size }, async (_, shardIndex) => {
@@ -145,9 +146,12 @@ async function fenceMultipartShards(
         scope.sub,
         shardIndex
       );
+      // The session's expiry becomes the shard fence's reclaim deadline:
+      // no token for this upload outlives it, so nothing can re-open the
+      // fence once it has passed.
       await ns
         .get(ns.idFromName(shardName))
-        .fenceMultipart(session.upload_id, session.fence_id!, state);
+        .fenceMultipart(session.upload_id, fenceId, state, session.expires_at);
     })
   );
 }

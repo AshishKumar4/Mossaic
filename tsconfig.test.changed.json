@@ -9,6 +9,7 @@
 		"tests/integration/cleanup-outbox-remaining-paths.test.ts",
 		"tests/integration/internal-rpc-surface.test.ts",
 		"tests/integration/migration.test.ts",
+		"tests/integration/multipart-shard-transaction.test.ts",
 		"tests/integration/multipart-versioning.test.ts",
 		"tests/integration/ordinary-publication-failures.test.ts",
 		"tests/integration/overwrite-cleanup-failures.test.ts",

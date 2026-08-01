@@ -6,8 +6,15 @@ import {
 } from "@core/lib/migrations";
 import type { UserDO } from "@app/objects/user/user-do";
 import type { SearchDO } from "@app/objects/search/search-do";
-import type { ShardDO } from "@core/objects/shard/shard-do";
+import {
+  MULTIPART_FENCE_PAGE_LIMIT,
+  type ShardDO,
+} from "@core/objects/shard/shard-do";
 import { vfsUserDOName } from "@core/lib/utils";
+import {
+  MULTIPART_FENCE_GC_GRACE_MS,
+  MULTIPART_MAX_TTL_MS,
+} from "@shared/multipart";
 
 /**
  * `applyMigrationOnce` — schema-version registry.
@@ -306,6 +313,185 @@ describe("transactional DO schema initialization", () => {
         { name: "vector_metadata_add_space" },
         { name: "vectors_add_space" },
       ]);
+    });
+  });
+});
+
+/**
+ * Fence rows predate `expires_at`, so an upgraded shard holds rows with
+ * no deadline at all. The backfill derives one from the only timestamp
+ * they carry, which is what lets them be reclaimed later instead of
+ * accumulating forever — and what keeps them from being reclaimed
+ * early, while a straggler PUT could still arrive.
+ */
+describe("multipart fence expiry migration", () => {
+  const LEGACY_FENCES_DDL = `
+    CREATE TABLE multipart_fences (
+      upload_id TEXT PRIMARY KEY,
+      fence_id TEXT NOT NULL,
+      state TEXT NOT NULL,
+      updated_at INTEGER NOT NULL
+    )
+  `;
+
+  function fenceRows(sql: SqlStorage): Array<Record<string, unknown>> {
+    return sql
+      .exec("SELECT upload_id, updated_at, expires_at FROM multipart_fences")
+      .toArray();
+  }
+
+  it("backfills legacy fences from updated_at and arms their GC deadline", async () => {
+    const stub = shardStub("schema-fence-expiry-backfill");
+    const updatedAt = Date.now() - 24 * 60 * 60 * 1000;
+    const expectedExpiry = updatedAt + MULTIPART_MAX_TTL_MS;
+
+    const migrated = await runInDurableObject(
+      stub,
+      async (instance: ShardDO, state) => {
+        const sql = state.storage.sql;
+        const internals = instance as unknown as InitializableDO;
+        sql.exec(LEGACY_FENCES_DDL);
+        sql.exec(
+          "INSERT INTO multipart_fences VALUES ('legacy-upload', 'legacy-fence', 'finalizing', ?)",
+          updatedAt
+        );
+
+        internals.ensureInit();
+        await Promise.resolve();
+        return {
+          row: sql
+            .exec(
+              "SELECT updated_at, expires_at FROM multipart_fences WHERE upload_id = 'legacy-upload'"
+            )
+            .toArray()[0],
+          migrations: sql
+            .exec(
+              `SELECT name FROM meta_schema
+                WHERE name LIKE 'multipart_fences_%' ORDER BY name`
+            )
+            .toArray(),
+        };
+      }
+    );
+    const alarm = await runInDurableObject(stub, (_instance, state) =>
+      state.storage.getAlarm()
+    );
+
+    expect(migrated).toEqual({
+      row: { updated_at: updatedAt, expires_at: expectedExpiry },
+      migrations: [{ name: "multipart_fences_add_expires_at" }],
+    });
+    expect(alarm).toBe(expectedExpiry + MULTIPART_FENCE_GC_GRACE_MS);
+  });
+
+  it("reclaims a backfilled fence only after max TTL and grace have elapsed", async () => {
+    const stub = shardStub("schema-fence-expiry-reclaim");
+    const updatedAt =
+      Date.now() - MULTIPART_MAX_TTL_MS - MULTIPART_FENCE_GC_GRACE_MS - 2_000;
+
+    await runInDurableObject(stub, (instance: ShardDO, state) => {
+      const sql = state.storage.sql;
+      const internals = instance as unknown as InitializableDO;
+      sql.exec(LEGACY_FENCES_DDL);
+      sql.exec(
+        "INSERT INTO multipart_fences VALUES ('expired-upload', 'expired-fence', 'aborting', ?)",
+        updatedAt
+      );
+      internals.ensureInit();
+    });
+
+    await runInDurableObject(stub, (instance) => instance.alarm());
+    await expect(
+      runInDurableObject(stub, (_instance, state) =>
+        state.storage.sql
+          .exec("SELECT COUNT(*) AS n FROM multipart_fences")
+          .toArray()[0]
+      )
+    ).resolves.toEqual({ n: 0 });
+  });
+
+  it("keeps a legacy fence whose derived deadline has not passed", async () => {
+    const stub = shardStub("schema-fence-expiry-still-owed");
+    // Older than any wall-clock margin the GC applies on its own, yet a
+    // token minted at the max TTL against it is still live for another
+    // minute — the row is the only thing that would reject that PUT.
+    const updatedAt = Date.now() - MULTIPART_MAX_TTL_MS + 60_000;
+
+    await runInDurableObject(stub, (instance: ShardDO, state) => {
+      const sql = state.storage.sql;
+      const internals = instance as unknown as InitializableDO;
+      sql.exec(LEGACY_FENCES_DDL);
+      sql.exec(
+        "INSERT INTO multipart_fences VALUES ('owed-upload', 'owed-fence', 'aborting', ?)",
+        updatedAt
+      );
+      internals.ensureInit();
+    });
+
+    await runInDurableObject(stub, (instance) => instance.alarm());
+    await expect(
+      runInDurableObject(stub, (_instance, state) =>
+        fenceRows(state.storage.sql)
+      )
+    ).resolves.toEqual([
+      {
+        upload_id: "owed-upload",
+        updated_at: updatedAt,
+        expires_at: updatedAt + MULTIPART_MAX_TTL_MS,
+      },
+    ]);
+  });
+
+  it("pages the backfill and the reclaim across invocations", async () => {
+    const stub = shardStub("schema-fence-expiry-paged");
+    const total = 2 * MULTIPART_FENCE_PAGE_LIMIT + 88;
+    const updatedAt =
+      Date.now() - MULTIPART_MAX_TTL_MS - MULTIPART_FENCE_GC_GRACE_MS - 2_000;
+
+    await runInDurableObject(stub, async (instance: ShardDO, state) => {
+      const sql = state.storage.sql;
+      const internals = instance as unknown as InitializableDO;
+      sql.exec(LEGACY_FENCES_DDL);
+      for (let index = 0; index < total; index++) {
+        sql.exec(
+          "INSERT INTO multipart_fences VALUES (?, 'legacy-fence', 'aborting', ?)",
+          `legacy-upload-${index.toString().padStart(4, "0")}`,
+          updatedAt
+        );
+      }
+
+      const withDeadline = (): number =>
+        (
+          sql
+            .exec(
+              "SELECT COUNT(*) AS n FROM multipart_fences WHERE expires_at IS NOT NULL"
+            )
+            .toArray()[0] as { n: number }
+        ).n;
+      const remaining = (): number =>
+        (
+          sql
+            .exec("SELECT COUNT(*) AS n FROM multipart_fences")
+            .toArray()[0] as { n: number }
+        ).n;
+
+      // A cold start backfills one page and leaves the rest for the next
+      // one, so no single invocation is unbounded.
+      for (const expected of [
+        MULTIPART_FENCE_PAGE_LIMIT,
+        2 * MULTIPART_FENCE_PAGE_LIMIT,
+        total,
+      ]) {
+        internals.initialized = false;
+        internals.ensureInit();
+        expect(withDeadline()).toBe(expected);
+      }
+
+      // Reclaiming is paged the same way, oldest deadline first.
+      for (const expected of [total - MULTIPART_FENCE_PAGE_LIMIT, 88, 0]) {
+        await instance.alarm();
+        expect(remaining()).toBe(expected);
+      }
     });
   });
 });
