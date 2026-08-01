@@ -13,6 +13,14 @@ import { hashChunk } from "../../../../../shared/crypto";
 import { computeChunkSpec } from "../../../../../shared/chunking";
 import { generateId, vfsShardDOName } from "../../../lib/utils";
 import { logWarn } from "../../../lib/logger";
+import {
+  drainReadyOperations,
+  type OperationClaim,
+  type OperationPage,
+  type OperationUnit,
+  type PagedOperationTable,
+  type ReadyOperationBatch,
+} from "../../../lib/paged-operation";
 import { placeChunk, POOL_FULL } from "../../../../../shared/placement";
 import { loadFullShards } from "../shard-capacity";
 import {
@@ -88,10 +96,34 @@ import {
 
 const CLEANUP_BATCH_LIMIT = 200;
 const CLEANUP_CONCURRENCY = 6;
-const CLEANUP_BACKOFF_BASE_MS = 60_000;
-const CLEANUP_BACKOFF_MAX_MS = 6 * 60 * 60 * 1000;
-const CLEANUP_CLAIM_LEASE_MS = 5 * 60 * 1000;
 const SYNTHETIC_REF_CLEANUP_GRACE_MS = 60 * 60 * 1000;
+
+/**
+ * The cleanup outbox as the shared control plane sees it.
+ *
+ * Every failure here is remote — an unreachable ShardDO, a lost response — so
+ * the retry cadence backs off hard but never gives up: the blobs are owed
+ * until the shard confirms. There is no poison policy for the same reason.
+ */
+const CHUNK_CLEANUP_OPERATION: PagedOperationTable = {
+  table: "chunk_cleanup_intents",
+  keyColumns: ["ref_id", "shard_index"],
+  retry: {
+    baseMs: 60_000,
+    maxMs: 6 * 60 * 60 * 1000,
+    maxDoublings: 16,
+  },
+};
+
+const CHUNK_CLEANUP_CLAIM: OperationClaim = {
+  column: "state",
+  ready: "pending",
+  claimed: "in_flight",
+  leaseMs: 5 * 60 * 1000,
+};
+
+const CLEANUP_INTENT_COLUMNS =
+  "ref_id, shard_index, cleanup_kind, attempts, generation, provisional";
 
 interface CleanupIntentRow extends Record<string, SqlStorageValue> {
   ref_id: string;
@@ -115,13 +147,6 @@ function isDestinationUniqueConstraintError(err: unknown): boolean {
 
 function errorMessage(err: unknown): string {
   return (err instanceof Error ? err.message : String(err)).slice(0, 2_000);
-}
-
-function cleanupBackoffMs(attempts: number): number {
-  return Math.min(
-    CLEANUP_BACKOFF_BASE_MS * 2 ** Math.min(attempts, 16),
-    CLEANUP_BACKOFF_MAX_MS
-  );
 }
 
 /**
@@ -379,264 +404,188 @@ export function hardDeleteFileRowLocal(
 }
 
 /**
+ * Build the units one drain invocation advances.
+ *
+ * Bulk intents for one shard collapse into a single `deleteManyChunks` call,
+ * so they share a claim and are acknowledged together; every other intent is
+ * its own unit.
+ */
+function chunkCleanupUnits(
+  rows: readonly CleanupIntentRow[]
+): readonly OperationUnit<CleanupIntentRow>[] {
+  const units: OperationUnit<CleanupIntentRow>[] = [];
+  const bulkByShard = new Map<
+    number,
+    [CleanupIntentRow, ...CleanupIntentRow[]]
+  >();
+  for (const row of rows) {
+    if (row.cleanup_kind !== ChunkCleanupKind.Bulk) {
+      units.push([row]);
+      continue;
+    }
+    const group = bulkByShard.get(row.shard_index);
+    if (group === undefined) bulkByShard.set(row.shard_index, [row]);
+    else group.push(row);
+  }
+  units.push(...bulkByShard.values());
+  return units;
+}
+
+/** Every intent whose backoff has elapsed, oldest deadline first. */
+function selectDueCleanupUnits(
+  durableObject: UserDO,
+  dueAt: number
+): ReadyOperationBatch<CleanupIntentRow> {
+  const rows = durableObject.sql
+    .exec<CleanupIntentRow>(
+      `SELECT ${CLEANUP_INTENT_COLUMNS}
+         FROM chunk_cleanup_intents
+        WHERE state = 'pending' AND next_attempt_at <= ?
+        ORDER BY next_attempt_at, created_at, ref_id, shard_index
+        LIMIT ?`,
+      dueAt,
+      CLEANUP_BATCH_LIMIT
+    )
+    .toArray();
+  return {
+    units: chunkCleanupUnits(rows),
+    saturated: rows.length === CLEANUP_BATCH_LIMIT,
+  };
+}
+
+/** Drop the terminal guards a completed cleanup no longer needs to hold. */
+function deleteSettledCleanupIntents(
+  durableObject: UserDO,
+  refIds: readonly string[]
+): void {
+  const placeholders = refIds.map(() => "?").join(",");
+  durableObject.sql.exec(
+    `DELETE FROM chunk_cleanup_intents
+      WHERE state = 'cleaned' AND ref_id IN (${placeholders})`,
+    ...refIds
+  );
+}
+
+/**
+ * Take over cleanup for refs whose publication was conclusively abandoned,
+ * then select their intents regardless of backoff.
+ *
+ * Clearing `provisional` is what makes the abandonment durable: a delayed
+ * publisher for the same ref can no longer disarm the intents, so it fails
+ * closed instead of publishing over reaped chunks.
+ */
+function selectAbandonedCleanupUnits(
+  durableObject: UserDO,
+  refIds: readonly string[]
+): ReadyOperationBatch<CleanupIntentRow> {
+  if (refIds.length === 0) return { units: [], saturated: false };
+  const placeholders = refIds.map(() => "?").join(",");
+  transactionSync(durableObject, () => {
+    durableObject.sql.exec(
+      `UPDATE chunk_cleanup_intents SET provisional = 0
+        WHERE state = 'pending' AND ref_id IN (${placeholders})`,
+      ...refIds
+    );
+    deleteSettledCleanupIntents(durableObject, refIds);
+  });
+  const rows = durableObject.sql
+    .exec<CleanupIntentRow>(
+      `SELECT ${CLEANUP_INTENT_COLUMNS}
+         FROM chunk_cleanup_intents
+        WHERE ref_id IN (${placeholders}) AND state = 'pending'
+        ORDER BY created_at, ref_id, shard_index
+        LIMIT ?`,
+      ...refIds,
+      CLEANUP_BATCH_LIMIT
+    )
+    .toArray();
+  return {
+    units: chunkCleanupUnits(rows),
+    saturated: rows.length === CLEANUP_BATCH_LIMIT,
+  };
+}
+
+/**
+ * One page of remote cleanup for a claimed unit. Ordinary refs use
+ * deleteChunks, multipart refs also clear staging, and bulk refs group into
+ * deleteManyChunks by shard. Any throw leaves every row of the unit durable.
+ */
+async function runChunkCleanupPage(
+  shardNs: DurableObjectNamespace<ShardDO>,
+  scope: VFSScope,
+  unit: OperationUnit<CleanupIntentRow>
+): Promise<OperationPage> {
+  const [first] = unit;
+  const shardName = vfsShardDOName(
+    scope.ns,
+    scope.tenant,
+    scope.sub,
+    first.shard_index
+  );
+  const stub = shardNs.get(shardNs.idFromName(shardName));
+  if (first.cleanup_kind === ChunkCleanupKind.Bulk) {
+    await stub.deleteManyChunks(unit.map((row) => row.ref_id));
+  } else if (first.cleanup_kind === ChunkCleanupKind.MultipartStaging) {
+    await stub.clearMultipartStaging(first.ref_id);
+  } else {
+    await stub.deleteChunks(first.ref_id);
+    if (first.cleanup_kind === ChunkCleanupKind.Multipart) {
+      await stub.clearMultipartStaging(first.ref_id);
+    }
+  }
+  return { kind: "completed" };
+}
+
+/**
  * Drain a bounded cleanup-intent batch with at most six shard RPCs in flight.
- * Ordinary refs use deleteChunks, multipart refs also clear staging, and bulk
- * refs group into deleteManyChunks by shard. An intent is acknowledged only
- * after its complete protocol resolves; any throw retains every affected row.
+ *
+ * The claim plane in `paged-operation` owns the control flow: expired claims
+ * return to `pending` with a bumped generation, each unit is claimed under
+ * generation fencing, failures back off, and the alarm is re-armed at the
+ * earliest deadline still owed. This module supplies the domain — which
+ * intents are due, how they group into shard calls, and what a completed
+ * intent leaves behind.
+ *
+ * A provisional intent settles as `cleaned` rather than disappearing: it is
+ * the guard that stops a delayed publisher from resurrecting a reaped ref. A
+ * ref-scoped drain speaks for the operation that abandoned that publication,
+ * so it drops the guard afterwards; the alarm-driven drain keeps it.
  */
 export async function drainChunkCleanupIntents(
   durableObject: UserDO,
   scope: VFSScope,
   refId?: string | readonly string[]
 ): Promise<void> {
-  const eligibleAt = Date.now();
-  transactionSync(durableObject, () => {
-    durableObject.sql.exec(
-      `UPDATE chunk_cleanup_intents
-          SET state = 'pending', generation = generation + 1,
-              updated_at = ?, next_attempt_at = ?
-        WHERE state = 'in_flight' AND next_attempt_at <= ?`,
-      eligibleAt,
-      eligibleAt,
-      eligibleAt
-    );
-  });
-  if (refId !== undefined) {
-    const abandonedRefIds = typeof refId === "string" ? [refId] : [...refId];
-    if (abandonedRefIds.length > 0) {
-      const placeholders = abandonedRefIds.map(() => "?").join(",");
-      transactionSync(durableObject, () => {
-        durableObject.sql.exec(
-          `UPDATE chunk_cleanup_intents SET provisional = 0
-            WHERE state = 'pending' AND ref_id IN (${placeholders})`,
-          ...abandonedRefIds
-        );
-        durableObject.sql.exec(
-          `DELETE FROM chunk_cleanup_intents
-            WHERE state = 'cleaned' AND ref_id IN (${placeholders})`,
-          ...abandonedRefIds
-        );
-      });
-    }
-  }
-  let rows: CleanupIntentRow[];
-  if (refId === undefined) {
-    rows = durableObject.sql
-      .exec<CleanupIntentRow>(
-        `SELECT ref_id, shard_index, cleanup_kind, attempts, generation, provisional
-           FROM chunk_cleanup_intents
-          WHERE state = 'pending' AND next_attempt_at <= ?
-           ORDER BY next_attempt_at, created_at, ref_id, shard_index
-           LIMIT ?`,
-        eligibleAt,
-        CLEANUP_BATCH_LIMIT
-      )
-      .toArray();
-  } else if (typeof refId === "string") {
-    rows = durableObject.sql
-      .exec<CleanupIntentRow>(
-        `SELECT ref_id, shard_index, cleanup_kind, attempts, generation, provisional
-           FROM chunk_cleanup_intents
-          WHERE ref_id = ? AND state = 'pending'
-          ORDER BY created_at, shard_index
-          LIMIT ?`,
-        refId,
-        CLEANUP_BATCH_LIMIT
-      )
-      .toArray();
-  } else if (refId.length === 0) {
-    rows = [];
-  } else {
-    const placeholders = refId.map(() => "?").join(",");
-    rows = durableObject.sql
-      .exec<CleanupIntentRow>(
-        `SELECT ref_id, shard_index, cleanup_kind, attempts, generation, provisional
-           FROM chunk_cleanup_intents
-          WHERE ref_id IN (${placeholders}) AND state = 'pending'
-          ORDER BY created_at, ref_id, shard_index
-          LIMIT ?`,
-        ...refId,
-        CLEANUP_BATCH_LIMIT
-      )
-      .toArray();
-  }
-
+  const abandonedRefIds =
+    refId === undefined
+      ? undefined
+      : typeof refId === "string"
+        ? [refId]
+        : [...refId];
   const env = durableObject.envPublic;
   const shardNs = env.MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
 
-  const units: CleanupIntentRow[][] = [];
-  const bulkByShard = new Map<number, CleanupIntentRow[]>();
-  for (const row of rows) {
-    if (row.cleanup_kind !== ChunkCleanupKind.Bulk) {
-      units.push([row]);
-      continue;
-    }
-    const group = bulkByShard.get(row.shard_index) ?? [];
-    group.push(row);
-    bulkByShard.set(row.shard_index, group);
-  }
-  units.push(...bulkByShard.values());
+  await drainReadyOperations<CleanupIntentRow>(durableObject, {
+    table: CHUNK_CLEANUP_OPERATION,
+    claim: CHUNK_CLEANUP_CLAIM,
+    fanOut: CLEANUP_CONCURRENCY,
+    maxPages: 1,
+    selectReady: (dueAt) =>
+      abandonedRefIds === undefined
+        ? selectDueCleanupUnits(durableObject, dueAt)
+        : selectAbandonedCleanupUnits(durableObject, abandonedRefIds),
+    advance: (unit) => runChunkCleanupPage(shardNs, scope, unit),
+    disposition: (row) =>
+      row.provisional !== 0
+        ? { kind: "retain", state: "cleaned" }
+        : { kind: "discard" },
+    armAlarmAt: (at) => scheduleChunkCleanupSweep(durableObject, at),
+  });
 
-  let cursor = 0;
-  let retrySchedulingNeeded = rows.length === CLEANUP_BATCH_LIMIT;
-  async function drainOne(unit: CleanupIntentRow[]): Promise<void> {
-    const claimed = transactionSync(durableObject, () => {
-      for (const row of unit) {
-        const current = durableObject.sql
-          .exec(
-            `SELECT state, generation FROM chunk_cleanup_intents
-              WHERE ref_id = ? AND shard_index = ?`,
-            row.ref_id,
-            row.shard_index
-          )
-          .toArray()[0] as
-          | { state: string; generation: number }
-          | undefined;
-        if (
-          !current ||
-          current.state !== "pending" ||
-          current.generation !== row.generation
-        ) {
-          return false;
-        }
-      }
-      for (const row of unit) {
-        durableObject.sql.exec(
-          `UPDATE chunk_cleanup_intents
-              SET state = 'in_flight', generation = generation + 1,
-                  updated_at = ?, next_attempt_at = ?
-            WHERE ref_id = ? AND shard_index = ?
-              AND state = 'pending' AND generation = ?`,
-          Date.now(),
-          Date.now() + CLEANUP_CLAIM_LEASE_MS,
-          row.ref_id,
-          row.shard_index,
-          row.generation
-        );
-        row.generation++;
-      }
-      return true;
-    });
-    if (!claimed) return;
-
-    const first = unit[0]!;
-    const shardName = vfsShardDOName(
-      scope.ns,
-      scope.tenant,
-      scope.sub,
-      first.shard_index
-    );
-    const stub = shardNs.get(shardNs.idFromName(shardName));
-    try {
-      if (first.cleanup_kind === ChunkCleanupKind.Bulk) {
-        await stub.deleteManyChunks(unit.map((row) => row.ref_id));
-      } else if (
-        first.cleanup_kind === ChunkCleanupKind.MultipartStaging
-      ) {
-        await stub.clearMultipartStaging(first.ref_id);
-      } else {
-        await stub.deleteChunks(first.ref_id);
-        if (first.cleanup_kind === ChunkCleanupKind.Multipart) {
-          await stub.clearMultipartStaging(first.ref_id);
-        }
-      }
-    } catch (err) {
-      retrySchedulingNeeded = true;
-      const failedAt = Date.now();
-      transactionSync(durableObject, () => {
-        for (const row of unit) {
-          durableObject.sql.exec(
-            `UPDATE chunk_cleanup_intents
-                SET state = 'pending', generation = generation + 1,
-                    attempts = attempts + 1,
-                    updated_at = ?,
-                    next_attempt_at = ?,
-                    last_error = ?
-              WHERE ref_id = ? AND shard_index = ?
-                AND state = 'in_flight' AND generation = ?`,
-            failedAt,
-            failedAt + cleanupBackoffMs(row.attempts),
-            errorMessage(err),
-            row.ref_id,
-            row.shard_index,
-            row.generation
-          );
-        }
-      });
-      return;
-    }
+  if (abandonedRefIds !== undefined && abandonedRefIds.length > 0) {
     transactionSync(durableObject, () => {
-      for (const row of unit) {
-        if (row.provisional !== 0) {
-          durableObject.sql.exec(
-            `UPDATE chunk_cleanup_intents
-                SET state = 'cleaned', generation = generation + 1,
-                    updated_at = ?, last_error = NULL
-              WHERE ref_id = ? AND shard_index = ?
-                AND state = 'in_flight' AND generation = ?`,
-            Date.now(),
-            row.ref_id,
-            row.shard_index,
-            row.generation
-          );
-        } else {
-          durableObject.sql.exec(
-            `DELETE FROM chunk_cleanup_intents
-              WHERE ref_id = ? AND shard_index = ?
-                AND state = 'in_flight' AND generation = ?`,
-            row.ref_id,
-            row.shard_index,
-            row.generation
-          );
-        }
-      }
+      deleteSettledCleanupIntents(durableObject, abandonedRefIds);
     });
-  }
-
-  async function lane(): Promise<void> {
-    while (true) {
-      const unit = units[cursor++];
-      if (unit === undefined) return;
-      await drainOne(unit);
-    }
-  }
-
-  await Promise.all(
-    Array.from(
-      { length: Math.min(CLEANUP_CONCURRENCY, units.length) },
-      () => lane()
-    )
-  );
-
-  // A ref-scoped drain is called by the operation that has conclusively
-  // abandoned publication. Once cleanup completed, its terminal guard no
-  // longer needs to block a publisher; no-scope alarm drains retain the guard
-  // so a still-running delayed publisher must fail closed.
-  if (refId !== undefined) {
-    const refIds = typeof refId === "string" ? [refId] : [...refId];
-    if (refIds.length > 0) {
-      const placeholders = refIds.map(() => "?").join(",");
-      transactionSync(durableObject, () => {
-        durableObject.sql.exec(
-          `DELETE FROM chunk_cleanup_intents
-            WHERE state = 'cleaned' AND ref_id IN (${placeholders})`,
-          ...refIds
-        );
-      });
-    }
-  }
-
-  if (retrySchedulingNeeded) {
-    const nextAttempt = durableObject.sql
-      .exec<{ next_attempt_at: number | null }>(
-        `SELECT MIN(next_attempt_at) AS next_attempt_at
-           FROM chunk_cleanup_intents
-          WHERE state IN ('pending', 'in_flight')`
-      )
-      .toArray()[0]?.next_attempt_at;
-    if (nextAttempt !== null && nextAttempt !== undefined) {
-      await scheduleChunkCleanupSweep(durableObject, nextAttempt);
-    }
   }
 }
 

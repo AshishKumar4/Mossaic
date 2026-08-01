@@ -1,3 +1,5 @@
+import { sqlRowsChanged } from "../../lib/paged-operation";
+
 interface StorageCapability {
   state: DurableObjectState;
   storage: DurableObjectStorage;
@@ -123,11 +125,7 @@ export function stageChunkCleanupIntent(
 }
 
 export function lastSqlChanges(durableObject: StorageCapability): number {
-  return (
-    durableObject.sql.exec("SELECT changes() AS n").toArray()[0] as {
-      n: number;
-    }
-  ).n;
+  return sqlRowsChanged(durableObject.sql);
 }
 
 /** Convert pre-publication multipart rollback intents into staging-only work. */
