@@ -1,0 +1,21 @@
+worker/core/lib/row-retention.ts
+  s_68c084e172f271::t_3f1680b7b8deff 1-87
+worker/core/objects/user/vfs/audit-log.ts
+  s_68c084e172f271::t_1c04b8a0b59d22 38,140-144,156-161
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "45651b57c6778a7eb9c7d26dc6f123ef903841ed",
+  "prompts": {},
+  "sessions": {
+    "s_68c084e172f271": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0424885a7ffe35Sdhcb8j6aKQz",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ashish Kumar Singh <ashishsingh@cloudflare.com>"
+    }
+  }
+}
