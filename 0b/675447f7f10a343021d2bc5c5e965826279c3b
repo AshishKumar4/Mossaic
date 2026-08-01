@@ -1,0 +1,71 @@
+worker/core/lib/migrations.ts
+  s_19e7df8c2ff011::t_f0b40a37751184 30-36
+worker/core/objects/shard/schema/chunks.ts
+  s_19e7df8c2ff011::t_f283443e62f1c5 1-49
+worker/core/objects/shard/schema/index.ts
+  s_19e7df8c2ff011::t_8fa6a76f3d96bc 1-13
+worker/core/objects/shard/schema/multipart.ts
+  s_19e7df8c2ff011::t_d0a33df570cd64 1-42
+worker/core/objects/shard/shard-do.ts
+  s_19e7df8c2ff011::t_71e354adbdbc42 3,5,25-27
+worker/core/objects/user/schema/audit.ts
+  s_19e7df8c2ff011::t_61d791618c821f 1-31
+worker/core/objects/user/schema/auth.ts
+  s_19e7df8c2ff011::t_a01749deb84923 1-11
+worker/core/objects/user/schema/cleanup.ts
+  s_19e7df8c2ff011::t_01bd5a6bea4e56 1-26
+worker/core/objects/user/schema/encryption.ts
+  s_19e7df8c2ff011::t_61036e1b4af7d6 1-36
+worker/core/objects/user/schema/files.ts
+  s_19e7df8c2ff011::t_1ba8c1761ce623 1-127
+worker/core/objects/user/schema/folders.ts
+  s_19e7df8c2ff011::t_77c1f4a005e93b 1-62
+worker/core/objects/user/schema/index.ts
+  s_a24f8b33d2ec7b::t_b01c5eda953b05 1-98
+worker/core/objects/user/schema/metadata-tags.ts
+  s_19e7df8c2ff011::t_4e13d7debbbb3b 1-66
+worker/core/objects/user/schema/multipart.ts
+  s_19e7df8c2ff011::t_734550d7a9cf32 1-68
+worker/core/objects/user/schema/path-indexes.ts
+  s_19e7df8c2ff011::t_d35954c0033aaf 1-113
+worker/core/objects/user/schema/preview.ts
+  s_19e7df8c2ff011::t_2066d5f1065517 1-86
+worker/core/objects/user/schema/quota.ts
+  s_19e7df8c2ff011::t_cfbfc34f7c1b0d 1-76
+worker/core/objects/user/schema/shard-capacity.ts
+  s_19e7df8c2ff011::t_6965dd9eeb9200 1-25
+worker/core/objects/user/schema/versions.ts
+  s_19e7df8c2ff011::t_4a51dba9cdf473 1-108
+worker/core/objects/user/schema/vfs-meta.ts
+  s_19e7df8c2ff011::t_5e542a187b418b 1-26
+worker/core/objects/user/schema/write-streams.ts
+  s_19e7df8c2ff011::t_f9f3d72765cdb4 1-35
+worker/core/objects/user/schema/yjs.ts
+  s_19e7df8c2ff011::t_bdd840d7d03ec6 1-76
+worker/core/objects/user/user-do-core.ts
+  s_19e7df8c2ff011::t_9aef03ebd0e7d5 57-58,200-201
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "0b675447f7f10a343021d2bc5c5e965826279c3b",
+  "prompts": {},
+  "sessions": {
+    "s_19e7df8c2ff011": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0426a7ea1ffeRj2OIGuZxE3YjQ",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ashish Kumar Singh <ashishsingh@cloudflare.com>"
+    },
+    "s_a24f8b33d2ec7b": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0557e411bffe1uab6RIcL1yfCq",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ashish Kumar Singh <ashishsingh@cloudflare.com>"
+    }
+  }
+}
