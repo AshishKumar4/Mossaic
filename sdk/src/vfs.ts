@@ -27,7 +27,7 @@ import {
   type WriteHandle,
   type ReadStreamOptions,
 } from "./streams";
-import { EINVAL, mapServerError } from "./errors";
+import { EINVAL, VFSFsError, mapServerError } from "./errors";
 import type {
   CacheResolveResult,
   OpenManifestResult,
@@ -38,7 +38,12 @@ import type {
   PatchMetadataIfHeadResult,
 } from "../../shared/patch-metadata-if-head";
 import { hashChunk } from "../../shared/crypto";
-import { placeChunk } from "../../shared/placement";
+import { placeMultipartChunk } from "../../shared/placement";
+import {
+  VFS_MP_SCOPE,
+  isMultipartPlacementVersion,
+  type MultipartPlacementVersion,
+} from "../../shared/multipart";
 import type {
   PreviewInfo,
   PreviewInfoBatchEntry,
@@ -234,6 +239,10 @@ export interface VFSClient {
    * `chunk` accepts Uint8Array, ArrayBuffer, or Blob; everything
    * else throws synchronously. Caller's responsibility to chunk
    * the source at `handle.chunkSize` boundaries.
+   *
+   * Throws `EACCES` when `handle.sessionToken` is malformed or its
+   * claims disagree with this client's tenant, and `EINVAL` when
+   * `index` falls outside the chunk count the server signed.
    */
   putMultipartChunk(
     handle: MultipartUploadHandle,
@@ -957,6 +966,11 @@ export interface MultipartUploadHandle {
   /**
    * Bearer-style session token. PUT/status calls require it on
    * `X-Session-Token`. Distinct from the API key on `Authorization`.
+   *
+   * Also the sole authority for where a chunk is routed: the server
+   * signs the tenant identity, pool size, chunk count, and placement
+   * version into it, and both the binding and HTTP PUT paths read the
+   * shard from those claims rather than from the fields above.
    */
   sessionToken: string;
   /** Wall-clock millisecond timestamp after which the session is invalid. */
@@ -2161,20 +2175,59 @@ export class VFS implements VFSClient {
     chunk: Uint8Array | ArrayBuffer | Blob,
     _opts?: MultipartRequestOpts
   ): Promise<PutMultipartChunkResult> {
+    // Route from the signed session token, never from the handle. The
+    // handle round-trips through caller memory (and often JSON), so a
+    // mutated `poolSize` would otherwise strand refs on shards outside
+    // the pool that finalize and abort clean up.
+    const scope = this.scope();
+    const claims = decodeMultipartRoutingClaims(handle.sessionToken);
+    if (
+      claims.ns !== scope.ns ||
+      claims.tn !== scope.tenant ||
+      claims.sub !== scope.sub
+    ) {
+      throw multipartAccessError(
+        "multipart session token scope does not match this VFS client"
+      );
+    }
+    if (claims.uploadId !== handle.uploadId) {
+      throw multipartAccessError(
+        "multipart session token uploadId does not match handle.uploadId"
+      );
+    }
+    if (
+      !Number.isSafeInteger(index) ||
+      index < 0 ||
+      index >= claims.totalChunks
+    ) {
+      throw new VFSFsError("EINVAL", {
+        syscall: "putMultipartChunk",
+        message: `EINVAL: multipart chunk index ${index} is out of range [0, ${claims.totalChunks})`,
+      });
+    }
+
     const bytes = await coerceMultipartChunk(chunk);
     const hash = await hashChunk(bytes);
-    const scope = this.scope();
-    const userId = userIdForScope(scope);
-    const shardIndex = placeChunk(userId, handle.uploadId, index, handle.poolSize);
+    const shardIndex = placeMultipartChunk(
+      claims.userId,
+      claims.uploadId,
+      index,
+      claims.poolSize,
+      claims.placementVersion
+    );
     const shardNs = this.env.MOSSAIC_SHARD as DurableObjectNamespace<ShardDO>;
-    const stub = shardNs.get(shardNs.idFromName(vfsShardDOName(scope.ns, scope.tenant, scope.sub, shardIndex)));
+    const stub = shardNs.get(
+      shardNs.idFromName(
+        vfsShardDOName(claims.ns, claims.tn, claims.sub, shardIndex)
+      )
+    );
     try {
       const result = await stub.putChunkMultipart(
         hash,
         bytes,
-        handle.uploadId,
+        claims.uploadId,
         index,
-        userId,
+        claims.userId,
         handle.sessionToken
       );
       return { chunkHash: hash, accepted: true, status: result.status };
@@ -2649,4 +2702,133 @@ async function coerceMultipartChunk(chunk: Uint8Array | ArrayBuffer | Blob): Pro
 
 function userIdForScope(scope: VFSScope): string {
   return scope.sub !== undefined ? `${scope.tenant}::${scope.sub}` : scope.tenant;
+}
+
+/**
+ * The routing dimensions the server signed into a multipart session
+ * token. Binding-mode chunk PUTs address a ShardDO directly, so these
+ * — not the caller's handle — decide which shard a chunk may reach.
+ */
+interface MultipartRoutingClaims {
+  uploadId: string;
+  userId: string;
+  ns: string;
+  tn: string;
+  sub?: string;
+  poolSize: number;
+  placementVersion?: MultipartPlacementVersion;
+  totalChunks: number;
+}
+
+const VFS_SCOPE_TOKEN = /^[A-Za-z0-9._-]{1,128}$/;
+const JWT_SEGMENT = /^[A-Za-z0-9_-]+$/;
+
+/**
+ * Read a session token's routing claims without verifying its HMAC.
+ *
+ * The signature stays authoritative on the ShardDO, which re-verifies
+ * the same token on every PUT and refuses to store anything under a
+ * forged one. Reading the claims here only decides where the client
+ * *sends* the chunk; validating their shape first is what keeps a
+ * malformed or self-inconsistent token from selecting a shard at all.
+ */
+function decodeMultipartRoutingClaims(token: string): MultipartRoutingClaims {
+  // Typed `string`, but handles round-trip through JSON and untyped
+  // JS callers, so a missing token has to surface as EACCES rather
+  // than a TypeError from `.split`.
+  if (typeof token !== "string") {
+    throw multipartAccessError("malformed multipart session token");
+  }
+  const parts = token.split(".");
+  if (
+    parts.length !== 3 ||
+    parts.some((part) => part.length === 0 || !JWT_SEGMENT.test(part))
+  ) {
+    throw multipartAccessError("malformed multipart session token");
+  }
+
+  let raw: Record<string, unknown>;
+  try {
+    const base64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const binary = atob(base64 + "=".repeat((4 - (base64.length % 4)) % 4));
+    const decoded: unknown = JSON.parse(
+      new TextDecoder().decode(
+        Uint8Array.from(binary, (char) => char.charCodeAt(0))
+      )
+    );
+    if (
+      decoded === null ||
+      typeof decoded !== "object" ||
+      Array.isArray(decoded)
+    ) {
+      throw new Error("JWT payload must be an object");
+    }
+    raw = decoded as Record<string, unknown>;
+  } catch {
+    throw multipartAccessError("malformed multipart session token payload");
+  }
+
+  if (raw.userId === undefined || raw.fenceId === undefined) {
+    throw multipartAccessError(
+      "pre-upgrade multipart session token lacks binding routing claims; " +
+        "call beginMultipartUpload(path, { resumeFrom: uploadId, size }) to remint it"
+    );
+  }
+  if (
+    raw.scope !== VFS_MP_SCOPE ||
+    typeof raw.uploadId !== "string" ||
+    raw.uploadId.length === 0 ||
+    typeof raw.fenceId !== "string" ||
+    raw.fenceId.length === 0 ||
+    typeof raw.userId !== "string" ||
+    raw.userId.length === 0 ||
+    typeof raw.ns !== "string" ||
+    !VFS_SCOPE_TOKEN.test(raw.ns) ||
+    typeof raw.tn !== "string" ||
+    !VFS_SCOPE_TOKEN.test(raw.tn) ||
+    (raw.sub !== undefined &&
+      (typeof raw.sub !== "string" || !VFS_SCOPE_TOKEN.test(raw.sub))) ||
+    typeof raw.poolSize !== "number" ||
+    !Number.isSafeInteger(raw.poolSize) ||
+    raw.poolSize < 1 ||
+    (raw.placementVersion !== undefined &&
+      !isMultipartPlacementVersion(raw.placementVersion)) ||
+    typeof raw.totalChunks !== "number" ||
+    !Number.isSafeInteger(raw.totalChunks) ||
+    raw.totalChunks < 0
+  ) {
+    throw multipartAccessError(
+      "invalid multipart session token routing claims"
+    );
+  }
+
+  const sub = raw.sub;
+  const claims: MultipartRoutingClaims = {
+    uploadId: raw.uploadId,
+    userId: raw.userId,
+    ns: raw.ns,
+    tn: raw.tn,
+    ...(sub === undefined ? {} : { sub }),
+    poolSize: raw.poolSize,
+    ...(raw.placementVersion === undefined
+      ? {}
+      : { placementVersion: raw.placementVersion }),
+    totalChunks: raw.totalChunks,
+  };
+  if (
+    claims.userId !==
+    userIdForScope({ ns: claims.ns, tenant: claims.tn, sub: claims.sub })
+  ) {
+    throw multipartAccessError(
+      "multipart session token userId does not match its tenant scope"
+    );
+  }
+  return claims;
+}
+
+function multipartAccessError(message: string): VFSFsError {
+  return new VFSFsError("EACCES", {
+    syscall: "putMultipartChunk",
+    message: `EACCES: ${message}`,
+  });
 }

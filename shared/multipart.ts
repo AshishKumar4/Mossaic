@@ -17,6 +17,25 @@ export const VFS_MP_SCOPE = "vfs-mp" as const;
 /** Sentinel for the cacheable-chunk download HMAC token. */
 export const VFS_DL_SCOPE = "vfs-dl" as const;
 
+/** Placement v1 is the original O(poolSize) rendezvous algorithm. */
+export const MULTIPART_LEGACY_PLACEMENT_VERSION = 1;
+
+/** Placement frozen into every session this server mints. */
+export const MULTIPART_PLACEMENT_VERSION = 2;
+
+export type MultipartPlacementVersion =
+  | typeof MULTIPART_LEGACY_PLACEMENT_VERSION
+  | typeof MULTIPART_PLACEMENT_VERSION;
+
+export function isMultipartPlacementVersion(
+  value: unknown
+): value is MultipartPlacementVersion {
+  return (
+    value === MULTIPART_LEGACY_PLACEMENT_VERSION ||
+    value === MULTIPART_PLACEMENT_VERSION
+  );
+}
+
 /** Default upload-session TTL — 24h. Configurable per `beginUpload` call. */
 export const MULTIPART_DEFAULT_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -51,6 +70,8 @@ export interface MultipartSessionTokenPayload {
   tn: string;
   sub?: string;
   poolSize: number;
+  /** Missing on tokens minted before placement versioning; interpreted as v1. */
+  placementVersion?: MultipartPlacementVersion;
   totalChunks: number;
   chunkSize: number;
   totalSize: number;

@@ -13,6 +13,7 @@ import {
 import { vfsUserDOName } from "@core/lib/utils";
 import {
   MULTIPART_FENCE_GC_GRACE_MS,
+  MULTIPART_LEGACY_PLACEMENT_VERSION,
   MULTIPART_MAX_TTL_MS,
 } from "@shared/multipart";
 
@@ -492,6 +493,78 @@ describe("multipart fence expiry migration", () => {
         await instance.alarm();
         expect(remaining()).toBe(expected);
       }
+    });
+  });
+});
+
+/**
+ * Placement versioning arrived after multipart sessions were already
+ * open on deployed instances. Those sessions staged chunks wherever
+ * rendezvous hashing put them, so the column has to read back as v1 for
+ * every row that predates it — otherwise finalize would look for their
+ * chunks on shards that never received any.
+ */
+describe("upload session placement-version migration", () => {
+  const LEGACY_SESSIONS_DDL = `
+    CREATE TABLE upload_sessions (
+      upload_id            TEXT PRIMARY KEY,
+      user_id              TEXT NOT NULL,
+      parent_id            TEXT,
+      leaf                 TEXT NOT NULL,
+      total_size           INTEGER NOT NULL,
+      total_chunks         INTEGER NOT NULL,
+      chunk_size           INTEGER NOT NULL,
+      pool_size            INTEGER NOT NULL,
+      expires_at           INTEGER NOT NULL,
+      status               TEXT NOT NULL,
+      encryption_mode      TEXT,
+      encryption_key_id    TEXT,
+      metadata_blob        BLOB,
+      tags_json            TEXT,
+      version_label        TEXT,
+      version_user_visible INTEGER,
+      mode                 INTEGER NOT NULL,
+      mime_type            TEXT NOT NULL,
+      created_at           INTEGER NOT NULL
+    )
+  `;
+
+  it("defaults pre-upgrade sessions to legacy rendezvous placement", async () => {
+    const stub = userStub("schema-placement-version");
+
+    const migrated = await runInDurableObject(stub, (instance: UserDO, state) => {
+      const sql = state.storage.sql;
+      const internals = instance as unknown as InitializableDO;
+      sql.exec(LEGACY_SESSIONS_DDL);
+      sql.exec(
+        `INSERT INTO upload_sessions
+           (upload_id, user_id, leaf, total_size, total_chunks, chunk_size,
+            pool_size, expires_at, status, mode, mime_type, created_at)
+         VALUES ('legacy-session', 'tenant-a', 'x.bin', 1, 1, 1, 32, ?, 'open',
+                 420, 'application/octet-stream', ?)`,
+        Date.now() + 60_000,
+        Date.now()
+      );
+
+      internals.ensureInit();
+      return {
+        row: sql
+          .exec(
+            "SELECT placement_version FROM upload_sessions WHERE upload_id = 'legacy-session'"
+          )
+          .toArray()[0],
+        migration: sql
+          .exec(
+            `SELECT name FROM meta_schema
+              WHERE name = 'upload_sessions_add_placement_version'`
+          )
+          .toArray(),
+      };
+    });
+
+    expect(migrated).toEqual({
+      row: { placement_version: MULTIPART_LEGACY_PLACEMENT_VERSION },
+      migration: [{ name: "upload_sessions_add_placement_version" }],
     });
   });
 });

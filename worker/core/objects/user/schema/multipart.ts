@@ -1,3 +1,4 @@
+import { MULTIPART_LEGACY_PLACEMENT_VERSION } from "../../../../../shared/multipart";
 import { applyMigrationOnce } from "../../../lib/migrations";
 
 export function applyUploadSessionsTable(sql: SqlStorage): void {
@@ -64,5 +65,14 @@ export function applyUploadSessionIndexes(sql: SqlStorage): void {
   );
   applyMigrationOnce(sql, "upload_sessions_add_fence_id", () =>
     sql.exec("ALTER TABLE upload_sessions ADD COLUMN fence_id TEXT")
+  );
+  // Sessions that predate placement versioning already staged chunks
+  // where rendezvous hashing put them, so they default to v1 and stay
+  // there for the rest of their life.
+  applyMigrationOnce(sql, "upload_sessions_add_placement_version", () =>
+    sql.exec(
+      `ALTER TABLE upload_sessions ADD COLUMN placement_version INTEGER NOT NULL
+         DEFAULT ${MULTIPART_LEGACY_PLACEMENT_VERSION}`
+    )
   );
 }

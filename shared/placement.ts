@@ -1,4 +1,8 @@
 import { murmurhash3 } from "./hash";
+import {
+  MULTIPART_LEGACY_PLACEMENT_VERSION,
+  MULTIPART_PLACEMENT_VERSION,
+} from "./multipart";
 
 /**
  * Build the score-key template for chunk placement. **This is NOT a
@@ -109,6 +113,118 @@ export function placeChunk(
   }
   // Every shard in the pool is full. Caller triggers pool growth.
   return POOL_FULL;
+}
+
+// ── multipart placement v2 ─────────────────────────────────────────────
+//
+// `placeChunk` scores every shard in the pool, so a chunk PUT costs
+// O(poolSize) hashes and finalize pays that again per verified chunk.
+// Multipart freezes its algorithm per session (see
+// `MULTIPART_PLACEMENT_VERSION`), which lets newer sessions use jump
+// consistent hashing instead: two hashes plus an O(log poolSize)
+// integer loop, and, like rendezvous, growing the pool relocates only
+// the minimum share of keys.
+//
+// Sessions and tokens minted before versioning carry no version and stay
+// on `placeChunk` forever — their chunks are already stored where
+// rendezvous put them.
+
+const UINT64_MASK = (1n << 64n) - 1n;
+const JUMP_HASH_MULTIPLIER = 2_862_933_555_777_941_757n;
+const JUMP_HASH_SCALE = 1n << 31n;
+/** Second Murmur3 seed. Any value distinct from the first works. */
+const MULTIPART_HASH_HIGH_SEED = 0x9747b28c;
+
+/**
+ * Optional counters used by `tests/bench/multipart-placement.bench.ts`
+ * to assert placement work stays constant in the hash and logarithmic
+ * in the pool. Omitted everywhere in production.
+ */
+export interface MultipartPlacementInstrumentation {
+  hash(): void;
+  jumpIteration(): void;
+}
+
+/**
+ * Hash a multipart chunk's placement identity into one 64-bit key.
+ * Takes no pool size: the hashing work is fixed no matter how many
+ * shards the key is later mapped onto.
+ */
+export function multipartPlacementHash(
+  userId: string,
+  fileId: string,
+  chunkIndex: number,
+  instrumentation?: MultipartPlacementInstrumentation
+): bigint {
+  // The rendezvous score input with the per-shard suffix dropped: one
+  // key for the chunk instead of one key per candidate shard. Pinned
+  // forever — changing it orphans every v2-placed chunk.
+  const key = `${fileId}:${chunkIndex}:shard:${userId}`;
+  instrumentation?.hash();
+  const low = murmurhash3(key);
+  instrumentation?.hash();
+  const high = murmurhash3(key, MULTIPART_HASH_HIGH_SEED);
+  return (BigInt(high) << 32n) | BigInt(low);
+}
+
+/**
+ * Lamping–Veach jump consistent hash. Maps a 64-bit key onto
+ * `[0, bucketCount)` in O(log bucketCount) integer steps, moving only
+ * `1/bucketCount'` of keys when the bucket count grows by one — and
+ * moving them only to the new bucket.
+ */
+export function jumpConsistentHash(
+  key: bigint,
+  bucketCount: number,
+  instrumentation?: MultipartPlacementInstrumentation
+): number {
+  if (!Number.isSafeInteger(bucketCount) || bucketCount < 1) {
+    throw new RangeError("bucketCount must be a positive safe integer");
+  }
+  let state = key & UINT64_MASK;
+  let bucket = -1n;
+  let next = 0n;
+  const buckets = BigInt(bucketCount);
+  while (next < buckets) {
+    instrumentation?.jumpIteration();
+    bucket = next;
+    state = (state * JUMP_HASH_MULTIPLIER + 1n) & UINT64_MASK;
+    next = ((bucket + 1n) * JUMP_HASH_SCALE) / ((state >> 33n) + 1n);
+  }
+  return Number(bucket);
+}
+
+/**
+ * Determine which shard index holds a multipart chunk under the
+ * algorithm frozen into its session and session token.
+ *
+ * `placementVersion` is `undefined` for sessions and tokens minted
+ * before versioning; those keep the original rendezvous result, which
+ * is where their chunks already live. An unrecognised version is a
+ * caller bug — placement must never silently guess.
+ */
+export function placeMultipartChunk(
+  userId: string,
+  fileId: string,
+  chunkIndex: number,
+  poolSize: number,
+  placementVersion?: number
+): number {
+  if (
+    placementVersion === undefined ||
+    placementVersion === MULTIPART_LEGACY_PLACEMENT_VERSION
+  ) {
+    return placeChunk(userId, fileId, chunkIndex, poolSize);
+  }
+  if (placementVersion !== MULTIPART_PLACEMENT_VERSION) {
+    throw new RangeError(
+      `unsupported multipart placement version ${placementVersion}`
+    );
+  }
+  return jumpConsistentHash(
+    multipartPlacementHash(userId, fileId, chunkIndex),
+    poolSize
+  );
 }
 
 /**

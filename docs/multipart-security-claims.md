@@ -102,6 +102,39 @@ The encryption metadata is propagated through
 re-stamped onto `files` / `file_versions` at finalize, mirroring the
 `vfsWriteFile` path's stamping at commit time.
 
+## Claim 5 — Placement-version consistency
+
+**Statement:** Every chunk in one multipart session is routed and
+verified with the same placement algorithm and the same pool size, and
+no caller can move a chunk onto a shard outside that session's pool.
+New sessions use jump consistent hash, whose hash work does not grow
+with the pool; sessions and tokens created before placement versioning
+retain the exact rendezvous result.
+
+**Argument:** `pool_size` and `placement_version` are persisted on
+`upload_sessions` and copied into the signed `vfs-mp` token. The HTTP
+chunk PUT and the binding SDK read those signed claims rather than the
+caller's handle; resume remints from the persisted row; finalize reads
+the row directly. All four paths call `placeMultipartChunk` from
+`shared/placement.ts`. Editing either claim invalidates the HMAC, and
+`verifyVFSMultipartToken` rejects a signed-but-unsupported version, so a
+tampered token selects a shard that then refuses to store anything. A
+missing claim resolves to v1 and the schema migration defaults existing
+rows to v1. Finalize additionally refuses to publish a manifest whose
+chunks are not on the shards placement says own them, or whose index is
+staged on more than one shard.
+
+**Why not formalised in Lean:** the multipart model does not model hash
+functions, JWT claims, schema migration, or cross-runtime placement
+parity. Golden vectors, distribution and pool-growth tests,
+HTTP-versus-binding parity, tamper tests, the migration test, and the
+placement benchmark cover the executable boundary.
+
+**Implementation:** `shared/placement.ts` (`placeMultipartChunk`),
+`worker/core/lib/auth.ts` (the `placementVersion` claim), and
+`worker/core/objects/user/multipart-upload.ts`
+(`planMultipartPlacement` / `collectVerifiedManifest`).
+
 ## What IS formalised in Lean
 
 `Mossaic.Vfs.Multipart` includes these relevant abstract-model theorems:

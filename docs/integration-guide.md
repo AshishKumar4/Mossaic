@@ -533,7 +533,31 @@ The same `includeContentHash: true` knob exists on `listFiles` since both surfac
 
 ---
 
-## 10. Wire schema conventions
+## 10. Multipart placement compatibility
+
+A multipart session freezes both its shard-pool size and its placement
+algorithm at begin: `upload_sessions.placement_version` persists them and the
+signed `vfs-mp` session token carries them as claims. The HTTP chunk PUT, the
+binding-mode `putMultipartChunk`, resume, and finalize all resolve a chunk's
+shard from those signed claims through the same `placeMultipartChunk`
+implementation in `shared/placement.ts`.
+
+Treat `MultipartUploadHandle.poolSize` and `expectedChunks` as informational.
+They round-trip through caller memory, so the SDK ignores them for routing and
+throws `EACCES` on a session token whose claims are malformed or disagree with
+their own tenant scope. Rewriting a claim invalidates the token's signature,
+and the ShardDO re-verifies it on every PUT.
+
+Placement version 2 hashes the `(userId, uploadId, chunkIndex)` identity once
+and maps it onto the pool with jump consistent hashing, so per-chunk hash work
+no longer scales with the shard pool. Version 1 is the original rendezvous
+implementation: sessions that predate versioning migrate to it, tokens without
+a `placementVersion` claim are read as it, and resuming a session keeps its
+persisted version rather than upgrading placement under already-staged chunks.
+
+---
+
+## 11. Wire schema conventions
 
 Runtime boundary DTOs are schema-first. For public request, response, token, and JSON config shapes, define the Zod schema and infer the TypeScript type from it:
 
@@ -562,7 +586,7 @@ Object strictness is a domain decision: prefer `.strict()` for new request paylo
 
 ---
 
-## 11. Operations checklist for a deploy
+## 12. Operations checklist for a deploy
 
 1. `pnpm typecheck` &mdash; exit 0.
 2. `pnpm ci:check` &mdash; chained typecheck + DTS-strict SDK build + no-Phase-tag lint gate; exit 0.

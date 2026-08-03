@@ -305,6 +305,7 @@ import {
   MULTIPART_DEFAULT_TTL_MS,
   MULTIPART_MAX_TTL_MS,
   DOWNLOAD_TOKEN_DEFAULT_TTL_MS,
+  isMultipartPlacementVersion,
   type MultipartSessionTokenPayload,
   type DownloadTokenPayload,
 } from "../../../shared/multipart";
@@ -314,10 +315,10 @@ import {
  * the resulting token is presented on every subsequent chunk PUT to
  * authorise it without a UserDO round-trip.
  *
- * `poolSize` is the snapshotted-at-begin pool size; freezing it in
- * the token guarantees `placeChunk(uid, uploadId, idx, poolSize)`
- * stays stable across the session even if the tenant's pool grows
- * between begin and finalize.
+ * `poolSize` and `placementVersion` are snapshotted at begin. Freezing
+ * both guarantees `placeMultipartChunk` returns the same shard for a
+ * chunk across the whole session even if the tenant's pool grows, or
+ * the server's current placement algorithm changes, in between.
  */
 export async function signVFSMultipartToken(
   env: Env,
@@ -336,6 +337,9 @@ export async function signVFSMultipartToken(
     chunkSize: payload.chunkSize,
     totalSize: payload.totalSize,
   };
+  if (payload.placementVersion !== undefined) {
+    claims.placementVersion = payload.placementVersion;
+  }
   if (payload.fenceId !== undefined) claims.fenceId = payload.fenceId;
   if (payload.userId !== undefined) claims.userId = payload.userId;
   if (payload.sub !== undefined) claims.sub = payload.sub;
@@ -372,6 +376,14 @@ export async function verifyVFSMultipartToken(
       typeof payload.poolSize !== "number" ||
       !Number.isInteger(payload.poolSize) ||
       payload.poolSize < 1
+    )
+      return null;
+    // Absent means the pre-versioning algorithm; a present-but-unknown
+    // version must never be coerced into one, or a token minted by a
+    // future server would silently route to the wrong shards.
+    if (
+      payload.placementVersion !== undefined &&
+      !isMultipartPlacementVersion(payload.placementVersion)
     )
       return null;
     if (
@@ -415,6 +427,9 @@ export async function verifyVFSMultipartToken(
       tn: payload.tn,
       sub,
       poolSize: payload.poolSize,
+      ...(payload.placementVersion === undefined
+        ? {}
+        : { placementVersion: payload.placementVersion }),
       totalChunks: payload.totalChunks,
       chunkSize: payload.chunkSize,
       totalSize: payload.totalSize,

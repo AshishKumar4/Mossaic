@@ -52,7 +52,7 @@ import {
   type DownloadTokenResponse,
 } from "../../../shared/multipart";
 import { hashChunk } from "../../../shared/crypto";
-import { placeChunk } from "../../../shared/placement";
+import { placeMultipartChunk } from "../../../shared/placement";
 import { userIdFor } from "../objects/user/vfs/helpers";
 import { edgeCacheLookup, edgeCachePut } from "../lib/edge-cache";
 
@@ -308,6 +308,21 @@ mp.put("/:uploadId/chunk/:idx", async (c) => {
         403
       );
     }
+    // Placement identity comes from the token, not from the bearer.
+    // Requiring the two to agree also retires session tokens minted
+    // before the identity was signed — those cannot be routed, and
+    // ShardDO would reject them anyway.
+    const userId = userIdFor(c.var.scope);
+    if (payload.userId !== userId) {
+      return c.json(
+        {
+          code: "EACCES",
+          message:
+            "session token carries no matching tenant identity; re-open the upload to remint it",
+        },
+        403
+      );
+    }
     // Token's `exp` is in seconds (jose convention). Convert + check.
     if (payload.exp * 1000 < Date.now()) {
       return c.json(
@@ -374,20 +389,21 @@ mp.put("/:uploadId/chunk/:idx", async (c) => {
     }
 
     const hash = await hashChunk(bytes);
-    const userId = userIdFor(c.var.scope);
-    // Multipart placement is intentionally pure-rendezvous (no
-    // `fullShards` skip-set). The per-chunk PUT here and
-    // `vfsFinalizeMultipart`'s touched-shard fan-out
-    // (multipart-upload.ts:573-587) MUST use the SAME placement
-    // decision; the `fullShards` set at finalize time may differ
-    // from the set at upload time, and the server has no reliable
-    // way to replay the upload-time snapshot. The signed
-    // `payload.poolSize` is server-authoritative (HMAC at begin) so
-    // adversarial clients can't tamper. Multipart cap-awareness is
-    // deferred until we persist a per-session full-shards snapshot.
-    // Reads work either way; only the write "prefer less-full
-    // shards" optimization is missing here.
-    const sIdx = placeChunk(userId, uploadId, idx, payload.poolSize);
+    // Every routing dimension is a signed claim, so the pool the chunk
+    // can reach is fixed at begin and this PUT resolves to the same
+    // shard `vfsFinalizeMultipart` will verify it on. Multipart
+    // placement is intentionally pure-rendezvous/jump (no `fullShards`
+    // skip-set): the full set at finalize time may differ from the set
+    // at upload time and the server cannot replay the upload-time
+    // snapshot. Reads work either way; only the write "prefer
+    // less-full shards" optimization is missing here.
+    const sIdx = placeMultipartChunk(
+      userId,
+      uploadId,
+      idx,
+      payload.poolSize,
+      payload.placementVersion
+    );
     const stub = shardStub(c.env, c.var.scope, sIdx);
     let putResult;
     try {

@@ -8,7 +8,8 @@ import { describe, expect, it } from "vitest";
 import { vfsShardDOName, vfsUserDOName } from "@core/lib/utils";
 import type { ShardDO } from "@core/objects/shard/shard-do";
 import { hashChunk } from "@shared/crypto";
-import { placeChunk } from "@shared/placement";
+import { MULTIPART_PLACEMENT_VERSION } from "@shared/multipart";
+import { placeChunk, placeMultipartChunk } from "@shared/placement";
 import { createVFS, type MossaicEnv, type UserDO } from "../../sdk/src/index";
 import type {
   DeleteChunksFailurePhase,
@@ -493,11 +494,12 @@ describe("stale version publication", () => {
       chunkSize: payload.byteLength,
     });
     const put = await vfs.putMultipartChunk(handle, 0, payload);
-    const shardIndex = placeChunk(
+    const shardIndex = placeMultipartChunk(
       tenant,
       handle.uploadId,
       0,
-      handle.poolSize
+      handle.poolSize,
+      MULTIPART_PLACEMENT_VERSION
     );
     const shard = shardStub(tenant, shardIndex);
     await shard.testConfigureMultipartManifestBlock(handle.uploadId);

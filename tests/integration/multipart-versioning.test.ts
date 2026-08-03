@@ -34,7 +34,8 @@ import { hashChunk } from "@shared/crypto";
 import { vfsShardDOName, vfsUserDOName } from "@core/lib/utils";
 import type { UserDO } from "@app/objects/user/user-do";
 import type { ShardDO } from "@core/objects/shard/shard-do";
-import { placeChunk } from "@shared/placement";
+import { MULTIPART_PLACEMENT_VERSION } from "@shared/multipart";
+import { placeMultipartChunk } from "@shared/placement";
 
 interface E {
   MOSSAIC_USER: DurableObjectNamespace<UserDO>;
@@ -354,7 +355,15 @@ describe("multipart × versioning — Phase 27 correct semantics (MV1, MV3)", ()
 
     const touched = new Set<number>();
     for (let index = 0; index < begin.totalChunks; index++) {
-      touched.add(placeChunk(tenant, begin.uploadId, index, begin.poolSize));
+      touched.add(
+        placeMultipartChunk(
+          tenant,
+          begin.uploadId,
+          index,
+          begin.poolSize,
+          MULTIPART_PLACEMENT_VERSION
+        )
+      );
     }
     const remainingRefs = await Promise.all(
       Array.from(touched, async (shardIndex) => {

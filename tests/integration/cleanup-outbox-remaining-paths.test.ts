@@ -9,7 +9,8 @@ import { vfsShardDOName, vfsUserDOName } from "@core/lib/utils";
 import type { ShardDO } from "@core/objects/shard/shard-do";
 import type { UserDO } from "@app/objects/user/user-do";
 import { hashChunk } from "@shared/crypto";
-import { placeChunk } from "@shared/placement";
+import { MULTIPART_PLACEMENT_VERSION } from "@shared/multipart";
+import { placeMultipartChunk } from "@shared/placement";
 import type {
   ClearMultipartStagingFailurePhase,
   DeleteManyChunksFailurePhase,
@@ -94,7 +95,13 @@ async function seedMultipart(
     size: data.byteLength,
     chunkSize: data.byteLength,
   });
-  const shardIndex = placeChunk(tenant, begin.uploadId, 0, begin.poolSize);
+  const shardIndex = placeMultipartChunk(
+    tenant,
+    begin.uploadId,
+    0,
+    begin.poolSize,
+    MULTIPART_PLACEMENT_VERSION
+  );
   const shard = shardStub(tenant, shardIndex);
   await shard.putChunkMultipart(
     await hashChunk(data),
@@ -420,7 +427,13 @@ describe("multipart cleanup outbox", () => {
       size: data.byteLength,
       chunkSize: data.byteLength,
     });
-    const shardIndex = placeChunk(tenant, begin.uploadId, 0, begin.poolSize);
+    const shardIndex = placeMultipartChunk(
+      tenant,
+      begin.uploadId,
+      0,
+      begin.poolSize,
+      MULTIPART_PLACEMENT_VERSION
+    );
     const shard = shardStub(tenant, shardIndex);
     await shard.testConfigurePutChunkBlock();
     const put = shard.putChunkMultipart(

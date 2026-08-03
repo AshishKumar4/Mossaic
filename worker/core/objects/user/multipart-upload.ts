@@ -35,15 +35,17 @@ import {
 import { computeChunkSpec } from "../../../../shared/chunking";
 import { generateId, vfsShardDOName } from "../../lib/utils";
 import { logError } from "../../lib/logger";
-import { placeChunk } from "../../../../shared/placement";
+import { placeMultipartChunk } from "../../../../shared/placement";
 import {
   signVFSMultipartToken,
 } from "../../lib/auth";
 import {
   MULTIPART_DEFAULT_TTL_MS,
   MULTIPART_MAX_OPEN_SESSIONS_PER_TENANT,
+  MULTIPART_PLACEMENT_VERSION,
   type MultipartBeginResponse,
   type MultipartFinalizeResponse,
+  type MultipartPlacementVersion,
   type ShardMultipartManifestRow,
 } from "../../../../shared/multipart";
 import {
@@ -111,6 +113,7 @@ interface UploadSessionRow {
   total_chunks: number;
   chunk_size: number;
   pool_size: number;
+  placement_version: MultipartPlacementVersion;
   expires_at: number;
   status: string;
   encryption_mode: string | null;
@@ -310,9 +313,9 @@ export async function vfsBeginMultipart(
     opts.tags !== undefined ? JSON.stringify([...opts.tags]) : null;
   durableObject.sql.exec(
     `INSERT INTO upload_sessions
-       (upload_id, fence_id, user_id, parent_id, leaf, total_size, total_chunks, chunk_size, pool_size, expires_at, status,
+       (upload_id, fence_id, user_id, parent_id, leaf, total_size, total_chunks, chunk_size, pool_size, placement_version, expires_at, status,
          encryption_mode, encryption_key_id, metadata_blob, tags_json, version_label, version_user_visible, mode, mime_type, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     tmpId,
     fenceId,
     userId,
@@ -322,6 +325,7 @@ export async function vfsBeginMultipart(
     finalTotalChunks,
     finalChunkSize,
     poolSize,
+    MULTIPART_PLACEMENT_VERSION,
     expiresAt,
     incomingEncryption?.mode ?? null,
     incomingEncryption?.keyId ?? null,
@@ -349,6 +353,7 @@ export async function vfsBeginMultipart(
       tn: scope.tenant,
       sub: scope.sub,
       poolSize,
+      placementVersion: MULTIPART_PLACEMENT_VERSION,
       totalChunks: finalTotalChunks,
       chunkSize: finalChunkSize,
       totalSize: opts.size,
@@ -458,6 +463,9 @@ async function resumeMultipart(
       tn: scope.tenant,
       sub: scope.sub,
       poolSize: row.pool_size,
+      // Re-freeze the session's own algorithm. A resumed session must
+      // keep addressing the shards its already-landed chunks are on.
+      placementVersion: row.placement_version,
       totalChunks: row.total_chunks,
       chunkSize: row.chunk_size,
       totalSize: row.total_size,
@@ -603,6 +611,153 @@ export async function vfsAbortMultipart(
   return { ok: true };
 }
 
+interface MultipartPlacementPlan {
+  /** Deterministic owner shard of each chunk index, in index order. */
+  readonly idxToShard: readonly number[];
+  /** The distinct shards in `idxToShard`. */
+  readonly touched: ReadonlySet<number>;
+}
+
+/**
+ * Replay the session's frozen placement over its whole chunk range.
+ * Every chunk PUT resolved its shard from the same inputs signed into
+ * the session token, so this is the only shard set finalize will read
+ * from — and the only one it will accept a chunk from.
+ */
+function planMultipartPlacement(
+  userId: string,
+  uploadId: string,
+  session: UploadSessionRow
+): MultipartPlacementPlan {
+  const touched = new Set<number>();
+  const idxToShard = new Array<number>(session.total_chunks);
+  for (let i = 0; i < session.total_chunks; i++) {
+    const shardIndex = placeMultipartChunk(
+      userId,
+      uploadId,
+      i,
+      session.pool_size,
+      session.placement_version
+    );
+    idxToShard[i] = shardIndex;
+    touched.add(shardIndex);
+  }
+  return { idxToShard, touched };
+}
+
+interface StagedChunk {
+  row: ShardMultipartManifestRow;
+  /** Shard that reported the row, which must be the chunk's owner. */
+  shard: number;
+}
+
+/**
+ * Fan out to the planned shards and return the staged manifest in
+ * chunk-index order, or throw.
+ *
+ * Rejects, besides a missing chunk or a hash the client did not
+ * declare:
+ *  - a chunk staged on a shard other than its deterministic owner, and
+ *  - an index staged on more than one shard.
+ * Both mean bytes reached a shard some other way than this session's
+ * placement, so the manifest no longer describes one reconstructable
+ * file and must not be published.
+ *
+ * A shard that fails to answer raises `EBUSY` — the caller retries
+ * rather than treating an unreachable shard as a verdict on the data.
+ */
+async function collectVerifiedManifest(
+  durableObject: UserDO,
+  scope: VFSScope,
+  uploadId: string,
+  plan: MultipartPlacementPlan,
+  chunkHashList: readonly string[]
+): Promise<ShardMultipartManifestRow[]> {
+  const ns = shardNs(durableObject);
+  const collectErrors: unknown[] = [];
+  // Shard-ordered so every diagnostic below reads the same on a replay,
+  // independent of which shard answered first.
+  const pages = await Promise.all(
+    Array.from(plan.touched)
+      .sort((a, b) => a - b)
+      .map(async (shardIndex) => {
+        const shardName = vfsShardDOName(
+          scope.ns,
+          scope.tenant,
+          scope.sub,
+          shardIndex
+        );
+        const stub = ns.get(ns.idFromName(shardName));
+        try {
+          const res = await stub.getMultipartManifest(uploadId);
+          return { shardIndex, rows: res.rows };
+        } catch (err) {
+          collectErrors.push(err);
+          return { shardIndex, rows: [] as ShardMultipartManifestRow[] };
+        }
+      })
+  );
+  if (collectErrors.length > 0) {
+    // Surface as EBUSY: a transient shard failure during the finalize
+    // fan-out is a "try again" signal.
+    throw new VFSError(
+      "EBUSY",
+      `finalizeMultipart: shard manifest collect failed on ${collectErrors.length} shard(s); first error: ${
+        (collectErrors[0] as Error)?.message ?? String(collectErrors[0])
+      }`
+    );
+  }
+
+  const staged = new Map<number, StagedChunk>();
+  const duplicates: string[] = [];
+  for (const page of pages) {
+    for (const row of page.rows) {
+      const prior = staged.get(row.idx);
+      if (prior !== undefined) {
+        duplicates.push(
+          `chunk ${row.idx} staged on shards ${prior.shard} and ${page.shardIndex}`
+        );
+        continue;
+      }
+      staged.set(row.idx, { row, shard: page.shardIndex });
+    }
+  }
+  if (duplicates.length > 0) {
+    throw new VFSError(
+      "EBADF",
+      `finalizeMultipart: ${duplicates.length} duplicate chunk index(es); first: ${duplicates[0]}`
+    );
+  }
+  const byIndex = Array.from(staged.entries()).sort(([a], [b]) => a - b);
+  for (const [idx, entry] of byIndex) {
+    if (plan.idxToShard[idx] !== entry.shard) {
+      throw new VFSError(
+        "EBADF",
+        `finalizeMultipart: chunk ${idx} staged on shard ${entry.shard}; expected ${plan.idxToShard[idx]}`
+      );
+    }
+  }
+
+  const manifestRows: ShardMultipartManifestRow[] = [];
+  for (let i = 0; i < plan.idxToShard.length; i++) {
+    const have = staged.get(i)?.row;
+    if (!have) {
+      throw new VFSError(
+        "ENOENT",
+        `finalizeMultipart: chunk ${i} not landed (shard ${plan.idxToShard[i]})`
+      );
+    }
+    if (have.hash !== chunkHashList[i]) {
+      throw new VFSError(
+        "EBADF",
+        `finalizeMultipart: chunk ${i} hash divergence (server=${have.hash}, client=${chunkHashList[i]})`
+      );
+    }
+    manifestRows.push(have);
+  }
+  return manifestRows;
+}
+
 /**
  * Finalize a multipart upload. ONE UserDO turn; one fan-out per
  * unique touched shard for manifest verification + a second fan-out
@@ -710,74 +865,31 @@ export async function vfsFinalizeMultipart(
     }
   };
 
-  // 3. Compute touched shards.
+  // 3. Compute the deterministic owner shard of every chunk index.
   //
   // Multipart placement intentionally does NOT pass `fullShards`
-  // to `placeChunk`. The route layer (`multipart-routes.ts`)
-  // places each chunk PUT via the same
-  // `placeChunk(uploadId, idx, payload.poolSize)` call without a
-  // skip-set; the `fullShards` set at finalize time may differ
-  // from the set at upload time, and we have no reliable way to
-  // replay the upload-time snapshot here. The deterministic
-  // pure-rendezvous form keeps finalize verification consistent
-  // with placement. Multipart cap-awareness is deferred until we
-  // persist the per-session full-shards snapshot. Reads work
-  // either way; only the write "prefer less-full shards"
-  // optimization is missing for multipart.
-  const touched = new Set<number>();
-  const idxToShard = new Array<number>(session.total_chunks);
-  for (let i = 0; i < session.total_chunks; i++) {
-    const sIdx = placeChunk(userIdFor(scope), uploadId, i, session.pool_size);
-    idxToShard[i] = sIdx;
-    touched.add(sIdx);
-  }
+  // to `placeChunk`. The route layer (`multipart-routes.ts`) and the
+  // binding SDK place each chunk PUT via the same
+  // `placeMultipartChunk(userId, uploadId, idx, poolSize, version)`
+  // call without a skip-set; the `fullShards` set at finalize time
+  // may differ from the set at upload time, and we have no reliable
+  // way to replay the upload-time snapshot here. The deterministic
+  // form keeps finalize verification consistent with placement.
+  // Multipart cap-awareness is deferred until we persist the
+  // per-session full-shards snapshot. Reads work either way; only
+  // the write "prefer less-full shards" optimization is missing for
+  // multipart.
+  const plan = planMultipartPlacement(userId, uploadId, session);
+  const { touched, idxToShard } = plan;
 
-  // 4. Fan out manifest collect across touched shards.
-  const ns = shardNs(durableObject);
-  const collected = new Map<number, ShardMultipartManifestRow>();
-  const collectErrors: unknown[] = [];
-  await Promise.all(
-    Array.from(touched).map(async (sIdx) => {
-      const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, sIdx);
-      const stub = ns.get(ns.idFromName(shardName));
-      try {
-        const res = await stub.getMultipartManifest(uploadId);
-        for (const r of res.rows) collected.set(r.idx, r);
-      } catch (err) {
-        collectErrors.push(err);
-      }
-    })
+  // 4. Collect and verify the staged manifest.
+  let manifestRows = await collectVerifiedManifest(
+    durableObject,
+    scope,
+    uploadId,
+    plan,
+    chunkHashList
   );
-  if (collectErrors.length > 0) {
-    // Surface as EBUSY: a transient shard failure during the finalize
-    // fan-out is a "try again" signal — the session is still 'open'
-    // and the caller can retry finalize after backoff.
-    throw new VFSError(
-      "EBUSY",
-      `finalizeMultipart: shard manifest collect failed on ${collectErrors.length} shard(s); first error: ${
-        (collectErrors[0] as Error)?.message ?? String(collectErrors[0])
-      }`
-    );
-  }
-
-  // 5. Cross-check: every idx must exist with matching hash.
-  const manifestRows: ShardMultipartManifestRow[] = [];
-  for (let i = 0; i < session.total_chunks; i++) {
-    const have = collected.get(i);
-    if (!have) {
-      throw new VFSError(
-        "ENOENT",
-        `finalizeMultipart: chunk ${i} not landed (shard ${idxToShard[i]})`
-      );
-    }
-    if (have.hash !== chunkHashList[i]) {
-      throw new VFSError(
-        "EBADF",
-        `finalizeMultipart: chunk ${i} hash divergence (server=${have.hash}, client=${chunkHashList[i]})`
-      );
-    }
-    manifestRows.push(have);
-  }
 
   if (session.status === "open") {
     transactionSync(durableObject, () => {
@@ -803,37 +915,23 @@ export async function vfsFinalizeMultipart(
 
   // Re-read after every shard acknowledges the fence. PUTs that completed
   // before their shard fenced are included; later PUTs are rejected.
-  collected.clear();
-  collectErrors.length = 0;
-  await Promise.all(
-    Array.from(touched).map(async (sIdx) => {
-      const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, sIdx);
-      const stub = ns.get(ns.idFromName(shardName));
-      try {
-        const res = await stub.getMultipartManifest(uploadId);
-        for (const row of res.rows) collected.set(row.idx, row);
-      } catch (err) {
-        collectErrors.push(err);
-      }
-    })
-  );
-  if (collectErrors.length > 0) {
-    throw new VFSError(
-      "EBUSY",
-      `finalizeMultipart: post-fence manifest collect failed on ${collectErrors.length} shard(s)`
+  try {
+    manifestRows = await collectVerifiedManifest(
+      durableObject,
+      scope,
+      uploadId,
+      plan,
+      chunkHashList
     );
-  }
-  manifestRows.length = 0;
-  for (let i = 0; i < session.total_chunks; i++) {
-    const have = collected.get(i);
-    if (!have || have.hash !== chunkHashList[i]) {
+  } catch (err) {
+    // EBUSY means a shard did not answer: retryable, so the session
+    // stays finalizing. Any other verdict is about bytes that are
+    // already staged and cannot heal on retry, and the session is past
+    // the point where the caller can abort it itself.
+    if (err instanceof VFSError && err.code !== "EBUSY") {
       await vfsAbortMultipart(durableObject, scope, uploadId, true);
-      throw new VFSError(
-        have ? "EBADF" : "ENOENT",
-        `finalizeMultipart: post-fence chunk ${i} is missing or changed`
-      );
     }
-    manifestRows.push(have);
+    throw err;
   }
 
   // 6. Compute file hash + total size from the collected sizes (which
