@@ -55,15 +55,47 @@ export {
   type PutMultipartChunkResult,
   type FinalizeMultipartUploadResult,
   type AbortMultipartUploadResult,
+  // Bounded completion surface — the checkpointable methods a caller drives
+  // when a completion method refuses work past the shared request budget.
+  type VFSBoundedOperationsClient,
+  type BoundedAbortMultipartUploadResult,
+  type BoundedFinalizeMultipartUploadResult,
+  type DropVersionsOptions,
+  type DropVersionsStepOptions,
+  type MultipartOperationOpts,
+  type MultipartRequestOpts,
+  type MultipartStatusOpts,
+  type MultipartStatusPageOpts,
+  type MultipartUploadStatus,
+  type MultipartUploadStatusPage,
+  type PendingMultipartOperation,
+  type ResumeMultipartUploadOpts,
+  type ResumeMultipartUploadResult,
 } from "./vfs";
 
 // Bounded version retention — the operation handle callers thread through
-// startDropVersions / stepDropVersions, and the budget dropVersions spends.
+// startDropVersions / stepDropVersions.
 export {
-  DROP_VERSIONS_STEP_BUDGET,
   type DropVersionsOperation,
   type DropVersionsProgress,
 } from "./version-retention";
+
+// The request budget every default completion method shares, and the progress
+// they report per request spent.
+export {
+  DEFAULT_COMPLETION_REQUEST_BUDGET,
+  type BoundedOperationProgress,
+} from "./bounded-operation";
+
+// Durable checkpoints a `CompletionBudgetExceededError` carries.
+export type {
+  MultipartAbortOperation,
+  MultipartFinalizeOperation,
+} from "./multipart-protocol";
+export type {
+  MultipartResumeCheckpoint,
+  MultipartStatusCheckpoint,
+} from "./multipart-client";
 
 // cap constants — surfaced for client-side pre-validation
 // + so consumers know the limits without reading the README.
@@ -94,6 +126,9 @@ export {
   EBADF,
   ENOTSUP,
   MossaicUnavailableError,
+  // EFBIG raised when a completion method reaches its request budget; carries
+  // the checkpoint that resumes whatever the refused pass had already done.
+  CompletionBudgetExceededError,
   isLikelyUnavailable,
   type VFSErrorCode,
 } from "./errors";
@@ -202,10 +237,13 @@ export {
   parallelDownload,
   parallelDownloadStream,
   beginUpload,
+  beginUploadPage,
   putChunk,
   finalizeUpload,
   abortUpload,
   statusUpload,
+  statusUploadPage,
+  TRANSFER_OPERATION_REQUEST_BUDGET,
   deriveClientChunkSpec,
   THROUGHPUT_MATH,
   type BeginUploadOpts,

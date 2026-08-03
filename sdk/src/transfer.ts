@@ -27,6 +27,20 @@
 
 import type { HttpVFS } from "./http";
 import { EINVAL, mapServerError, MossaicUnavailableError } from "./errors";
+import {
+  completionBudgetExceeded,
+  DEFAULT_COMPLETION_REQUEST_BUDGET,
+  RequestBudget,
+  type BoundedOperationProgress,
+} from "./bounded-operation";
+import {
+  collectMultipartStatusPages,
+  driveMultipartAbort,
+  driveMultipartFinalize,
+  usesPagedMultipartProtocol,
+  type MultipartAbortOperation,
+  type MultipartFinalizeOperation,
+} from "./multipart-protocol";
 
 /**
  * Public client alias. The transfer engine is a method
@@ -39,8 +53,12 @@ import type {
   MultipartBeginResponse,
   MultipartFinalizeResponse,
   MultipartPutChunkResponse,
-  MultipartStatusResponse,
+  MultipartStatusPageResponse,
   DownloadTokenResponse,
+} from "@shared/multipart";
+import {
+  MULTIPART_ONE_REQUEST_FINALIZE_MAX_PAGES,
+  MULTIPART_PROTOCOL_VERSION,
 } from "@shared/multipart";
 import { hashChunk } from "@shared/crypto";
 import { computeChunkSpec } from "@shared/chunking";
@@ -83,6 +101,8 @@ export interface ParallelUploadOpts extends Omit<BeginUploadOpts, "size" | "sign
   onChunkEvent?: (e: ChunkEvent) => void;
   /** Cancel the in-flight upload. Triggers `abortUpload` on the server. */
   signal?: AbortSignal;
+  /** Called once per bounded request the finalize or abort spends. */
+  onOperationProgress?: (progress: BoundedOperationProgress) => void;
   /**
    * Optional per-chunk transformer. encryption uses this to
    * seal each plaintext chunk into an envelope BEFORE the engine
@@ -181,11 +201,46 @@ export interface ParallelDownloadOpts {
 // ── Raw protocol ───────────────────────────────────────────────────────
 
 /**
- * Mint a multipart upload session. One round-trip; caller then
- * spawns parallel `putChunk` calls bounded by their own concurrency
- * budget (typically 32–64) and finalises with `finalizeUpload`.
+ * Requests one raw-protocol call may spend driving a bounded operation.
+ *
+ * The transfer engine is the layer whose job is to *finish* an operation
+ * rather than to fit inside one Worker invocation, so its ceiling is the one
+ * the server applies to its own multi-page work: generous enough for a
+ * hundred-thousand-chunk upload, finite so a server that never reports `done`
+ * cannot spin here. Reaching it raises `CompletionBudgetExceededError`
+ * carrying the operation, so the caller resumes rather than restarts.
  */
-export async function beginUpload(
+export const TRANSFER_OPERATION_REQUEST_BUDGET =
+  MULTIPART_ONE_REQUEST_FINALIZE_MAX_PAGES;
+
+/** Bounded passes one raw-protocol call makes, each spending its own budget. */
+const TRANSFER_OPERATION_PASSES = Math.ceil(
+  TRANSFER_OPERATION_REQUEST_BUDGET / DEFAULT_COMPLETION_REQUEST_BUDGET
+);
+
+interface OperationOpts {
+  signal?: AbortSignal;
+  onProgress?: (progress: BoundedOperationProgress) => void;
+}
+
+function operationBudget(
+  operation: BoundedOperationProgress["operation"],
+  opts: OperationOpts,
+  limit = DEFAULT_COMPLETION_REQUEST_BUDGET
+): RequestBudget {
+  return new RequestBudget(operation, limit, opts);
+}
+
+/**
+ * Mint a multipart upload session, reading one bounded page of what has
+ * already landed on it.
+ *
+ * The paged control plane is declared here, so the server accepts uploads too
+ * large for a one-request finalize and hands back the version it agreed to.
+ * A session whose landed set spans more than one page carries a
+ * `continuation`; `beginUpload` follows those, this does not.
+ */
+export async function beginUploadPage(
   client: MossaicHttpClient,
   path: string,
   opts: BeginUploadOpts
@@ -193,6 +248,7 @@ export async function beginUpload(
   const body: MultipartBeginRequest = {
     path,
     size: opts.size,
+    protocolVersion: MULTIPART_PROTOCOL_VERSION,
     ...(opts.chunkSize !== undefined ? { chunkSize: opts.chunkSize } : {}),
     ...(opts.mode !== undefined ? { mode: opts.mode } : {}),
     ...(opts.mimeType !== undefined ? { mimeType: opts.mimeType } : {}),
@@ -208,6 +264,37 @@ export async function beginUpload(
   } catch (err) {
     throw mapServerError(err, { path, syscall: "open" });
   }
+}
+
+/**
+ * Mint or resume a session and read its complete landed set.
+ *
+ * Following the continuations is what makes a resumed upload skip only the
+ * chunks that really landed: a caller handed the first page alone would
+ * re-PUT everything the later pages knew about.
+ */
+export async function beginUpload(
+  client: MossaicHttpClient,
+  path: string,
+  opts: BeginUploadOpts
+): Promise<BeginUploadResult> {
+  const first = await beginUploadPage(client, path, opts);
+  if (first.continuation === undefined) return first;
+  const status = await followStatusPages(
+    client,
+    first,
+    {
+      landed: first.landed,
+      total: first.totalChunks,
+      bytesUploaded: 0,
+      expiresAtMs: first.expiresAtMs,
+      continuation: first.continuation,
+    },
+    { ...(opts.signal === undefined ? {} : { signal: opts.signal }) },
+    path
+  );
+  const { continuation: _read, ...session } = first;
+  return { ...session, landed: status.landed };
 }
 
 /** PUT a single chunk by index. Idempotent under same (uploadId, idx, hash). */
@@ -227,45 +314,200 @@ export async function putChunk(
   );
 }
 
-/** Atomic commit. */
+/**
+ * Commit, driving the bounded finalize to completion.
+ *
+ * One request while the server can verify the whole manifest in one; otherwise
+ * the manifest is staged in pages and the durable machine is advanced a page
+ * at a time. The operation handle is carried across passes, so a manifest
+ * larger than one pass can stage costs more requests rather than a second
+ * attempt at the pages already done.
+ */
 export async function finalizeUpload(
   client: MossaicHttpClient,
   session: BeginUploadResult,
   chunkHashList: readonly string[],
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onProgress?: (progress: BoundedOperationProgress) => void
 ): Promise<MultipartFinalizeResponse> {
+  const opts: OperationOpts = {
+    ...(signal === undefined ? {} : { signal }),
+    ...(onProgress === undefined ? {} : { onProgress }),
+  };
   try {
-    return await client.multipartFinalize(session.uploadId, chunkHashList, signal);
-  } catch (err) {
-    throw mapServerError(err, {
-      syscall: "open",
+    if (!usesPagedMultipartProtocol(session.protocolVersion)) {
+      return await client.multipartFinalize(
+        session.uploadId,
+        chunkHashList,
+        signal
+      );
+    }
+    let operation: MultipartFinalizeOperation | undefined;
+    for (let pass = 0; pass < TRANSFER_OPERATION_PASSES; pass++) {
+      const result = await driveMultipartFinalize(
+        {
+          uploadId: session.uploadId,
+          chunkHashList,
+          ...(operation === undefined ? {} : { operation }),
+          stageHashes: (startIndex, hashes) =>
+            client.multipartStageHashes(
+              session.uploadId,
+              startIndex,
+              hashes,
+              signal
+            ),
+          finalizeStep: () =>
+            client.multipartFinalizeStep(session.uploadId, signal),
+        },
+        operationBudget("finalize", opts)
+      );
+      if (result.done) return result.result;
+      operation = result.state;
+    }
+    throw completionBudgetExceeded<MultipartFinalizeOperation>({
+      syscall: "finalizeUpload",
+      requestBudget: TRANSFER_OPERATION_REQUEST_BUDGET,
+      boundedApis: "finalizeUpload() again with the same session",
+      checkpoint: operation,
     });
+  } catch (err) {
+    if (signal?.aborted) throw err;
+    throw mapServerError(err, { syscall: "open" });
   }
 }
 
-/** Drop the session — releases chunks via the existing GC. */
+/**
+ * Drop the session, driving the bounded abort to completion.
+ *
+ * Chunks are released by the existing GC; what this waits for is the session
+ * becoming terminal, which is the only state in which nothing is still pinned
+ * on its behalf.
+ */
 export async function abortUpload(
   client: MossaicHttpClient,
   session: BeginUploadResult,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onProgress?: (progress: BoundedOperationProgress) => void
 ): Promise<{ ok: true }> {
+  const opts: OperationOpts = {
+    ...(signal === undefined ? {} : { signal }),
+    ...(onProgress === undefined ? {} : { onProgress }),
+  };
   try {
-    return await client.multipartAbort(session.uploadId, signal);
+    if (!usesPagedMultipartProtocol(session.protocolVersion)) {
+      return await client.multipartAbort(session.uploadId, signal);
+    }
+    let operation: MultipartAbortOperation | undefined;
+    for (let pass = 0; pass < TRANSFER_OPERATION_PASSES; pass++) {
+      const result = await driveMultipartAbort(
+        {
+          uploadId: session.uploadId,
+          ...(operation === undefined ? {} : { operation }),
+          abortStep: () => client.multipartAbortStep(session.uploadId, signal),
+        },
+        operationBudget("abort", opts)
+      );
+      if (result.done) return result.result;
+      operation = result.state;
+    }
+    throw completionBudgetExceeded<MultipartAbortOperation>({
+      syscall: "abortUpload",
+      requestBudget: TRANSFER_OPERATION_REQUEST_BUDGET,
+      boundedApis: "abortUpload() again with the same session",
+      checkpoint: operation,
+    });
+  } catch (err) {
+    if (signal?.aborted) throw err;
+    throw mapServerError(err, { syscall: "open" });
+  }
+}
+
+/** Read one bounded page of landed[] for resume / progress. */
+export async function statusUploadPage(
+  client: MossaicHttpClient,
+  session: BeginUploadResult,
+  continuation?: string,
+  signal?: AbortSignal
+): Promise<MultipartStatusPageResponse> {
+  try {
+    return await client.multipartStatus(
+      session.uploadId,
+      session.sessionToken,
+      continuation,
+      signal
+    );
   } catch (err) {
     throw mapServerError(err, { syscall: "open" });
   }
 }
 
-/** Read landed[] for resume / progress. */
+/**
+ * Read the complete landed[] for resume / progress.
+ *
+ * Every continuation is followed, so the returned set is what an unbounded
+ * scan would have reported — the difference being that this one is paid for a
+ * page at a time and has a ceiling.
+ */
 export async function statusUpload(
   client: MossaicHttpClient,
-  session: BeginUploadResult
-): Promise<MultipartStatusResponse> {
+  session: BeginUploadResult,
+  continuation?: string,
+  signal?: AbortSignal,
+  onProgress?: (progress: BoundedOperationProgress) => void
+): Promise<MultipartStatusPageResponse> {
+  const first = await statusUploadPage(
+    client,
+    session,
+    continuation,
+    signal
+  );
+  return await followStatusPages(client, session, first, {
+    ...(signal === undefined ? {} : { signal }),
+    ...(onProgress === undefined ? {} : { onProgress }),
+  });
+}
+
+/**
+ * Follow status continuations to the end of the landed set.
+ *
+ * The ceiling is the transfer engine's, not one Worker invocation's, and
+ * reaching it surfaces the continuation still unread rather than a set that
+ * silently stops short.
+ */
+async function followStatusPages(
+  client: MossaicHttpClient,
+  session: BeginUploadResult,
+  first: MultipartStatusPageResponse,
+  opts: OperationOpts,
+  path?: string
+): Promise<MultipartStatusPageResponse> {
+  let complete: MultipartStatusPageResponse;
   try {
-    return await client.multipartStatus(session.uploadId, session.sessionToken);
+    complete = await collectMultipartStatusPages(
+      first,
+      (next) =>
+        client.multipartStatus(
+          session.uploadId,
+          session.sessionToken,
+          next,
+          opts.signal
+        ),
+      operationBudget("status", opts, TRANSFER_OPERATION_REQUEST_BUDGET)
+    );
   } catch (err) {
-    throw mapServerError(err, { syscall: "open" });
+    if (opts.signal?.aborted) throw err;
+    throw mapServerError(err, { ...(path === undefined ? {} : { path }), syscall: "open" });
   }
+  if (complete.continuation !== undefined) {
+    throw completionBudgetExceeded<string>({
+      syscall: "statusUpload",
+      requestBudget: TRANSFER_OPERATION_REQUEST_BUDGET,
+      boundedApis: "statusUploadPage() with the returned continuation",
+      ...(path === undefined ? {} : { path }),
+      checkpoint: complete.continuation,
+    });
+  }
+  return complete;
 }
 
 // ── Adaptive engine ────────────────────────────────────────────────────
@@ -625,7 +867,13 @@ export async function parallelUpload(
 
   if (totalChunks === 0) {
     // Empty file. Finalize immediately with an empty hash list.
-    const f = await finalizeUpload(client, session, [], opts.signal);
+    const f = await finalizeUpload(
+      client,
+      session,
+      [],
+      opts.signal,
+      opts.onOperationProgress
+    );
     return {
       fileId: f.fileId,
       size: f.size,
@@ -896,7 +1144,7 @@ export async function parallelUpload(
   } catch (err) {
     // Best-effort abort on the server so chunks aren't pinned.
     try {
-      await abortUpload(client, session);
+      await abortUpload(client, session, undefined, opts.onOperationProgress);
     } catch {
       // ignore
     }
@@ -905,7 +1153,13 @@ export async function parallelUpload(
 
   // Finalize. The server cross-checks our hash list against shard
   // staging — any divergence throws EBADF.
-  const f = await finalizeUpload(client, session, chunkHashList, opts.signal);
+  const f = await finalizeUpload(
+    client,
+    session,
+    chunkHashList,
+    opts.signal,
+    opts.onOperationProgress
+  );
   if (f.size !== bytesAccepted) {
     throw new EINVAL({ syscall: "parallelUpload", path });
   }

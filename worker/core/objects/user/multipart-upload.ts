@@ -69,11 +69,15 @@ import {
   MULTIPART_FENCE_PAGE_SIZE,
   MULTIPART_HASH_PAGE_SIZE,
   MULTIPART_MAX_OPEN_SESSIONS_PER_TENANT,
+  MULTIPART_ONE_REQUEST_ABORT_MAX_PAGES,
+  MULTIPART_ONE_REQUEST_FINALIZE_MAX_FANOUT,
+  MULTIPART_ONE_REQUEST_FINALIZE_MAX_PAGES,
   MULTIPART_PLACEMENT_VERSION,
   MULTIPART_PROTOCOL_VERSION,
   MULTIPART_STATUS_CURSOR_MAX_BYTES,
   MULTIPART_STATUS_ENTRY_PAGE_SIZE,
   MULTIPART_STATUS_SHARD_PAGE_SIZE,
+  multipartFinalizeFanout,
   type MultipartAbortProgress,
   type MultipartBeginResponse,
   type MultipartFinalizeProgress,
@@ -490,40 +494,6 @@ export async function vfsBeginMultipart(
       ? { protocolVersion: MULTIPART_PROTOCOL_VERSION }
       : {}),
   };
-}
-
-/**
- * Shard round-trips one one-request finalize may spend.
- *
- * Fencing and verification are the only phases that leave the object, and a
- * Durable Object invocation may issue on the order of a thousand subrequests.
- * Half of that is what a caller who only knows the one-request finalize may
- * commit to at begin; the rest stays for the cleanup drain publication
- * triggers. An upload past this ceiling is refused before a single chunk is
- * accepted rather than after every one of them has been.
- */
-const MULTIPART_ONE_REQUEST_FINALIZE_MAX_FANOUT = 500;
-
-/**
- * Bounded pages one one-request finalize may run before it asks the caller to
- * call again. Begin bounds the pages an upload of its own needs; this also
- * bounds the routing scan over a file the upload displaces, whose size the
- * upload itself says nothing about. Every page it did run is durable, so the
- * next call resumes from the cursor instead of restarting.
- */
-const MULTIPART_ONE_REQUEST_FINALIZE_MAX_PAGES = 512;
-
-/** Shard round-trips finalizing this shape costs, fencing through publication. */
-function multipartFinalizeFanout(
-  totalChunks: number,
-  poolSize: number
-): number {
-  const chunkPages = Math.ceil(totalChunks / MULTIPART_HASH_PAGE_SIZE);
-  // Fencing walks the whole pool once, and every chunk page walks the shards
-  // its own indices are placed on — at most one page's worth of them.
-  return (
-    poolSize + chunkPages * Math.min(poolSize, MULTIPART_HASH_PAGE_SIZE)
-  );
 }
 
 /**
@@ -2890,17 +2860,6 @@ const MULTIPART_ABORT_OPERATION: PagedOperationTable<MultipartAbortPhase> = {
  * temporary row is still occupying the path.
  */
 const MULTIPART_ABORT_RESUME_DELAY_MS = 1_000;
-
-/**
- * Pages one one-request abort may run before it hands the rest to the alarm.
- *
- * Only two phases leave the object — fencing walks the pool, and the terminal
- * page drains one bounded batch of the cleanup it staged — so the ceiling here
- * is about the local pages: a session with a hundred thousand verified chunks
- * owes four hundred of them. Every page it does run is durable, so the next
- * call resumes from the cursor.
- */
-const MULTIPART_ONE_REQUEST_ABORT_MAX_PAGES = 512;
 
 /**
  * Abort a multipart upload in one request.

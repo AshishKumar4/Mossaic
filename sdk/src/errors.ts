@@ -127,8 +127,35 @@ export class ENOTDIR extends VFSFsError {
   }
 }
 export class EFBIG extends VFSFsError {
-  constructor(opts: { syscall?: string; path?: string } = {}) {
+  constructor(
+    opts: { syscall?: string; path?: string; message?: string } = {}
+  ) {
     super("EFBIG", opts);
+  }
+}
+
+/**
+ * `EFBIG` raised when a completion method reaches its request budget.
+ *
+ * `checkpoint` is present exactly when the refusal came after work the server
+ * made durable — the operation handle or continuation that resumes it. A
+ * refusal raised before anything was mutated carries none, because there is
+ * nothing to resume: the caller starts the bounded pair named in the message.
+ */
+export class CompletionBudgetExceededError<
+  Checkpoint = never,
+> extends EFBIG {
+  readonly checkpoint?: Checkpoint;
+
+  constructor(opts: {
+    syscall: string;
+    path?: string;
+    message: string;
+    checkpoint?: Checkpoint;
+  }) {
+    super(opts);
+    this.name = "CompletionBudgetExceededError";
+    if (opts.checkpoint !== undefined) this.checkpoint = opts.checkpoint;
   }
 }
 export class ELOOP extends VFSFsError {

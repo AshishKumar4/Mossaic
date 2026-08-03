@@ -8,7 +8,7 @@ The single source of truth for Mossaic's external surface. README and `sdk/READM
 
 ## 1. Library mode (the supported path)
 
-The consumer's Worker re-exports Mossaic's two Durable Object classes from `@mossaic/sdk` and uses `createVFS(env, opts)` for every request. One DO RPC subrequest per VFS call regardless of internal chunk fan-out.
+The consumer's Worker re-exports Mossaic's two Durable Object classes from `@mossaic/sdk` and uses `createVFS(env, opts)` for every request. One DO RPC subrequest per single-step VFS call regardless of internal chunk fan-out; the five completion methods are bounded by a documented request ceiling instead (§11).
 
 ### 1.1 `wrangler.jsonc` shape
 
@@ -557,7 +557,67 @@ persisted version rather than upgrading placement under already-staged chunks.
 
 ---
 
-## 11. Wire schema conventions
+## 11. Bounded completion methods and their request cost
+
+Most VFS methods are one request: one typed DO RPC in library mode, one route
+in HTTP mode, whatever the internal fan-out. Five are not, because the work
+behind them is proportional to a manifest or a version history rather than to
+one row, and the server does that work as a sequence of durable pages:
+`finalizeMultipartUpload`, `abortMultipartUpload`, `getMultipartUploadStatus`,
+`resumeMultipartUpload` and `dropVersions`.
+
+Those five share one ceiling, exported as
+`DEFAULT_COMPLETION_REQUEST_BUDGET` (16), and follow one policy:
+
+1. **One request while one server invocation can finish the work.** Each side
+   computes that from the same arithmetic in `shared/multipart.ts`, so a
+   session inside the server's own fanout ceiling costs a single finalize
+   request and a history inside its own bound costs a single retention call.
+2. **Bounded pages otherwise**, at most the shared budget in total. The
+   manifest is staged 256 hashes per request and the machine advances one page
+   per request; a landed set is read one page per request.
+3. **Refusal before mutation** when the work is knowably past the budget from
+   the server-issued handle: `CompletionBudgetExceededError` (code `EFBIG`)
+   naming the bounded pair to drive instead, with nothing staged, fenced or
+   re-minted.
+4. **Refusal with a checkpoint** when the budget is reached anyway — the case
+   nothing in the session predicted, such as a publication displacing a
+   manifest of unknown length. The same error carries `checkpoint`: the
+   durable operation handle, or the continuation still unread. Every page that
+   completed is committed server-side, so resuming continues rather than
+   restarts.
+
+The checkpointable surface is `VFSBoundedOperationsClient`, implemented by both
+clients and kept off `VFSClient` so existing structural implementations of that
+interface stay valid:
+
+| Method | Requests | Returns |
+|---|---|---|
+| `getMultipartUploadStatusPage` | exactly 1 | one page, `continuation` while more remain |
+| `resumeMultipartUploadPage` | exactly 1 | re-minted handle + one page |
+| `startFinalizeMultipartUpload` / `stepFinalizeMultipartUpload` | ≤ budget | the result, or `{ operation }` |
+| `startAbortMultipartUpload` / `stepAbortMultipartUpload` | ≤ budget | the result, or `{ operation }` |
+| `startDropVersions` / `stepDropVersions` | 1 | progress, terminal or not |
+
+The completion methods keep their original completed-result shapes — they never
+return a pending union — so existing callers are unaffected until they hit work
+past the budget, which they previously could not do at all.
+
+Following a continuation is never optional. `getMultipartUploadStatus` and
+`resumeMultipartUpload` either return the complete landed set or refuse with
+what is still unread: a truncated set would have a resumed upload re-PUT every
+chunk the unread pages knew about. The transfer engine's `beginUpload` and
+`statusUpload` do the same paging with the engine's own larger ceiling, since
+their job is to finish rather than to fit inside one Worker invocation.
+
+Every response the SDK reads is validated before it is trusted — page sizes,
+landed indices against the session's chunk count, totals holding steady across
+pages, and continuations that do not loop. A server that answers outside the
+protocol raises `MossaicUnavailableError` rather than being followed.
+
+---
+
+## 12. Wire schema conventions
 
 Runtime boundary DTOs are schema-first. For public request, response, token, and JSON config shapes, define the Zod schema and infer the TypeScript type from it:
 
@@ -586,7 +646,7 @@ Object strictness is a domain decision: prefer `.strict()` for new request paylo
 
 ---
 
-## 12. Operations checklist for a deploy
+## 13. Operations checklist for a deploy
 
 1. `pnpm typecheck` &mdash; exit 0.
 2. `pnpm ci:check` &mdash; chained typecheck + DTS-strict SDK build + no-Phase-tag lint gate; exit 0.

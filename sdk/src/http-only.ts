@@ -47,6 +47,7 @@ export {
   EBADF,
   ENOTSUP,
   MossaicUnavailableError,
+  CompletionBudgetExceededError,
   isLikelyUnavailable,
   type VFSErrorCode,
 } from "./errors";
@@ -102,13 +103,41 @@ export type {
   PutMultipartChunkResult,
   FinalizeMultipartUploadResult,
   AbortMultipartUploadResult,
+  // Bounded completion surface — same shape as `@mossaic/sdk`.
+  VFSBoundedOperationsClient,
+  BoundedAbortMultipartUploadResult,
+  BoundedFinalizeMultipartUploadResult,
+  DropVersionsOptions,
+  DropVersionsStepOptions,
+  MultipartOperationOpts,
+  MultipartRequestOpts,
+  MultipartStatusOpts,
+  MultipartStatusPageOpts,
+  MultipartUploadStatus,
+  MultipartUploadStatusPage,
+  PendingMultipartOperation,
+  ResumeMultipartUploadOpts,
+  ResumeMultipartUploadResult,
 } from "./vfs";
 
 export {
-  DROP_VERSIONS_STEP_BUDGET,
   type DropVersionsOperation,
   type DropVersionsProgress,
 } from "./version-retention";
+
+export {
+  DEFAULT_COMPLETION_REQUEST_BUDGET,
+  type BoundedOperationProgress,
+} from "./bounded-operation";
+
+export type {
+  MultipartAbortOperation,
+  MultipartFinalizeOperation,
+} from "./multipart-protocol";
+export type {
+  MultipartResumeCheckpoint,
+  MultipartStatusCheckpoint,
+} from "./multipart-client";
 
 // cap constants — surfaced for client-side pre-validation.
 export {
@@ -135,10 +164,13 @@ export {
   parallelDownload,
   parallelDownloadStream,
   beginUpload,
+  beginUploadPage,
   putChunk,
   finalizeUpload,
   abortUpload,
   statusUpload,
+  statusUploadPage,
+  TRANSFER_OPERATION_REQUEST_BUDGET,
   deriveClientChunkSpec,
   THROUGHPUT_MATH,
   type BeginUploadOpts,

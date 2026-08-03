@@ -31,6 +31,7 @@ describe("SDK surface parity — `@mossaic/sdk` vs `@mossaic/sdk/http`", () => {
       "EBADF",
       "ENOTSUP",
       "MossaicUnavailableError",
+      "CompletionBudgetExceededError",
     ] as const;
     for (const name of errorClassNames) {
       expect(name in sdk, `${name} missing from @mossaic/sdk`).toBe(true);
@@ -55,12 +56,24 @@ describe("SDK surface parity — `@mossaic/sdk` vs `@mossaic/sdk/http`", () => {
     expect(sdk.parallelDownload).toBe(sdkHttp.parallelDownload);
     expect(sdk.parallelDownloadStream).toBe(sdkHttp.parallelDownloadStream);
     expect(sdk.beginUpload).toBe(sdkHttp.beginUpload);
+    expect(sdk.beginUploadPage).toBe(sdkHttp.beginUploadPage);
     expect(sdk.putChunk).toBe(sdkHttp.putChunk);
     expect(sdk.finalizeUpload).toBe(sdkHttp.finalizeUpload);
     expect(sdk.abortUpload).toBe(sdkHttp.abortUpload);
     expect(sdk.statusUpload).toBe(sdkHttp.statusUpload);
+    expect(sdk.statusUploadPage).toBe(sdkHttp.statusUploadPage);
+    expect(sdk.TRANSFER_OPERATION_REQUEST_BUDGET).toBe(
+      sdkHttp.TRANSFER_OPERATION_REQUEST_BUDGET
+    );
     expect(sdk.deriveClientChunkSpec).toBe(sdkHttp.deriveClientChunkSpec);
     expect(sdk.THROUGHPUT_MATH).toBe(sdkHttp.THROUGHPUT_MATH);
+  });
+
+  it("bounded completion — the shared request budget is one value", () => {
+    expect(sdk.DEFAULT_COMPLETION_REQUEST_BUDGET).toBe(
+      sdkHttp.DEFAULT_COMPLETION_REQUEST_BUDGET
+    );
+    expect(sdk.DEFAULT_COMPLETION_REQUEST_BUDGET).toBe(16);
   });
 
   it("constants — VFS_MODE_YJS_BIT, AIMDController, hashChunk match", () => {

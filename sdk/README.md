@@ -429,9 +429,58 @@ console.log(`uploaded ${result.size} bytes to ${result.path}`);
 - **Custom upload schedulers**: feed handle.chunkSize-sized buffers from a producer queue with non-default concurrency policy.
 - **Out-of-band chunk validation**: PUT a chunk, validate its `chunkHash` against your own SHA-256, queue retries on mismatch.
 
-`abortMultipartUpload` is idempotent — aborting an already-finalized or already-aborted session returns `{aborted: false}` rather than throwing.
+`abortMultipartUpload` is idempotent — aborting an already-finalized session returns `{aborted: false}` rather than throwing, and aborting an already-aborted one is a no-op that reports the same terminal outcome.
 
 Both SDK clients support these methods: `createMossaicHttpClient(...)` routes through the public multipart HTTP endpoints, while binding-mode `createVFS(env, opts)` exposes the same surface for Workers with Mossaic bindings.
+
+#### Request cost, and what happens past it
+
+Finalize, abort, status, resume and retention are durable server-side machines that advance a bounded page per call, so the convenience methods above drive them under one shared ceiling:
+
+```ts
+import { DEFAULT_COMPLETION_REQUEST_BUDGET } from "@mossaic/sdk/http"; // 16
+```
+
+- A session one server invocation can finalize costs **one** finalize request. That is the common case, and it is what the server's own fanout ceiling decides.
+- A session past that ceiling is finalized in pages — the manifest staged 256 hashes at a time, then the machine stepped — for at most `DEFAULT_COMPLETION_REQUEST_BUDGET` requests in total.
+- Work knowably past the budget is refused **before anything is staged**, with a `CompletionBudgetExceededError` (code `EFBIG`) naming the bounded pair to drive instead.
+- Work that reaches the budget anyway — a publication displacing a manifest whose length nothing in the session predicted — throws the same error with `err.checkpoint` set to the durable operation. Every page that ran is committed server-side, so stepping with that checkpoint continues rather than restarts.
+
+The checkpointable surface is `VFSBoundedOperationsClient`, which both clients implement:
+
+```ts
+import type { VFSBoundedOperationsClient } from "@mossaic/sdk/http";
+
+const bounded = client as VFSBoundedOperationsClient;
+
+let outcome = await bounded.startFinalizeMultipartUpload(handle, hashes);
+while ("operation" in outcome) {
+  // Each call spends at most the shared budget and hands back where it got to.
+  outcome = await bounded.stepFinalizeMultipartUpload(handle, hashes, outcome.operation);
+}
+console.log(`uploaded ${outcome.size} bytes to ${outcome.path}`);
+```
+
+The same shape exists for abort (`startAbortMultipartUpload` / `stepAbortMultipartUpload`) and retention (`startDropVersions` / `stepDropVersions`).
+
+#### Reading what has landed
+
+`getMultipartUploadStatus(handle)` and `resumeMultipartUpload(handle)` return the **complete** landed set, following the server's continuations within the shared budget. A landed set spread over more pages than that is refused with the continuation still unread attached, rather than silently truncated — a truncated set would have a resumed upload re-PUT every chunk the unread pages knew about.
+
+For sets that large, page explicitly:
+
+```ts
+const first = await bounded.resumeMultipartUploadPage(handle);
+const landed = new Set(first.landed);
+let continuation = first.continuation;
+while (continuation !== undefined) {
+  const page = await bounded.getMultipartUploadStatusPage(first.handle, { continuation });
+  for (const index of page.landed) landed.add(index);
+  continuation = page.continuation;
+}
+```
+
+Every `*Page` method is exactly one request. The transfer engine's `beginUpload` / `statusUpload` do this paging for you and have no per-invocation ceiling to respect; `beginUploadPage` / `statusUploadPage` are their single-request forms.
 
 ---
 
@@ -686,6 +735,18 @@ await vfs.dropVersions("/notes.md", {});
 ```
 
 Returns `{ dropped, kept }`. Chunks whose last reference was dropped become eligible for the alarm sweeper after its 30s grace.
+
+Retention is a bounded operation, so `dropVersions` follows the same request policy as the multipart completion methods: one request for a history one server invocation can finish, then bounded steps up to `DEFAULT_COMPLETION_REQUEST_BUDGET`, then a `CompletionBudgetExceededError` carrying the operation. A history deep enough to reach that ceiling is finished by driving the pair directly:
+
+```ts
+let progress = await vfs.startDropVersions("/notes.md", { keepLast: 5 });
+while (!progress.done) {
+  // The same operation id all the way through — the server continues one walk
+  // of the history rather than starting a second pass.
+  progress = await vfs.stepDropVersions("/notes.md", { keepLast: 5 }, progress.operation);
+}
+console.log(progress.dropped, progress.kept);
+```
 
 ### Cross-version dedup
 
@@ -1082,7 +1143,7 @@ The compaction snapshot captures whatever the live `Y.Doc` holds at the moment o
 
 ## Subrequest model
 
-> **Each VFS method = exactly 1 outbound DO RPC subrequest in the consumer's Worker invocation, regardless of internal chunk fan-out.**
+> **Every single-step VFS method = exactly 1 outbound DO RPC subrequest in the consumer's Worker invocation, regardless of internal chunk fan-out. The five completion methods are bounded by a documented ceiling instead of a single request.**
 
 Cloudflare Workers cap subrequests per invocation at 50 (free) / 10,000 (paid). A `readFile` of a 100-chunk file would otherwise burn 100 subrequests in the consumer's budget. With Mossaic's typed-DO-RPC architecture:
 
@@ -1094,8 +1155,16 @@ Cloudflare Workers cap subrequests per invocation at 50 (free) / 10,000 (paid). 
 | `vfs.writeFile(N-chunk payload)` | 1 | N (to ShardDOs) |
 | `vfs.readManyStat(10k paths)` | 1 | 0 |
 | `vfs.unlink(file)` | 1 | U (one per touched shard) |
+| `vfs.beginMultipartUpload` / `putMultipartChunk` | 1 | 1 (one ShardDO; UserDO untouched on PUT) |
+| `getMultipartUploadStatusPage` / `resumeMultipartUploadPage` | 1 | ≤64 shards, ≤256 entries |
+| `finalizeMultipartUpload` / `abortMultipartUpload` | 1 while one invocation can finish it, else ≤16 | one bounded page per request |
+| `getMultipartUploadStatus` / `resumeMultipartUpload` | ≤16 (one per landed page) | ≤64 shards per page |
+| `dropVersions` | 1 while one invocation can finish it, else ≤16 | ≤128 versions per step |
+| `start*` / `step*` (finalize, abort, retention) | ≤16 per call, checkpointable | one bounded page per request |
 
 The internal fan-out is billed against Mossaic's per-DO-invocation budget (10,000 paid). Consumer Workers stay well under their own cap. This is the load-bearing efficiency property of the as-Library architecture, pinned by `tests/integration/consumer-fixture.test.ts`.
+
+The completion methods are the exception, and deliberately so: the work behind them is proportional to a manifest or a history rather than to one row, so it is done as a sequence of durable pages. `DEFAULT_COMPLETION_REQUEST_BUDGET` (16) is the ceiling all five share, work past it is refused rather than attempted, and the `start*` / `step*` pair is how a caller spends more than one invocation's worth. See [Request cost, and what happens past it](#request-cost-and-what-happens-past-it).
 
 ---
 
@@ -1219,7 +1288,7 @@ Mossaic ships **horizontally-parallel chunked `fs/promises` with content-address
 - Per-chunk SHA-256 dedup *within a tenant* (identical bytes stored once).
 - A Node `fs/promises` surface that works with any tool that already speaks it (tar, zip, image processing, isomorphic-git).
 - Per-tenant isolation guarantees (separate DO instance per tenant; cross-tenant dedup impossible by construction).
-- One outbound DO RPC per VFS call regardless of internal chunk fan-out — the consumer's per-invocation subrequest budget is preserved.
+- One outbound DO RPC per single-step VFS call regardless of internal chunk fan-out, and a documented ceiling on the five completion methods — the consumer's per-invocation subrequest budget stays predictable either way.
 
 ### How they compose
 

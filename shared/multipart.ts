@@ -64,6 +64,117 @@ export const MULTIPART_STATUS_ENTRY_PAGE_SIZE = 256;
  */
 export const MULTIPART_STATUS_CURSOR_MAX_BYTES = 4 * 1024;
 
+// ── Bounded-operation arithmetic ───────────────────────────────────────
+//
+// Both sides of the protocol need the same answer to "how much work does
+// this shape cost". The server refuses at begin what one request cannot
+// finish; the client picks between the one-request form and the paged
+// control plane from the dimensions the server already handed it, without
+// spending a round-trip to discover the answer. One definition, so the two
+// can never disagree about where the boundary is.
+
+/** Shard round-trips finalizing this shape costs, fencing through publication. */
+export function multipartFinalizeFanout(
+  totalChunks: number,
+  poolSize: number
+): number {
+  const chunkPages = Math.ceil(totalChunks / MULTIPART_HASH_PAGE_SIZE);
+  // Fencing walks the whole pool once, and every chunk page walks the shards
+  // its own indices are placed on — at most one page's worth of them.
+  return poolSize + chunkPages * Math.min(poolSize, MULTIPART_HASH_PAGE_SIZE);
+}
+
+/**
+ * Shard round-trips one `finalize` invocation may spend.
+ *
+ * Half of the per-invocation subrequest budget is what a caller who only
+ * knows the one-request finalize may commit to at begin; the rest stays for
+ * the cleanup drain publication triggers.
+ */
+export const MULTIPART_ONE_REQUEST_FINALIZE_MAX_FANOUT = 500;
+
+/**
+ * Bounded pages one one-request finalize may run before it asks the caller to
+ * call again. Begin bounds the pages an upload of its own needs; this also
+ * bounds the routing scan over a file the upload displaces, whose size the
+ * upload itself says nothing about. Every page it did run is durable, so the
+ * next call resumes from the cursor instead of restarting.
+ */
+export const MULTIPART_ONE_REQUEST_FINALIZE_MAX_PAGES = 512;
+
+/**
+ * Pages one one-request abort may run before it hands the rest to the alarm.
+ *
+ * Only two phases leave the object — fencing walks the pool, and the terminal
+ * page drains one bounded batch of the cleanup it staged — so the ceiling here
+ * is about the local pages, which is why it can be this generous.
+ */
+export const MULTIPART_ONE_REQUEST_ABORT_MAX_PAGES = 512;
+
+/**
+ * Bounded requests driving a fresh finalize costs: one per staged hash page,
+ * then one per page of the machine — fencing the pool, verifying each chunk
+ * page against the shards holding it, publishing, and reaping the scratch the
+ * publication leaves.
+ *
+ * A publication that displaces an existing file owes further pages over *that*
+ * file's manifest, whose length this upload's dimensions say nothing about, so
+ * this is the cost of the fresh path rather than of every path.
+ */
+export function multipartFinalizeRequestCount(
+  chunkCount: number,
+  poolSize: number
+): number {
+  const fencePages = Math.ceil(poolSize / MULTIPART_FENCE_PAGE_SIZE);
+  const hashPages = Math.ceil(chunkCount / MULTIPART_HASH_PAGE_SIZE);
+  // An empty upload still costs the page that observes it has nothing to
+  // verify, and the publication after it.
+  if (hashPages === 0) return fencePages + 2;
+  const verifyPagesPerChunkPage = Math.ceil(
+    Math.min(chunkCount, poolSize, MULTIPART_HASH_PAGE_SIZE) /
+      MULTIPART_FENCE_PAGE_SIZE
+  );
+  return (
+    hashPages +
+    fencePages +
+    hashPages * Math.max(1, verifyPagesPerChunkPage) +
+    1 +
+    hashPages
+  );
+}
+
+/**
+ * Bounded pages an abort of this shape owes: fencing and staging intents walk
+ * the pool, dropping what a finalize staged walks the manifest, discarding its
+ * routing walks the pool again, and one page makes the session terminal.
+ */
+export function multipartAbortPageCount(
+  totalChunks: number,
+  poolSize: number
+): number {
+  const poolPages = Math.ceil(poolSize / MULTIPART_FENCE_PAGE_SIZE);
+  const cleanupPages = Math.max(
+    1,
+    Math.ceil(totalChunks / MULTIPART_HASH_PAGE_SIZE)
+  );
+  return poolPages * 3 + cleanupPages + 1;
+}
+
+/**
+ * Bounded status pages a session owes. Every page ends either because it
+ * filled its entry budget or because it exhausted a page of the pool, so the
+ * two limits bound the walk together.
+ */
+export function multipartStatusPageCount(
+  totalChunks: number,
+  poolSize: number
+): number {
+  return (
+    Math.floor(totalChunks / MULTIPART_STATUS_ENTRY_PAGE_SIZE) +
+    Math.ceil(poolSize / MULTIPART_STATUS_SHARD_PAGE_SIZE)
+  );
+}
+
 /** Default upload-session TTL — 24h. Configurable per `beginUpload` call. */
 export const MULTIPART_DEFAULT_TTL_MS = 24 * 60 * 60 * 1000;
 

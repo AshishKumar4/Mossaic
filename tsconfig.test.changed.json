@@ -23,6 +23,7 @@
 		"tests/integration/overwrite-cleanup-failures.test.ts",
 		"tests/integration/refcount.test.ts",
 		"tests/integration/schema-migrations.test.ts",
+		"tests/integration/sdk-bounded-completion.test.ts",
 		"tests/integration/sdk-multipart-manual.test.ts",
 		"tests/integration/streaming.test.ts",
 		"tests/integration/tombstone-consistency.test.ts",
@@ -31,6 +32,8 @@
 		"tests/integration/vfs-state-machine.test.ts",
 		"tests/unit/incremental-sha256.test.ts",
 		"tests/unit/multipart-placement.test.ts",
+		"tests/unit/sdk-bounded-completion.test.ts",
+		"tests/unit/sdk-surface-parity.test.ts",
 		"tests/unit/vitest-unhandled-errors.test.ts",
 		"tests/types/internal-storage.ts",
 		"vitest-unhandled-errors.ts"

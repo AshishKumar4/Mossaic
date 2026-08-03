@@ -35,6 +35,17 @@ import {
   type DropVersionsOperation,
   type DropVersionsProgress,
 } from "./version-retention";
+import {
+  DEFAULT_COMPLETION_REQUEST_BUDGET,
+  RequestBudget,
+  type BoundedOperationProgress,
+} from "./bounded-operation";
+import { MultipartOperations } from "./multipart-client";
+import {
+  parseMultipartShardPutResponse,
+  type MultipartAbortOperation,
+  type MultipartFinalizeOperation,
+} from "./multipart-protocol";
 import type {
   CacheResolveResult,
   DropVersionsPolicy,
@@ -52,6 +63,7 @@ import {
   VFS_MP_SCOPE,
   isMultipartPlacementVersion,
   type MultipartPlacementVersion,
+  type MultipartStatusPageResponse,
 } from "../../shared/multipart";
 import type {
   PreviewInfo,
@@ -265,11 +277,18 @@ export interface VFSClient {
    * index order. Server cross-checks against landed chunks; mismatch
    * throws `EAGAIN` (transient — retry the missing chunks) or
    * `EINVAL` (chunk hash list malformed).
+   *
+   * One request for a manifest one server invocation can verify; otherwise a
+   * bounded number of them, capped by
+   * {@link DEFAULT_COMPLETION_REQUEST_BUDGET}. A manifest past that cap
+   * throws `CompletionBudgetExceededError` before staging anything, and the
+   * caller drives `startFinalizeMultipartUpload` /
+   * `stepFinalizeMultipartUpload` instead.
    */
   finalizeMultipartUpload(
     handle: MultipartUploadHandle,
     chunkHashList: readonly string[],
-    opts?: MultipartRequestOpts
+    opts?: MultipartOperationOpts
   ): Promise<FinalizeMultipartUploadResult>;
 
   /**
@@ -277,10 +296,15 @@ export interface VFSClient {
    * callers MUST NOT rely on instant chunk reclamation. Idempotent
    * — aborting an already-finalised or already-aborted session
    * returns `{aborted: false}` rather than throwing.
+   *
+   * One request for a session one server invocation can clean up; a session
+   * past that throws `CompletionBudgetExceededError` before touching it, and
+   * the caller drives `startAbortMultipartUpload` /
+   * `stepAbortMultipartUpload` instead.
    */
   abortMultipartUpload(
     handle: MultipartUploadHandle,
-    opts?: MultipartRequestOpts
+    opts?: MultipartOperationOpts
   ): Promise<AbortMultipartUploadResult>;
 
   // Low-level escape hatch
@@ -375,9 +399,19 @@ export interface VFSClient {
     opts?: ListVersionsOpts
   ): Promise<VersionInfo[]>;
   restoreVersion(p: string, sourceVersionId: string): Promise<{ id: string }>;
+  /**
+   * Apply a retention policy and report the counts.
+   *
+   * One request for a history one server invocation can finish; otherwise a
+   * bounded number of steps, capped by
+   * {@link DEFAULT_COMPLETION_REQUEST_BUDGET}. A history past that cap throws
+   * `CompletionBudgetExceededError` carrying the operation every completed
+   * step is durable under, so the caller resumes rather than restarts.
+   */
   dropVersions(
     p: string,
-    policy: DropVersionsPolicy
+    policy: DropVersionsPolicy,
+    opts?: DropVersionsOptions
   ): Promise<{ dropped: number; kept: number }>;
   /**
    * Start a bounded retention operation and run its first step.
@@ -389,7 +423,8 @@ export interface VFSClient {
    */
   startDropVersions(
     p: string,
-    policy: DropVersionsPolicy
+    policy: DropVersionsPolicy,
+    opts?: DropVersionsStepOptions
   ): Promise<DropVersionsProgress>;
   /**
    * Run one more bounded step of an operation `startDropVersions` began.
@@ -400,7 +435,8 @@ export interface VFSClient {
   stepDropVersions(
     p: string,
     policy: DropVersionsPolicy,
-    operation: DropVersionsOperation
+    operation: DropVersionsOperation,
+    opts?: DropVersionsStepOptions
   ): Promise<DropVersionsProgress>;
   /** set per-version label and/or user-visible flag. */
   markVersion(
@@ -452,6 +488,70 @@ export interface VFSClient {
    * `restoreVersion` work as expected with snapshot history.
    */
   commitYjsSnapshot(p: string, doc: import("yjs").Doc): Promise<void>;
+}
+
+/**
+ * Explicitly bounded multipart operations, for callers whose work outgrows the
+ * shared completion budget.
+ *
+ * Kept off {@link VFSClient} so an existing structural implementation of that
+ * interface stays valid. Both shipped clients implement this as well, so a
+ * caller that needs the checkpointable surface can widen to it:
+ * `const bounded: VFSBoundedOperationsClient = vfs`.
+ *
+ * Every method here issues a known, small number of requests: the `*Page`
+ * methods exactly one, the `start*` / `step*` pair at most the shared budget,
+ * returning `{ operation }` when work remains. Repeating a step whose response
+ * was lost is safe — the server holds the only cursor over its own machine.
+ */
+export interface VFSBoundedOperationsClient {
+  /** Read one bounded page of the landed set. One request. */
+  getMultipartUploadStatusPage(
+    handle: MultipartUploadHandle,
+    opts?: MultipartStatusPageOpts
+  ): Promise<MultipartUploadStatusPage>;
+  /**
+   * Read the complete landed set within the shared budget. Throws
+   * `CompletionBudgetExceededError` carrying the continuation still unread.
+   */
+  getMultipartUploadStatus(
+    handle: MultipartUploadHandle,
+    opts?: MultipartStatusOpts
+  ): Promise<MultipartUploadStatus>;
+  /** Re-mint the session and read one bounded page of its landed set. */
+  resumeMultipartUploadPage(
+    handle: MultipartUploadHandle,
+    opts?: ResumeMultipartUploadOpts
+  ): Promise<ResumeMultipartUploadResult>;
+  /**
+   * Re-mint the session and read its complete landed set within the shared
+   * budget. Throws `CompletionBudgetExceededError` carrying the re-minted
+   * handle and the continuation still unread, so no re-mint is wasted.
+   */
+  resumeMultipartUpload(
+    handle: MultipartUploadHandle,
+    opts?: ResumeMultipartUploadOpts
+  ): Promise<ResumeMultipartUploadResult>;
+  startFinalizeMultipartUpload(
+    handle: MultipartUploadHandle,
+    chunkHashList: readonly string[],
+    opts?: MultipartOperationOpts
+  ): Promise<BoundedFinalizeMultipartUploadResult>;
+  stepFinalizeMultipartUpload(
+    handle: MultipartUploadHandle,
+    chunkHashList: readonly string[],
+    operation: MultipartFinalizeOperation,
+    opts?: MultipartOperationOpts
+  ): Promise<BoundedFinalizeMultipartUploadResult>;
+  startAbortMultipartUpload(
+    handle: MultipartUploadHandle,
+    opts?: MultipartOperationOpts
+  ): Promise<BoundedAbortMultipartUploadResult>;
+  stepAbortMultipartUpload(
+    handle: MultipartUploadHandle,
+    operation: MultipartAbortOperation,
+    opts?: MultipartOperationOpts
+  ): Promise<BoundedAbortMultipartUploadResult>;
 }
 
 /**
@@ -507,7 +607,8 @@ export interface UserDOClient {
   vfsBeginMultipart(
     scope: VFSScope,
     path: string,
-    opts: BeginMultipartUploadOpts
+    /** The SDK adds `protocolVersion` so the server can offer the paged plane. */
+    opts: BeginMultipartUploadOpts & { protocolVersion?: number }
   ): Promise<import("../../shared/multipart").MultipartBeginResponse>;
   vfsFinalizeMultipart(
     scope: VFSScope,
@@ -518,6 +619,29 @@ export interface UserDOClient {
     scope: VFSScope,
     uploadId: string
   ): Promise<{ ok: true }>;
+  /** Persist one bounded page of the manifest a finalize will verify. */
+  vfsStageMultipartHashes(
+    scope: VFSScope,
+    uploadId: string,
+    startIndex: number,
+    hashes: readonly string[]
+  ): Promise<import("../../shared/multipart").MultipartHashPageResponse>;
+  /** Advance the durable finalize machine by one bounded page. */
+  vfsFinalizeMultipartStep(
+    scope: VFSScope,
+    uploadId: string
+  ): Promise<import("../../shared/multipart").MultipartFinalizeProgress>;
+  /** Advance the durable abort machine by one bounded page. */
+  vfsAbortMultipartStep(
+    scope: VFSScope,
+    uploadId: string
+  ): Promise<import("../../shared/multipart").MultipartAbortProgress>;
+  /** One bounded page of the landed set, with a continuation while more remain. */
+  vfsGetMultipartStatus(
+    scope: VFSScope,
+    uploadId: string,
+    continuation?: string
+  ): Promise<import("../../shared/multipart").MultipartStatusPageResponse>;
   vfsWriteFile(
     scope: VFSScope,
     path: string,
@@ -1014,6 +1138,18 @@ export interface MultipartUploadHandle {
   sessionToken: string;
   /** Wall-clock millisecond timestamp after which the session is invalid. */
   expiresAtMs: number;
+  /**
+   * Source byte length, which resume has to restate. Absent on handles
+   * serialised before this field existed; `resumeMultipartUpload` then needs
+   * it in its options instead.
+   */
+  size?: number;
+  /**
+   * Control-plane version the server accepted at begin. Absent means the
+   * server predates the paged plane, so finalize and abort stay single
+   * requests and an upload too large for one is refused at begin.
+   */
+  protocolVersion?: number;
 }
 
 /** Options for {@link VFSClient.beginMultipartUpload}. */
@@ -1055,6 +1191,56 @@ export interface BeginMultipartUploadOpts {
 
 export interface MultipartRequestOpts {
   signal?: AbortSignal;
+}
+
+/** Options for a method that may spend several bounded requests. */
+export interface MultipartOperationOpts extends MultipartRequestOpts {
+  onProgress?: (progress: BoundedOperationProgress) => void;
+}
+
+/** Options for one explicitly bounded status page. */
+export interface MultipartStatusPageOpts extends MultipartRequestOpts {
+  /** Seek state a previous page handed back. Omit for the first page. */
+  continuation?: string;
+}
+
+/** Options for the budgeted status walk. */
+export interface MultipartStatusOpts extends MultipartOperationOpts {
+  continuation?: string;
+}
+
+export interface ResumeMultipartUploadOpts extends MultipartOperationOpts {
+  /** Required only for handles serialised before `size` was on them. */
+  size?: number;
+  /** Session TTL for the re-minted token. Server clamps to its policy. */
+  ttlMs?: number;
+}
+
+/** One bounded page of a session's landed set. */
+export type MultipartUploadStatusPage = MultipartStatusPageResponse;
+
+/**
+ * A session's complete landed set.
+ *
+ * Never carries a continuation: the budgeted walk either read every page or
+ * refused with `CompletionBudgetExceededError`.
+ */
+export type MultipartUploadStatus = Omit<
+  MultipartStatusPageResponse,
+  "continuation"
+>;
+
+/**
+ * A re-minted session plus what has landed on it.
+ *
+ * `continuation` is present only on `resumeMultipartUploadPage`, and only
+ * while pages remain — a caller that ignores it would re-upload every chunk
+ * the unread pages knew about.
+ */
+export interface ResumeMultipartUploadResult {
+  handle: MultipartUploadHandle;
+  landed: number[];
+  continuation?: string;
 }
 
 /** Result of {@link VFSClient.putMultipartChunk}. */
@@ -1108,6 +1294,24 @@ export interface AbortMultipartUploadResult {
    */
   aborted: boolean;
 }
+
+/**
+ * A bounded pass that ran out of budget, and the handle that resumes it.
+ *
+ * Everything the pass completed is durable server-side, so stepping with this
+ * operation continues the same finalize or abort instead of starting another.
+ */
+export interface PendingMultipartOperation<Operation> {
+  operation: Operation;
+}
+
+export type BoundedFinalizeMultipartUploadResult =
+  | FinalizeMultipartUploadResult
+  | PendingMultipartOperation<MultipartFinalizeOperation>;
+
+export type BoundedAbortMultipartUploadResult =
+  | AbortMultipartUploadResult
+  | PendingMultipartOperation<MultipartAbortOperation>;
 
 /**
  * Extended writeFile options. Defaults preserve plain `writeFile`
@@ -1379,6 +1583,16 @@ export interface ListVersionsOpts {
 
 export type { DropVersionsPolicy } from "../../shared/vfs-types";
 
+/** Options for one bounded retention step. */
+export interface DropVersionsStepOptions {
+  signal?: AbortSignal;
+}
+
+/** Options for the budgeted retention walk. */
+export interface DropVersionsOptions extends DropVersionsStepOptions {
+  onProgress?: (progress: BoundedOperationProgress) => void;
+}
+
 import { vfsUserDOName } from "../../worker/core/lib/utils";
 import { vfsShardDOName } from "../../worker/core/lib/utils";
 
@@ -1389,7 +1603,7 @@ import { vfsShardDOName } from "../../worker/core/lib/utils";
  * `VFSFsError` subclasses with Node-fs-like `code` / `errno` /
  * `syscall` / `path`.
  */
-export class VFS implements VFSClient {
+export class VFS implements VFSClient, VFSBoundedOperationsClient {
   /**
    * Self-reference so `vfs.promises === vfs` (isomorphic-git reads
    * `.promises`). Typed as `VFS` (a subtype of `VFSClient`) so the
@@ -1409,6 +1623,8 @@ export class VFS implements VFSClient {
    * is a no-op server-side.
    */
   private versioningLatched = false;
+  /** Lazily built multipart protocol driver; see {@link VFS.multipart}. */
+  private multipartOps: MultipartOperations | undefined;
   // Explicit fields instead of constructor parameter properties —
   // `erasableSyntaxOnly` rejects the shorthand.
   protected readonly env: MossaicEnv;
@@ -2172,24 +2388,74 @@ export class VFS implements VFSClient {
     return createWriteStreamWithHandleRpc(this.user(), this.scope(), p, opts);
   }
 
+  /**
+   * The bounded multipart protocol, over this client's typed RPC.
+   *
+   * Cached because it holds no per-call state — every method takes the handle
+   * it operates on, and `user()` is resolved per request underneath.
+   */
+  private multipart(): MultipartOperations {
+    this.multipartOps ??= new MultipartOperations({
+      beginUpload: (path, opts) =>
+        this.user().vfsBeginMultipart(this.scope(), path, opts),
+      stageHashes: (uploadId, startIndex, hashes) =>
+        this.user().vfsStageMultipartHashes(
+          this.scope(),
+          uploadId,
+          startIndex,
+          hashes
+        ),
+      finalizeOneRequest: (uploadId, chunkHashList) =>
+        this.user().vfsFinalizeMultipart(this.scope(), uploadId, chunkHashList),
+      finalizeStep: (uploadId) =>
+        this.user().vfsFinalizeMultipartStep(this.scope(), uploadId),
+      abortOneRequest: (uploadId) =>
+        this.user().vfsAbortMultipart(this.scope(), uploadId),
+      abortStep: (uploadId) =>
+        this.user().vfsAbortMultipartStep(this.scope(), uploadId),
+      statusPage: (handle, continuation) =>
+        this.user().vfsGetMultipartStatus(
+          this.scope(),
+          handle.uploadId,
+          continuation
+        ),
+    });
+    return this.multipartOps;
+  }
+
   async beginMultipartUpload(
     p: string,
     opts: BeginMultipartUploadOpts
   ): Promise<MultipartUploadHandle> {
-    try {
-      const res = await this.user().vfsBeginMultipart(this.scope(), p, opts);
-      return {
-        uploadId: res.uploadId,
-        path: p,
-        chunkSize: res.chunkSize,
-        expectedChunks: res.totalChunks,
-        poolSize: res.poolSize,
-        sessionToken: res.sessionToken,
-        expiresAtMs: res.expiresAtMs,
-      };
-    } catch (err) {
-      throw mapServerError(err, { path: p, syscall: "open" });
-    }
+    return await this.multipart().begin(p, opts);
+  }
+
+  async getMultipartUploadStatusPage(
+    handle: MultipartUploadHandle,
+    opts?: MultipartStatusPageOpts
+  ): Promise<MultipartUploadStatusPage> {
+    return await this.multipart().statusPage(handle, opts);
+  }
+
+  async getMultipartUploadStatus(
+    handle: MultipartUploadHandle,
+    opts?: MultipartStatusOpts
+  ): Promise<MultipartUploadStatus> {
+    return await this.multipart().status(handle, opts);
+  }
+
+  async resumeMultipartUploadPage(
+    handle: MultipartUploadHandle,
+    opts?: ResumeMultipartUploadOpts
+  ): Promise<ResumeMultipartUploadResult> {
+    return await this.multipart().resumePage(handle, opts);
+  }
+
+  async resumeMultipartUpload(
+    handle: MultipartUploadHandle,
+    opts?: ResumeMultipartUploadOpts
+  ): Promise<ResumeMultipartUploadResult> {
+    return await this.multipart().resume(handle, opts);
   }
 
   async putMultipartChunk(
@@ -2245,13 +2511,15 @@ export class VFS implements VFSClient {
       )
     );
     try {
-      const result = await stub.putChunkMultipart(
-        hash,
-        bytes,
-        claims.uploadId,
-        index,
-        claims.userId,
-        handle.sessionToken
+      const result = parseMultipartShardPutResponse(
+        await stub.putChunkMultipart(
+          hash,
+          bytes,
+          claims.uploadId,
+          index,
+          claims.userId,
+          handle.sessionToken
+        )
       );
       return { chunkHash: hash, accepted: true, status: result.status };
     } catch (err) {
@@ -2262,28 +2530,58 @@ export class VFS implements VFSClient {
   async finalizeMultipartUpload(
     handle: MultipartUploadHandle,
     chunkHashList: readonly string[],
-    _opts?: MultipartRequestOpts
+    opts?: MultipartOperationOpts
   ): Promise<FinalizeMultipartUploadResult> {
-    try {
-      const r = await this.user().vfsFinalizeMultipart(this.scope(), handle.uploadId, chunkHashList);
-      return { path: r.path, pathId: r.fileId, versionId: "", size: r.size, fileHash: r.fileHash, isEncrypted: r.isEncrypted };
-    } catch (err) {
-      throw mapServerError(err, { syscall: "open" });
-    }
+    return await this.multipart().finalize(handle, chunkHashList, opts);
+  }
+
+  async startFinalizeMultipartUpload(
+    handle: MultipartUploadHandle,
+    chunkHashList: readonly string[],
+    opts?: MultipartOperationOpts
+  ): Promise<BoundedFinalizeMultipartUploadResult> {
+    return await this.multipart().boundedFinalize(
+      handle,
+      chunkHashList,
+      undefined,
+      opts
+    );
+  }
+
+  async stepFinalizeMultipartUpload(
+    handle: MultipartUploadHandle,
+    chunkHashList: readonly string[],
+    operation: MultipartFinalizeOperation,
+    opts?: MultipartOperationOpts
+  ): Promise<BoundedFinalizeMultipartUploadResult> {
+    return await this.multipart().boundedFinalize(
+      handle,
+      chunkHashList,
+      operation,
+      opts
+    );
   }
 
   async abortMultipartUpload(
     handle: MultipartUploadHandle,
-    _opts?: MultipartRequestOpts
+    opts?: MultipartOperationOpts
   ): Promise<AbortMultipartUploadResult> {
-    try {
-      const r = await this.user().vfsAbortMultipart(this.scope(), handle.uploadId);
-      return { aborted: r.ok === true };
-    } catch (err) {
-      const code = (err as { code?: string }).code;
-      if (code === "ENOENT" || code === "EBUSY") return { aborted: false };
-      throw mapServerError(err, { syscall: "open" });
-    }
+    return await this.multipart().abort(handle, opts);
+  }
+
+  async startAbortMultipartUpload(
+    handle: MultipartUploadHandle,
+    opts?: MultipartOperationOpts
+  ): Promise<BoundedAbortMultipartUploadResult> {
+    return await this.multipart().boundedAbort(handle, undefined, opts);
+  }
+
+  async stepAbortMultipartUpload(
+    handle: MultipartUploadHandle,
+    operation: MultipartAbortOperation,
+    opts?: MultipartOperationOpts
+  ): Promise<BoundedAbortMultipartUploadResult> {
+    return await this.multipart().boundedAbort(handle, operation, opts);
   }
 
   // ── Low-level escape hatch (caller-orchestrated multi-invocation reads) ──
@@ -2712,39 +3010,58 @@ export class VFS implements VFSClient {
    */
   async dropVersions(
     p: string,
-    policy: DropVersionsPolicy
+    policy: DropVersionsPolicy,
+    opts: DropVersionsOptions = {}
   ): Promise<{ dropped: number; kept: number }> {
     return await applyDropVersions(
       p,
       () => this.user().vfsDropVersions(this.scope(), p, policy),
       (operation) =>
         operation === undefined
-          ? this.startDropVersions(p, policy)
-          : this.stepDropVersions(p, policy, operation)
+          ? this.startDropVersions(p, policy, opts)
+          : this.stepDropVersions(p, policy, operation, opts),
+      new RequestBudget(
+        "dropVersions",
+        DEFAULT_COMPLETION_REQUEST_BUDGET,
+        opts
+      )
     );
   }
 
   async startDropVersions(
     p: string,
-    policy: DropVersionsPolicy
+    policy: DropVersionsPolicy,
+    opts?: DropVersionsStepOptions
   ): Promise<DropVersionsProgress> {
-    return await this.stepDropVersions(p, policy, newDropVersionsOperation());
+    return await this.stepDropVersions(
+      p,
+      policy,
+      newDropVersionsOperation(),
+      opts
+    );
   }
 
   async stepDropVersions(
     p: string,
     policy: DropVersionsPolicy,
-    operation: DropVersionsOperation
+    operation: DropVersionsOperation,
+    opts?: DropVersionsStepOptions
   ): Promise<DropVersionsProgress> {
     try {
-      const step = await this.user().vfsDropVersionsStep(
-        this.scope(),
-        p,
-        policy,
-        operation.operationId
+      opts?.signal?.throwIfAborted();
+      const progress = dropVersionsProgress(
+        operation,
+        await this.user().vfsDropVersionsStep(
+          this.scope(),
+          p,
+          policy,
+          operation.operationId
+        )
       );
-      return dropVersionsProgress(operation, step);
+      opts?.signal?.throwIfAborted();
+      return progress;
     } catch (err) {
+      if (opts?.signal?.aborted) throw err;
       throw mapServerError(err, { path: p, syscall: "dropVersions" });
     }
   }

@@ -37,7 +37,6 @@ import {
 import {
   parsePatchMetadataIfHeadResult,
 } from "../../shared/patch-metadata-if-head";
-import type { DropVersionsStepResult } from "../../shared/vfs-types";
 import type {
   PreviewInfo,
   PreviewInfoBatchEntry,
@@ -48,18 +47,31 @@ import type {
 import type { ReadHandle, WriteHandle } from "./streams";
 import type {
   VFSClient,
+  VFSBoundedOperationsClient,
   FileInfoOpts,
   ListFilesItem,
   ListFilesOpts,
   ListFilesPage,
   VersionInfo,
   DropVersionsPolicy,
+  DropVersionsOptions,
+  DropVersionsStepOptions,
   PatchMetadataIfHeadResult,
   BeginMultipartUploadOpts,
+  BoundedAbortMultipartUploadResult,
+  BoundedFinalizeMultipartUploadResult,
+  MultipartOperationOpts,
+  MultipartRequestOpts,
+  MultipartStatusOpts,
+  MultipartStatusPageOpts,
   MultipartUploadHandle,
+  MultipartUploadStatus,
+  MultipartUploadStatusPage,
   PutMultipartChunkResult,
   FinalizeMultipartUploadResult,
   AbortMultipartUploadResult,
+  ResumeMultipartUploadOpts,
+  ResumeMultipartUploadResult,
 } from "./vfs";
 import {
   applyDropVersions,
@@ -68,12 +80,50 @@ import {
   type DropVersionsOperation,
   type DropVersionsProgress,
 } from "./version-retention";
+import {
+  DEFAULT_COMPLETION_REQUEST_BUDGET,
+  RequestBudget,
+} from "./bounded-operation";
+import {
+  MultipartOperations,
+  type MultipartBeginWireOpts,
+} from "./multipart-client";
+import {
+  parseMultipartAbortProgress,
+  parseMultipartAbortResponse,
+  parseMultipartBeginResponse,
+  parseMultipartFinalizeProgress,
+  parseMultipartFinalizeResponse,
+  parseMultipartHashPageResponse,
+  parseMultipartPutChunkResponse,
+  parseMultipartStatusPageResponse,
+  type MultipartAbortOperation,
+  type MultipartFinalizeOperation,
+} from "./multipart-protocol";
+import type { MultipartBeginRequest } from "../../shared/multipart";
 export { hashChunk } from "../../shared/crypto";
 
 const HTTP_MULTIPART_TIMEOUT_MS = 10 * 60_000;
 
-interface MultipartRequestOpts {
-  signal?: AbortSignal;
+/** The begin body, assembled so an absent option is an absent field. */
+function multipartBeginBody(
+  path: string,
+  opts: MultipartBeginWireOpts
+): MultipartBeginRequest {
+  return {
+    path,
+    size: opts.size,
+    protocolVersion: opts.protocolVersion,
+    ...(opts.chunkSize !== undefined ? { chunkSize: opts.chunkSize } : {}),
+    ...(opts.mode !== undefined ? { mode: opts.mode } : {}),
+    ...(opts.mimeType !== undefined ? { mimeType: opts.mimeType } : {}),
+    ...(opts.metadata !== undefined ? { metadata: opts.metadata } : {}),
+    ...(opts.tags !== undefined ? { tags: opts.tags } : {}),
+    ...(opts.version !== undefined ? { version: opts.version } : {}),
+    ...(opts.encryption !== undefined ? { encryption: opts.encryption } : {}),
+    ...(opts.resumeFrom !== undefined ? { resumeFrom: opts.resumeFrom } : {}),
+    ...(opts.ttlMs !== undefined ? { ttlMs: opts.ttlMs } : {}),
+  };
 }
 
 interface ListFilesItemWire {
@@ -152,11 +202,13 @@ export interface CreateMossaicHttpClientOptions {
  * token; the server extracts it via verifyVFSToken. This makes
  * cross-tenant impersonation impossible by construction.
  */
-export class HttpVFS implements VFSClient {
+export class HttpVFS implements VFSClient, VFSBoundedOperationsClient {
   readonly promises: HttpVFS;
   private readonly fetcher: typeof fetch;
   private readonly base: string;
   private readonly apiKeyProvider: ApiKeyProvider;
+  /** Lazily built multipart protocol driver; see {@link HttpVFS.multipart}. */
+  private multipartOps: MultipartOperations | undefined;
 
   constructor(opts: CreateMossaicHttpClientOptions) {
     if (!opts || typeof opts.url !== "string" || opts.url.length === 0) {
@@ -204,8 +256,10 @@ export class HttpVFS implements VFSClient {
     body: object | Uint8Array,
     syscall: string,
     path: string | undefined,
-    expect: "json" | "octet-stream"
+    expect: "json" | "octet-stream",
+    signal?: AbortSignal
   ): Promise<Response> {
+    signal?.throwIfAborted();
     const url = `${this.base}/api/vfs/${method}`;
     const apiKey = await this.getApiKey();
     const headers: Record<string, string> = {
@@ -221,8 +275,14 @@ export class HttpVFS implements VFSClient {
     }
     let res: Response;
     try {
-      res = await this.fetcher(url, { method: "POST", headers, body: payload });
+      res = await this.fetcher(url, {
+        method: "POST",
+        headers,
+        body: payload,
+        signal,
+      });
     } catch (err) {
+      if (signal?.aborted) throw err;
       // Network-level failure (DNS, TCP RST, etc.) → MossaicUnavailable.
       throw new MossaicUnavailableError({
         message: `HTTP fetch to ${url} failed: ${(err as Error).message}`,
@@ -571,46 +631,100 @@ export class HttpVFS implements VFSClient {
 
   // ── Manual multipart upload ────────────────────────────────────────────
   //
-  // Thin wrappers over the existing `multipartBegin` / `multipartPutChunk` /
-  // `multipartFinalize` / `multipartAbort` wire helpers. Surface a stable
-  // user-facing handle shape (`MultipartUploadHandle`) decoupled from the
-  // server's `MultipartBeginResponse` so future server changes don't break
-  // serialised handles cached by external callers.
+  // Every method here delegates to `MultipartOperations`, which owns the
+  // protocol: which requests each one may issue, in what order, and under
+  // what budget. This class contributes only the requests themselves, so the
+  // HTTP surface and the binding surface cannot drift apart.
   //
-  // `parallelUpload` (transfer.ts) drives the same wire endpoints but
-  // owns its own AIMD controller + concurrency. The methods here are
-  // for callers who need to do the chunking themselves.
+  // `parallelUpload` (transfer.ts) drives the same wire helpers but owns its
+  // own AIMD controller + concurrency. The methods here are for callers who
+  // need to do the chunking themselves.
+
+  /** The bounded multipart protocol, over this client's routes. */
+  private multipart(): MultipartOperations {
+    this.multipartOps ??= new MultipartOperations({
+      beginUpload: (path, opts, signal) =>
+        this.multipartPost(
+          "begin",
+          multipartBeginBody(path, opts),
+          signalWithTimeout(signal),
+          path
+        ),
+      stageHashes: (uploadId, startIndex, hashes, signal) =>
+        this.multipartPost(
+          "hash-page",
+          { uploadId, startIndex, hashes },
+          signalWithTimeout(signal)
+        ),
+      finalizeOneRequest: (uploadId, chunkHashList, signal) =>
+        this.multipartPost(
+          "finalize",
+          { uploadId, chunkHashList },
+          signalWithTimeout(signal)
+        ),
+      finalizeStep: (uploadId, signal) =>
+        this.multipartPost(
+          "finalize-step",
+          { uploadId },
+          signalWithTimeout(signal)
+        ),
+      abortOneRequest: (uploadId, signal) =>
+        this.multipartPost("abort", { uploadId }, signalWithTimeout(signal)),
+      abortStep: (uploadId, signal) =>
+        this.multipartPost(
+          "abort-step",
+          { uploadId },
+          signalWithTimeout(signal)
+        ),
+      statusPage: (handle, continuation, signal) =>
+        this.multipartStatusJson(
+          handle.uploadId,
+          handle.sessionToken,
+          continuation,
+          signalWithTimeout(signal)
+        ),
+    });
+    return this.multipartOps;
+  }
 
   async beginMultipartUpload(
     p: string,
     opts: BeginMultipartUploadOpts
   ): Promise<MultipartUploadHandle> {
     if (opts.encryption !== undefined) {
+      // The HTTP surface hashes what it is handed, so it cannot seal chunks on
+      // the caller's behalf; `parallelUpload`'s `chunkTransform` is that path.
       throw new EINVAL({ syscall: "beginMultipartUpload", path: p });
     }
-    const body: import("../../shared/multipart").MultipartBeginRequest = {
-      path: p,
-      size: opts.size,
-      ...(opts.chunkSize !== undefined ? { chunkSize: opts.chunkSize } : {}),
-      ...(opts.mode !== undefined ? { mode: opts.mode } : {}),
-      ...(opts.mimeType !== undefined ? { mimeType: opts.mimeType } : {}),
-      ...(opts.metadata !== undefined ? { metadata: opts.metadata } : {}),
-      ...(opts.tags !== undefined ? { tags: opts.tags } : {}),
-      ...(opts.version !== undefined ? { version: opts.version } : {}),
-      ...(opts.encryption !== undefined ? { encryption: opts.encryption } : {}),
-      ...(opts.resumeFrom !== undefined ? { resumeFrom: opts.resumeFrom } : {}),
-      ...(opts.ttlMs !== undefined ? { ttlMs: opts.ttlMs } : {}),
-    };
-    const res = await this.multipartBegin(body, signalWithTimeout(opts.signal));
-    return {
-      uploadId: res.uploadId,
-      path: p,
-      chunkSize: res.chunkSize,
-      expectedChunks: res.totalChunks,
-      poolSize: res.poolSize,
-      sessionToken: res.sessionToken,
-      expiresAtMs: res.expiresAtMs,
-    };
+    return await this.multipart().begin(p, opts);
+  }
+
+  async getMultipartUploadStatusPage(
+    handle: MultipartUploadHandle,
+    opts?: MultipartStatusPageOpts
+  ): Promise<MultipartUploadStatusPage> {
+    return await this.multipart().statusPage(handle, opts);
+  }
+
+  async getMultipartUploadStatus(
+    handle: MultipartUploadHandle,
+    opts?: MultipartStatusOpts
+  ): Promise<MultipartUploadStatus> {
+    return await this.multipart().status(handle, opts);
+  }
+
+  async resumeMultipartUploadPage(
+    handle: MultipartUploadHandle,
+    opts?: ResumeMultipartUploadOpts
+  ): Promise<ResumeMultipartUploadResult> {
+    return await this.multipart().resumePage(handle, opts);
+  }
+
+  async resumeMultipartUpload(
+    handle: MultipartUploadHandle,
+    opts?: ResumeMultipartUploadOpts
+  ): Promise<ResumeMultipartUploadResult> {
+    return await this.multipart().resume(handle, opts);
   }
 
   async putMultipartChunk(
@@ -637,43 +751,58 @@ export class HttpVFS implements VFSClient {
   async finalizeMultipartUpload(
     handle: MultipartUploadHandle,
     chunkHashList: readonly string[],
-    opts?: MultipartRequestOpts
+    opts?: MultipartOperationOpts
   ): Promise<FinalizeMultipartUploadResult> {
-    const r = await this.multipartFinalize(handle.uploadId, chunkHashList, signalWithTimeout(opts?.signal));
-    return {
-      path: r.path,
-      pathId: r.fileId,
-      // Server's MultipartFinalizeResponse does not yet surface
-      // `versionId` (only `fileId`). Until it does, we expose an
-      // empty string — callers that need the version row should
-      // follow up with `listVersions(path)`. Documented on the type.
-      versionId: "",
-      size: r.size,
-      fileHash: r.fileHash,
-      isEncrypted: r.isEncrypted,
-    };
+    return await this.multipart().finalize(handle, chunkHashList, opts);
+  }
+
+  async startFinalizeMultipartUpload(
+    handle: MultipartUploadHandle,
+    chunkHashList: readonly string[],
+    opts?: MultipartOperationOpts
+  ): Promise<BoundedFinalizeMultipartUploadResult> {
+    return await this.multipart().boundedFinalize(
+      handle,
+      chunkHashList,
+      undefined,
+      opts
+    );
+  }
+
+  async stepFinalizeMultipartUpload(
+    handle: MultipartUploadHandle,
+    chunkHashList: readonly string[],
+    operation: MultipartFinalizeOperation,
+    opts?: MultipartOperationOpts
+  ): Promise<BoundedFinalizeMultipartUploadResult> {
+    return await this.multipart().boundedFinalize(
+      handle,
+      chunkHashList,
+      operation,
+      opts
+    );
   }
 
   async abortMultipartUpload(
     handle: MultipartUploadHandle,
-    opts?: MultipartRequestOpts
+    opts?: MultipartOperationOpts
   ): Promise<AbortMultipartUploadResult> {
-    try {
-      const r = await this.multipartAbort(handle.uploadId, signalWithTimeout(opts?.signal));
-      return { aborted: r.ok === true };
-    } catch (err) {
-      // Server raises ENOENT for an unknown / already-aborted session
-      // and EBUSY for a session that has already finalized (cannot
-      // un-finalize). Both are "already terminal" — surface as
-      // idempotent { aborted: false } rather than throwing so callers
-      // can call abortMultipartUpload unconditionally in cleanup
-      // paths without try/catch.
-      const code = (err as { code?: string }).code;
-      if (code === "ENOENT" || code === "EBUSY") {
-        return { aborted: false };
-      }
-      throw err;
-    }
+    return await this.multipart().abort(handle, opts);
+  }
+
+  async startAbortMultipartUpload(
+    handle: MultipartUploadHandle,
+    opts?: MultipartOperationOpts
+  ): Promise<BoundedAbortMultipartUploadResult> {
+    return await this.multipart().boundedAbort(handle, undefined, opts);
+  }
+
+  async stepAbortMultipartUpload(
+    handle: MultipartUploadHandle,
+    operation: MultipartAbortOperation,
+    opts?: MultipartOperationOpts
+  ): Promise<BoundedAbortMultipartUploadResult> {
+    return await this.multipart().boundedAbort(handle, operation, opts);
   }
 
   // ── Low-level escape hatch ────────────────────────────────────────────
@@ -884,50 +1013,62 @@ export class HttpVFS implements VFSClient {
    */
   async dropVersions(
     p: string,
-    policy: DropVersionsPolicy
+    policy: DropVersionsPolicy,
+    opts: DropVersionsOptions = {}
   ): Promise<{ dropped: number; kept: number }> {
     return await applyDropVersions(
       p,
-      async () => {
-        const res = await this.post(
-          "dropVersions",
-          { path: p, policy },
-          "dropVersions",
-          p,
-          "json"
-        );
-        return (await res.json()) as { dropped: number; kept: number };
-      },
+      async () =>
+        await (
+          await this.post(
+            "dropVersions",
+            { path: p, policy },
+            "dropVersions",
+            p,
+            "json",
+            opts.signal
+          )
+        ).json(),
       (operation) =>
         operation === undefined
-          ? this.startDropVersions(p, policy)
-          : this.stepDropVersions(p, policy, operation)
+          ? this.startDropVersions(p, policy, opts)
+          : this.stepDropVersions(p, policy, operation, opts),
+      new RequestBudget(
+        "dropVersions",
+        DEFAULT_COMPLETION_REQUEST_BUDGET,
+        opts
+      )
     );
   }
 
   async startDropVersions(
     p: string,
-    policy: DropVersionsPolicy
+    policy: DropVersionsPolicy,
+    opts?: DropVersionsStepOptions
   ): Promise<DropVersionsProgress> {
-    return await this.stepDropVersions(p, policy, newDropVersionsOperation());
+    return await this.stepDropVersions(
+      p,
+      policy,
+      newDropVersionsOperation(),
+      opts
+    );
   }
 
   async stepDropVersions(
     p: string,
     policy: DropVersionsPolicy,
-    operation: DropVersionsOperation
+    operation: DropVersionsOperation,
+    opts?: DropVersionsStepOptions
   ): Promise<DropVersionsProgress> {
     const res = await this.post(
       "dropVersionsStep",
       { path: p, policy, operationId: operation.operationId },
       "dropVersions",
       p,
-      "json"
+      "json",
+      opts?.signal
     );
-    return dropVersionsProgress(
-      operation,
-      (await res.json()) as DropVersionsStepResult
-    );
+    return dropVersionsProgress(operation, await res.json());
   }
 
   // ── ──────────────────────────────────────────────────────────
@@ -1154,19 +1295,21 @@ export class HttpVFS implements VFSClient {
 
   // ── multipart parallel transfer ───────────────────────────
   //
-  // Thin wire helpers used by `sdk/src/transfer.ts`. They speak the
-  // shapes declared in `shared/multipart.ts`. Each method maps 1:1 to
-  // a route under `/api/vfs/multipart/*`. Errors are surfaced
-  // unmapped — the transfer engine catches and routes them through
-  // `mapServerError` itself so it can implement adaptive backoff.
+  // Wire helpers over the routes under `/api/vfs/multipart/*`. Each performs
+  // exactly one round-trip and validates what comes back, so the bounded
+  // protocol above and `sdk/src/transfer.ts` compose them without either
+  // having to trust the shape.
 
-  async multipartBegin(
-    body: import("../../shared/multipart").MultipartBeginRequest,
-    signal?: AbortSignal
-  ): Promise<import("../../shared/multipart").MultipartBeginResponse> {
-    const url = `${this.base}/api/vfs/multipart/begin`;
+  /** POST a JSON body to a multipart route and return its parsed JSON. */
+  private async multipartPost(
+    route: string,
+    body: object,
+    signal?: AbortSignal,
+    path?: string
+  ): Promise<unknown> {
+    signal?.throwIfAborted();
     const apiKey = await this.getApiKey();
-    const res = await this.fetcher(url, {
+    const res = await this.fetcher(`${this.base}/api/vfs/multipart/${route}`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${apiKey}`,
@@ -1175,10 +1318,18 @@ export class HttpVFS implements VFSClient {
       body: JSON.stringify(body),
       signal,
     });
-    if (!res.ok) {
-      await this.throwHttp(res, "open", body.path);
-    }
-    return (await res.json()) as import("../../shared/multipart").MultipartBeginResponse;
+    signal?.throwIfAborted();
+    if (!res.ok) await this.throwHttp(res, "open", path);
+    return await res.json();
+  }
+
+  async multipartBegin(
+    body: import("../../shared/multipart").MultipartBeginRequest,
+    signal?: AbortSignal
+  ): Promise<import("../../shared/multipart").MultipartBeginResponse> {
+    return parseMultipartBeginResponse(
+      await this.multipartPost("begin", body, signal, body.path)
+    );
   }
 
   async multipartPutChunk(
@@ -1204,69 +1355,108 @@ export class HttpVFS implements VFSClient {
     if (!res.ok) {
       await this.throwHttp(res, "open", undefined);
     }
-    return (await res.json()) as import("../../shared/multipart").MultipartPutChunkResponse;
+    return parseMultipartPutChunkResponse(await res.json());
   }
 
+  /** Commit in one request. Refused by the server past its own fanout cap. */
   async multipartFinalize(
     uploadId: string,
     chunkHashList: readonly string[],
     signal?: AbortSignal
   ): Promise<import("../../shared/multipart").MultipartFinalizeResponse> {
-    const url = `${this.base}/api/vfs/multipart/finalize`;
-    const apiKey = await this.getApiKey();
-    const res = await this.fetcher(url, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ uploadId, chunkHashList }),
-      signal,
-    });
-    if (!res.ok) {
-      await this.throwHttp(res, "open", undefined);
-    }
-    return (await res.json()) as import("../../shared/multipart").MultipartFinalizeResponse;
+    return parseMultipartFinalizeResponse(
+      await this.multipartPost("finalize", { uploadId, chunkHashList }, signal)
+    );
+  }
+
+  /** Stage one bounded page of the manifest a finalize will verify. */
+  async multipartStageHashes(
+    uploadId: string,
+    startIndex: number,
+    hashes: readonly string[],
+    signal?: AbortSignal
+  ): Promise<import("../../shared/multipart").MultipartHashPageResponse> {
+    return parseMultipartHashPageResponse(
+      await this.multipartPost(
+        "hash-page",
+        { uploadId, startIndex, hashes },
+        signal
+      )
+    );
+  }
+
+  /** Advance the durable finalize machine by one bounded page. */
+  async multipartFinalizeStep(
+    uploadId: string,
+    signal?: AbortSignal
+  ): Promise<import("../../shared/multipart").MultipartFinalizeProgress> {
+    return parseMultipartFinalizeProgress(
+      await this.multipartPost("finalize-step", { uploadId }, signal)
+    );
   }
 
   async multipartAbort(
     uploadId: string,
     signal?: AbortSignal
   ): Promise<{ ok: true }> {
-    const url = `${this.base}/api/vfs/multipart/abort`;
-    const apiKey = await this.getApiKey();
-    const res = await this.fetcher(url, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ uploadId }),
-      signal,
-    });
-    if (!res.ok) {
-      await this.throwHttp(res, "open", undefined);
-    }
-    return (await res.json()) as { ok: true };
+    return parseMultipartAbortResponse(
+      await this.multipartPost("abort", { uploadId }, signal)
+    );
   }
 
+  /** Advance the durable abort machine by one bounded page. */
+  async multipartAbortStep(
+    uploadId: string,
+    signal?: AbortSignal
+  ): Promise<import("../../shared/multipart").MultipartAbortProgress> {
+    return parseMultipartAbortProgress(
+      await this.multipartPost("abort-step", { uploadId }, signal)
+    );
+  }
+
+  /**
+   * One bounded page of the landed set.
+   *
+   * `continuation` is the seek state a previous page handed back; a caller
+   * that stops following continuations is left believing chunks the unread
+   * pages knew about never landed.
+   */
   async multipartStatus(
     uploadId: string,
-    sessionToken: string
-  ): Promise<import("../../shared/multipart").MultipartStatusResponse> {
-    const url = `${this.base}/api/vfs/multipart/${encodeURIComponent(uploadId)}/status`;
+    sessionToken: string,
+    continuation?: string,
+    signal?: AbortSignal
+  ): Promise<import("../../shared/multipart").MultipartStatusPageResponse> {
+    return parseMultipartStatusPageResponse(
+      await this.multipartStatusJson(uploadId, sessionToken, continuation, signal)
+    );
+  }
+
+  private async multipartStatusJson(
+    uploadId: string,
+    sessionToken: string,
+    continuation?: string,
+    signal?: AbortSignal
+  ): Promise<unknown> {
+    signal?.throwIfAborted();
+    const url = new URL(
+      `${this.base}/api/vfs/multipart/${encodeURIComponent(uploadId)}/status`
+    );
+    if (continuation !== undefined) {
+      url.searchParams.set("continuation", continuation);
+    }
     const apiKey = await this.getApiKey();
-    const res = await this.fetcher(url, {
+    const res = await this.fetcher(url.toString(), {
       method: "GET",
       headers: {
         Authorization: `Bearer ${apiKey}`,
         "X-Session-Token": sessionToken,
       },
+      signal,
     });
-    if (!res.ok) {
-      await this.throwHttp(res, "open", undefined);
-    }
-    return (await res.json()) as import("../../shared/multipart").MultipartStatusResponse;
+    signal?.throwIfAborted();
+    if (!res.ok) await this.throwHttp(res, "open", undefined);
+    return await res.json();
   }
 
   async multipartDownloadToken(

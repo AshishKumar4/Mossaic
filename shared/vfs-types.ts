@@ -182,6 +182,48 @@ export type DropVersionsStepResult =
   | { done: false }
   | { done: true; dropped: number; kept: number };
 
+/** Counts a completed retention reports, whichever surface produced them. */
+export interface DropVersionsResult {
+	dropped: number;
+	kept: number;
+}
+
+function parseRetentionCount(value: unknown, field: string): number {
+	if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+		throw new TypeError(`dropVersions.${field}: expected non-negative integer`);
+	}
+	return value;
+}
+
+// Boundary validators for the retention surfaces. Hand-rolled to match
+// `parseCacheResolveResult` above; a client that narrowed structurally would
+// report counts a server never sent.
+
+export function parseDropVersionsResult(raw: unknown): DropVersionsResult {
+	if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+		throw new TypeError("dropVersions result: expected object");
+	}
+	const value = raw as Record<string, unknown>;
+	return {
+		dropped: parseRetentionCount(value.dropped, "dropped"),
+		kept: parseRetentionCount(value.kept, "kept"),
+	};
+}
+
+export function parseDropVersionsStepResult(
+	raw: unknown,
+): DropVersionsStepResult {
+	if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+		throw new TypeError("dropVersions step: expected object");
+	}
+	const value = raw as Record<string, unknown>;
+	if (value.done === false) return { done: false };
+	if (value.done !== true) {
+		throw new TypeError("dropVersions step.done: expected boolean");
+	}
+	return { done: true, ...parseDropVersionsResult(value) };
+}
+
 /**
  * Path resolution result. read-side ops (vfsStat/lstat/exists/readlink/...)
  * all flow through resolvePath() and discriminate on `kind`.

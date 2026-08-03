@@ -7,6 +7,7 @@
  *   POST   /api/vfs/multipart/begin              → mint session + token
  *   POST   /api/vfs/multipart/hash-page          → stage ≤256 chunk hashes
  *   POST   /api/vfs/multipart/finalize           → atomic commit
+ *   POST   /api/vfs/multipart/finalize-step      → one bounded finalize page
  *   POST   /api/vfs/multipart/abort              → drop session
  *   POST   /api/vfs/multipart/abort-step         → one bounded abort page
  *   GET    /api/vfs/multipart/:uploadId/status   → one landed[] page
@@ -49,6 +50,8 @@ import {
   MULTIPART_STATUS_CURSOR_MAX_BYTES,
   type MultipartBeginRequest,
   type MultipartFinalizeRequest,
+  type MultipartFinalizeResponse,
+  type MultipartFinalizeStepRequest,
   type MultipartHashPageRequest,
   type MultipartAbortRequest,
   type MultipartPutChunkResponse,
@@ -120,6 +123,37 @@ function shardStub(
 // per-tenant rate-limit hit would return 500 instead of "retry-
 // with-backoff". The vfs.ts version is the single source of truth
 // for HTTP status mapping; both routers must share it.
+
+/**
+ * Warm the standard preview variants for a just-published upload.
+ *
+ * Scoped to image MIME types: that's the gallery-thumbnail use case where
+ * pre-gen actually saves user-visible latency. Other renderers (code-svg,
+ * waveform, icon-card) are cheap enough to run on-demand from
+ * `vfsReadPreview`. Best-effort — the routine catches per-variant failures
+ * internally.
+ */
+function preGeneratePreviews(
+  c: {
+    env: Env;
+    var: { scope: VFSScope };
+    executionCtx: { waitUntil: (promise: Promise<unknown>) => void };
+  },
+  result: MultipartFinalizeResponse
+): void {
+  if (result.size === 0 || result.isEncrypted) return;
+  if (!result.mimeType.startsWith("image/")) return;
+  c.executionCtx.waitUntil(
+    userStub(c).adminPreGenerateStandardVariants(c.var.scope, {
+      fileId: result.fileId,
+      path: result.path,
+      mimeType: result.mimeType,
+      fileName: result.path.split("/").pop() ?? result.fileId,
+      fileSize: result.size,
+      isEncrypted: result.isEncrypted,
+    })
+  );
+}
 
 // ── Multipart router ───────────────────────────────────────────────────
 
@@ -230,32 +264,42 @@ mp.post("/finalize", async (c) => {
         400
       );
     }
-    const stub = userStub(c);
-    const r = await stub.vfsFinalizeMultipart(
+    const r = await userStub(c).vfsFinalizeMultipart(
       c.var.scope,
       body.uploadId,
       body.chunkHashList
     );
-    // Pre-generate standard preview variants in the background so
-    // the user's first gallery click hits a warm cache. Scoped to
-    // image MIME types: that's the gallery-thumbnail use case where
-    // pre-gen actually saves user-visible latency. Other renderers
-    // (code-svg, waveform, icon-card) are cheap enough to run
-    // on-demand from `vfsReadPreview`. Best-effort: the routine
-    // catches per-variant failures internally.
-    if (r.size > 0 && !r.isEncrypted && r.mimeType.startsWith("image/")) {
-      c.executionCtx.waitUntil(
-        stub.adminPreGenerateStandardVariants(c.var.scope, {
-          fileId: r.fileId,
-          path: r.path,
-          mimeType: r.mimeType,
-          fileName: r.path.split("/").pop() ?? r.fileId,
-          fileSize: r.size,
-          isEncrypted: r.isEncrypted,
-        })
+    preGeneratePreviews(c, r);
+    return c.json(r);
+  } catch (err) {
+    const r = errToResponse(err);
+    return c.json(r.body, r.status as 400);
+  }
+});
+
+// POST /finalize-step
+//
+// One bounded page of the finalize machine, for a caller driving a manifest
+// too large for one request to stage and verify. Publication is reported once —
+// the page that observed it says `fresh` — so the side effects `/finalize`
+// dispatches happen exactly there rather than on every following page.
+mp.post("/finalize-step", async (c) => {
+  try {
+    const body = await c.req.json<MultipartFinalizeStepRequest>();
+    if (typeof body.uploadId !== "string" || body.uploadId.length === 0) {
+      return c.json(
+        { code: "EINVAL", message: "body.uploadId must be a non-empty string" },
+        400
       );
     }
-    return c.json(r);
+    const progress = await userStub(c).vfsFinalizeMultipartStep(
+      c.var.scope,
+      body.uploadId
+    );
+    if (progress.done && progress.fresh) {
+      preGeneratePreviews(c, progress.result);
+    }
+    return c.json(progress);
   } catch (err) {
     const r = errToResponse(err);
     return c.json(r.body, r.status as 400);
