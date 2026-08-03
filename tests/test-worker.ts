@@ -106,6 +106,7 @@ export class FaultInjectingShardDO extends ShardDO {
   private putChunkMultipartResponseLossesRemaining = 0;
   private multipartManifestRangeLossesRemaining = 0;
   private scheduleSweepFailuresRemaining = 0;
+  private fenceMultipartFailure: { remaining: number | null } | undefined;
   private putChunkFailure:
     | {
         phase: PutChunkFailurePhase;
@@ -283,6 +284,17 @@ export class FaultInjectingShardDO extends ShardDO {
     remaining: number
   ): Promise<void> {
     this.putChunkMultipartResponseLossesRemaining = remaining;
+  }
+
+  /** `null` fails every fence until cleared — a shard that stays unreachable. */
+  async testConfigureFenceMultipartFailure(
+    remaining: number | null
+  ): Promise<void> {
+    this.fenceMultipartFailure = { remaining };
+  }
+
+  async testClearFenceMultipartFailure(): Promise<void> {
+    this.fenceMultipartFailure = undefined;
   }
 
   async testConfigureScheduleSweepFailure(remaining: number): Promise<void> {
@@ -497,11 +509,35 @@ export class FaultInjectingShardDO extends ShardDO {
     return super.restoreChunkRef(chunkHash, newRefId, chunkIndex, userId);
   }
 
+  // A fence that never lands is the transient remote failure the abort
+  // machine must keep retrying instead of poisoning the session over.
+  override async fenceMultipart(
+    uploadId: string,
+    fenceId: string,
+    state: "finalizing" | "aborting",
+    expiresAt: number
+  ): Promise<void> {
+    const failure = this.fenceMultipartFailure;
+    if (
+      failure !== undefined &&
+      (failure.remaining === null || failure.remaining > 0)
+    ) {
+      if (failure.remaining !== null) {
+        failure.remaining--;
+        if (failure.remaining === 0) this.fenceMultipartFailure = undefined;
+      }
+      throw new Error(`injected multipart fence failure: ${uploadId}`);
+    }
+    return super.fenceMultipart(uploadId, fenceId, state, expiresAt);
+  }
+
   override async getMultipartManifest(
-    uploadId: string
+    uploadId: string,
+    afterIndex?: number,
+    limit?: number
   ): Promise<{ rows: Array<{ idx: number; hash: string; size: number }> }> {
     await this.awaitMultipartManifestBlock(uploadId);
-    return super.getMultipartManifest(uploadId);
+    return super.getMultipartManifest(uploadId, afterIndex, limit);
   }
 
   // The paged finalize reads ranges, so the manifest block and the response

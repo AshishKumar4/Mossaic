@@ -220,6 +220,13 @@ describe("ordinary write-ahead chunk cleanup", () => {
       stub.vfsAppendWriteStream(scope, handle, 0, chunkedBytes(0x51))
     ).rejects.toThrow(/putChunk response loss after mutation/);
 
+    // The failed append arms the maintenance alarm. Park it out of reach so it
+    // cannot drain the intent underneath the assertions below; the test re-arms
+    // it in the past once it is ready to observe recovery.
+    await runInDurableObject(stub, async (_instance, state) => {
+      await state.storage.setAlarm(Date.now() + 60 * 60 * 1000);
+    });
+
     expect(await readIntents(tenant)).toMatchObject([
       { ref_id: handle.tmpId, shard_index: shardIndex, attempts: 0 },
     ]);

@@ -8,7 +8,8 @@
  *   POST   /api/vfs/multipart/hash-page          → stage ≤256 chunk hashes
  *   POST   /api/vfs/multipart/finalize           → atomic commit
  *   POST   /api/vfs/multipart/abort              → drop session
- *   GET    /api/vfs/multipart/:uploadId/status   → landed[] for resume
+ *   POST   /api/vfs/multipart/abort-step         → one bounded abort page
+ *   GET    /api/vfs/multipart/:uploadId/status   → one landed[] page
  *   PUT    /api/vfs/multipart/:uploadId/chunk/:idx
  *                                                → per-chunk PUT (NO UserDO RPC)
  *   POST   /api/vfs/multipart/download-token     → cacheable-chunk dl token
@@ -45,12 +46,13 @@ import { parseRange, rangeResponse, rangeNotSatisfiableResponse } from "../lib/h
 import {
   MULTIPART_HASH_PAGE_SIZE,
   MULTIPART_MAX_CHUNK_BYTES,
+  MULTIPART_STATUS_CURSOR_MAX_BYTES,
   type MultipartBeginRequest,
   type MultipartFinalizeRequest,
   type MultipartHashPageRequest,
   type MultipartAbortRequest,
   type MultipartPutChunkResponse,
-  type MultipartStatusResponse,
+  type MultipartStatusPageResponse,
   type DownloadTokenRequest,
   type DownloadTokenResponse,
 } from "../../../shared/multipart";
@@ -278,22 +280,67 @@ mp.post("/abort", async (c) => {
   }
 });
 
+// POST /abort-step
+//
+// One bounded page of the abort machine, for a caller that would rather drive
+// the cleanup itself than have `/abort` spend a whole request on it.
+mp.post("/abort-step", async (c) => {
+  try {
+    const body = await c.req.json<MultipartAbortRequest>();
+    if (typeof body.uploadId !== "string" || body.uploadId.length === 0) {
+      return c.json(
+        { code: "EINVAL", message: "body.uploadId must be a non-empty string" },
+        400
+      );
+    }
+    const progress = await userStub(c).vfsAbortMultipartStep(
+      c.var.scope,
+      body.uploadId
+    );
+    return c.json(progress);
+  } catch (err) {
+    const r = errToResponse(err);
+    return c.json(r.body, r.status as 400);
+  }
+});
+
 // GET /:uploadId/status
+//
+// The oversize continuation check is here as well as in the RPC so a caller
+// cannot make the DO turn pay for a token it was never going to accept.
 mp.get("/:uploadId/status", async (c) => {
   try {
     const uploadId = c.req.param("uploadId");
+    const continuation = c.req.query("continuation");
     if (typeof uploadId !== "string" || uploadId.length === 0) {
       return c.json(
         { code: "EINVAL", message: "uploadId required" },
         400
       );
     }
-    const r = await userStub(c).vfsGetMultipartStatus(c.var.scope, uploadId);
-    const out: MultipartStatusResponse = {
+    if (
+      continuation !== undefined &&
+      (continuation.length === 0 ||
+        continuation.length > MULTIPART_STATUS_CURSOR_MAX_BYTES)
+    ) {
+      return c.json(
+        { code: "EINVAL", message: "malformed continuation" },
+        400
+      );
+    }
+    const r = await userStub(c).vfsGetMultipartStatus(
+      c.var.scope,
+      uploadId,
+      continuation
+    );
+    const out: MultipartStatusPageResponse = {
       landed: r.landed,
       total: r.total,
       bytesUploaded: r.bytesUploaded,
       expiresAtMs: r.expiresAtMs,
+      ...(r.continuation === undefined
+        ? {}
+        : { continuation: r.continuation }),
     };
     return c.json(out);
   } catch (err) {

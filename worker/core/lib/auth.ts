@@ -294,19 +294,24 @@ export async function verifyVFSToken(
 //     `mintDownloadToken`, validates per-chunk GETs against the
 //     browser-direct cacheable endpoint. Short-lived (1h default).
 //
-// Same JWT_SECRET signs all three (`vfs`, `vfs-mp`, `vfs-dl`); each
-// verify function rejects tokens lacking its sentinel — RFC 8725 §2.8
-// scope-binding pattern. Cross-purpose forgery is impossible without
-// the secret.
+//   - `scope: "vfs-mp-status"` — opaque status/resume continuation,
+//     bound to the tenant and upload whose scan it describes.
+//
+// Same JWT_SECRET signs all four (`vfs`, `vfs-mp`, `vfs-mp-status`,
+// `vfs-dl`); each verify function rejects tokens lacking its sentinel —
+// RFC 8725 §2.8 scope-binding pattern. Cross-purpose forgery is
+// impossible without the secret.
 
 import {
   VFS_MP_SCOPE,
+  VFS_MP_STATUS_SCOPE,
   VFS_DL_SCOPE,
   MULTIPART_DEFAULT_TTL_MS,
   MULTIPART_MAX_TTL_MS,
   DOWNLOAD_TOKEN_DEFAULT_TTL_MS,
   isMultipartPlacementVersion,
   type MultipartSessionTokenPayload,
+  type MultipartStatusCursorPayload,
   type DownloadTokenPayload,
 } from "../../../shared/multipart";
 
@@ -439,6 +444,87 @@ export async function verifyVFSMultipartToken(
   } catch {
     return null;
   }
+}
+
+/**
+ * Sign where a bounded status or resume scan got to.
+ *
+ * The seek state is the server's, not the caller's: signing it is what lets
+ * the next page trust a shard index and a row boundary it did not compute.
+ * It expires with the longest session a continuation could belong to.
+ */
+export async function signVFSMultipartStatusCursor(
+  env: Env,
+  payload: Omit<MultipartStatusCursorPayload, "scope" | "iat" | "exp">
+): Promise<string> {
+  const claims: Record<string, unknown> = {
+    scope: VFS_MP_STATUS_SCOPE,
+    uploadId: payload.uploadId,
+    userId: payload.userId,
+    ns: payload.ns,
+    tn: payload.tn,
+    shardIndex: payload.shardIndex,
+    afterIndex: payload.afterIndex,
+  };
+  if (payload.sub !== undefined) claims.sub = payload.sub;
+  return signScopedJwt(
+    getSecret(env),
+    claims,
+    Date.now() + MULTIPART_MAX_TTL_MS
+  );
+}
+
+/**
+ * Verify a status continuation. Returns null on any failure, including a
+ * token minted for another surface — the caller then decides which of its own
+ * bindings the payload has to match.
+ */
+export async function verifyVFSMultipartStatusCursor(
+  env: Env,
+  token: string
+): Promise<MultipartStatusCursorPayload | null> {
+  const result = await verifyAgainstSecrets(env, token);
+  if (result === null) return null;
+  const { payload } = result;
+  if (payload.scope !== VFS_MP_STATUS_SCOPE) return null;
+  if (typeof payload.uploadId !== "string" || payload.uploadId.length === 0) {
+    return null;
+  }
+  if (typeof payload.userId !== "string" || payload.userId.length === 0) {
+    return null;
+  }
+  if (typeof payload.ns !== "string" || payload.ns.length === 0) return null;
+  if (typeof payload.tn !== "string" || payload.tn.length === 0) return null;
+  if (
+    typeof payload.shardIndex !== "number" ||
+    !Number.isSafeInteger(payload.shardIndex) ||
+    payload.shardIndex < 0
+  ) {
+    return null;
+  }
+  if (
+    typeof payload.afterIndex !== "number" ||
+    !Number.isSafeInteger(payload.afterIndex) ||
+    payload.afterIndex < -1
+  ) {
+    return null;
+  }
+  const sub =
+    typeof payload.sub === "string" && payload.sub.length > 0
+      ? payload.sub
+      : undefined;
+  return {
+    scope: VFS_MP_STATUS_SCOPE,
+    uploadId: payload.uploadId,
+    userId: payload.userId,
+    ns: payload.ns,
+    tn: payload.tn,
+    sub,
+    shardIndex: payload.shardIndex,
+    afterIndex: payload.afterIndex,
+    iat: typeof payload.iat === "number" ? payload.iat : 0,
+    exp: typeof payload.exp === "number" ? payload.exp : 0,
+  };
 }
 
 /**

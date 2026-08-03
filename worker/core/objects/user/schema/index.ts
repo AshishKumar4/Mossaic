@@ -19,6 +19,7 @@ import {
   applyTagsAndListingIndexes,
 } from "./metadata-tags";
 import {
+  applyMultipartAbortSchema,
   applyMultipartFinalizeSchema,
   applyUploadSessionIndexes,
   applyUploadSessionsTable,
@@ -97,4 +98,5 @@ export const USER_SCHEMA_STEPS: readonly SchemaStep[] = [
   applyAuditLog,
   verifyPathUniquenessIndexes,
   applyMultipartFinalizeSchema,
+  applyMultipartAbortSchema,
 ];

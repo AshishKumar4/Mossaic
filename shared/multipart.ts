@@ -17,6 +17,9 @@ export const VFS_MP_SCOPE = "vfs-mp" as const;
 /** Sentinel for the cacheable-chunk download HMAC token. */
 export const VFS_DL_SCOPE = "vfs-dl" as const;
 
+/** Sentinel for the opaque status/resume continuation. */
+export const VFS_MP_STATUS_SCOPE = "vfs-mp-status" as const;
+
 /** Placement v1 is the original O(poolSize) rendezvous algorithm. */
 export const MULTIPART_LEGACY_PLACEMENT_VERSION = 1;
 
@@ -48,6 +51,18 @@ export const MULTIPART_HASH_PAGE_SIZE = 256;
 
 /** Shard fences persisted, and shards fanned out to, per call. */
 export const MULTIPART_FENCE_PAGE_SIZE = 64;
+
+/** Shards one status or resume invocation may probe. */
+export const MULTIPART_STATUS_SHARD_PAGE_SIZE = 64;
+
+/** Landed entries one status or resume invocation may report. */
+export const MULTIPART_STATUS_ENTRY_PAGE_SIZE = 256;
+
+/**
+ * Longest continuation this server will look at. A continuation is a small
+ * signed token, so anything larger is rejected before it costs a verify.
+ */
+export const MULTIPART_STATUS_CURSOR_MAX_BYTES = 4 * 1024;
 
 /** Default upload-session TTL — 24h. Configurable per `beginUpload` call. */
 export const MULTIPART_DEFAULT_TTL_MS = 24 * 60 * 60 * 1000;
@@ -92,6 +107,29 @@ export interface MultipartSessionTokenPayload {
   exp: number;
 }
 
+/**
+ * Seek state of one status or resume page, signed so the server never has to
+ * trust a caller with where its own scan got to.
+ *
+ * The tenant and upload it was minted for are part of the payload: a
+ * continuation presented against any other upload, or by any other tenant, is
+ * refused rather than followed.
+ */
+export interface MultipartStatusCursorPayload {
+  scope: typeof VFS_MP_STATUS_SCOPE;
+  uploadId: string;
+  userId: string;
+  ns: string;
+  tn: string;
+  sub?: string;
+  /** Shard the next page resumes on. */
+  shardIndex: number;
+  /** Highest chunk index that shard already reported. */
+  afterIndex: number;
+  iat: number;
+  exp: number;
+}
+
 /** Wire shape of a `vfs-dl` download token's payload. */
 export interface DownloadTokenPayload {
   scope: typeof VFS_DL_SCOPE;
@@ -132,6 +170,8 @@ export interface MultipartBeginResponse {
   putEndpoint: string;
   expiresAtMs: number;
   landed: number[];
+  /** Opaque seek state for the next bounded landed page, when one remains. */
+  continuation?: string;
   recommendedConcurrency?: number;
   /** Echoed when the server accepted the client's paged control plane. */
   protocolVersion?: number;
@@ -201,10 +241,26 @@ export type MultipartFinalizeProgress =
     }
   | { done: true; result: MultipartFinalizeResponse; fresh: boolean };
 
-/** Body of `POST /api/vfs/multipart/abort`. */
+/** Body of `POST /api/vfs/multipart/abort` and `.../abort-step`. */
 export interface MultipartAbortRequest {
   uploadId: string;
 }
+
+/**
+ * One `POST /api/vfs/multipart/abort-step` outcome.
+ *
+ * Same contract as `MultipartFinalizeProgress`: `cursor`/`total` are progress
+ * to display, not a resume token, and `done: true` is only ever returned by a
+ * session whose abort is terminal — a caller that sees it owes nothing more.
+ */
+export type MultipartAbortProgress =
+  | {
+      done: false;
+      phase: "fencing" | "intents" | "cleanup" | "old_intents" | "local";
+      cursor: number;
+      total: number;
+    }
+  | { done: true };
 
 /** Response of `GET /api/vfs/multipart/:uploadId/status`. */
 export interface MultipartStatusResponse {
@@ -212,6 +268,15 @@ export interface MultipartStatusResponse {
   total: number;
   bytesUploaded: number;
   expiresAtMs: number;
+}
+
+/**
+ * One bounded status page. `continuation` is present exactly while shards
+ * remain unread, so a caller with no continuation has the complete set — which
+ * is every caller whose session fits inside one page.
+ */
+export interface MultipartStatusPageResponse extends MultipartStatusResponse {
+  continuation?: string;
 }
 
 /** Response of `PUT /api/vfs/multipart/:uploadId/chunk/:idx`. */
@@ -254,11 +319,16 @@ export interface DownloadTokenResponse {
 
 // ── Internal ShardDO wire shapes (HTTP-internal, used by UserDO finalize) ──
 
-export interface ShardMultipartManifestRow {
+/**
+ * One staged chunk, as the shard reports it. Declared as an alias rather than
+ * an interface so it carries the implicit index signature
+ * `SqlStorage.exec<T>` requires of the projection that produces it.
+ */
+export type ShardMultipartManifestRow = {
   idx: number;
   hash: string;
   size: number;
-}
+};
 
 export interface ShardMultipartManifestResponse {
   rows: ShardMultipartManifestRow[];
@@ -266,6 +336,8 @@ export interface ShardMultipartManifestResponse {
 
 export interface ShardMultipartLandedResponse {
   idx: number[];
+  /** Staged byte count per entry, positionally aligned with `idx`. */
+  sizes: number[];
 }
 
 export interface ShardMultipartClearResponse {

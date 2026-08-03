@@ -4,6 +4,10 @@ import {
   MULTIPART_FENCE_GC_GRACE_MS,
   MULTIPART_HASH_PAGE_SIZE,
   MULTIPART_MAX_TTL_MS,
+  MULTIPART_STATUS_ENTRY_PAGE_SIZE,
+  type ShardMultipartLandedResponse,
+  type ShardMultipartManifestResponse,
+  type ShardMultipartManifestRow,
 } from "../../../../shared/multipart";
 import { ensureMigrationsTable } from "../../lib/migrations";
 import { sqlRowsChanged } from "../../lib/paged-operation";
@@ -13,6 +17,20 @@ import { SHARD_SCHEMA_STEPS } from "./schema";
 
 /** Fence rows one invocation may backfill or reclaim. */
 export const MULTIPART_FENCE_PAGE_LIMIT = 256;
+
+/**
+ * `(afterIndex, limit)` a staging read was asked for. Absent params take the
+ * method's defaults; anything else is passed through so the method's own page
+ * validation is what refuses it.
+ */
+function readMultipartPageParams(url: URL): [number, number] {
+  const afterIndex = url.searchParams.get("after_index");
+  const limit = url.searchParams.get("limit");
+  return [
+    afterIndex === null ? -1 : Number(afterIndex),
+    limit === null ? MULTIPART_STATUS_ENTRY_PAGE_SIZE : Number(limit),
+  ];
+}
 
 export class ShardDO extends DurableObject<Env> {
   sql: SqlStorage;
@@ -217,23 +235,23 @@ export class ShardDO extends DurableObject<Env> {
 
       // ── multipart staging endpoints ─────────────────────────
       //
-      // Internal HTTP shapes used by UserDO finalize/abort to query
-      // the staging table this shard accumulated during the upload.
-      // All three are read-only or staging-only (they never touch
-      // `chunk_refs` or `chunks`); committing real refs goes through
-      // the typed `putChunkMultipart` RPC.
+      // Internal HTTP shapes for the staging table this shard accumulated
+      // during an upload. All three are read-only or staging-only (they never
+      // touch `chunk_refs` or `chunks`); committing real refs goes through the
+      // typed `putChunkMultipart` RPC. Each one delegates to the RPC method of
+      // the same name, so the page bound the reads enforce is a property of
+      // the shard rather than of the entry point a caller happened to use.
       if (path === "/multipart/manifest" && request.method === "GET") {
         const uploadId = url.searchParams.get("upload_id") ?? "";
         if (uploadId.length === 0) {
           return Response.json({ error: "upload_id required" }, { status: 400 });
         }
-        const rows = this.sql
-          .exec(
-            "SELECT chunk_index AS idx, chunk_hash AS hash, chunk_size AS size FROM upload_chunks WHERE upload_id = ? ORDER BY chunk_index",
-            uploadId
+        return Response.json(
+          await this.getMultipartManifest(
+            uploadId,
+            ...readMultipartPageParams(url)
           )
-          .toArray();
-        return Response.json({ rows });
+        );
       }
 
       if (path === "/multipart/landed" && request.method === "GET") {
@@ -241,13 +259,12 @@ export class ShardDO extends DurableObject<Env> {
         if (uploadId.length === 0) {
           return Response.json({ error: "upload_id required" }, { status: 400 });
         }
-        const rows = this.sql
-          .exec(
-            "SELECT chunk_index FROM upload_chunks WHERE upload_id = ? ORDER BY chunk_index",
-            uploadId
+        return Response.json(
+          await this.getMultipartLanded(
+            uploadId,
+            ...readMultipartPageParams(url)
           )
-          .toArray() as { chunk_index: number }[];
-        return Response.json({ idx: rows.map((r) => r.chunk_index) });
+        );
       }
 
       if (path === "/multipart/clear" && request.method === "DELETE") {
@@ -255,19 +272,7 @@ export class ShardDO extends DurableObject<Env> {
         if (uploadId.length === 0) {
           return Response.json({ error: "upload_id required" }, { status: 400 });
         }
-        const before = (
-          this.sql
-            .exec(
-              "SELECT COUNT(*) AS n FROM upload_chunks WHERE upload_id = ?",
-              uploadId
-            )
-            .toArray()[0] as { n: number }
-        ).n;
-        this.sql.exec(
-          "DELETE FROM upload_chunks WHERE upload_id = ?",
-          uploadId
-        );
-        return Response.json({ dropped: before });
+        return Response.json(await this.clearMultipartStaging(uploadId));
       }
 
       return new Response("Not found", { status: 404 });
@@ -690,20 +695,35 @@ export class ShardDO extends DurableObject<Env> {
   }
 
   /**
-   * read the staging manifest for a given upload_id. Used by
-   * UserDO finalize to verify chunk completeness across all touched
-   * shards. Read-only; never mutates state.
+   * Read one page of the staging manifest for an upload, seeking past
+   * `afterIndex`.
+   *
+   * The page bound is the response bound: a shard holding a whole
+   * hundred-thousand-chunk upload answers with at most
+   * `MULTIPART_STATUS_ENTRY_PAGE_SIZE` rows, so neither this object nor the
+   * RPC channel between it and its caller ever materialises the set. The
+   * defaults are what a caller that only wants the head of a small upload's
+   * manifest passes.
    */
   async getMultipartManifest(
-    uploadId: string
-  ): Promise<{ rows: Array<{ idx: number; hash: string; size: number }> }> {
+    uploadId: string,
+    afterIndex = -1,
+    limit = MULTIPART_STATUS_ENTRY_PAGE_SIZE
+  ): Promise<ShardMultipartManifestResponse> {
     this.ensureInit();
+    this.assertMultipartReadPage(afterIndex, limit);
     const rows = this.sql
-      .exec(
-        "SELECT chunk_index AS idx, chunk_hash AS hash, chunk_size AS size FROM upload_chunks WHERE upload_id = ? ORDER BY chunk_index",
-        uploadId
+      .exec<ShardMultipartManifestRow>(
+        `SELECT chunk_index AS idx, chunk_hash AS hash, chunk_size AS size
+           FROM upload_chunks
+          WHERE upload_id = ? AND chunk_index > ?
+          ORDER BY chunk_index
+          LIMIT ?`,
+        uploadId,
+        afterIndex,
+        limit
       )
-      .toArray() as Array<{ idx: number; hash: string; size: number }>;
+      .toArray();
     return { rows };
   }
 
@@ -718,7 +738,7 @@ export class ShardDO extends DurableObject<Env> {
     uploadId: string,
     startIndex: number,
     endIndex: number
-  ): Promise<{ rows: Array<{ idx: number; hash: string; size: number }> }> {
+  ): Promise<ShardMultipartManifestResponse> {
     this.ensureInit();
     if (
       !Number.isInteger(startIndex) ||
@@ -732,7 +752,7 @@ export class ShardDO extends DurableObject<Env> {
       );
     }
     const rows = this.sql
-      .exec(
+      .exec<ShardMultipartManifestRow>(
         `SELECT chunk_index AS idx, chunk_hash AS hash, chunk_size AS size
            FROM upload_chunks
           WHERE upload_id = ? AND chunk_index >= ? AND chunk_index < ?
@@ -741,25 +761,61 @@ export class ShardDO extends DurableObject<Env> {
         startIndex,
         endIndex
       )
-      .toArray() as Array<{ idx: number; hash: string; size: number }>;
+      .toArray();
     return { rows };
   }
 
   /**
-   * read just the landed-chunk indices. Cheaper than the
-   * full manifest — used by status / resume probe.
+   * Read one page of landed chunk indices and their staged sizes, seeking
+   * past `afterIndex`. Cheaper than the manifest — the status and resume
+   * probes need to know which indices arrived and how many bytes they were,
+   * not what they hashed to.
    */
   async getMultipartLanded(
-    uploadId: string
-  ): Promise<{ idx: number[] }> {
+    uploadId: string,
+    afterIndex = -1,
+    limit = MULTIPART_STATUS_ENTRY_PAGE_SIZE
+  ): Promise<ShardMultipartLandedResponse> {
     this.ensureInit();
+    this.assertMultipartReadPage(afterIndex, limit);
     const rows = this.sql
-      .exec(
-        "SELECT chunk_index FROM upload_chunks WHERE upload_id = ? ORDER BY chunk_index",
-        uploadId
+      .exec<{ chunk_index: number; chunk_size: number }>(
+        `SELECT chunk_index, chunk_size
+           FROM upload_chunks
+          WHERE upload_id = ? AND chunk_index > ?
+          ORDER BY chunk_index
+          LIMIT ?`,
+        uploadId,
+        afterIndex,
+        limit
       )
-      .toArray() as { chunk_index: number }[];
-    return { idx: rows.map((r) => r.chunk_index) };
+      .toArray();
+    return {
+      idx: rows.map((row) => row.chunk_index),
+      sizes: rows.map((row) => row.chunk_size),
+    };
+  }
+
+  /**
+   * Refuse a page a bounded reader could not have asked for.
+   *
+   * This is the guard that makes the response size a property of the RPC
+   * rather than of the upload: no caller — including one that reached this
+   * object with a forged limit — can make a single answer carry more than
+   * one page of rows.
+   */
+  private assertMultipartReadPage(afterIndex: number, limit: number): void {
+    if (
+      !Number.isSafeInteger(afterIndex) ||
+      afterIndex < -1 ||
+      !Number.isSafeInteger(limit) ||
+      limit < 1 ||
+      limit > MULTIPART_STATUS_ENTRY_PAGE_SIZE
+    ) {
+      throw new Error(
+        `EINVAL: multipart read page requires afterIndex >= -1 and limit 1..${MULTIPART_STATUS_ENTRY_PAGE_SIZE}`
+      );
+    }
   }
 
   /**

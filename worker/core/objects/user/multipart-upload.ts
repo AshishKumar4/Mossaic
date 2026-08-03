@@ -1,16 +1,24 @@
 /**
  * Multipart parallel transfer engine, server-side.
  *
- * This module implements five UserDO RPCs:
+ * This module implements seven UserDO RPCs:
  *
  *   - `vfsBeginMultipart` — mints a session, inserts a tmp `files` row
  *     (status='uploading'), inserts an `upload_sessions` row, signs an
  *     HMAC session token. Single UserDO turn; zero ShardDO RPCs.
  *
- *   - `vfsAbortMultipart` — flips session status to 'aborted', drops
- *     `chunk_refs` on every shard in the pool via `deleteChunks`, drops
- *     `upload_chunks` staging on every shard via `clearMultipartStaging`,
- *     hard-deletes the tmp `files` row.
+ *   - `vfsAbortMultipartStep` — advances the durable abort machine by one
+ *     bounded page: at most 64 terminal shard fences, at most 64 staged
+ *     cleanup intents, at most 256 rows of the manifests a verified upload
+ *     staged, at most 64 discarded cleanup routes, or the local finish that
+ *     makes the session terminal. Every page is resumable after Durable
+ *     Object eviction.
+ *
+ *   - `vfsAbortMultipart` — the one-request entry point, which drives that
+ *     machine to its terminal state inside a single turn. It answers `ok`
+ *     only from a session that reached it: an abort with pages still owed
+ *     raises `EBUSY` and leaves them to the alarm rather than reporting a
+ *     cleanup that has not happened.
  *
  *   - `vfsStageMultipartHashes` — persists at most 256 declared chunk
  *     hashes per call into `upload_expected_chunks`, advancing the
@@ -30,6 +38,10 @@
  *     caller owns a file, so this returns the recorded result and leaves the
  *     bounded cleaning still owed to the alarm.
  *
+ *   - `vfsGetMultipartStatus` — one bounded page of the landed set, at most
+ *     64 shards and 256 entries per call, with a signed continuation while
+ *     shards remain.
+ *
  * The chunk PUT path lives entirely in the routes layer (not here) —
  * it doesn't touch UserDO at all, by design (Hard Constraint 1 from
  * the plan: UserDO touched only at session boundaries).
@@ -48,7 +60,9 @@ import { generateId, vfsShardDOName } from "../../lib/utils";
 import { logError } from "../../lib/logger";
 import { placeMultipartChunk } from "../../../../shared/placement";
 import {
+  signVFSMultipartStatusCursor,
   signVFSMultipartToken,
+  verifyVFSMultipartStatusCursor,
 } from "../../lib/auth";
 import {
   MULTIPART_DEFAULT_TTL_MS,
@@ -57,18 +71,27 @@ import {
   MULTIPART_MAX_OPEN_SESSIONS_PER_TENANT,
   MULTIPART_PLACEMENT_VERSION,
   MULTIPART_PROTOCOL_VERSION,
+  MULTIPART_STATUS_CURSOR_MAX_BYTES,
+  MULTIPART_STATUS_ENTRY_PAGE_SIZE,
+  MULTIPART_STATUS_SHARD_PAGE_SIZE,
+  type MultipartAbortProgress,
   type MultipartBeginResponse,
   type MultipartFinalizeProgress,
   type MultipartFinalizeResponse,
   type MultipartHashPageResponse,
   type MultipartPlacementVersion,
+  type MultipartStatusPageResponse,
+  type ShardMultipartLandedResponse,
   type ShardMultipartManifestRow,
 } from "../../../../shared/multipart";
 import {
   commitOperationTransition,
   heldProgress,
+  isPoisonous,
+  retryDelayMs,
   runOperationPages,
   type PagedOperationTable,
+  type PoisonPolicy,
   type RetryPolicy,
 } from "../../lib/paged-operation";
 import {
@@ -168,6 +191,13 @@ type UploadSessionRow = {
   mode: number;
   mime_type: string;
   created_at: number;
+  attempts: number;
+  abort_phase: string | null;
+  abort_fence_cursor: number;
+  abort_intent_cursor: number;
+  abort_cleanup_cursor: number;
+  abort_old_intent_cursor: number;
+  abort_retry_at: number;
   staged_hash_cursor: number;
   finalize_phase: string | null;
   finalize_fence_cursor: number;
@@ -202,22 +232,32 @@ function shardNs(durableObject: UserDO): DurableObjectNamespace<ShardDO> {
     .MOSSAIC_SHARD as unknown as DurableObjectNamespace<ShardDO>;
 }
 
-async function fenceMultipartShards(
+/**
+ * Close one bounded range of the session's frozen pool to further PUTs.
+ *
+ * Both terminal machines fence, and neither may fan out over a whole pool in
+ * one invocation, so both come through here with the range their own cursor
+ * reached. Replaying a range re-fences shards that already hold the fence,
+ * which the ShardDO treats as the state it is already in.
+ */
+async function fenceMultipartShardPage(
   durableObject: UserDO,
   scope: VFSScope,
   session: UploadSessionRow,
-  state: "finalizing" | "aborting"
+  state: "finalizing" | "aborting",
+  startShard: number,
+  endShard: number
 ): Promise<void> {
   const fenceId = session.fence_id;
   if (fenceId === null) return;
   const ns = shardNs(durableObject);
   await Promise.all(
-    Array.from({ length: session.pool_size }, async (_, shardIndex) => {
+    Array.from({ length: endShard - startShard }, async (_unused, offset) => {
       const shardName = vfsShardDOName(
         scope.ns,
         scope.tenant,
         scope.sub,
-        shardIndex
+        startShard + offset
       );
       // The session's expiry becomes the shard fence's reclaim deadline:
       // no token for this upload outlives it, so nothing can re-open the
@@ -560,30 +600,18 @@ async function resumeMultipart(
     opts.protocolVersion
   );
 
-  // Probe every shard in the pool for landed indices. This is the
-  // ONE place the resume probe pays a per-shard subrequest. For
-  // typical pools (32) that's 32 subrequests — well within the
-  // budget for a one-shot begin call.
-  const ns = shardNs(durableObject);
-  const landedSet = new Set<number>();
-  const probes: Promise<void>[] = [];
-  for (let sIdx = 0; sIdx < row.pool_size; sIdx++) {
-    const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, sIdx);
-    const stub = ns.get(ns.idFromName(shardName));
-    probes.push(
-      (async () => {
-        try {
-          const res = await stub.getMultipartLanded(uploadId);
-          for (const i of res.idx) landedSet.add(i);
-        } catch {
-          // Best-effort; a shard fan-out failure on resume just means
-          // the caller will see fewer landed chunks and re-PUT them.
-          // Idempotent supersession on the ShardDO absorbs that.
-        }
-      })()
-    );
-  }
-  await Promise.all(probes);
+  // One bounded page of the landed set, exactly as `vfsGetMultipartStatus`
+  // reports it. A session small enough to fit in one page — which is every
+  // session a client without the paged control plane may open — gets its
+  // whole landed set here; a larger one gets a continuation to follow, and a
+  // client that ignores it simply re-PUTs the chunks it was not told about.
+  const landedPage = await readMultipartLandedPage(
+    durableObject,
+    scope,
+    userId,
+    row,
+    MULTIPART_STATUS_PAGE_START
+  );
 
   // Re-mint the session token (extending the expiry).
   const ttl =
@@ -619,7 +647,6 @@ async function resumeMultipart(
     uploadId
   );
 
-  const landed = Array.from(landedSet).sort((a, b) => a - b);
   return {
     uploadId,
     chunkSize: row.chunk_size,
@@ -628,126 +655,14 @@ async function resumeMultipart(
     sessionToken: token,
     putEndpoint: `/api/vfs/multipart/${uploadId}`,
     expiresAtMs: expiresAt,
-    landed,
+    landed: landedPage.landed,
+    ...(landedPage.continuation === undefined
+      ? {}
+      : { continuation: landedPage.continuation }),
     ...(opts.protocolVersion === MULTIPART_PROTOCOL_VERSION
       ? { protocolVersion: MULTIPART_PROTOCOL_VERSION }
       : {}),
   };
-}
-
-/**
- * Abort a multipart upload. Idempotent: aborting a session that is
- * already 'aborted' is a no-op; aborting a 'finalized' session
- * raises EBUSY (cannot un-finalize).
- *
- * The session transition, temp-row deletion, and one durable cleanup intent
- * per pool shard commit together. The outbox then runs the idempotent
- * `deleteChunks` + `clearMultipartStaging` protocol and alarm-retries any
- * unacknowledged shard.
- */
-export async function vfsAbortMultipart(
-  durableObject: UserDO,
-  scope: VFSScope,
-  uploadId: string,
-  allowFinalizing = false
-): Promise<{ ok: true }> {
-  const userId = userIdFor(scope);
-  const row = readUploadSession(durableObject, userId, uploadId);
-  if (!row) {
-    throw new VFSError("ENOENT", `abortMultipart: session not found: ${uploadId}`);
-  }
-  if (row.status === "finalized") {
-    throw new VFSError(
-      "EBUSY",
-      `abortMultipart: session is already finalized; cannot un-finalize`
-    );
-  }
-  if (row.status === "aborted") return { ok: true };
-  if (row.status === "finalizing" && !allowFinalizing) {
-    throw new VFSError("EBUSY", "abortMultipart: finalize is in progress");
-  }
-
-  await scheduleStaleUploadSweep(durableObject);
-  transactionSync(durableObject, () => {
-    const current = durableObject.sql
-      .exec(
-        `SELECT status, pool_size FROM upload_sessions
-          WHERE upload_id = ? AND user_id = ?`,
-        uploadId,
-        userId
-      )
-      .toArray()[0] as
-      | { status: string; pool_size: number }
-      | undefined;
-    if (!current) {
-      throw new VFSError(
-        "ENOENT",
-        `abortMultipart: session not found: ${uploadId}`
-      );
-    }
-    if (current.status === "finalized") {
-      throw new VFSError(
-        "EBUSY",
-        "abortMultipart: session is already finalized; cannot un-finalize"
-      );
-    }
-    if (current.status === "aborted") return;
-    if (current.status === "finalizing" && !allowFinalizing) {
-      throw new VFSError("EBUSY", "abortMultipart: finalize is in progress");
-    }
-
-    durableObject.sql.exec(
-      `UPDATE upload_sessions SET status = 'aborting'
-        WHERE upload_id = ? AND user_id = ? AND status IN ('open', 'finalizing')`,
-      uploadId,
-      userId
-    );
-  });
-
-  await fenceMultipartShards(durableObject, scope, row, "aborting");
-
-  transactionSync(durableObject, () => {
-    const current = durableObject.sql
-      .exec(
-        `SELECT status, pool_size FROM upload_sessions
-          WHERE upload_id = ? AND user_id = ?`,
-        uploadId,
-        userId
-      )
-      .toArray()[0] as
-      | { status: string; pool_size: number }
-      | undefined;
-    if (!current || current.status === "aborted") return;
-    if (current.status !== "aborting") {
-      throw new VFSError("EBUSY", "abortMultipart: session changed while fencing");
-    }
-
-    const now = Date.now();
-    for (let shardIndex = 0; shardIndex < current.pool_size; shardIndex++) {
-      stageChunkCleanupIntent(
-        durableObject,
-        uploadId,
-        shardIndex,
-        now,
-        now,
-        ChunkCleanupKind.Multipart
-      );
-    }
-    durableObject.sql.exec(
-      `UPDATE upload_sessions SET status = 'aborted'
-        WHERE upload_id = ? AND user_id = ? AND status = 'aborting'`,
-      uploadId,
-      userId
-    );
-    // The temporary row takes its own chunk rows with it; a candidate
-    // version's are reachable only through the frozen context.
-    hardDeleteFileRowLocal(durableObject, userId, uploadId);
-    discardMultipartFinalizeScratch(durableObject, row);
-  });
-
-  await drainChunkCleanupIntents(durableObject, scope, uploadId);
-
-  return { ok: true };
 }
 
 /**
@@ -955,7 +870,8 @@ type MultipartFinalizePhase = (typeof MULTIPART_FINALIZE_PHASES)[number];
  * policy and the alarm's fixed maintenance cadence is what actually paces
  * retries.
  *
- * The driver's poison policy is deliberately not consumed either. Before
+ * The driver's poison policy is deliberately not consumed by this machine
+ * either — the abort machine below is the one that reaches for it. Before
  * publication a deterministic failure releases the session outright, which is
  * a stronger disposition than a retry cap; after publication the file exists
  * and the reaping it left owed is still owed however often it fails, which is
@@ -1358,45 +1274,6 @@ function commitFinalizePage(
   });
 }
 
-/**
- * Undo everything a finalize staged locally before it published.
- *
- * Called from the abort's terminal transaction. Besides the scratch, that
- * includes the destination manifest verification materialised a page at a time
- * so publication would not have to: the temporary row's chunks go with the row
- * itself, but a candidate version's are reachable only through the frozen
- * context, which an aborting session reads best-effort — a context this server
- * cannot read is one no verification page could have written against.
- *
- * A published finalize pages its scratch off instead, because by then it is as
- * large as the manifest.
- */
-function discardMultipartFinalizeScratch(
-  durableObject: UserDO,
-  session: UploadSessionRow
-): void {
-  const uploadId = session.upload_id;
-  durableObject.sql.exec(
-    "DELETE FROM upload_expected_chunks WHERE upload_id = ?",
-    uploadId
-  );
-  durableObject.sql.exec(
-    "DELETE FROM upload_verified_chunks WHERE upload_id = ?",
-    uploadId
-  );
-  durableObject.sql.exec(
-    "DELETE FROM upload_cleanup_routes WHERE upload_id = ?",
-    uploadId
-  );
-  const versionId = candidateVersionId(session);
-  if (versionId !== null) {
-    durableObject.sql.exec(
-      "DELETE FROM version_chunks WHERE version_id = ?",
-      versionId
-    );
-  }
-}
-
 /** Version id a finalize froze, if it froze one this server can still read. */
 function candidateVersionId(session: UploadSessionRow): string | null {
   if (session.finalize_context === null) return null;
@@ -1473,7 +1350,7 @@ export async function vfsFinalizeMultipartStep(
     // A finalize that predates the durable machine froze no decision and left
     // no resumable page, and its shards are already fenced, so releasing the
     // session is the only way to let the caller upload again.
-    await vfsAbortMultipart(durableObject, scope, uploadId, true);
+    await releaseMultipartSession(durableObject, scope, uploadId);
     throw new VFSError(
       "EBUSY",
       "finalizeMultipart: released a finalize that started before this server owned the session"
@@ -1497,7 +1374,7 @@ export async function vfsFinalizeMultipartStep(
         // already staged and cannot heal on retry, and the session is past
         // the point where the caller can abort it itself.
         if (err instanceof VFSError && err.code !== "EBUSY") {
-          await vfsAbortMultipart(durableObject, scope, uploadId, true);
+          await releaseMultipartSession(durableObject, scope, uploadId);
         }
         throw err;
       }
@@ -1637,7 +1514,7 @@ async function releaseUnpublishedMultipart(
   ) {
     return;
   }
-  await vfsAbortMultipart(durableObject, scope, session.upload_id, true);
+  await releaseMultipartSession(durableObject, scope, session.upload_id);
 }
 
 /** The upload's temporary row, still where the session put it. */
@@ -1680,31 +1557,14 @@ async function advanceMultipartFence(
     startShard + MULTIPART_FENCE_PAGE_SIZE,
     session.pool_size
   );
-  const fenceId = session.fence_id;
-  if (fenceId !== null) {
-    const ns = shardNs(durableObject);
-    await Promise.all(
-      Array.from({ length: endShard - startShard }, async (_, offset) => {
-        const shardName = vfsShardDOName(
-          scope.ns,
-          scope.tenant,
-          scope.sub,
-          startShard + offset
-        );
-        // The session's expiry becomes the shard fence's reclaim deadline:
-        // no token for this upload outlives it, so nothing can re-open the
-        // fence once it has passed.
-        await ns
-          .get(ns.idFromName(shardName))
-          .fenceMultipart(
-            session.upload_id,
-            fenceId,
-            "finalizing",
-            session.expires_at
-          );
-      })
-    );
-  }
+  await fenceMultipartShardPage(
+    durableObject,
+    scope,
+    session,
+    "finalizing",
+    startShard,
+    endShard
+  );
   const fenced = endShard >= session.pool_size;
   commitFinalizePage(durableObject, session, "fencing", {
     finalize_fence_cursor: endShard,
@@ -2908,74 +2768,951 @@ function reconstructFinalizedPath(
   return "/" + segments.join("/");
 }
 
+// ── the durable abort machine ─────────────────────────────────────────
+
 /**
- * Read the status of an open session. Used by the SDK to decide
- * whether to resume or restart. Returns landed[] from the shards.
+ * Phases of one multipart abort, in the order they may be reached.
  *
- * Like `resumeMultipart`'s probe, this fans out to every shard in
- * the pool; for an open session that's bounded (poolSize ≤ 200 in
- * practice).
+ * An abort undoes an upload, so it is as large as the upload: a terminal fence
+ * and a cleanup intent for every shard of the pool, and — once a finalize has
+ * verified anything — a row per chunk in the scratch tables and in the
+ * destination manifest verification materialised. None of that fits one
+ * transaction, so each phase pages:
+ *
+ *   `fencing` closes the session's shards to further PUTs, which is what makes
+ *   everything after it stable. `intents` stages the durable cleanup the
+ *   outbox executes, one page of pool shards at a time. `cleanup` drops the
+ *   manifests and scratch a verified finalize staged, a chunk-index page at a
+ *   time. `old_intents` discards the routing that finalize's preparation
+ *   recorded for a file this abort is no longer going to displace. `local`
+ *   then makes the session terminal in one bounded transaction, and `done` is
+ *   terminal.
+ *
+ * The order is load-bearing at exactly one point: no local row that names a
+ * shard may go away before that shard's cleanup intent is durable, which is
+ * why `intents` precedes `cleanup`.
  */
-export async function vfsGetMultipartStatus(
+const MULTIPART_ABORT_PHASES = [
+  "fencing",
+  "intents",
+  "cleanup",
+  "old_intents",
+  "local",
+  "done",
+] as const;
+
+type MultipartAbortPhase = (typeof MULTIPART_ABORT_PHASES)[number];
+
+/**
+ * A failure this Durable Object can attribute to its own inconsistent state.
+ *
+ * The distinction is what the driver's poison policy turns on: a session whose
+ * phase column holds a value no version of this machine writes fails the same
+ * way on every replay, so retrying it forever is pointless. Anything else — an
+ * unreachable shard, a lost response, a cleanup intent another invocation
+ * still holds — is work that is simply still owed.
+ */
+class MultipartLocalCorruptionError extends Error {}
+
+/** Backoff the sweep applies between attempts at one aborting session. */
+const MULTIPART_ABORT_RETRY: RetryPolicy = {
+  baseMs: 1_000,
+  maxMs: 10 * 60_000,
+  maxDoublings: 9,
+};
+
+/**
+ * Consecutive failures tolerated at one session's abort before a
+ * local-corruption verdict abandons it. Remote failures never consume it:
+ * their work is still owed however often it recurs, and once the cleanup
+ * intents commit the outbox retries them independently.
+ */
+export const MULTIPART_MAX_ABORT_ATTEMPTS = 5;
+
+/**
+ * Sessions one alarm sweeps, and abort pages it runs on each.
+ *
+ * Eight pages is what finishes an ordinary session — one fence page, one
+ * intent page, one scratch page, one routing page, one local page — inside a
+ * single alarm, so a tenant sitting at its open-session cap does not wait an
+ * alarm per session to get its capacity back. Fencing is the only phase that
+ * fans out, one page of shards at a time, so four sessions cost at most four
+ * pool walks; a pool wide enough to need all eight pages for fencing alone
+ * could still exhaust an invocation's subrequests, which costs a retry rather
+ * than progress: every page commits before the next one starts.
+ */
+export const MULTIPART_SWEEP_SESSION_LIMIT = 4;
+export const MULTIPART_ABORT_PAGES_PER_SESSION = 8;
+
+/**
+ * When an abort may be abandoned instead of retried.
+ *
+ * `attempts` counts consecutive failures — every page that makes progress
+ * resets it — so reaching the cap means this many attempts in a row got
+ * nowhere. Only a local-corruption verdict is eligible: a remote failure
+ * leaves the same work owed however often it recurs.
+ */
+const MULTIPART_ABORT_POISON: PoisonPolicy = {
+  maxAttempts: MULTIPART_MAX_ABORT_ATTEMPTS,
+  isLocalCorruption: (error) => error instanceof MultipartLocalCorruptionError,
+};
+
+/**
+ * The control-plane columns `lib/paged-operation` fences this machine on.
+ *
+ * Each cursor belongs to one phase and only ever advances, so their declared
+ * order is just the phase order. `status` is passed as an extra guard on every
+ * transition, which is what keeps this machine and the finalize machine from
+ * both winning: an abort only ever commits against `aborting`, a finalize only
+ * ever against `open` or `finalizing`, and the first transition either one
+ * makes takes the status the other requires away.
+ */
+const MULTIPART_ABORT_OPERATION: PagedOperationTable<MultipartAbortPhase> = {
+  table: "upload_sessions",
+  keyColumns: ["upload_id", "user_id"],
+  phases: {
+    column: "abort_phase",
+    forward: MULTIPART_ABORT_PHASES,
+    terminal: ["done"],
+  },
+  cursorColumns: [
+    "abort_fence_cursor",
+    "abort_intent_cursor",
+    "abort_cleanup_cursor",
+    "abort_old_intent_cursor",
+  ],
+  retry: MULTIPART_ABORT_RETRY,
+};
+
+/**
+ * How soon the alarm looks at an abort that still owes pages. Short by design:
+ * until the abort is terminal the upload's chunks are still refcounted and its
+ * temporary row is still occupying the path.
+ */
+const MULTIPART_ABORT_RESUME_DELAY_MS = 1_000;
+
+/**
+ * Pages one one-request abort may run before it hands the rest to the alarm.
+ *
+ * Only two phases leave the object — fencing walks the pool, and the terminal
+ * page drains one bounded batch of the cleanup it staged — so the ceiling here
+ * is about the local pages: a session with a hundred thousand verified chunks
+ * owes four hundred of them. Every page it does run is durable, so the next
+ * call resumes from the cursor.
+ */
+const MULTIPART_ONE_REQUEST_ABORT_MAX_PAGES = 512;
+
+/**
+ * Abort a multipart upload in one request.
+ *
+ * Idempotent: a session whose abort is already terminal answers `ok` without
+ * doing anything, and a session already mid-abort resumes from its cursor
+ * rather than starting again. A `finalized` session raises EBUSY — there is
+ * nothing left to un-finalize — and so does a `finalizing` one unless the
+ * caller is the machine itself.
+ *
+ * `ok` means terminal. An abort that ran out of pages raises EBUSY instead,
+ * because the alternative is telling a caller its chunks are gone while a
+ * shard still holds them; the pages it completed are durable and the alarm
+ * finishes the rest.
+ */
+export async function vfsAbortMultipart(
+  durableObject: UserDO,
+  scope: VFSScope,
+  uploadId: string,
+  allowFinalizing = false
+): Promise<{ ok: true }> {
+  const progress = await driveMultipartAbort(
+    durableObject,
+    scope,
+    uploadId,
+    allowFinalizing,
+    MULTIPART_ONE_REQUEST_ABORT_MAX_PAGES
+  );
+  if (progress.done) return { ok: true };
+  throw new VFSError(
+    "EBUSY",
+    `abortMultipart: bounded abort is still ${progress.phase}; step it or let the alarm finish it`
+  );
+}
+
+/**
+ * Advance a multipart abort by one bounded, durable page.
+ *
+ * Where it got to lives in the session row, so a Durable Object eviction
+ * between calls costs at most the page that was in flight, and a caller that
+ * lost a response can simply call again: a page whose row already moved is
+ * refused rather than replayed.
+ */
+export async function vfsAbortMultipartStep(
+  durableObject: UserDO,
+  scope: VFSScope,
+  uploadId: string,
+  allowFinalizing = false
+): Promise<MultipartAbortProgress> {
+  return await driveMultipartAbort(
+    durableObject,
+    scope,
+    uploadId,
+    allowFinalizing,
+    1
+  );
+}
+
+/**
+ * Release a session a finalize can no longer publish, without letting the
+ * release displace the reason.
+ *
+ * Every caller is about to raise a failure of its own, so an abort that cannot
+ * finish here is left to the alarm rather than surfacing in place of that
+ * failure: the session is already `aborting`, which is the state the sweep
+ * resumes from.
+ */
+async function releaseMultipartSession(
   durableObject: UserDO,
   scope: VFSScope,
   uploadId: string
-): Promise<{
-  landed: number[];
-  total: number;
-  bytesUploaded: number;
-  expiresAtMs: number;
-  status: string;
-}> {
+): Promise<void> {
+  try {
+    await driveMultipartAbort(
+      durableObject,
+      scope,
+      uploadId,
+      true,
+      MULTIPART_ONE_REQUEST_ABORT_MAX_PAGES
+    );
+  } catch (error) {
+    logError("multipart finalize release failed", {}, error, {
+      event: "multipart_release_failed",
+      uploadId,
+    });
+  }
+}
+
+/**
+ * Take ownership of the session and run at most `maxPages` bounded pages of
+ * its abort. `maxPages` is at least one, so every invocation makes an attempt.
+ */
+async function driveMultipartAbort(
+  durableObject: UserDO,
+  scope: VFSScope,
+  uploadId: string,
+  allowFinalizing: boolean,
+  maxPages: number
+): Promise<MultipartAbortProgress> {
   const userId = userIdFor(scope);
-  const row = readUploadSession(durableObject, userId, uploadId);
-  if (!row) {
-    throw new VFSError(
-      "ENOENT",
-      `getMultipartStatus: session not found: ${uploadId}`
+  const armed = await armMultipartAbort(
+    durableObject,
+    userId,
+    uploadId,
+    allowFinalizing
+  );
+  if (armed === "terminal") return { done: true };
+  const page = (): Promise<MultipartAbortProgress> =>
+    advanceMultipartAbortPage(durableObject, scope, userId, uploadId);
+  let progress = await page();
+  if (!progress.done) {
+    await runOperationPages(maxPages - 1, async () => {
+      progress = await page();
+      return progress.done ? { kind: "completed" } : { kind: "advanced" };
+    });
+  }
+  // Nobody is obliged to come back for the pages this invocation could not
+  // run, and until they run the upload still holds bytes on its shards.
+  if (!progress.done) {
+    await scheduleAlarmAt(
+      durableObject,
+      Date.now() + MULTIPART_ABORT_RESUME_DELAY_MS
     );
   }
+  return progress;
+}
 
-  const ns = shardNs(durableObject);
-  const landedSet = new Set<number>();
-  let bytesUploaded = 0;
-  await Promise.all(
-    Array.from({ length: row.pool_size }, (_, sIdx) => sIdx).map(
-      async (sIdx) => {
-        const shardName = vfsShardDOName(scope.ns, scope.tenant, scope.sub, sIdx);
-        const stub = ns.get(ns.idFromName(shardName));
-        try {
-          const res = await stub.getMultipartManifest(uploadId);
-          for (const r of res.rows) {
-            landedSet.add(r.idx);
-            bytesUploaded += r.size;
-          }
-        } catch {
-          // best-effort
-        }
-      }
-    )
+/** Whether a session still owes abort pages after being taken over. */
+type MultipartAbortArming = "terminal" | "armed";
+
+/**
+ * Move the session into `aborting` and arm the machine, or report that its
+ * abort already reached its terminal state.
+ *
+ * The status is re-read inside the transaction that arms it, so a session that
+ * published, or that another caller aborted, in between is answered on what it
+ * became rather than on what this call first saw.
+ */
+async function armMultipartAbort(
+  durableObject: UserDO,
+  userId: string,
+  uploadId: string,
+  allowFinalizing: boolean
+): Promise<MultipartAbortArming> {
+  const session = readUploadSessionOrThrow(
+    durableObject,
+    userId,
+    uploadId,
+    "abortMultipart"
   );
+  assertMultipartAbortable(session, allowFinalizing);
+  if (session.status === "aborted") return "terminal";
+  if (session.status === "aborting") return "armed";
+  // An abort the caller walks away from is finished by the same alarm that
+  // sweeps stale uploads, so the machine never depends on anyone coming back.
+  await scheduleStaleUploadSweep(durableObject);
+  return transactionSync(durableObject, (): MultipartAbortArming => {
+    const current = readUploadSessionOrThrow(
+      durableObject,
+      userId,
+      uploadId,
+      "abortMultipart"
+    );
+    assertMultipartAbortable(current, allowFinalizing);
+    if (current.status === "aborted") return "terminal";
+    if (current.status === "aborting") return "armed";
+    const committed = commitOperationTransition(
+      durableObject,
+      MULTIPART_ABORT_OPERATION,
+      { upload_id: uploadId, user_id: userId },
+      { status: current.status },
+      {
+        status: "aborting",
+        abort_phase: "fencing",
+        abort_fence_cursor: 0,
+        abort_intent_cursor: 0,
+        abort_cleanup_cursor: 0,
+        abort_old_intent_cursor: MULTIPART_SEEK_CURSOR_START,
+        attempts: 0,
+        abort_retry_at: 0,
+      }
+    );
+    if (!committed) {
+      throw new VFSError(
+        "EBUSY",
+        "abortMultipart: session changed before fencing"
+      );
+    }
+    return "armed";
+  });
+}
 
+/** Refuse an abort of a session whose outcome is already decided. */
+function assertMultipartAbortable(
+  session: UploadSessionRow,
+  allowFinalizing: boolean
+): void {
+  if (session.status === "finalized") {
+    throw new VFSError(
+      "EBUSY",
+      "abortMultipart: session is already finalized; cannot un-finalize"
+    );
+  }
+  if (session.status === "finalizing" && !allowFinalizing) {
+    throw new VFSError("EBUSY", "abortMultipart: finalize is in progress");
+  }
+  if (
+    session.status !== "open" &&
+    session.status !== "finalizing" &&
+    session.status !== "aborting" &&
+    session.status !== "aborted"
+  ) {
+    throw new VFSError(
+      "EBUSY",
+      `abortMultipart: session status='${session.status}'`
+    );
+  }
+}
+
+/** Run whichever page the session's phase owes. */
+async function advanceMultipartAbortPage(
+  durableObject: UserDO,
+  scope: VFSScope,
+  userId: string,
+  uploadId: string
+): Promise<MultipartAbortProgress> {
+  const session = readUploadSessionOrThrow(
+    durableObject,
+    userId,
+    uploadId,
+    "abortMultipart"
+  );
+  if (session.status === "aborted") return { done: true };
+  if (session.status !== "aborting") {
+    throw new MultipartLocalCorruptionError(
+      `abortMultipart: session ${uploadId} is not aborting (status='${session.status}')`
+    );
+  }
+  switch (abortPhaseOf(session)) {
+    case "fencing":
+      return await advanceMultipartAbortFence(durableObject, scope, session);
+    case "intents":
+      return advanceMultipartAbortIntents(durableObject, session);
+    case "cleanup":
+      return advanceMultipartAbortCleanup(durableObject, session);
+    case "old_intents":
+      return advanceMultipartAbortRoutes(durableObject, session);
+    case "local":
+      return await finishMultipartAbort(durableObject, scope, session);
+    case "done":
+      // `local` writes the terminal phase and the terminal status together,
+      // so one without the other is a row nothing this machine wrote.
+      throw new MultipartLocalCorruptionError(
+        `abortMultipart: session ${uploadId} is aborting in a terminal phase`
+      );
+  }
+}
+
+/** The session's abort phase, refusing a column no version of this wrote. */
+function abortPhaseOf(session: UploadSessionRow): MultipartAbortPhase {
+  const phase = MULTIPART_ABORT_PHASES.find(
+    (candidate) => candidate === session.abort_phase
+  );
+  if (phase === undefined) {
+    throw new MultipartLocalCorruptionError(
+      `abortMultipart: session ${session.upload_id} carries abort phase '${session.abort_phase}'`
+    );
+  }
+  return phase;
+}
+
+/** Close one page of the pool to further PUTs. */
+async function advanceMultipartAbortFence(
+  durableObject: UserDO,
+  scope: VFSScope,
+  session: UploadSessionRow
+): Promise<MultipartAbortProgress> {
+  const start = session.abort_fence_cursor;
+  const end = Math.min(start + MULTIPART_FENCE_PAGE_SIZE, session.pool_size);
+  await fenceMultipartShardPage(
+    durableObject,
+    scope,
+    session,
+    "aborting",
+    start,
+    end
+  );
+  const fenced = end >= session.pool_size;
+  commitAbortPage(durableObject, session, "fencing", {
+    abort_fence_cursor: end,
+    abort_phase: fenced ? "intents" : "fencing",
+  });
+  return fenced
+    ? abortProgressAt(session, "intents", 0)
+    : abortProgressAt(session, "fencing", end);
+}
+
+/**
+ * Stage the durable cleanup for one page of the pool.
+ *
+ * The intents are the whole point of the phase: once they commit, the shards'
+ * `chunk_refs` and `upload_chunks` are the outbox's problem rather than this
+ * abort's, which is what lets the local rows that name those shards go away
+ * afterwards. The chunk PUT path placed every ref under `refId = uploadId`, so
+ * one intent per shard covers everything this upload put there.
+ */
+function advanceMultipartAbortIntents(
+  durableObject: UserDO,
+  session: UploadSessionRow
+): MultipartAbortProgress {
+  const start = session.abort_intent_cursor;
+  const end = Math.min(start + MULTIPART_FENCE_PAGE_SIZE, session.pool_size);
+  const staged = end >= session.pool_size;
+  const now = Date.now();
+  commitAbortPage(
+    durableObject,
+    session,
+    "intents",
+    {
+      abort_intent_cursor: end,
+      abort_phase: staged ? "cleanup" : "intents",
+    },
+    () => {
+      for (let shardIndex = start; shardIndex < end; shardIndex++) {
+        stageChunkCleanupIntent(
+          durableObject,
+          session.upload_id,
+          shardIndex,
+          now,
+          now,
+          ChunkCleanupKind.Multipart
+        );
+      }
+    }
+  );
+  return staged
+    ? abortProgressAt(session, "cleanup", 0)
+    : abortProgressAt(session, "intents", end);
+}
+
+/**
+ * Drop one chunk-index page of everything a finalize staged locally.
+ *
+ * A finalize that verified anything before the abort left rows in the upload's
+ * own scratch and in the manifest publication was going to hand to readers —
+ * the temporary row's for an overwrite, a candidate version's otherwise. All
+ * of it is as large as the manifest, so all of it pages together, which is
+ * what keeps aborting a verified hundred-thousand-chunk upload the same size
+ * of transaction as aborting an empty one.
+ */
+function advanceMultipartAbortCleanup(
+  durableObject: UserDO,
+  session: UploadSessionRow
+): MultipartAbortProgress {
+  const uploadId = session.upload_id;
+  const start = session.abort_cleanup_cursor;
+  const end = Math.min(start + MULTIPART_HASH_PAGE_SIZE, session.total_chunks);
+  const cleaned = end >= session.total_chunks;
+  // A frozen context this server cannot read is one no verification page could
+  // have written a version manifest against.
+  const versionId = candidateVersionId(session);
+  commitAbortPage(
+    durableObject,
+    session,
+    "cleanup",
+    {
+      abort_cleanup_cursor: end,
+      abort_phase: cleaned ? "old_intents" : "cleanup",
+    },
+    () => {
+      // Four tables, one range, one statement shape. The table and column
+      // names are literals from the calls below; only the key and the bounds
+      // are ever bound values.
+      const dropRange = (table: string, keyColumn: string, key: string): void => {
+        durableObject.sql.exec(
+          `DELETE FROM ${table}
+            WHERE ${keyColumn} = ? AND chunk_index >= ? AND chunk_index < ?`,
+          key,
+          start,
+          end
+        );
+      };
+      dropRange("upload_expected_chunks", "upload_id", uploadId);
+      dropRange("upload_verified_chunks", "upload_id", uploadId);
+      dropRange("file_chunks", "file_id", uploadId);
+      if (versionId !== null) dropRange("version_chunks", "version_id", versionId);
+    }
+  );
+  return cleaned
+    ? abortProgressAt(session, "old_intents", 0)
+    : abortProgressAt(session, "cleanup", end);
+}
+
+/**
+ * Discard one page of the cleanup routing a finalize recorded.
+ *
+ * Preparation routes the shards a *displaced* file's bytes live on so that
+ * publication can owe their cleanup in constant size. An abort publishes
+ * nothing, so that file is still live and its routing must be thrown away
+ * rather than executed. Seeking by shard index takes every kind of route at
+ * that index with it, so this page ends the phase with the table empty for
+ * this upload.
+ */
+function advanceMultipartAbortRoutes(
+  durableObject: UserDO,
+  session: UploadSessionRow
+): MultipartAbortProgress {
+  const uploadId = session.upload_id;
+  const cursor = session.abort_old_intent_cursor;
+  const shards = durableObject.sql
+    .exec<{ shard_index: number }>(
+      `SELECT DISTINCT shard_index FROM upload_cleanup_routes
+        WHERE upload_id = ? AND shard_index > ?
+        ORDER BY shard_index LIMIT ?`,
+      uploadId,
+      cursor,
+      MULTIPART_FENCE_PAGE_SIZE + 1
+    )
+    .toArray();
+  const page = shards.slice(0, MULTIPART_FENCE_PAGE_SIZE);
+  const hasMore = shards.length > MULTIPART_FENCE_PAGE_SIZE;
+  const nextCursor = page.at(-1)?.shard_index ?? cursor;
+  commitAbortPage(
+    durableObject,
+    session,
+    "old_intents",
+    {
+      abort_old_intent_cursor: nextCursor,
+      abort_phase: hasMore ? "old_intents" : "local",
+    },
+    () => {
+      durableObject.sql.exec(
+        `DELETE FROM upload_cleanup_routes
+          WHERE upload_id = ? AND shard_index > ? AND shard_index <= ?`,
+        uploadId,
+        cursor,
+        nextCursor
+      );
+    }
+  );
+  return hasMore
+    ? abortProgressAt(session, "old_intents", nextCursor)
+    : abortProgressAt(session, "local", 0);
+}
+
+/**
+ * Make the session terminal.
+ *
+ * Everything proportional to the upload is already gone, so the temporary row
+ * takes no manifest with it and this is a bounded transaction whatever the
+ * upload's size. The cleanup drain that follows it is the same bounded outbox
+ * batch publication triggers; whatever it does not reach stays durable.
+ */
+async function finishMultipartAbort(
+  durableObject: UserDO,
+  scope: VFSScope,
+  session: UploadSessionRow
+): Promise<MultipartAbortProgress> {
+  commitAbortPage(
+    durableObject,
+    session,
+    "local",
+    {
+      status: "aborted",
+      abort_phase: "done",
+      ...MULTIPART_TERMINAL_COMPACTION,
+    },
+    () => {
+      hardDeleteFileRowLocal(durableObject, session.user_id, session.upload_id);
+    }
+  );
+  await drainChunkCleanupIntents(durableObject, scope, session.upload_id);
+  return { done: true };
+}
+
+/**
+ * Compare-and-set one abort transition, and the mutations it commits, in a
+ * single transaction — transition first, so a page whose row already moved is
+ * refused before it writes anything.
+ *
+ * The guard is the progress the page read plus `status`, so a page whose
+ * session was aborted by someone else, or taken over by a finalize, matches
+ * zero rows instead of applying its work a second time. Every page that makes
+ * progress clears the retry bookkeeping, which is what makes `attempts` a
+ * count of consecutive failures rather than of lifetime ones.
+ */
+function commitAbortPage(
+  durableObject: UserDO,
+  session: UploadSessionRow,
+  phase: MultipartAbortPhase,
+  next: Readonly<Record<string, SqlStorageValue>>,
+  mutate?: () => void
+): void {
+  transactionSync(durableObject, () => {
+    const committed = commitOperationTransition(
+      durableObject,
+      MULTIPART_ABORT_OPERATION,
+      { upload_id: session.upload_id, user_id: session.user_id },
+      {
+        ...heldProgress(MULTIPART_ABORT_OPERATION, session),
+        status: session.status,
+      },
+      { ...next, attempts: 0, abort_retry_at: 0 }
+    );
+    if (!committed) {
+      throw new VFSError(
+        "EBUSY",
+        `abortMultipart: session changed while ${phase}`
+      );
+    }
+    mutate?.();
+  });
+}
+
+/** Where an abort stands, for a caller to display. */
+function abortProgressAt(
+  session: UploadSessionRow,
+  phase: Exclude<MultipartAbortPhase, "done">,
+  cursor: number
+): MultipartAbortProgress {
+  return { done: false, phase, cursor, total: abortPhaseTotal(session, phase) };
+}
+
+/** What the phase's cursor counts towards. */
+function abortPhaseTotal(
+  session: UploadSessionRow,
+  phase: Exclude<MultipartAbortPhase, "done">
+): number {
+  switch (phase) {
+    case "cleanup":
+      return session.total_chunks;
+    case "local":
+      return 1;
+    // Fencing and intent staging walk the pool; the routing phase seeks by
+    // shard index over a table the pool bounds in practice.
+    default:
+      return session.pool_size;
+  }
+}
+
+/**
+ * Record a failed abort attempt, backing off or — for a session this object
+ * has proven inconsistent, often enough — abandoning it.
+ *
+ * A poisoned session keeps its phase, so an operator can see where it stuck,
+ * and stops being selected. The transition is fenced on the status and the
+ * attempt count the failing invocation read: another writer that meanwhile
+ * finished the abort, or recorded its own failure, keeps its outcome. Guarding
+ * on the status is what keeps a terminal session from being poisoned, because
+ * `local` writes `aborted` and `done` together.
+ */
+function recordMultipartAbortFailure(
+  durableObject: UserDO,
+  userId: string,
+  uploadId: string,
+  error: unknown,
+  failedAt: number
+): void {
+  const session = readUploadSession(durableObject, userId, uploadId);
+  if (session === undefined) return;
+  const failureCount = session.attempts + 1;
+  const poisoned = isPoisonous(MULTIPART_ABORT_POISON, error, failureCount);
+  transactionSync(durableObject, () => {
+    commitOperationTransition(
+      durableObject,
+      MULTIPART_ABORT_OPERATION,
+      { upload_id: uploadId, user_id: userId },
+      { status: session.status, attempts: session.attempts },
+      poisoned
+        ? { status: "poisoned", attempts: failureCount, abort_retry_at: 0 }
+        : {
+            attempts: failureCount,
+            abort_retry_at:
+              failedAt + retryDelayMs(MULTIPART_ABORT_RETRY, failureCount),
+          }
+    );
+  });
+  if (poisoned) {
+    logError("multipart session poisoned after abort attempts", {}, error, {
+      event: "multipart_session_poisoned",
+      uploadId,
+      attempts: failureCount,
+    });
+  }
+}
+
+// ── bounded status and resume ─────────────────────────────────────────
+
+/**
+ * Where a landed-set scan stands: the shard it resumes on, and the highest
+ * chunk index that shard already reported.
+ */
+interface MultipartStatusPosition {
+  readonly shardIndex: number;
+  readonly afterIndex: number;
+}
+
+/** A scan that has read nothing yet. */
+const MULTIPART_STATUS_PAGE_START: MultipartStatusPosition = {
+  shardIndex: 0,
+  afterIndex: MULTIPART_SEEK_CURSOR_START,
+};
+
+/**
+ * Resolve where a status page starts.
+ *
+ * A continuation is the server's own seek state, signed, so this refuses one
+ * that was not minted for this upload and this tenant rather than following a
+ * shard index and a row boundary a caller made up. The oversize check comes
+ * first so a caller cannot make the verify itself expensive.
+ */
+async function decodeMultipartStatusPosition(
+  durableObject: UserDO,
+  scope: VFSScope,
+  userId: string,
+  uploadId: string,
+  continuation: string | undefined
+): Promise<MultipartStatusPosition> {
+  if (continuation === undefined) return MULTIPART_STATUS_PAGE_START;
+  if (
+    continuation.length === 0 ||
+    continuation.length > MULTIPART_STATUS_CURSOR_MAX_BYTES
+  ) {
+    throw new VFSError("EINVAL", "getMultipartStatus: malformed continuation");
+  }
+  const cursor = await verifyVFSMultipartStatusCursor(
+    durableObject.envPublic,
+    continuation
+  );
+  if (
+    cursor === null ||
+    cursor.uploadId !== uploadId ||
+    cursor.userId !== userId ||
+    cursor.ns !== scope.ns ||
+    cursor.tn !== scope.tenant ||
+    cursor.sub !== scope.sub
+  ) {
+    throw new VFSError(
+      "EINVAL",
+      "getMultipartStatus: continuation does not belong to this upload"
+    );
+  }
+  return { shardIndex: cursor.shardIndex, afterIndex: cursor.afterIndex };
+}
+
+/**
+ * Read one bounded page of the landed set.
+ *
+ * The scan is sequential rather than a fan-out precisely because it is
+ * bounded: it visits at most `MULTIPART_STATUS_SHARD_PAGE_SIZE` shards and
+ * inspects at most `MULTIPART_STATUS_ENTRY_PAGE_SIZE` staged rows, asking each
+ * shard for only the rows past the boundary the previous page left, and stops
+ * as soon as either bound is reached. A page therefore costs a fixed number of
+ * subrequests and carries a fixed number of entries however large the upload
+ * is, which is what keeps the response far below what an RPC may return.
+ *
+ * A shard that fails ends the page instead of being skipped: the continuation
+ * then names that shard, so the next call retries it. Skipping it would report
+ * a complete landed set that silently omits chunks, and the caller would never
+ * re-PUT them.
+ */
+async function readMultipartLandedPage(
+  durableObject: UserDO,
+  scope: VFSScope,
+  userId: string,
+  session: UploadSessionRow,
+  start: MultipartStatusPosition
+): Promise<MultipartStatusPageResponse> {
+  const ns = shardNs(durableObject);
+  const landed: number[] = [];
+  let bytesUploaded = 0;
+  let shardIndex = start.shardIndex;
+  let afterIndex = start.afterIndex;
+  let shardsRead = 0;
+  let entriesInspected = 0;
+
+  while (
+    shardIndex < session.pool_size &&
+    shardsRead < MULTIPART_STATUS_SHARD_PAGE_SIZE &&
+    entriesInspected < MULTIPART_STATUS_ENTRY_PAGE_SIZE
+  ) {
+    const limit = MULTIPART_STATUS_ENTRY_PAGE_SIZE - entriesInspected;
+    const shardName = vfsShardDOName(
+      scope.ns,
+      scope.tenant,
+      scope.sub,
+      shardIndex
+    );
+    let page: ShardMultipartLandedResponse;
+    try {
+      page = await ns
+        .get(ns.idFromName(shardName))
+        .getMultipartLanded(session.upload_id, afterIndex, limit);
+    } catch (err) {
+      logError("multipart landed page read failed", {}, err, {
+        event: "multipart_landed_page_failed",
+        uploadId: session.upload_id,
+        shardIndex,
+      });
+      break;
+    }
+    if (page.sizes.length !== page.idx.length) {
+      throw new VFSError(
+        "EBUSY",
+        `getMultipartStatus: shard ${shardIndex} reported a malformed landed page`
+      );
+    }
+    shardsRead++;
+
+    for (let offset = 0; offset < page.idx.length; offset++) {
+      const index = page.idx[offset];
+      // The shard answered a seek, so anything at or below the boundary would
+      // be a row this scan already counted.
+      if (!Number.isSafeInteger(index) || index <= afterIndex) continue;
+      entriesInspected++;
+      afterIndex = index;
+      // A chunk staged where this session's placement does not put it can
+      // never be verified, so reporting it landed would have the client skip
+      // re-PUTting a chunk the finalize is going to refuse.
+      if (
+        index >= session.total_chunks ||
+        placeMultipartChunk(
+          userId,
+          session.upload_id,
+          index,
+          session.pool_size,
+          session.placement_version
+        ) !== shardIndex
+      ) {
+        continue;
+      }
+      landed.push(index);
+      bytesUploaded += page.sizes[offset];
+    }
+
+    // The shard filled the page's remaining budget, so it may hold more.
+    if (entriesInspected >= MULTIPART_STATUS_ENTRY_PAGE_SIZE) break;
+    shardIndex++;
+    afterIndex = MULTIPART_SEEK_CURSOR_START;
+  }
+
+  landed.sort((left, right) => left - right);
+  const complete = shardIndex >= session.pool_size;
   return {
-    landed: Array.from(landedSet).sort((a, b) => a - b),
-    total: row.total_chunks,
+    landed,
+    total: session.total_chunks,
     bytesUploaded,
-    expiresAtMs: row.expires_at,
-    status: row.status,
+    expiresAtMs: session.expires_at,
+    ...(complete
+      ? {}
+      : {
+          continuation: await signVFSMultipartStatusCursor(
+            durableObject.envPublic,
+            {
+              uploadId: session.upload_id,
+              userId,
+              ns: scope.ns,
+              tn: scope.tenant,
+              sub: scope.sub,
+              shardIndex,
+              afterIndex,
+            }
+          ),
+        }),
   };
 }
 
 /**
- * Cap on local abort failures for one expired session. Remote shard failures
- * do not consume this budget because their committed outbox intents retry
- * independently.
+ * Read one bounded page of a session's landed set.
  *
- * 5 attempts × ~10 minute alarm cadence = ~50 minutes of retries
- * before declaring the session unrecoverable. Generous given that
- * the typical failure mode is a transient ShardDO error.
+ * Called with no continuation — which is what the SDK and the resume probe
+ * do — this answers the head of the scan, and for any session whose pool and
+ * landed set fit inside one page that is the whole set. A caller that gets a
+ * continuation back has more to read and passes it to the next call.
  */
-export const MULTIPART_MAX_ABORT_ATTEMPTS = 5;
+export async function vfsGetMultipartStatus(
+  durableObject: UserDO,
+  scope: VFSScope,
+  uploadId: string,
+  continuation?: string
+): Promise<MultipartStatusPageResponse & { status: string }> {
+  const userId = userIdFor(scope);
+  const position = await decodeMultipartStatusPosition(
+    durableObject,
+    scope,
+    userId,
+    uploadId,
+    continuation
+  );
+  const row = readUploadSessionOrThrow(
+    durableObject,
+    userId,
+    uploadId,
+    "getMultipartStatus"
+  );
+  if (position.shardIndex > row.pool_size) {
+    throw new VFSError(
+      "EINVAL",
+      "getMultipartStatus: continuation is past the session's pool"
+    );
+  }
+  return {
+    ...(await readMultipartLandedPage(
+      durableObject,
+      scope,
+      userId,
+      row,
+      position
+    )),
+    status: row.status,
+  };
+}
 
 /** Published sessions one alarm resumes, and pages it runs on each. */
 export const MULTIPART_CLEANING_SESSION_LIMIT = 4;
@@ -3043,87 +3780,80 @@ export async function resumeCleaningMultipartSessions(
 }
 
 /**
- * Alarm-driven sweep of expired open sessions. Called from
- * UserDOCore's alarm() handler at scheduled intervals. Idempotent and
- * batch-bounded (LIMIT 32 per call) to keep DO turns short.
+ * Sessions the sweep is due to work on: every abort still owing pages, and
+ * every open or finalizing session whose deadline has passed.
  *
- * For each expired session, performs the equivalent of
- * `vfsAbortMultipart` — flips status, fans out cleanup, hard-deletes
- * the tmp files row.
+ * An `aborting` session is selected regardless of its expiry — it is already
+ * terminal-bound, its shards are fenced, and its bytes stay refcounted until
+ * the machine finishes — so it is also taken first. `abort_retry_at` is what a
+ * failing session backs off with; it is zero for every session that has not
+ * failed, so an ordinary abort is due immediately.
+ */
+const MULTIPART_SWEEP_DUE_PREDICATE = `abort_retry_at <= ?
+          AND (status = 'aborting'
+            OR (status IN ('open', 'finalizing') AND expires_at < ?))`;
+
+/**
+ * Alarm-driven sweep of sessions whose abort is owed. Called from UserDOCore's
+ * alarm() handler at scheduled intervals.
  *
- * A local transaction failure increments `attempts` and leaves the session
- * open. After the cap, `poisoned` keeps the corrupt session operator-visible.
- * Once the local transaction commits, shard cleanup is owned by the outbox.
+ * Bounded twice over: at most `MULTIPART_SWEEP_SESSION_LIMIT` sessions, at
+ * most `MULTIPART_ABORT_PAGES_PER_SESSION` pages each — the same shape as the
+ * cleaning resumer above, and the reason one alarm turn cannot fan out over an
+ * unbounded number of shards. `remaining` keeps the alarm cadence tight until
+ * every one of them is terminal.
+ *
+ * Failures never discard the pages a session already committed: they back off,
+ * and only a session this object has proven inconsistent, `attempts` times in
+ * a row, is abandoned as `poisoned`.
  */
 export async function sweepExpiredMultipartSessions(
   durableObject: UserDO,
   scopeForUser: (userId: string) => VFSScope
 ): Promise<{ swept: number; remaining: boolean }> {
   const now = Date.now();
-  const stale = durableObject.sql
-    .exec(
-      `SELECT upload_id, user_id, attempts FROM upload_sessions
-        WHERE status IN ('open', 'finalizing', 'aborting') AND expires_at < ?
-        ORDER BY expires_at ASC
-        LIMIT 32`,
-      now
+  const due = durableObject.sql
+    .exec<{ upload_id: string; user_id: string }>(
+      `SELECT upload_id, user_id FROM upload_sessions
+        WHERE ${MULTIPART_SWEEP_DUE_PREDICATE}
+        ORDER BY CASE WHEN status = 'aborting' THEN 0 ELSE 1 END, expires_at
+        LIMIT ?`,
+      now,
+      now,
+      MULTIPART_SWEEP_SESSION_LIMIT
     )
-    .toArray() as {
-      upload_id: string;
-      user_id: string;
-      attempts: number;
-    }[];
+    .toArray();
 
-  for (const row of stale) {
+  for (const row of due) {
     try {
-      const scope = scopeForUser(row.user_id);
-      await vfsAbortMultipart(durableObject, scope, row.upload_id, true);
+      await driveMultipartAbort(
+        durableObject,
+        scopeForUser(row.user_id),
+        row.upload_id,
+        true,
+        MULTIPART_ABORT_PAGES_PER_SESSION
+      );
     } catch (err) {
-      const nextAttempts = (row.attempts ?? 0) + 1;
-      if (nextAttempts >= MULTIPART_MAX_ABORT_ATTEMPTS) {
-        // Give up on a repeatedly failing local transition and keep the row
-        // operator-visible. No terminal state was committed, so no outbox
-        // intent can safely replace this retry yet.
-        durableObject.sql.exec(
-          `UPDATE upload_sessions
-              SET status = 'poisoned', attempts = ?
-            WHERE upload_id = ?`,
-          nextAttempts,
-          row.upload_id
-        );
-        logError(
-          "multipart session poisoned after abort attempts",
-          {},
-          err,
-          {
-            event: "multipart_session_poisoned",
-            uploadId: row.upload_id,
-            attempts: nextAttempts,
-          }
-        );
-      } else {
-        // Bump the attempt counter; leave status='open' so the
-        // next sweep retries. The next sweep query at the top of
-        // this function still finds this row (status='open' AND
-        // expires_at<now), so retries continue on the alarm
-        // cadence until MULTIPART_MAX_ABORT_ATTEMPTS.
-        durableObject.sql.exec(
-          "UPDATE upload_sessions SET attempts = ? WHERE upload_id = ?",
-          nextAttempts,
-          row.upload_id
-        );
-      }
+      recordMultipartAbortFailure(
+        durableObject,
+        row.user_id,
+        row.upload_id,
+        err,
+        now
+      );
     }
   }
 
-  const stillOpen = (
+  const remaining =
     durableObject.sql
       .exec(
-        "SELECT COUNT(*) AS n FROM upload_sessions WHERE status IN ('open', 'finalizing', 'aborting') AND expires_at < ?",
+        `SELECT 1 AS one FROM upload_sessions
+          WHERE ${MULTIPART_SWEEP_DUE_PREDICATE}
+          LIMIT 1`,
+        now,
         now
       )
-      .toArray()[0] as { n: number }
-  ).n;
+      .toArray().length > 0;
 
-  return { swept: stale.length, remaining: stillOpen > 0 };
+  return { swept: due.length, remaining };
 }

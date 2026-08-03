@@ -538,6 +538,12 @@ export class UserDOCore extends DurableObject<Env> {
            UNION ALL
             SELECT expires_at AS deadline FROM upload_sessions WHERE status IN ('open', 'finalizing', 'aborting')
            UNION ALL
+           -- An abort owes its pages whether or not the session expired, so
+           -- its retry deadline is a maintenance deadline of its own. Zero
+           -- for a session that has not failed, which the floor below turns
+           -- into the next prompt tick.
+            SELECT abort_retry_at AS deadline FROM upload_sessions WHERE status = 'aborting'
+           UNION ALL
            SELECT f.created_at + 3600000 AS deadline
              FROM files f
              LEFT JOIN write_stream_sessions ws ON ws.tmp_id = f.file_id
@@ -1407,15 +1413,18 @@ export class UserDOCore extends DurableObject<Env> {
   //
   // - vfsBeginMultipart: mints session, inserts tmp row + session row,
   //   returns HMAC token. Resume mode probes shards for landed[].
-  // - vfsAbortMultipart: flips status, fans out chunk-ref drops + staging
-  //   clears across the pool, hard-deletes tmp row.
+  // - vfsAbortMultipartStep: advances the durable abort machine by one
+  //   bounded page — fence, stage cleanup, drop staged rows, or finish.
+  // - vfsAbortMultipart: drives that machine to its terminal state in one
+  //   turn, and answers `ok` only from a session that reached it.
   // - vfsStageMultipartHashes: persists one bounded page of declared
   //   chunk hashes, advancing the session's contiguous staging cursor.
   // - vfsFinalizeMultipartStep: advances the durable finalize machine by
   //   one bounded page — fence, verify, or publish.
   // - vfsFinalizeMultipart: stages the declared manifest and drives that
   //   machine to completion in one turn.
-  // - vfsGetMultipartStatus: read landed[] for resume / progress.
+  // - vfsGetMultipartStatus: one bounded page of landed[] for resume /
+  //   progress, with a continuation while shards remain.
   //
   // See worker/core/objects/user/multipart-upload.ts for implementation
   // details; this file just wires the RPCs to gates.
@@ -1441,6 +1450,15 @@ export class UserDOCore extends DurableObject<Env> {
     this.gateVfs(scope);
     const { vfsAbortMultipart } = await import("./multipart-upload");
     return vfsAbortMultipart(this, scope, uploadId);
+  }
+
+  async vfsAbortMultipartStep(
+    scope: VFSScope,
+    uploadId: string
+  ): Promise<import("../../../../shared/multipart").MultipartAbortProgress> {
+    this.gateVfs(scope);
+    const { vfsAbortMultipartStep } = await import("./multipart-upload");
+    return vfsAbortMultipartStep(this, scope, uploadId);
   }
 
   async vfsStageMultipartHashes(
@@ -1475,17 +1493,16 @@ export class UserDOCore extends DurableObject<Env> {
 
   async vfsGetMultipartStatus(
     scope: VFSScope,
-    uploadId: string
-  ): Promise<{
-    landed: number[];
-    total: number;
-    bytesUploaded: number;
-    expiresAtMs: number;
-    status: string;
-  }> {
+    uploadId: string,
+    continuation?: string
+  ): Promise<
+    import("../../../../shared/multipart").MultipartStatusPageResponse & {
+      status: string;
+    }
+  > {
     this.gateVfs(scope);
     const { vfsGetMultipartStatus } = await import("./multipart-upload");
-    return vfsGetMultipartStatus(this, scope, uploadId);
+    return vfsGetMultipartStatus(this, scope, uploadId, continuation);
   }
 
   // ── file-level versioning RPCs ───────────────────────────────

@@ -164,3 +164,51 @@ export function applyMultipartFinalizeSchema(sql: SqlStorage): void {
     )
   );
 }
+
+/**
+ * Control-plane columns of a resumable multipart abort.
+ *
+ * An abort is as large as the upload it undoes — a shard fence and a cleanup
+ * intent per pool shard, a manifest row per chunk in up to four tables — so it
+ * cannot be one transaction either. `abort_phase` and its four cursors are the
+ * tuple `lib/paged-operation` fences those pages on; `abort_retry_at` is when
+ * the sweep may look at the session again, which is what keeps a failing abort
+ * backing off instead of spinning on the maintenance cadence.
+ *
+ * Every one of them is additive: an abort in flight when this schema arrives
+ * is adopted below rather than restarted.
+ */
+export function applyMultipartAbortSchema(sql: SqlStorage): void {
+  const addColumn = (name: string, definition: string): void =>
+    applyMigrationOnce(sql, `upload_sessions_add_${name}`, () =>
+      sql.exec(`ALTER TABLE upload_sessions ADD COLUMN ${name} ${definition}`)
+    );
+
+  addColumn("abort_phase", "TEXT");
+  addColumn("abort_fence_cursor", "INTEGER NOT NULL DEFAULT 0");
+  addColumn("abort_intent_cursor", "INTEGER NOT NULL DEFAULT 0");
+  addColumn("abort_cleanup_cursor", "INTEGER NOT NULL DEFAULT 0");
+  // Seeks by shard index, which starts at zero, so the first page selects
+  // `> -1` and takes shard zero.
+  addColumn("abort_old_intent_cursor", "INTEGER NOT NULL DEFAULT -1");
+  addColumn("abort_retry_at", "INTEGER NOT NULL DEFAULT 0");
+
+  // A session left mid-abort by a server that had no phase column has already
+  // fenced some of its shards and staged none of its cleanup. Arming it at the
+  // first phase is what the machine would do for it anyway: every page is
+  // idempotent, so re-fencing a shard that already holds the fence and
+  // re-staging an intent that already exists cost a replay, not a conflict.
+  // Adopting the terminal rows too leaves `status = 'aborted'` and
+  // `abort_phase = 'done'` the same fact, so no later reader has to special-
+  // case a row this migration found.
+  applyMigrationOnce(sql, "upload_sessions_adopt_abort_phase", () => {
+    sql.exec(
+      `UPDATE upload_sessions SET abort_phase = 'fencing'
+        WHERE status = 'aborting' AND abort_phase IS NULL`
+    );
+    sql.exec(
+      `UPDATE upload_sessions SET abort_phase = 'done'
+        WHERE status IN ('aborted', 'poisoned') AND abort_phase IS NULL`
+    );
+  });
+}

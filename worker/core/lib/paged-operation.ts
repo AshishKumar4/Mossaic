@@ -78,11 +78,17 @@
  *   phase    abort_phase: fencing → intents → cleanup → old_intents →
  *            local → done (terminal)
  *   cursors  abort_fence_cursor, abort_intent_cursor, abort_cleanup_cursor,
- *            abort_old_intent_cursor
- *   fence    `status = 'aborting'` in `expected`
- *   terminal phase `done` with `status = 'aborted'` and `terminal_at` stamped;
- *            `status = 'poisoned'` when `isPoisonous` holds
- *   bounded  `runOperationPages` with five pages per invocation
+ *            abort_old_intent_cursor. Each belongs to one phase and only ever
+ *            advances, so their declared order is the phase order.
+ *   fence    `status` in `expected` — 'aborting' for every page, the status the
+ *            arming call read for the transition into it. That is what keeps
+ *            this machine and the finalize machine from both winning: the
+ *            first transition either makes takes away the status the other
+ *            requires.
+ *   terminal phase `done` with `status = 'aborted'`; `status = 'poisoned'`,
+ *            keeping the phase it stuck in, when `isPoisonous` holds
+ *   bounded  `runOperationPages`; one page per `vfsAbortMultipartStep`, eight
+ *            per swept session, `retryDelayMs` between failed attempts
  *
  * chunk cleanup outbox (`drainChunkCleanupIntents`, the caller migrated here)
  *   table    chunk_cleanup_intents, key (ref_id, shard_index)

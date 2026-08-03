@@ -568,3 +568,116 @@ describe("upload session placement-version migration", () => {
     });
   });
 });
+
+/**
+ * Paged abort arrived after multipart sessions were already being aborted on
+ * deployed instances. A session the previous server left mid-abort has already
+ * fenced some of its shards, so the machine has to adopt it at the first phase
+ * rather than treat an absent phase as a corrupt row — and a session that
+ * already reached its terminal status has to read back as terminal, so no
+ * later reader has to special-case the rows this migration found.
+ */
+describe("upload session abort-phase migration", () => {
+  const LEGACY_SESSIONS_DDL = `
+    CREATE TABLE upload_sessions (
+      upload_id            TEXT PRIMARY KEY,
+      user_id              TEXT NOT NULL,
+      parent_id            TEXT,
+      leaf                 TEXT NOT NULL,
+      total_size           INTEGER NOT NULL,
+      total_chunks         INTEGER NOT NULL,
+      chunk_size           INTEGER NOT NULL,
+      pool_size            INTEGER NOT NULL,
+      expires_at           INTEGER NOT NULL,
+      status               TEXT NOT NULL,
+      encryption_mode      TEXT,
+      encryption_key_id    TEXT,
+      metadata_blob        BLOB,
+      tags_json            TEXT,
+      version_label        TEXT,
+      version_user_visible INTEGER,
+      mode                 INTEGER NOT NULL,
+      mime_type            TEXT NOT NULL,
+      created_at           INTEGER NOT NULL
+    )
+  `;
+
+  it("arms a session left mid-abort and labels the terminal ones", async () => {
+    const stub = userStub("schema-abort-phase");
+
+    const migrated = await runInDurableObject(stub, (instance: UserDO, state) => {
+      const sql = state.storage.sql;
+      const internals = instance as unknown as InitializableDO;
+      sql.exec(LEGACY_SESSIONS_DDL);
+      for (const [uploadId, status] of [
+        ["mid-abort", "aborting"],
+        ["already-aborted", "aborted"],
+        ["already-poisoned", "poisoned"],
+        ["still-open", "open"],
+      ]) {
+        sql.exec(
+          `INSERT INTO upload_sessions
+             (upload_id, user_id, leaf, total_size, total_chunks, chunk_size,
+              pool_size, expires_at, status, mode, mime_type, created_at)
+           VALUES (?, 'tenant-a', 'x.bin', 1, 1, 1, 32, ?, ?, 420,
+                   'application/octet-stream', ?)`,
+          uploadId,
+          Date.now() + 60_000,
+          status,
+          Date.now()
+        );
+      }
+
+      internals.ensureInit();
+      return {
+        rows: sql
+          .exec(
+            `SELECT upload_id, abort_phase, abort_fence_cursor,
+                    abort_old_intent_cursor, abort_retry_at
+               FROM upload_sessions ORDER BY upload_id`
+          )
+          .toArray(),
+        migration: sql
+          .exec(
+            `SELECT name FROM meta_schema
+              WHERE name = 'upload_sessions_adopt_abort_phase'`
+          )
+          .toArray(),
+      };
+    });
+
+    expect(migrated).toEqual({
+      rows: [
+        {
+          upload_id: "already-aborted",
+          abort_phase: "done",
+          abort_fence_cursor: 0,
+          abort_old_intent_cursor: -1,
+          abort_retry_at: 0,
+        },
+        {
+          upload_id: "already-poisoned",
+          abort_phase: "done",
+          abort_fence_cursor: 0,
+          abort_old_intent_cursor: -1,
+          abort_retry_at: 0,
+        },
+        {
+          upload_id: "mid-abort",
+          abort_phase: "fencing",
+          abort_fence_cursor: 0,
+          abort_old_intent_cursor: -1,
+          abort_retry_at: 0,
+        },
+        {
+          upload_id: "still-open",
+          abort_phase: null,
+          abort_fence_cursor: 0,
+          abort_old_intent_cursor: -1,
+          abort_retry_at: 0,
+        },
+      ],
+      migration: [{ name: "upload_sessions_adopt_abort_phase" }],
+    });
+  });
+});
