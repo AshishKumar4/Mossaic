@@ -37,6 +37,7 @@ import {
 import {
   parsePatchMetadataIfHeadResult,
 } from "../../shared/patch-metadata-if-head";
+import type { DropVersionsStepResult } from "../../shared/vfs-types";
 import type {
   PreviewInfo,
   PreviewInfoBatchEntry,
@@ -60,6 +61,13 @@ import type {
   FinalizeMultipartUploadResult,
   AbortMultipartUploadResult,
 } from "./vfs";
+import {
+  applyDropVersions,
+  dropVersionsProgress,
+  newDropVersionsOperation,
+  type DropVersionsOperation,
+  type DropVersionsProgress,
+} from "./version-retention";
 export { hashChunk } from "../../shared/crypto";
 
 const HTTP_MULTIPART_TIMEOUT_MS = 10 * 60_000;
@@ -869,18 +877,57 @@ export class HttpVFS implements VFSClient {
     return body;
   }
 
+  /**
+   * The one-call route first — it is what a server predating the bounded step
+   * route answers — then the bounded steps for a history that route refuses
+   * with `EFBIG`. The caller's result shape is the same either way.
+   */
   async dropVersions(
     p: string,
     policy: DropVersionsPolicy
   ): Promise<{ dropped: number; kept: number }> {
+    return await applyDropVersions(
+      p,
+      async () => {
+        const res = await this.post(
+          "dropVersions",
+          { path: p, policy },
+          "dropVersions",
+          p,
+          "json"
+        );
+        return (await res.json()) as { dropped: number; kept: number };
+      },
+      (operation) =>
+        operation === undefined
+          ? this.startDropVersions(p, policy)
+          : this.stepDropVersions(p, policy, operation)
+    );
+  }
+
+  async startDropVersions(
+    p: string,
+    policy: DropVersionsPolicy
+  ): Promise<DropVersionsProgress> {
+    return await this.stepDropVersions(p, policy, newDropVersionsOperation());
+  }
+
+  async stepDropVersions(
+    p: string,
+    policy: DropVersionsPolicy,
+    operation: DropVersionsOperation
+  ): Promise<DropVersionsProgress> {
     const res = await this.post(
-      "dropVersions",
-      { path: p, policy },
+      "dropVersionsStep",
+      { path: p, policy, operationId: operation.operationId },
       "dropVersions",
       p,
       "json"
     );
-    return (await res.json()) as { dropped: number; kept: number };
+    return dropVersionsProgress(
+      operation,
+      (await res.json()) as DropVersionsStepResult
+    );
   }
 
   // ── ──────────────────────────────────────────────────────────

@@ -5,7 +5,11 @@ import type { MiddlewareHandler } from "hono";
 import { verifyVFSToken, VFSConfigError } from "../lib/auth";
 import { vfsUserDOName } from "../lib/utils";
 import type { UserDOCore } from "../objects/user/user-do-core";
-import { VFSError, type VFSScope } from "../../../shared/vfs-types";
+import {
+  VFSError,
+  type DropVersionsPolicy,
+  type VFSScope,
+} from "../../../shared/vfs-types";
 import {
   PatchMetadataIfHeadRequestSchema,
   type PatchMetadataIfHeadRequest,
@@ -989,17 +993,43 @@ vfs.post("/dropVersions", async (c) => {
   try {
     const body = await c.req.json<{
       path: string;
-      policy: {
-        olderThan?: number;
-        keepLast?: number;
-        exceptVersions?: string[];
-      };
+      policy: DropVersionsPolicy;
     }>();
     const path = expectPath(body);
     const r = await userStub(c).vfsDropVersions(
       c.var.scope,
       path,
       body.policy ?? {}
+    );
+    return c.json(r);
+  } catch (err) {
+    const r = errToResponse(err);
+    return vfsJsonErrorResponse(r);
+  }
+});
+
+// One bounded retention step. The caller owns `operationId` and repeats the
+// call with the same value until the response carries the counts, so a lost
+// response costs a replay rather than a second pass over the history.
+vfs.post("/dropVersionsStep", async (c) => {
+  try {
+    const body = await c.req.json<{
+      path: string;
+      policy: DropVersionsPolicy;
+      operationId: string;
+    }>();
+    const path = expectPath(body);
+    if (typeof body.operationId !== "string") {
+      return c.json(
+        { code: "EINVAL", message: "body.operationId must be a string" },
+        400
+      );
+    }
+    const r = await userStub(c).vfsDropVersionsStep(
+      c.var.scope,
+      path,
+      body.policy ?? {},
+      body.operationId
     );
     return c.json(r);
   } catch (err) {

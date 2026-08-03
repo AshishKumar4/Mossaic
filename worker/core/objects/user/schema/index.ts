@@ -36,6 +36,7 @@ import {
   applyQuotaVersioningToggle,
 } from "./quota";
 import { applyShardStorageCache } from "./shard-capacity";
+import { applyVersionRetentionSchema } from "./version-retention";
 import { applyVersionSchema, applyVersionShardRefColumn } from "./versions";
 import { applyVfsMetaTable } from "./vfs-meta";
 import { applyWriteStreamSessions } from "./write-streams";
@@ -99,4 +100,5 @@ export const USER_SCHEMA_STEPS: readonly SchemaStep[] = [
   verifyPathUniquenessIndexes,
   applyMultipartFinalizeSchema,
   applyMultipartAbortSchema,
+  applyVersionRetentionSchema,
 ];

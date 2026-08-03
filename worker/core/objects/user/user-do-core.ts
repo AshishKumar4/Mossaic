@@ -40,6 +40,8 @@ import {
   type VFSWriteHandle,
 } from "./vfs-ops";
 import type {
+  DropVersionsPolicy,
+  DropVersionsStepResult,
   OpenManifestResult,
   VFSScope,
   VFSStatRaw,
@@ -52,7 +54,7 @@ import type {
   Variant,
 } from "../../../../shared/preview-types";
 import { VFSError } from "../../../../shared/vfs-types";
-import { vfsShardDOName } from "../../lib/utils";
+import { generateId, vfsShardDOName } from "../../lib/utils";
 import { logError, logInfo } from "../../lib/logger";
 import { ensureMigrationsTable } from "../../lib/migrations";
 import { USER_SCHEMA_STEPS } from "./schema";
@@ -95,7 +97,6 @@ import {
 import type { YjsRuntime } from "./yjs";
 import { enforceRateLimit } from "./rate-limit";
 import {
-  dropVersions,
   isVersioningEnabled,
   listVersions,
   resolvePathId,
@@ -103,6 +104,11 @@ import {
   setVersioningEnabled,
   type VersionRow,
 } from "./vfs-versions";
+import {
+  assertLegacyDropVersionsBounded,
+  dropVersionsStep,
+  resumeVersionRetention,
+} from "./version-retention";
 import {
   scheduleAlarmAt,
   scheduleStaleUploadSweep,
@@ -478,6 +484,20 @@ export class UserDOCore extends DurableObject<Env> {
       this.recordAlarmFailure("multipart_cleaning", "", err);
     }
 
+    // A retention operation whose caller walked away still owes the manifest
+    // rows and shard cleanup of every version it already dropped, so the alarm
+    // is what guarantees it finishes. One bounded step per tick.
+    let retentionHasMore = false;
+    try {
+      const r = await resumeVersionRetention(this, scope);
+      retentionHasMore = r.remaining;
+    } catch (err) {
+      // A retention step that fails is owed either way, so the alarm keeps
+      // coming back for it instead of dropping it here.
+      retentionHasMore = true;
+      this.recordAlarmFailure("version_retention", "", err);
+    }
+
     // Shard capacity warning poll. Throttled (once per cadence) by
     // the helper itself; reads `quota.pool_size` and fans out a
     // `getStorageBytes` RPC per shard. Logs a structured warning
@@ -560,7 +580,8 @@ export class UserDOCore extends DurableObject<Env> {
       rows.length === 200 ||
       staleSweepFailed ||
       multipartHasMore ||
-      multipartCleaningHasMore;
+      multipartCleaningHasMore ||
+      retentionHasMore;
     if (
       maintenanceHasMore ||
       (nextCleanupAttempt !== null && nextCleanupAttempt !== undefined) ||
@@ -1818,33 +1839,76 @@ export class UserDOCore extends DurableObject<Env> {
   }
 
   /**
-   * Drop versions per a retention policy. Head version is always
-   * preserved (S3 invariant). Returns counts. Chunks whose last
-   * version reference was dropped are reaped by the alarm
-   * sweeper after its 30s grace.
+   * Advance one durable retention operation by one bounded step.
+   *
+   * `operationId` is the caller's, and it is what makes retention resumable:
+   * a caller that lost a response repeats the call with the same id and the
+   * server continues from where it got to instead of starting again. The
+   * counts arrive with the step that observed the operation finish, and a
+   * replay of that call returns the same pair.
+   */
+  async vfsDropVersionsStep(
+    scope: VFSScope,
+    path: string,
+    policy: DropVersionsPolicy,
+    operationId: string
+  ): Promise<DropVersionsStepResult> {
+    this.gateVfs(scope);
+    const userId = userIdFor(scope);
+    const pathId = this.resolveRetentionPathId(userId, path);
+    return dropVersionsStep(this, scope, userId, pathId, policy, operationId);
+  }
+
+  /**
+   * Drop versions per a retention policy in one call. Head version is always
+   * preserved (S3 invariant). Returns counts. Chunks whose last version
+   * reference was dropped are reaped by the alarm sweeper after its 30s grace.
+   *
+   * The one-call contract every released client speaks: it answers with the
+   * counts or it throws, never with a pending shape the caller would not
+   * recognise. What it cannot do is grow without bound, so a history or a
+   * drop-set manifest larger than one bounded step is refused up front —
+   * before anything is mutated — and those callers use
+   * `vfsDropVersionsStep` instead.
    */
   async vfsDropVersions(
     scope: VFSScope,
     path: string,
-    policy: {
-      olderThan?: number;
-      keepLast?: number;
-      exceptVersions?: string[];
-    }
+    policy: DropVersionsPolicy
   ): Promise<{ dropped: number; kept: number }> {
     this.gateVfs(scope);
-    const userId = scope.sub
-      ? `${scope.tenant}::${scope.sub}`
-      : scope.tenant;
-    const pathId = resolvePathId(this, userId, path);
-    if (!pathId) {
-      const { VFSError } = await import("../../../../shared/vfs-types");
+    const userId = userIdFor(scope);
+    const pathId = this.resolveRetentionPathId(userId, path);
+    assertLegacyDropVersionsBounded(this, userId, pathId, policy);
+    const step = await dropVersionsStep(
+      this,
+      scope,
+      userId,
+      pathId,
+      policy,
+      generateId()
+    );
+    if (!step.done) {
+      // The gate admitted work a step could finish, so getting here means the
+      // history grew underneath it. What was reaped is durable and the alarm
+      // finishes the rest; the caller is told the call did not complete
+      // rather than handed counts that describe part of it.
+      await scheduleAlarmAt(this, Date.now() + 1_000);
       throw new VFSError(
-        "ENOENT",
-        `dropVersions: path not found: ${path}`
+        "EBUSY",
+        "dropVersions: history changed during retention; retry"
       );
     }
-    return dropVersions(this, scope, userId, pathId, policy);
+    return { dropped: step.dropped, kept: step.kept };
+  }
+
+  /** Resolve a retention RPC's path, or refuse it as missing. */
+  private resolveRetentionPathId(userId: string, path: string): string {
+    const pathId = resolvePathId(this, userId, path);
+    if (pathId === null) {
+      throw new VFSError("ENOENT", `dropVersions: path not found: ${path}`);
+    }
+    return pathId;
   }
 
   /**

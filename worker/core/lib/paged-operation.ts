@@ -103,21 +103,25 @@
  *            provisional intents, row discarded otherwise
  *   bounded  200 rows per invocation, six concurrent units, one page per claim
  *
- * version retention (`dropVersions`)
+ * version retention (`dropVersionsStep`)
  *   table    version_retention_operations, key (operation_id)
- *   phase    status: running → expiring → done (terminal)
- *   cursors  plan_generation, mirrored from files.version_generation. Its
- *            per-version bookkeeping — the descending (cursor_mtime_ms,
- *            cursor_version_id) seek, pending_metadata_deleted, manifest_cursor
- *            — is *not* declared, because it legitimately restarts for each
- *            version without any declared outer component advancing. It stays
- *            domain state written inside the transition's transaction, which is
- *            the boundary the rule above draws: declare a cursor only when it
+ *   phase    status: running → done (terminal)
+ *   cursors  plan_generation, the operation's own fence: it advances exactly
+ *            when a head switch invalidates the remaining plan, which is the
+ *            one event that legitimately rewinds the scan. Its per-version
+ *            bookkeeping — the descending (cursor_mtime_ms, cursor_version_id)
+ *            seek, the pending_version_id whose manifest is mid-reap — is
+ *            *not* declared, because it legitimately restarts for each version
+ *            without any declared outer component advancing. It stays domain
+ *            state written inside the transition's transaction, which is the
+ *            boundary the rule above draws: declare a cursor only when it
  *            rewinds no further than a declared outer component allows.
  *   fence    (status, plan_generation) in `expected`; the whole step runs in
- *            one synchronous transaction, so no second writer can interleave
+ *            one synchronous transaction, so no second writer can interleave,
+ *            and the claim and retry column sets are omitted for the same
+ *            reason — one caller addresses one operation id
  *   terminal status `done`; result decoded from the persisted dropped / kept
- *   bounded  128 versions, 200 manifest rows, 128 cleanup intents
+ *   bounded  128 versions, 200 manifest rows, 128 cleanup routes
  *
  * yjs cleanup (`dropOpsBefore`)
  *   table    yjs_cleanup_operations, key (path_id)

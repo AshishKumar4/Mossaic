@@ -57,6 +57,14 @@ export {
   type AbortMultipartUploadResult,
 } from "./vfs";
 
+// Bounded version retention — the operation handle callers thread through
+// startDropVersions / stepDropVersions, and the budget dropVersions spends.
+export {
+  DROP_VERSIONS_STEP_BUDGET,
+  type DropVersionsOperation,
+  type DropVersionsProgress,
+} from "./version-retention";
+
 // cap constants — surfaced for client-side pre-validation
 // + so consumers know the limits without reading the README.
 export {

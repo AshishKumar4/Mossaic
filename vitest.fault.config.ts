@@ -11,6 +11,7 @@ export default defineWorkersTestConfig({
 		"tests/integration/multipart-shard-transaction.test.ts",
 		"tests/integration/ordinary-publication-failures.test.ts",
 		"tests/integration/overwrite-cleanup-failures.test.ts",
+		"tests/integration/version-retention-scan-cost.test.ts",
 		"tests/integration/versioned-publication-failures.test.ts",
 	],
 });

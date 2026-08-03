@@ -28,8 +28,17 @@ import {
   type ReadStreamOptions,
 } from "./streams";
 import { EINVAL, VFSFsError, mapServerError } from "./errors";
+import {
+  applyDropVersions,
+  dropVersionsProgress,
+  newDropVersionsOperation,
+  type DropVersionsOperation,
+  type DropVersionsProgress,
+} from "./version-retention";
 import type {
   CacheResolveResult,
+  DropVersionsPolicy,
+  DropVersionsStepResult,
   OpenManifestResult,
   VFSScope,
   VFSStatRaw,
@@ -370,6 +379,29 @@ export interface VFSClient {
     p: string,
     policy: DropVersionsPolicy
   ): Promise<{ dropped: number; kept: number }>;
+  /**
+   * Start a bounded retention operation and run its first step.
+   *
+   * `dropVersions` is the convenience form and drives these steps itself; use
+   * this pair directly when the caller wants to own the pacing — a history
+   * deep enough to outlast one invocation, a progress bar, or a worker that
+   * resumes the same operation across requests.
+   */
+  startDropVersions(
+    p: string,
+    policy: DropVersionsPolicy
+  ): Promise<DropVersionsProgress>;
+  /**
+   * Run one more bounded step of an operation `startDropVersions` began.
+   * Repeating a step whose response was lost is safe: the server continues
+   * from the cursor it committed, and a step against a finished operation
+   * returns its recorded counts.
+   */
+  stepDropVersions(
+    p: string,
+    policy: DropVersionsPolicy,
+    operation: DropVersionsOperation
+  ): Promise<DropVersionsProgress>;
   /** set per-version label and/or user-visible flag. */
   markVersion(
     p: string,
@@ -726,6 +758,13 @@ export interface UserDOClient {
     path: string,
     policy: DropVersionsPolicy
   ): Promise<{ dropped: number; kept: number }>;
+  /** One bounded retention step, keyed on the caller's `operationId`. */
+  vfsDropVersionsStep(
+    scope: VFSScope,
+    path: string,
+    policy: DropVersionsPolicy,
+    operationId: string
+  ): Promise<DropVersionsStepResult>;
   /** set per-version label / mark user-visible. */
   vfsMarkVersion(
     scope: VFSScope,
@@ -1338,23 +1377,7 @@ export interface ListVersionsOpts {
   includeMetadata?: boolean;
 }
 
-/**
- * retention-policy parameters for `vfs.dropVersions(path, policy)`.
- *
- * The CURRENT head version is ALWAYS preserved, regardless of filters
- * (S3 invariant). Surviving versions = (head) ∪ (exceptVersions) ∪
- * (newest `keepLast`) ∪ (versions not older than `olderThan`).
- *
- * Pass an empty policy `{}` to drop everything except the head.
- */
-export interface DropVersionsPolicy {
-  /** ms-since-epoch cutoff: keep versions with mtimeMs ≥ olderThan. */
-  olderThan?: number;
-  /** Keep the N newest versions (in addition to the head). */
-  keepLast?: number;
-  /** Explicit allowlist of version_ids to preserve. */
-  exceptVersions?: string[];
-}
+export type { DropVersionsPolicy } from "../../shared/vfs-types";
 
 import { vfsUserDOName } from "../../worker/core/lib/utils";
 import { vfsShardDOName } from "../../worker/core/lib/utils";
@@ -2680,13 +2703,47 @@ export class VFS implements VFSClient {
    * Drop versions per a retention policy. Head version is always
    * preserved. Chunks whose last reference was dropped are reaped
    * by the alarm sweeper after its 30s grace.
+   *
+   * The one-call RPC is tried first — it is the contract every deployed
+   * server answers, so this keeps working against one that predates the
+   * bounded step surface. A server that has that surface refuses a history it
+   * cannot finish in one bounded invocation with `EFBIG`, and this drives the
+   * steps itself from there, so the caller's result shape never changes.
    */
   async dropVersions(
     p: string,
     policy: DropVersionsPolicy
   ): Promise<{ dropped: number; kept: number }> {
+    return await applyDropVersions(
+      p,
+      () => this.user().vfsDropVersions(this.scope(), p, policy),
+      (operation) =>
+        operation === undefined
+          ? this.startDropVersions(p, policy)
+          : this.stepDropVersions(p, policy, operation)
+    );
+  }
+
+  async startDropVersions(
+    p: string,
+    policy: DropVersionsPolicy
+  ): Promise<DropVersionsProgress> {
+    return await this.stepDropVersions(p, policy, newDropVersionsOperation());
+  }
+
+  async stepDropVersions(
+    p: string,
+    policy: DropVersionsPolicy,
+    operation: DropVersionsOperation
+  ): Promise<DropVersionsProgress> {
     try {
-      return await this.user().vfsDropVersions(this.scope(), p, policy);
+      const step = await this.user().vfsDropVersionsStep(
+        this.scope(),
+        p,
+        policy,
+        operation.operationId
+      );
+      return dropVersionsProgress(operation, step);
     } catch (err) {
       throw mapServerError(err, { path: p, syscall: "dropVersions" });
     }

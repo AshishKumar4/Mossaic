@@ -104,6 +104,12 @@ export type {
   AbortMultipartUploadResult,
 } from "./vfs";
 
+export {
+  DROP_VERSIONS_STEP_BUDGET,
+  type DropVersionsOperation,
+  type DropVersionsProgress,
+} from "./version-retention";
+
 // cap constants — surfaced for client-side pre-validation.
 export {
   METADATA_MAX_BYTES,

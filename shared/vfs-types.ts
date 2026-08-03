@@ -151,6 +151,38 @@ export interface OpenManifestResult {
 }
 
 /**
+ * Retention-policy parameters for version retention.
+ *
+ * The CURRENT head version is ALWAYS preserved, regardless of filters (S3
+ * invariant), and it counts as one of `keepLast`. Surviving versions =
+ * (head) ∪ (exceptVersions) ∪ (newest `keepLast`) ∪ (versions not older than
+ * `olderThan`) — each rule is additive.
+ *
+ * Pass an empty policy `{}` to drop everything except the head.
+ */
+export interface DropVersionsPolicy {
+  /** ms-since-epoch cutoff: keep versions with mtimeMs ≥ olderThan. */
+  olderThan?: number;
+  /** Keep the N newest versions; the head is the first of them. */
+  keepLast?: number;
+  /** Explicit allowlist of version_ids to preserve. */
+  exceptVersions?: string[];
+}
+
+/**
+ * One `vfsDropVersionsStep` outcome.
+ *
+ * A step that ran out of budget answers `{ done: false }` and carries no
+ * cursor: the operation row on the server holds the only authoritative one, so
+ * a caller resumes by repeating the call with the same operation id. The
+ * counts arrive exactly once the operation is terminal, and a replayed call
+ * against a terminal operation returns the same pair rather than recounting.
+ */
+export type DropVersionsStepResult =
+  | { done: false }
+  | { done: true; dropped: number; kept: number };
+
+/**
  * Path resolution result. read-side ops (vfsStat/lstat/exists/readlink/...)
  * all flow through resolvePath() and discriminate on `kind`.
  */
