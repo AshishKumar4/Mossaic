@@ -1,0 +1,79 @@
+tests/integration/multipart-paged-abort.test.ts
+  s_29b9e6f0871340::t_f13c2b2974656d 1-669
+tests/integration/multipart-poison.test.ts
+  s_89915ad0de22dc::t_d99fd2d31545ff 1-16,19,21-27,29,31-38,41-44,46-48,50,53-67,69-74,78-108,111-167,171-205,207-219,223-231,233-240,242-252,255-264,267-283,285-289,291-298,300-336,338,340-377
+tests/integration/multipart-status-pages.test.ts
+  s_89915ad0de22dc::t_d7d985af0c0b50 1-402
+tests/integration/ordinary-publication-failures.test.ts
+  s_6ca33ca8799205::t_66fca75fe2b9bf 223-229
+tests/integration/schema-migrations.test.ts
+  s_89915ad0de22dc::t_a5f3e20cfe893d 571-683
+tests/test-worker.ts
+  s_6cb60617991778::t_ac45f932068318 109,289-299,512-533,535-537,540
+tsconfig.test.changed.json
+  s_89915ad0de22dc::t_82ea01a0c25d8c 15-17
+vitest.config.ts
+  s_89915ad0de22dc::t_0e25b2e6837c42 36-37
+vitest.fault.config.ts
+  s_89915ad0de22dc::t_bae142f051c230 9-10
+worker/core/lib/paged-operation.ts
+  s_29b9e6f0871340::t_15eed5c489f597 81-91
+worker/core/objects/shard/shard-do.ts
+  s_e756571b0cd13f::t_6860e00fda28fa 7-10,21-34,238-243,249-252,254,262-265,267,275,698-706,709-712,714,716-724,726,741,755,764,769-772,775-778,780,782-790,792-818
+worker/core/objects/user/multipart-upload.ts
+  s_6cb60617991778::t_989d9aa1e322f2 4,10-21,41-44,63,65,74-77,83-84,90-91,94,194-200,235-243,247-249,255,260,603-614,658-661,873-874,1353,1377,1517,1560-1567,2771-2772,2774-2780,2782-2793,2795-2802,2804,2807,2809-2828,2832-2845,2848,2850-2853,2855-2858,2860-2885,2887-2903,2906,2908-2912,2914-2917,2919,2921-2937,2939-3847,3850-3853,3856,3858
+worker/core/objects/user/schema/index.ts
+  s_89915ad0de22dc::t_81d8046b788768 22,101
+worker/core/objects/user/user-do-core.ts
+  s_e756571b0cd13f::t_215751db8427d3 541-546,1416-1419,1426-1427,1455-1463,1496-1502,1505
+worker/core/routes/multipart-routes.ts
+  s_29b9e6f0871340::t_383018978dcd0a 11-12,49,55,283-306,308-310,314,321-336,341-343
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "09306e4719db0407824e23f57ec4a1c850e3f284",
+  "prompts": {},
+  "sessions": {
+    "s_29b9e6f0871340": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_09d8de3cdffeyPFYAr8d5enel2",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ashish Kumar Singh <ashishsingh@cloudflare.com>"
+    },
+    "s_6ca33ca8799205": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_037cf4233ffeun10uERnLny25u",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Ashish Kumar Singh <ashishsingh@cloudflare.com>"
+    },
+    "s_6cb60617991778": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_036efa6c5ffe1WPcItJjjfTE9s",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ashish Kumar Singh <ashishsingh@cloudflare.com>"
+    },
+    "s_89915ad0de22dc": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_036f6a668ffeRolZVGXx66Pe5N",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ashish Kumar Singh <ashishsingh@cloudflare.com>"
+    },
+    "s_e756571b0cd13f": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_036efe1f8ffeUhTVk6yN5BVAhU",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ashish Kumar Singh <ashishsingh@cloudflare.com>"
+    }
+  }
+}
