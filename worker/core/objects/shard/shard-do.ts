@@ -2,6 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import type { EnvCore as Env } from "../../../../shared/types";
 import {
   MULTIPART_FENCE_GC_GRACE_MS,
+  MULTIPART_HASH_PAGE_SIZE,
   MULTIPART_MAX_TTL_MS,
 } from "../../../../shared/multipart";
 import { ensureMigrationsTable } from "../../lib/migrations";
@@ -701,6 +702,44 @@ export class ShardDO extends DurableObject<Env> {
       .exec(
         "SELECT chunk_index AS idx, chunk_hash AS hash, chunk_size AS size FROM upload_chunks WHERE upload_id = ? ORDER BY chunk_index",
         uploadId
+      )
+      .toArray() as Array<{ idx: number; hash: string; size: number }>;
+    return { rows };
+  }
+
+  /**
+   * Read the staging manifest for one bounded chunk-index range.
+   *
+   * A paged finalize verifies a fixed slice of the file per invocation, so it
+   * must be able to ask each shard for only that slice: `getMultipartManifest`
+   * returns every staged row and grows without bound with the upload.
+   */
+  async getMultipartManifestRange(
+    uploadId: string,
+    startIndex: number,
+    endIndex: number
+  ): Promise<{ rows: Array<{ idx: number; hash: string; size: number }> }> {
+    this.ensureInit();
+    if (
+      !Number.isInteger(startIndex) ||
+      !Number.isInteger(endIndex) ||
+      startIndex < 0 ||
+      endIndex < startIndex ||
+      endIndex - startIndex > MULTIPART_HASH_PAGE_SIZE
+    ) {
+      throw new Error(
+        `EINVAL: multipart manifest range must cover <=${MULTIPART_HASH_PAGE_SIZE} chunks`
+      );
+    }
+    const rows = this.sql
+      .exec(
+        `SELECT chunk_index AS idx, chunk_hash AS hash, chunk_size AS size
+           FROM upload_chunks
+          WHERE upload_id = ? AND chunk_index >= ? AND chunk_index < ?
+          ORDER BY chunk_index`,
+        uploadId,
+        startIndex,
+        endIndex
       )
       .toArray() as Array<{ idx: number; hash: string; size: number }>;
     return { rows };

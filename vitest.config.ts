@@ -31,6 +31,7 @@ export default defineWorkersTestConfig({
 	include: ["tests/**/*.test.ts"],
 	exclude: [
 		"tests/integration/cleanup-outbox-remaining-paths.test.ts",
+		"tests/integration/multipart-finalize-steps.test.ts",
 		"tests/integration/multipart-shard-transaction.test.ts",
 		"tests/integration/ordinary-publication-failures.test.ts",
 		"tests/integration/overwrite-cleanup-failures.test.ts",

@@ -36,6 +36,19 @@ export function isMultipartPlacementVersion(
   );
 }
 
+/**
+ * Control plane a client must speak to drive an upload whose finalize cannot
+ * fit in one call. Absent means the caller only knows the original one-request
+ * finalize, which the server then has to keep within its bounded limits.
+ */
+export const MULTIPART_PROTOCOL_VERSION = 2;
+
+/** Expected hashes staged, and chunks verified, per call. */
+export const MULTIPART_HASH_PAGE_SIZE = 256;
+
+/** Shard fences persisted, and shards fanned out to, per call. */
+export const MULTIPART_FENCE_PAGE_SIZE = 64;
+
 /** Default upload-session TTL — 24h. Configurable per `beginUpload` call. */
 export const MULTIPART_DEFAULT_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -96,6 +109,8 @@ export interface DownloadTokenPayload {
 export interface MultipartBeginRequest {
   path: string;
   size: number;
+  /** Control plane the client can drive. Absent means one-request finalize. */
+  protocolVersion?: number;
   chunkSize?: number;
   mode?: number;
   mimeType?: string;
@@ -118,12 +133,32 @@ export interface MultipartBeginResponse {
   expiresAtMs: number;
   landed: number[];
   recommendedConcurrency?: number;
+  /** Echoed when the server accepted the client's paged control plane. */
+  protocolVersion?: number;
 }
 
 /** Body of `POST /api/vfs/multipart/finalize`. */
 export interface MultipartFinalizeRequest {
   uploadId: string;
   chunkHashList: string[];
+}
+
+/** Body of `POST /api/vfs/multipart/hash-page`. */
+export interface MultipartHashPageRequest {
+  uploadId: string;
+  startIndex: number;
+  hashes: string[];
+}
+
+/** Response of `POST /api/vfs/multipart/hash-page`. */
+export interface MultipartHashPageResponse {
+  staged: number;
+  total: number;
+}
+
+/** Body of `POST /api/vfs/multipart/finalize-step`. */
+export interface MultipartFinalizeStepRequest {
+  uploadId: string;
 }
 
 /** Response of `POST /api/vfs/multipart/finalize`. */
@@ -148,6 +183,23 @@ export interface MultipartFinalizeResponse {
    */
   isEncrypted: boolean;
 }
+
+/**
+ * One `POST /api/vfs/multipart/finalize-step` outcome.
+ *
+ * `cursor`/`total` are progress for the caller to display, not a resume
+ * token: the server holds the only authoritative cursor. `fresh` is true on
+ * the single response that observed the operation reach its terminal state,
+ * so a caller can run one-shot side effects without a second guard.
+ */
+export type MultipartFinalizeProgress =
+  | {
+      done: false;
+      phase: "fencing" | "verifying" | "preparing" | "publishing" | "cleaning";
+      cursor: number;
+      total: number;
+    }
+  | { done: true; result: MultipartFinalizeResponse; fresh: boolean };
 
 /** Body of `POST /api/vfs/multipart/abort`. */
 export interface MultipartAbortRequest {

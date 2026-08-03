@@ -19,6 +19,7 @@ import {
   applyTagsAndListingIndexes,
 } from "./metadata-tags";
 import {
+  applyMultipartFinalizeSchema,
   applyUploadSessionIndexes,
   applyUploadSessionsTable,
 } from "./multipart";
@@ -95,4 +96,5 @@ export const USER_SCHEMA_STEPS: readonly SchemaStep[] = [
   applyPreviewVariants,
   applyAuditLog,
   verifyPathUniquenessIndexes,
+  applyMultipartFinalizeSchema,
 ];

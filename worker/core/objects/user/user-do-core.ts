@@ -1381,7 +1381,7 @@ export class UserDOCore extends DurableObject<Env> {
 
   // ── multipart parallel transfer engine ─────────────────────
   //
-  // Three RPCs forming the upload session boundary. Per-chunk PUTs do
+  // The RPCs forming the upload session boundary. Per-chunk PUTs do
   // NOT touch UserDO — they validate the session token in the route
   // handler (CPU-only, HMAC verify) and call ShardDO directly. This
   // is the load-bearing constraint that lets multipart saturate user
@@ -1391,8 +1391,12 @@ export class UserDOCore extends DurableObject<Env> {
   //   returns HMAC token. Resume mode probes shards for landed[].
   // - vfsAbortMultipart: flips status, fans out chunk-ref drops + staging
   //   clears across the pool, hard-deletes tmp row.
-  // - vfsFinalizeMultipart: verifies completeness, batch-inserts
-  //   file_chunks, atomic supersede via commitRename.
+  // - vfsStageMultipartHashes: persists one bounded page of declared
+  //   chunk hashes, advancing the session's contiguous staging cursor.
+  // - vfsFinalizeMultipartStep: advances the durable finalize machine by
+  //   one bounded page — fence, verify, or publish.
+  // - vfsFinalizeMultipart: stages the declared manifest and drives that
+  //   machine to completion in one turn.
   // - vfsGetMultipartStatus: read landed[] for resume / progress.
   //
   // See worker/core/objects/user/multipart-upload.ts for implementation
@@ -1419,6 +1423,26 @@ export class UserDOCore extends DurableObject<Env> {
     this.gateVfs(scope);
     const { vfsAbortMultipart } = await import("./multipart-upload");
     return vfsAbortMultipart(this, scope, uploadId);
+  }
+
+  async vfsStageMultipartHashes(
+    scope: VFSScope,
+    uploadId: string,
+    startIndex: number,
+    hashes: readonly string[]
+  ): Promise<import("../../../../shared/multipart").MultipartHashPageResponse> {
+    this.gateVfsWrite(scope);
+    const { vfsStageMultipartHashes } = await import("./multipart-upload");
+    return vfsStageMultipartHashes(this, scope, uploadId, startIndex, hashes);
+  }
+
+  async vfsFinalizeMultipartStep(
+    scope: VFSScope,
+    uploadId: string
+  ): Promise<import("../../../../shared/multipart").MultipartFinalizeProgress> {
+    this.gateVfsWrite(scope);
+    const { vfsFinalizeMultipartStep } = await import("./multipart-upload");
+    return vfsFinalizeMultipartStep(this, scope, uploadId);
   }
 
   async vfsFinalizeMultipart(

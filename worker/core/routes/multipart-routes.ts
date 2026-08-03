@@ -5,6 +5,7 @@
  *
  * Endpoint inventory:
  *   POST   /api/vfs/multipart/begin              → mint session + token
+ *   POST   /api/vfs/multipart/hash-page          → stage ≤256 chunk hashes
  *   POST   /api/vfs/multipart/finalize           → atomic commit
  *   POST   /api/vfs/multipart/abort              → drop session
  *   GET    /api/vfs/multipart/:uploadId/status   → landed[] for resume
@@ -42,9 +43,11 @@ import {
 import { errToResponse } from "./vfs";
 import { parseRange, rangeResponse, rangeNotSatisfiableResponse } from "../lib/http-range";
 import {
+  MULTIPART_HASH_PAGE_SIZE,
   MULTIPART_MAX_CHUNK_BYTES,
   type MultipartBeginRequest,
   type MultipartFinalizeRequest,
+  type MultipartHashPageRequest,
   type MultipartAbortRequest,
   type MultipartPutChunkResponse,
   type MultipartStatusResponse,
@@ -153,6 +156,54 @@ mp.post("/begin", async (c) => {
       resumeFrom: body.resumeFrom,
       ttlMs: body.ttlMs,
     });
+    return c.json(r);
+  } catch (err) {
+    const r = errToResponse(err);
+    return c.json(r.body, r.status as 400);
+  }
+});
+
+// POST /hash-page
+//
+// The page cap is enforced here as well as in the RPC so an oversized
+// manifest is refused before it costs a UserDO turn.
+mp.post("/hash-page", async (c) => {
+  try {
+    const body = await c.req.json<MultipartHashPageRequest>();
+    if (typeof body.uploadId !== "string" || body.uploadId.length === 0) {
+      return c.json(
+        { code: "EINVAL", message: "body.uploadId must be a non-empty string" },
+        400
+      );
+    }
+    if (!Number.isInteger(body.startIndex) || body.startIndex < 0) {
+      return c.json(
+        {
+          code: "EINVAL",
+          message: "body.startIndex must be a non-negative integer",
+        },
+        400
+      );
+    }
+    if (
+      !Array.isArray(body.hashes) ||
+      body.hashes.length === 0 ||
+      body.hashes.length > MULTIPART_HASH_PAGE_SIZE
+    ) {
+      return c.json(
+        {
+          code: "EINVAL",
+          message: `body.hashes must hold 1..${MULTIPART_HASH_PAGE_SIZE} strings`,
+        },
+        400
+      );
+    }
+    const r = await userStub(c).vfsStageMultipartHashes(
+      c.var.scope,
+      body.uploadId,
+      body.startIndex,
+      body.hashes
+    );
     return c.json(r);
   } catch (err) {
     const r = errToResponse(err);

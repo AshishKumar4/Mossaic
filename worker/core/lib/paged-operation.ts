@@ -56,14 +56,17 @@
  *   table    upload_sessions, key (upload_id, user_id)
  *   phase    finalize_phase: fencing → verifying → preparing → publishing →
  *            cleaning_upload_intents → cleaning_old_intents →
- *            cleaning_old_manifest → cleaning → done (terminal)
+ *            cleaning_old_manifest → cleaning → done (terminal). Declared so
+ *            far: fencing → verifying → publishing → done, publication being
+ *            the one step still synchronous.
  *   cursors  finalize_fence_cursor, finalize_chunk_cursor,
  *            finalize_verify_shard_cursor, finalize_intent_cursor,
  *            finalize_old_intent_cursor, finalize_old_cleanup_cursor,
- *            finalize_cleanup_cursor. Only one pair has to be ordered:
- *            finalize_verify_shard_cursor sits inside finalize_chunk_cursor,
- *            because finishing a chunk page restarts the shard fan-out at
- *            zero. The rest only ever advance.
+ *            finalize_cleanup_cursor. Declared so far: the first three, which
+ *            are the ones the paged phases move. Only one pair has to be
+ *            ordered: finalize_verify_shard_cursor sits inside
+ *            finalize_chunk_cursor, because finishing a chunk page restarts
+ *            the shard fan-out at zero. The rest only ever advance.
  *   fence    `status` ('finalizing' / 'finalized') passed in `expected`, so a
  *            session that aborted underneath the page changes zero rows
  *   terminal phase `done`; result decoded from `finalize_result`
@@ -420,6 +423,28 @@ export function commitOperationTransition(
   return sqlRowsChanged(store.sql) === 1;
 }
 
+/**
+ * The declared progress a row currently holds, as a guard for its next
+ * transition.
+ *
+ * An addressed page reads its row, computes one page of work, and commits;
+ * passing this as `expected` says "nothing moved underneath me", which is the
+ * same fence the claim plane puts on a released unit. Columns the row does not
+ * carry are simply absent, so a projection that selected only part of the
+ * progress tuple still guards the part it read.
+ */
+export function heldProgress(
+  table: PagedOperationTable<string>,
+  row: OperationColumns
+): OperationColumns {
+  const held: Record<string, SqlStorageValue> = {};
+  for (const column of progressColumns(table)) {
+    const value = row[column];
+    if (value !== undefined) held[column] = value;
+  }
+  return held;
+}
+
 /** Drop a terminal operation row, fenced the same way as a transition. */
 function discardOperation(
   store: DurableSqlStore,
@@ -762,19 +787,6 @@ function releaseUnit<TRow extends ClaimableOperationRow>(
     }
   });
   return withCommitted(unit, release);
-}
-
-/** The declared progress a claimed row currently holds. */
-function heldProgress(
-  table: PagedOperationTable<string>,
-  row: OperationColumns
-): OperationColumns {
-  const held: Record<string, SqlStorageValue> = {};
-  for (const column of progressColumns(table)) {
-    const value = row[column];
-    if (value !== undefined) held[column] = value;
-  }
-  return held;
 }
 
 /** Apply each row's terminal disposition. */

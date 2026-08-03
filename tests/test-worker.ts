@@ -86,6 +86,7 @@ export class FaultInjectingUserDO extends UserDO {
 
 export class FaultInjectingShardDO extends ShardDO {
   private putChunkMultipartResponseLossesRemaining = 0;
+  private multipartManifestRangeLossesRemaining = 0;
   private scheduleSweepFailuresRemaining = 0;
   private putChunkFailure:
     | {
@@ -252,6 +253,12 @@ export class FaultInjectingShardDO extends ShardDO {
     const block = this.multipartManifestBlock;
     if (!block) throw new Error("multipart manifest block is not configured");
     block.unblock();
+  }
+
+  async testConfigureMultipartManifestRangeResponseLoss(
+    remaining: number
+  ): Promise<void> {
+    this.multipartManifestRangeLossesRemaining = remaining;
   }
 
   async testConfigurePutChunkMultipartResponseLoss(
@@ -475,15 +482,40 @@ export class FaultInjectingShardDO extends ShardDO {
   override async getMultipartManifest(
     uploadId: string
   ): Promise<{ rows: Array<{ idx: number; hash: string; size: number }> }> {
-    const block = this.multipartManifestBlock;
-    if (block?.uploadId === uploadId) {
-      block.markEntered();
-      await block.release;
-      if (this.multipartManifestBlock === block) {
-        this.multipartManifestBlock = undefined;
-      }
-    }
+    await this.awaitMultipartManifestBlock(uploadId);
     return super.getMultipartManifest(uploadId);
+  }
+
+  // The paged finalize reads ranges, so the manifest block and the response
+  // loss both have to reach this entry point to describe the same faults.
+  override async getMultipartManifestRange(
+    uploadId: string,
+    startIndex: number,
+    endIndex: number
+  ): Promise<{ rows: Array<{ idx: number; hash: string; size: number }> }> {
+    await this.awaitMultipartManifestBlock(uploadId);
+    const result = await super.getMultipartManifestRange(
+      uploadId,
+      startIndex,
+      endIndex
+    );
+    if (this.multipartManifestRangeLossesRemaining > 0) {
+      this.multipartManifestRangeLossesRemaining--;
+      throw new Error(
+        `injected getMultipartManifestRange response loss: ${uploadId}`
+      );
+    }
+    return result;
+  }
+
+  private async awaitMultipartManifestBlock(uploadId: string): Promise<void> {
+    const block = this.multipartManifestBlock;
+    if (block?.uploadId !== uploadId) return;
+    block.markEntered();
+    await block.release;
+    if (this.multipartManifestBlock === block) {
+      this.multipartManifestBlock = undefined;
+    }
   }
 
   override async deleteChunks(fileId: string): Promise<{ marked: number }> {
