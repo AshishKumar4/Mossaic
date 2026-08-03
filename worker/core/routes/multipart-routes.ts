@@ -146,6 +146,7 @@ mp.post("/begin", async (c) => {
     }
     const r = await userStub(c).vfsBeginMultipart(c.var.scope, body.path, {
       size: body.size,
+      protocolVersion: body.protocolVersion,
       chunkSize: body.chunkSize,
       mode: body.mode,
       mimeType: body.mimeType,

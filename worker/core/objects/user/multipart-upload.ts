@@ -17,16 +17,18 @@
  *     session's contiguous `staged_hash_cursor`.
  *
  *   - `vfsFinalizeMultipartStep` — advances the durable finalize machine by
- *     one bounded page: at most 64 shard fences, or at most 256 verified
- *     chunks, or the publication that turns the verified manifest into a
- *     live file. Every page is resumable after Durable Object eviction.
+ *     one bounded page: at most 64 shard fences, at most 256 verified chunks,
+ *     at most 256 rows of a displaced manifest, or the constant-size
+ *     publication that switches the path onto the new file. Every page is
+ *     resumable after Durable Object eviction.
  *
  *   - `vfsFinalizeMultipart` — the one-request entry point, which stages the
- *     hashes the caller declared and then drives that machine to completion
- *     inside a single turn. `commitRename` atomically supersedes any prior
- *     row at the target path. The chunk_refs were placed under
- *     `refId = uploadId`; rename preserves `file_id`, so the refs
- *     remain valid for the post-rename file.
+ *     hashes the caller declared and then drives that machine as far as
+ *     publication inside a single turn. The chunk_refs were placed under
+ *     `refId = uploadId` and publication keeps the temporary row's `file_id`,
+ *     so they remain valid for the published file. Past publication the
+ *     caller owns a file, so this returns the recorded result and leaves the
+ *     bounded cleaning still owed to the alarm.
  *
  * The chunk PUT path lives entirely in the routes layer (not here) —
  * it doesn't touch UserDO at all, by design (Hard Constraint 1 from
@@ -54,6 +56,7 @@ import {
   MULTIPART_HASH_PAGE_SIZE,
   MULTIPART_MAX_OPEN_SESSIONS_PER_TENANT,
   MULTIPART_PLACEMENT_VERSION,
+  MULTIPART_PROTOCOL_VERSION,
   type MultipartBeginResponse,
   type MultipartFinalizeProgress,
   type MultipartFinalizeResponse,
@@ -69,7 +72,6 @@ import {
   type RetryPolicy,
 } from "../../lib/paged-operation";
 import {
-  commitRename,
   userIdFor,
   resolveParent,
   poolSizeFor,
@@ -77,13 +79,11 @@ import {
   folderExists,
   bumpFolderRevision,
   drainChunkCleanupIntents,
-  stageChunkCleanupIntents,
 } from "./vfs-ops";
 import { hardDeleteFileRowLocal } from "./vfs/write-commit";
 import {
   commitVersionChecked,
   dropTmpRowAfterVersionCommit,
-  insertVersionChunk,
   isVersioningEnabled,
   type VersionedFileExpectation,
 } from "./vfs-versions";
@@ -98,7 +98,12 @@ import {
   stampFileEncryption,
   type EncryptionStampOpts,
 } from "./encryption-stamp";
-import { bytesToHex } from "../../../../shared/crypto";
+import type { EncryptionMode } from "../../../../shared/encryption-types";
+import {
+  base64ToBytes,
+  bytesToBase64,
+  bytesToHex,
+} from "../../../../shared/crypto";
 import {
   createSha256State,
   digestSha256,
@@ -111,14 +116,20 @@ import { readMetadataBytes, replaceTags } from "./metadata-tags";
 import {
   ChunkCleanupKind,
   lastSqlChanges,
+  scheduleAlarmAt,
   scheduleStaleUploadSweep,
   stageChunkCleanupIntent,
-  retainMultipartStagingCleanup,
   transactionSync,
 } from "./internal-storage";
 
 export interface VFSBeginMultipartOpts {
   size: number;
+  /**
+   * Control plane the caller can drive. Absent means it only knows the
+   * one-request finalize, which the server then has to keep inside the
+   * bounds one invocation can carry.
+   */
+  protocolVersion?: number;
   chunkSize?: number;
   mode?: number;
   mimeType?: string;
@@ -162,8 +173,12 @@ type UploadSessionRow = {
   finalize_fence_cursor: number;
   finalize_chunk_cursor: number;
   finalize_verify_shard_cursor: number;
+  finalize_old_manifest_cursor: number;
+  finalize_old_cleanup_cursor: number;
+  finalize_cleanup_cursor: number;
   finalize_total_size: number;
   finalize_sha_state: string | null;
+  finalize_context: string | null;
   finalize_result: string | null;
 };
 
@@ -327,6 +342,12 @@ export async function vfsBeginMultipart(
   const tmpId = generateId();
   const fenceId = generateId();
   const poolSize = poolSizeFor(durableObject, userId);
+  assertFinalizeFitsOneRequest(
+    "beginMultipart",
+    finalTotalChunks,
+    poolSize,
+    opts.protocolVersion
+  );
   const now = Date.now();
   const ttl =
     typeof opts.ttlMs === "number" && opts.ttlMs > 0
@@ -425,7 +446,68 @@ export async function vfsBeginMultipart(
     putEndpoint: `/api/vfs/multipart/${tmpId}`,
     expiresAtMs: expiresAt,
     landed: [],
+    ...(opts.protocolVersion === MULTIPART_PROTOCOL_VERSION
+      ? { protocolVersion: MULTIPART_PROTOCOL_VERSION }
+      : {}),
   };
+}
+
+/**
+ * Shard round-trips one one-request finalize may spend.
+ *
+ * Fencing and verification are the only phases that leave the object, and a
+ * Durable Object invocation may issue on the order of a thousand subrequests.
+ * Half of that is what a caller who only knows the one-request finalize may
+ * commit to at begin; the rest stays for the cleanup drain publication
+ * triggers. An upload past this ceiling is refused before a single chunk is
+ * accepted rather than after every one of them has been.
+ */
+const MULTIPART_ONE_REQUEST_FINALIZE_MAX_FANOUT = 500;
+
+/**
+ * Bounded pages one one-request finalize may run before it asks the caller to
+ * call again. Begin bounds the pages an upload of its own needs; this also
+ * bounds the routing scan over a file the upload displaces, whose size the
+ * upload itself says nothing about. Every page it did run is durable, so the
+ * next call resumes from the cursor instead of restarting.
+ */
+const MULTIPART_ONE_REQUEST_FINALIZE_MAX_PAGES = 512;
+
+/** Shard round-trips finalizing this shape costs, fencing through publication. */
+function multipartFinalizeFanout(
+  totalChunks: number,
+  poolSize: number
+): number {
+  const chunkPages = Math.ceil(totalChunks / MULTIPART_HASH_PAGE_SIZE);
+  // Fencing walks the whole pool once, and every chunk page walks the shards
+  // its own indices are placed on — at most one page's worth of them.
+  return (
+    poolSize + chunkPages * Math.min(poolSize, MULTIPART_HASH_PAGE_SIZE)
+  );
+}
+
+/**
+ * Refuse work one request cannot spend its way through.
+ *
+ * Begin and resume call this so a caller that only knows the one-request
+ * finalize is turned away before a single chunk is accepted; the one-request
+ * finalize calls it so a session opened for the paged control plane cannot be
+ * driven down this path either. A caller that declared the paged control plane
+ * at begin is bounded by nothing here — it finalizes a page per request.
+ */
+function assertFinalizeFitsOneRequest(
+  operation: string,
+  totalChunks: number,
+  poolSize: number,
+  protocolVersion?: number
+): void {
+  if (protocolVersion === MULTIPART_PROTOCOL_VERSION) return;
+  const fanout = multipartFinalizeFanout(totalChunks, poolSize);
+  if (fanout <= MULTIPART_ONE_REQUEST_FINALIZE_MAX_FANOUT) return;
+  throw new VFSError(
+    "EINVAL",
+    `${operation}: finalizing ${totalChunks} chunks across ${poolSize} shards costs ${fanout} shard round-trips (cap ${MULTIPART_ONE_REQUEST_FINALIZE_MAX_FANOUT}); declare protocolVersion ${MULTIPART_PROTOCOL_VERSION} and drive finalize in pages`
+  );
 }
 
 /**
@@ -469,6 +551,14 @@ async function resumeMultipart(
       `resumeMultipart: size mismatch (session=${row.total_size}, caller=${opts.size})`
     );
   }
+  // The session's dimensions are frozen, so a caller that resumes it without
+  // the paged control plane is held to the same ceiling a cold begin is.
+  assertFinalizeFitsOneRequest(
+    "resumeMultipart",
+    row.total_chunks,
+    row.pool_size,
+    opts.protocolVersion
+  );
 
   // Probe every shard in the pool for landed indices. This is the
   // ONE place the resume probe pays a per-shard subrequest. For
@@ -539,6 +629,9 @@ async function resumeMultipart(
     putEndpoint: `/api/vfs/multipart/${uploadId}`,
     expiresAtMs: expiresAt,
     landed,
+    ...(opts.protocolVersion === MULTIPART_PROTOCOL_VERSION
+      ? { protocolVersion: MULTIPART_PROTOCOL_VERSION }
+      : {}),
   };
 }
 
@@ -646,8 +739,10 @@ export async function vfsAbortMultipart(
       uploadId,
       userId
     );
+    // The temporary row takes its own chunk rows with it; a candidate
+    // version's are reachable only through the frozen context.
     hardDeleteFileRowLocal(durableObject, userId, uploadId);
-    discardMultipartFinalizeScratch(durableObject, uploadId);
+    discardMultipartFinalizeScratch(durableObject, row);
   });
 
   await drainChunkCleanupIntents(durableObject, scope, uploadId);
@@ -830,16 +925,24 @@ function firstStagedHashMismatch(
 /**
  * Phases of one multipart finalize, in the order they may be reached.
  *
- * `fencing` closes the session's shards to further PUTs, `verifying` turns the
- * declared manifest into `upload_verified_chunks` a page at a time, and
- * `publishing` makes the verified manifest a live file in one local
- * transaction. `done` is terminal, and its `finalize_result` is what every
- * later replay reads.
+ * `fencing` closes the session's shards to further PUTs. `verifying` turns the
+ * declared manifest into `upload_verified_chunks` a page at a time and copies
+ * each page straight into the destination manifest, so no phase ever holds the
+ * whole manifest. `preparing` routes the shards a displaced file's chunks live
+ * on. `publishing` is then a constant-size head switch: it materialises
+ * nothing, and the routing it froze becomes executable cleanup in the same
+ * transaction. What the switch left owed is paged off afterwards —
+ * `cleaning_old_manifest` drops the displaced file's chunk rows,
+ * `cleaning` drops this upload's scratch — and `done` is terminal, its
+ * `finalize_result` what every later replay reads.
  */
 const MULTIPART_FINALIZE_PHASES = [
   "fencing",
   "verifying",
+  "preparing",
   "publishing",
+  "cleaning_old_manifest",
+  "cleaning",
   "done",
 ] as const;
 
@@ -847,8 +950,16 @@ type MultipartFinalizePhase = (typeof MULTIPART_FINALIZE_PHASES)[number];
 
 /**
  * Backoff a resumed finalize would wait between attempts. Only the driver's
- * claim plane reads it, and finalize is addressed directly rather than
- * claimed, so it is declared here as the operation's stated policy.
+ * claim plane reads it, and finalize is addressed directly by `upload_id`
+ * rather than claimed, so it is declared here as the operation's stated
+ * policy and the alarm's fixed maintenance cadence is what actually paces
+ * retries.
+ *
+ * The driver's poison policy is deliberately not consumed either. Before
+ * publication a deterministic failure releases the session outright, which is
+ * a stronger disposition than a retry cap; after publication the file exists
+ * and the reaping it left owed is still owed however often it fails, which is
+ * exactly the case `PoisonPolicy` says must never be abandoned.
  */
 const MULTIPART_FINALIZE_RETRY: RetryPolicy = {
   baseMs: 1_000,
@@ -861,7 +972,8 @@ const MULTIPART_FINALIZE_RETRY: RetryPolicy = {
  *
  * `finalize_verify_shard_cursor` is declared inside `finalize_chunk_cursor`
  * because finishing a chunk page restarts the shard fan-out at zero, which is
- * exactly the reset the driver's lexicographic rule permits.
+ * exactly the reset the driver's lexicographic rule permits. The three that
+ * follow belong to one phase each and only ever advance.
  * `finalize_total_size` and `finalize_sha_state` are not cursors: they are
  * domain state the same transition writes.
  */
@@ -878,111 +990,281 @@ const MULTIPART_FINALIZE_OPERATION: PagedOperationTable<MultipartFinalizePhase> 
       "finalize_fence_cursor",
       "finalize_chunk_cursor",
       "finalize_verify_shard_cursor",
+      "finalize_old_manifest_cursor",
+      "finalize_old_cleanup_cursor",
+      "finalize_cleanup_cursor",
     ],
     retry: MULTIPART_FINALIZE_RETRY,
   };
 
 /**
- * Compare-and-set one finalize transition. Must run inside the transaction
- * that carries the rows it commits, so a refused transition takes them with
- * it.
- *
- * The guard is the progress the page read plus `status`: a page whose row
- * moved underneath it — a concurrent step, an abort — matches zero rows
- * instead of applying its work a second time.
+ * Cursors that seek by a chunk index start one step below zero, so the first
+ * page selects `> -1` and takes index zero.
  */
-function commitFinalizeAdvance(
-  durableObject: UserDO,
-  session: UploadSessionRow,
-  phase: MultipartFinalizePhase,
-  next: Readonly<Record<string, SqlStorageValue>>
-): void {
-  const committed = commitOperationTransition(
-    durableObject,
-    MULTIPART_FINALIZE_OPERATION,
-    { upload_id: session.upload_id, user_id: session.user_id },
-    {
-      ...heldProgress(MULTIPART_FINALIZE_OPERATION, session),
-      status: "finalizing",
-    },
-    next
-  );
-  if (!committed) {
-    throw new VFSError(
-      "EBUSY",
-      `finalizeMultipart: session changed while ${phase}`
-    );
-  }
-}
+const MULTIPART_SEEK_CURSOR_START = -1;
 
-/** Run one page's mutations and its transition in a single transaction. */
-function commitFinalizePage(
-  durableObject: UserDO,
-  session: UploadSessionRow,
-  phase: MultipartFinalizePhase,
-  advance: () => Readonly<Record<string, SqlStorageValue>>
-): void {
-  transactionSync(durableObject, () => {
-    commitFinalizeAdvance(durableObject, session, phase, advance());
-  });
+/**
+ * How long a published session may wait before the alarm picks up the
+ * cleaning it still owes. Only a caller that walked away pays it: a caller
+ * that keeps stepping finishes the cleaning itself.
+ */
+const MULTIPART_CLEANING_RESUME_DELAY_MS = 60_000;
+
+/** Encryption a session was opened with, narrowed out of its text columns. */
+interface MultipartEncryption {
+  readonly mode: EncryptionMode;
+  readonly keyId: string | null;
 }
 
 /**
- * Drop the per-upload scratch a terminal session no longer reads. Runs in the
- * transaction that made the session terminal, so nothing can observe a
- * finished upload whose manifest tables are half gone.
+ * Everything publication is allowed to decide, decided once and written to
+ * `upload_sessions.finalize_context` before a single shard is fenced.
+ *
+ * Publication re-derives each of these from live state and refuses rather than
+ * apply a decision the operation never made: a destination that appeared,
+ * moved or was replaced, versioning switched underneath the upload, a rewritten
+ * metadata blob or tag set, a changed encryption stamp. The serialized form is
+ * also the compare-and-set token every page of the machine is fenced on, so a
+ * context rewritten mid-flight invalidates the pages that read it.
  */
-function discardMultipartFinalizeScratch(
-  durableObject: UserDO,
-  uploadId: string
-): void {
-  durableObject.sql.exec(
-    "DELETE FROM upload_expected_chunks WHERE upload_id = ?",
-    uploadId
-  );
-  durableObject.sql.exec(
-    "DELETE FROM upload_verified_chunks WHERE upload_id = ?",
-    uploadId
-  );
-  durableObject.sql.exec(
-    "DELETE FROM upload_cleanup_routes WHERE upload_id = ?",
-    uploadId
-  );
+interface MultipartFinalizeContext {
+  readonly schema: 1;
+  /** Non-null exactly when the tenant had versioning on at freeze time. */
+  readonly version: { readonly versionId: string } | null;
+  /** Path identity the publication attaches to. */
+  readonly pathId: string;
+  readonly parentId: string | null;
+  readonly leaf: string;
+  /** The live row this publication displaces, or null for a vacant path. */
+  readonly destination: {
+    readonly fileId: string;
+    readonly headVersionId: string | null;
+  } | null;
+  readonly encryption: MultipartEncryption | null;
+  /** Absent means "inherit"; `{ base64: null }` means "clear". */
+  readonly metadata: { readonly base64: string | null } | null;
+  /** Absent means "inherit". */
+  readonly tags: readonly string[] | null;
+  readonly committedAt: number;
 }
 
-/** Shards a finished upload still has to clean, routed during verification. */
-function readMultipartCleanupRoutes(
+function readUploadSessionOrThrow(
   durableObject: UserDO,
-  uploadId: string
-): number[] {
-  return durableObject.sql
-    .exec<{ shard_index: number }>(
-      `SELECT shard_index FROM upload_cleanup_routes
-        WHERE upload_id = ? AND cleanup_kind = ?
-        ORDER BY shard_index`,
-      uploadId,
-      ChunkCleanupKind.MultipartStaging
+  userId: string,
+  uploadId: string,
+  operation: string
+): UploadSessionRow {
+  const session = readUploadSession(durableObject, userId, uploadId);
+  if (!session) {
+    throw new VFSError("ENOENT", `${operation}: session not found: ${uploadId}`);
+  }
+  return session;
+}
+
+/** The session's encryption stamp, refusing a column this server never wrote. */
+function sessionEncryption(
+  session: UploadSessionRow
+): MultipartEncryption | null {
+  const mode = session.encryption_mode;
+  if (mode === null) return null;
+  if (mode !== "convergent" && mode !== "random") {
+    throw new VFSError(
+      "EBUSY",
+      `finalizeMultipart: session ${session.upload_id} carries unknown encryption mode '${mode}'`
+    );
+  }
+  return { mode, keyId: session.encryption_key_id };
+}
+
+function encryptionStamp(
+  encryption: MultipartEncryption | null
+): EncryptionStampOpts | undefined {
+  if (encryption === null) return undefined;
+  return encryption.keyId === null
+    ? { mode: encryption.mode }
+    : { mode: encryption.mode, keyId: encryption.keyId };
+}
+
+/** The metadata decision the session carries, in the context's shape. */
+function sessionMetadata(
+  session: UploadSessionRow
+): { base64: string | null } | null {
+  const blob = session.metadata_blob;
+  if (blob === null) return null;
+  return {
+    base64:
+      blob.byteLength === 0 ? null : bytesToBase64(new Uint8Array(blob)),
+  };
+}
+
+/** The tag decision the session carries, in the context's shape. */
+function sessionTags(session: UploadSessionRow): string[] | null {
+  if (session.tags_json === null) return null;
+  const raw: unknown = JSON.parse(session.tags_json);
+  if (!Array.isArray(raw) || raw.some((tag) => typeof tag !== "string")) {
+    throw new VFSError(
+      "EBUSY",
+      `finalizeMultipart: session ${session.upload_id} carries a malformed tag set`
+    );
+  }
+  return raw.filter((tag): tag is string => typeof tag === "string");
+}
+
+/** The live row occupying the session's destination, if any. */
+function readFinalizeDestination(
+  durableObject: UserDO,
+  userId: string,
+  parentId: string | null,
+  leaf: string
+): { fileId: string; headVersionId: string | null } | null {
+  const row = durableObject.sql
+    .exec<{ file_id: string; head_version_id: string | null }>(
+      `SELECT file_id, head_version_id FROM files
+        WHERE user_id = ? AND IFNULL(parent_id, '') = IFNULL(?, '')
+          AND file_name = ? AND status = 'complete'`,
+      userId,
+      parentId,
+      leaf
     )
     .toArray()
-    .map((row) => row.shard_index);
-}
-
-/** Restore the running content hash a previous page persisted. */
-function restoreFinalizeDigest(session: UploadSessionRow): Sha256State {
-  if (session.finalize_sha_state === null) {
-    throw new VFSError(
-      "EBUSY",
-      "finalizeMultipart: the running content hash is missing"
-    );
-  }
-  const serialized: unknown = JSON.parse(session.finalize_sha_state);
-  return restoreSha256State(serialized);
+    .at(0);
+  return row === undefined
+    ? null
+    : { fileId: row.file_id, headVersionId: row.head_version_id };
 }
 
 /**
- * Terminal results are read back out of the row on every replay, so the JSON
- * is a trust boundary and is checked rather than asserted.
+ * The displaced file whose local manifest publication leaves behind, or null.
+ *
+ * Only a non-versioned overwrite has one: a versioned overwrite keeps the
+ * prior version's chunk rows, and a vacant destination displaces nothing.
  */
+function displacedManifestOwner(
+  context: MultipartFinalizeContext
+): string | null {
+  return context.version === null && context.destination !== null
+    ? context.destination.fileId
+    : null;
+}
+
+/**
+ * Terminal results and frozen contexts are read back out of the row on every
+ * replay, so their JSON is a trust boundary and is checked rather than
+ * asserted.
+ */
+function parseFinalizeContext(
+  session: UploadSessionRow
+): MultipartFinalizeContext {
+  const raw: unknown =
+    session.finalize_context === null
+      ? null
+      : JSON.parse(session.finalize_context);
+  const context = asFinalizeContext(raw);
+  if (context === null) {
+    throw new VFSError(
+      "EBUSY",
+      `finalizeMultipart: session ${session.upload_id} carries a frozen context this server cannot read`
+    );
+  }
+  return context;
+}
+
+/** A decoded JSON object, or null when the value is anything else. */
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return null;
+  }
+  const record: Record<string, unknown> = { ...value };
+  return record;
+}
+
+function isString(value: unknown): value is string {
+  return typeof value === "string";
+}
+
+function asFinalizeContext(raw: unknown): MultipartFinalizeContext | null {
+  const root = asRecord(raw);
+  if (root === null || root.schema !== 1) return null;
+  const { pathId, leaf, parentId, committedAt } = root;
+  if (
+    typeof pathId !== "string" ||
+    typeof leaf !== "string" ||
+    typeof committedAt !== "number" ||
+    (parentId !== null && typeof parentId !== "string")
+  ) {
+    return null;
+  }
+
+  let version: { versionId: string } | null = null;
+  if (root.version !== null) {
+    const record = asRecord(root.version);
+    if (record === null || typeof record.versionId !== "string") return null;
+    version = { versionId: record.versionId };
+  }
+
+  let destination: MultipartFinalizeContext["destination"] = null;
+  if (root.destination !== null) {
+    const record = asRecord(root.destination);
+    if (
+      record === null ||
+      typeof record.fileId !== "string" ||
+      (record.headVersionId !== null && typeof record.headVersionId !== "string")
+    ) {
+      return null;
+    }
+    destination = {
+      fileId: record.fileId,
+      headVersionId: record.headVersionId,
+    };
+  }
+
+  let encryption: MultipartEncryption | null = null;
+  if (root.encryption !== null) {
+    const record = asRecord(root.encryption);
+    if (
+      record === null ||
+      (record.mode !== "convergent" && record.mode !== "random") ||
+      (record.keyId !== null && typeof record.keyId !== "string")
+    ) {
+      return null;
+    }
+    encryption = { mode: record.mode, keyId: record.keyId };
+  }
+
+  let metadata: MultipartFinalizeContext["metadata"] = null;
+  if (root.metadata !== null) {
+    const record = asRecord(root.metadata);
+    if (
+      record === null ||
+      (record.base64 !== null && typeof record.base64 !== "string")
+    ) {
+      return null;
+    }
+    metadata = { base64: record.base64 };
+  }
+
+  let tags: string[] | null = null;
+  if (root.tags !== null) {
+    if (!Array.isArray(root.tags)) return null;
+    const declared: unknown[] = root.tags;
+    if (!declared.every(isString)) return null;
+    tags = declared;
+  }
+
+  return {
+    schema: 1,
+    version,
+    pathId,
+    parentId,
+    leaf,
+    destination,
+    encryption,
+    metadata,
+    tags,
+    committedAt,
+  };
+}
+
 function parseFinalizeResult(
   session: UploadSessionRow
 ): MultipartFinalizeResponse {
@@ -1023,14 +1305,133 @@ function parseFinalizeResult(
 }
 
 /**
+ * Compare-and-set one finalize transition. Must run inside the transaction
+ * that carries the rows it commits, so a refused transition takes them with
+ * it.
+ *
+ * The guard is the progress the page read, plus `status` and the frozen
+ * context: a page whose row moved underneath it — a concurrent step, an abort,
+ * a re-frozen decision — matches zero rows instead of applying its work a
+ * second time.
+ */
+function commitFinalizeAdvance(
+  durableObject: UserDO,
+  session: UploadSessionRow,
+  phase: MultipartFinalizePhase,
+  next: Readonly<Record<string, SqlStorageValue>>
+): void {
+  const committed = commitOperationTransition(
+    durableObject,
+    MULTIPART_FINALIZE_OPERATION,
+    { upload_id: session.upload_id, user_id: session.user_id },
+    {
+      ...heldProgress(MULTIPART_FINALIZE_OPERATION, session),
+      status: session.status,
+      finalize_context: session.finalize_context,
+    },
+    next
+  );
+  if (!committed) {
+    throw new VFSError(
+      "EBUSY",
+      `finalizeMultipart: session changed while ${phase}`
+    );
+  }
+}
+
+/**
+ * Run one page's transition and the mutations it commits in a single
+ * transaction, transition first: a page whose row already moved is refused
+ * before it writes anything, so the driver's verdict is what surfaces rather
+ * than a constraint violation from rows a losing page tried to insert.
+ */
+function commitFinalizePage(
+  durableObject: UserDO,
+  session: UploadSessionRow,
+  phase: MultipartFinalizePhase,
+  next: Readonly<Record<string, SqlStorageValue>>,
+  mutate?: () => void
+): void {
+  transactionSync(durableObject, () => {
+    commitFinalizeAdvance(durableObject, session, phase, next);
+    mutate?.();
+  });
+}
+
+/**
+ * Undo everything a finalize staged locally before it published.
+ *
+ * Called from the abort's terminal transaction. Besides the scratch, that
+ * includes the destination manifest verification materialised a page at a time
+ * so publication would not have to: the temporary row's chunks go with the row
+ * itself, but a candidate version's are reachable only through the frozen
+ * context, which an aborting session reads best-effort — a context this server
+ * cannot read is one no verification page could have written against.
+ *
+ * A published finalize pages its scratch off instead, because by then it is as
+ * large as the manifest.
+ */
+function discardMultipartFinalizeScratch(
+  durableObject: UserDO,
+  session: UploadSessionRow
+): void {
+  const uploadId = session.upload_id;
+  durableObject.sql.exec(
+    "DELETE FROM upload_expected_chunks WHERE upload_id = ?",
+    uploadId
+  );
+  durableObject.sql.exec(
+    "DELETE FROM upload_verified_chunks WHERE upload_id = ?",
+    uploadId
+  );
+  durableObject.sql.exec(
+    "DELETE FROM upload_cleanup_routes WHERE upload_id = ?",
+    uploadId
+  );
+  const versionId = candidateVersionId(session);
+  if (versionId !== null) {
+    durableObject.sql.exec(
+      "DELETE FROM version_chunks WHERE version_id = ?",
+      versionId
+    );
+  }
+}
+
+/** Version id a finalize froze, if it froze one this server can still read. */
+function candidateVersionId(session: UploadSessionRow): string | null {
+  if (session.finalize_context === null) return null;
+  let raw: unknown;
+  try {
+    raw = JSON.parse(session.finalize_context);
+  } catch {
+    return null;
+  }
+  return asFinalizeContext(raw)?.version?.versionId ?? null;
+}
+
+/** Restore the running content hash a previous page persisted. */
+function restoreFinalizeDigest(session: UploadSessionRow): Sha256State {
+  if (session.finalize_sha_state === null) {
+    throw new VFSError(
+      "EBUSY",
+      "finalizeMultipart: the running content hash is missing"
+    );
+  }
+  const serialized: unknown = JSON.parse(session.finalize_sha_state);
+  return restoreSha256State(serialized);
+}
+
+/**
  * Advance a multipart finalize by one bounded, durable page.
  *
- * Each call fences at most `MULTIPART_FENCE_PAGE_SIZE` shards, or verifies at
- * most `MULTIPART_HASH_PAGE_SIZE` chunks, or publishes the verified manifest —
- * never more. Where it got to lives in the session row, so a Durable Object
- * eviction between calls costs at most the page that was in flight, and a
- * caller that lost a response can simply call again: the server holds the only
- * cursor, and a page whose row already moved is refused rather than replayed.
+ * Each call fences at most `MULTIPART_FENCE_PAGE_SIZE` shards, verifies at
+ * most `MULTIPART_HASH_PAGE_SIZE` chunks, routes or reaps at most that many
+ * rows of a displaced manifest, or publishes — never more. Where it got to
+ * lives in the session row, so a Durable Object eviction between calls costs
+ * at most the page that was in flight, and a caller that lost a response can
+ * simply call again: the server holds the only cursor, a page whose row
+ * already moved is refused rather than replayed, and a session that already
+ * published answers from what it recorded.
  */
 export async function vfsFinalizeMultipartStep(
   durableObject: UserDO,
@@ -1038,15 +1439,14 @@ export async function vfsFinalizeMultipartStep(
   uploadId: string
 ): Promise<MultipartFinalizeProgress> {
   const userId = userIdFor(scope);
-  let session = readUploadSession(durableObject, userId, uploadId);
-  if (!session) {
-    throw new VFSError(
-      "ENOENT",
-      `finalizeMultipart: session not found: ${uploadId}`
-    );
-  }
+  let session = readUploadSessionOrThrow(
+    durableObject,
+    userId,
+    uploadId,
+    "finalizeMultipart"
+  );
   if (session.status === "finalized") {
-    return { done: true, result: parseFinalizeResult(session), fresh: false };
+    return advanceMultipartCleaning(durableObject, session);
   }
   if (session.status !== "open" && session.status !== "finalizing") {
     throw new VFSError(
@@ -1061,32 +1461,36 @@ export async function vfsFinalizeMultipartStep(
     );
   }
   if (session.status === "open") {
-    await enterMultipartFinalize(durableObject, session);
-    const entered = readUploadSession(durableObject, userId, uploadId);
-    if (!entered) {
-      throw new VFSError(
-        "ENOENT",
-        `finalizeMultipart: session not found: ${uploadId}`
-      );
-    }
-    session = entered;
+    await freezeMultipartFinalizeContext(durableObject, session);
+    session = readUploadSessionOrThrow(
+      durableObject,
+      userId,
+      uploadId,
+      "finalizeMultipart"
+    );
   }
-  if (session.finalize_phase === null) {
-    // A finalize that predates the durable machine left no resumable page and
-    // its shards are already fenced, so releasing the session is the only way
-    // to let the caller upload again.
+  if (session.finalize_context === null) {
+    // A finalize that predates the durable machine froze no decision and left
+    // no resumable page, and its shards are already fenced, so releasing the
+    // session is the only way to let the caller upload again.
     await vfsAbortMultipart(durableObject, scope, uploadId, true);
     throw new VFSError(
       "EBUSY",
       "finalizeMultipart: released a finalize that started before this server owned the session"
     );
   }
+  const context = parseFinalizeContext(session);
   switch (session.finalize_phase) {
     case "fencing":
       return await advanceMultipartFence(durableObject, scope, session);
     case "verifying":
       try {
-        return await advanceMultipartVerification(durableObject, scope, session);
+        return await advanceMultipartVerification(
+          durableObject,
+          scope,
+          session,
+          context
+        );
       } catch (err) {
         // EBUSY means a shard did not answer: retryable, so the session
         // stays finalizing. Any other verdict is about bytes that are
@@ -1097,8 +1501,19 @@ export async function vfsFinalizeMultipartStep(
         }
         throw err;
       }
+    case "preparing":
+      return advanceMultipartPreparation(durableObject, session, context);
     case "publishing":
-      return await publishMultipart(durableObject, scope, session);
+      try {
+        return await publishMultipart(durableObject, scope, session, context);
+      } catch (err) {
+        // Publication commits or it does not, and nothing it refuses on heals:
+        // either the frozen decision no longer matches live state, or the
+        // local write failed deterministically. Release the session so the
+        // caller can upload again.
+        await releaseUnpublishedMultipart(durableObject, scope, session);
+        throw err;
+      }
     default:
       throw new VFSError(
         "EBUSY",
@@ -1108,13 +1523,14 @@ export async function vfsFinalizeMultipartStep(
 }
 
 /**
- * Take ownership of an open session and arm its finalize machine.
+ * Take ownership of an open session, freeze every decision publication will
+ * later be held to, and arm the machine.
  *
  * The declared manifest has to be complete first: every later page compares
  * what the shards hold against `upload_expected_chunks`, so a session that
  * staged only part of it could never satisfy one.
  */
-async function enterMultipartFinalize(
+async function freezeMultipartFinalizeContext(
   durableObject: UserDO,
   session: UploadSessionRow
 ): Promise<void> {
@@ -1127,11 +1543,46 @@ async function enterMultipartFinalize(
   // A finalize the caller walks away from is reclaimed by the same alarm that
   // sweeps stale uploads, so the machine never depends on anyone coming back.
   await scheduleStaleUploadSweep(durableObject);
+  const versionId = generateId();
   transactionSync(durableObject, () => {
+    const userId = session.user_id;
+    assertTemporaryRowPresent(durableObject, session);
+    const encryption = sessionEncryption(session);
+    enforceModeMonotonic(
+      durableObject,
+      userId,
+      session.parent_id,
+      session.leaf,
+      encryptionStamp(encryption)
+    );
+    const versioning = isVersioningEnabled(durableObject, userId);
+    const destination = readFinalizeDestination(
+      durableObject,
+      userId,
+      session.parent_id,
+      session.leaf
+    );
+    const context: MultipartFinalizeContext = {
+      schema: 1,
+      version: versioning ? { versionId } : null,
+      // A versioned overwrite attaches to the existing path's identity; every
+      // other publication keeps the upload's own id.
+      pathId:
+        versioning && destination !== null
+          ? destination.fileId
+          : session.upload_id,
+      parentId: session.parent_id,
+      leaf: session.leaf,
+      destination,
+      encryption,
+      metadata: sessionMetadata(session),
+      tags: sessionTags(session),
+      committedAt: Date.now(),
+    };
     const committed = commitOperationTransition(
       durableObject,
       MULTIPART_FINALIZE_OPERATION,
-      { upload_id: session.upload_id, user_id: session.user_id },
+      { upload_id: session.upload_id, user_id: userId },
       {
         status: "open",
         created_at: session.created_at,
@@ -1143,10 +1594,14 @@ async function enterMultipartFinalize(
         finalize_fence_cursor: 0,
         finalize_chunk_cursor: 0,
         finalize_verify_shard_cursor: 0,
+        finalize_old_manifest_cursor: MULTIPART_SEEK_CURSOR_START,
+        finalize_old_cleanup_cursor: MULTIPART_SEEK_CURSOR_START,
+        finalize_cleanup_cursor: 0,
         finalize_total_size: 0,
         finalize_sha_state: JSON.stringify(
           serializeSha256State(createSha256State())
         ),
+        finalize_context: JSON.stringify(context),
       }
     );
     if (!committed) {
@@ -1156,6 +1611,56 @@ async function enterMultipartFinalize(
       );
     }
   });
+}
+
+/**
+ * Release a session whose publication did not commit, if it is still ours.
+ *
+ * A page that merely lost its fence must not release anything: the session
+ * moved because another writer owns it — one that may already have published —
+ * and aborting there would destroy a live file's session or mask that writer's
+ * outcome with an unrelated error.
+ */
+async function releaseUnpublishedMultipart(
+  durableObject: UserDO,
+  scope: VFSScope,
+  session: UploadSessionRow
+): Promise<void> {
+  const current = readUploadSession(
+    durableObject,
+    session.user_id,
+    session.upload_id
+  );
+  if (
+    current?.status !== "finalizing" ||
+    current.finalize_context !== session.finalize_context
+  ) {
+    return;
+  }
+  await vfsAbortMultipart(durableObject, scope, session.upload_id, true);
+}
+
+/** The upload's temporary row, still where the session put it. */
+function assertTemporaryRowPresent(
+  durableObject: UserDO,
+  session: UploadSessionRow
+): void {
+  const rows = durableObject.sql
+    .exec(
+      `SELECT 1 FROM files
+        WHERE file_id = ? AND user_id = ? AND status = 'uploading'
+          AND IFNULL(parent_id, '') = IFNULL(?, '')`,
+      session.upload_id,
+      session.user_id,
+      session.parent_id
+    )
+    .toArray();
+  if (rows.length !== 1) {
+    throw new VFSError(
+      "EBUSY",
+      "finalizeMultipart: the upload's temporary file changed"
+    );
+  }
 }
 
 /**
@@ -1201,10 +1706,10 @@ async function advanceMultipartFence(
     );
   }
   const fenced = endShard >= session.pool_size;
-  commitFinalizePage(durableObject, session, "fencing", () => ({
+  commitFinalizePage(durableObject, session, "fencing", {
     finalize_fence_cursor: endShard,
     finalize_phase: fenced ? "verifying" : "fencing",
-  }));
+  });
   return fenced
     ? { done: false, phase: "verifying", cursor: 0, total: session.total_chunks }
     : { done: false, phase: "fencing", cursor: endShard, total: session.pool_size };
@@ -1231,18 +1736,22 @@ type VerifiedChunkRow = {
 };
 
 /**
- * Verify one page of the declared manifest against what the shards hold.
+ * Verify one page of the declared manifest against what the shards hold, and
+ * copy it into the destination manifest.
  *
  * The page's indices name their own owner shards, so those are the only
  * manifests it reads, and it reads only the page's index range from each. When
- * the last of them answers, the page's rows, its byte count and its slice of
- * the running content hash are committed in one transition — an interrupted
- * invocation therefore replays a whole page rather than half-counting one.
+ * the last of them answers, the page's rows, its byte count, its slice of the
+ * running content hash and its slice of the destination manifest are committed
+ * in one transition — an interrupted invocation therefore replays a whole page
+ * rather than half-counting one, and publication inherits a manifest it never
+ * has to build.
  */
 async function advanceMultipartVerification(
   durableObject: UserDO,
   scope: VFSScope,
-  session: UploadSessionRow
+  session: UploadSessionRow,
+  context: MultipartFinalizeContext
 ): Promise<MultipartFinalizeProgress> {
   const uploadId = session.upload_id;
   const startIndex = session.finalize_chunk_cursor;
@@ -1350,10 +1859,13 @@ async function advanceMultipartVerification(
 
   if (shardPage.length < pending.length) {
     const nextShard = shardPage[shardPage.length - 1] + 1;
-    commitFinalizePage(durableObject, session, "verifying", () => {
-      persistLanded();
-      return { finalize_verify_shard_cursor: nextShard };
-    });
+    commitFinalizePage(
+      durableObject,
+      session,
+      "verifying",
+      { finalize_verify_shard_cursor: nextShard },
+      persistLanded
+    );
     return {
       done: false,
       phase: "verifying",
@@ -1363,8 +1875,12 @@ async function advanceMultipartVerification(
   }
 
   const nextPhase =
-    endIndex >= session.total_chunks ? "publishing" : "verifying";
-  commitFinalizePage(durableObject, session, "verifying", () => {
+    endIndex < session.total_chunks
+      ? "verifying"
+      : displacedManifestOwner(context) === null
+        ? "publishing"
+        : "preparing";
+  transactionSync(durableObject, () => {
     persistLanded();
     const verified = durableObject.sql
       .exec<VerifiedChunkRow>(
@@ -1398,13 +1914,20 @@ async function advanceMultipartVerification(
       pageBytes += row.chunk_size;
       updateSha256(digest, encoder.encode(row.chunk_hash));
     }
-    return {
+    commitFinalizeAdvance(durableObject, session, "verifying", {
       finalize_chunk_cursor: endIndex,
       finalize_verify_shard_cursor: 0,
       finalize_total_size: session.finalize_total_size + pageBytes,
       finalize_sha_state: JSON.stringify(serializeSha256State(digest)),
       finalize_phase: nextPhase,
-    };
+    });
+    materializeManifestPage(
+      durableObject,
+      context,
+      uploadId,
+      startIndex,
+      endIndex
+    );
   });
   return {
     done: false,
@@ -1412,6 +1935,49 @@ async function advanceMultipartVerification(
     cursor: endIndex,
     total: session.total_chunks,
   };
+}
+
+/**
+ * Copy one verified index range into the manifest publication will hand to
+ * readers, set-based, so no page and no publication ever holds it in memory.
+ *
+ * A versioned publication builds the fresh version's manifest; every other one
+ * builds the temporary row's, which `publishMultipart` renames into place
+ * without touching a chunk row.
+ */
+function materializeManifestPage(
+  durableObject: UserDO,
+  context: MultipartFinalizeContext,
+  uploadId: string,
+  startIndex: number,
+  endIndex: number
+): void {
+  const version = context.version;
+  if (version !== null) {
+    durableObject.sql.exec(
+      `INSERT INTO version_chunks
+         (version_id, chunk_index, chunk_hash, chunk_size, shard_index)
+       SELECT ?, chunk_index, chunk_hash, chunk_size, shard_index
+         FROM upload_verified_chunks
+        WHERE upload_id = ? AND chunk_index >= ? AND chunk_index < ?`,
+      version.versionId,
+      uploadId,
+      startIndex,
+      endIndex
+    );
+    return;
+  }
+  durableObject.sql.exec(
+    `INSERT INTO file_chunks
+       (file_id, chunk_index, chunk_hash, chunk_size, shard_index)
+     SELECT ?, chunk_index, chunk_hash, chunk_size, shard_index
+       FROM upload_verified_chunks
+      WHERE upload_id = ? AND chunk_index >= ? AND chunk_index < ?`,
+    uploadId,
+    uploadId,
+    startIndex,
+    endIndex
+  );
 }
 
 /**
@@ -1528,12 +2094,99 @@ function acceptMultipartManifestPage(
 }
 
 /**
- * Publish the verified manifest as a live file.
+ * Route one page of a displaced file's chunks onto the shards that hold them.
  *
- * ONE UserDO turn; the manifest, the total size and the file hash all come
- * from what verification persisted, so publication reads no shard and repeats
- * no work. The terminal transition records the answer in `finalize_result`,
- * which is what makes a replayed step idempotent.
+ * A non-versioned overwrite orphans the prior file's bytes, and the shards
+ * that own them can only be read off its manifest — which publication is about
+ * to make unreachable. Recording the routing beforehand is what lets
+ * publication owe the cleanup in constant size and lets the manifest itself be
+ * reaped a page at a time afterwards. Verification skips this phase entirely
+ * when the publication displaces nothing.
+ */
+function advanceMultipartPreparation(
+  durableObject: UserDO,
+  session: UploadSessionRow,
+  context: MultipartFinalizeContext
+): MultipartFinalizeProgress {
+  const displaced = displacedManifestOwner(context);
+  if (displaced === null) {
+    throw new VFSError(
+      "EBUSY",
+      "finalizeMultipart: a displaced manifest routing has no displaced file"
+    );
+  }
+  const cursor = session.finalize_old_manifest_cursor;
+  const rows = durableObject.sql
+    .exec<{ chunk_index: number; shard_index: number }>(
+      `SELECT chunk_index, shard_index FROM file_chunks
+        WHERE file_id = ? AND chunk_index > ?
+        ORDER BY chunk_index LIMIT ?`,
+      displaced,
+      cursor,
+      MULTIPART_HASH_PAGE_SIZE + 1
+    )
+    .toArray();
+  const page = rows.slice(0, MULTIPART_HASH_PAGE_SIZE);
+  const hasMore = rows.length > MULTIPART_HASH_PAGE_SIZE;
+  const nextCursor = page.at(-1)?.chunk_index ?? cursor;
+  commitFinalizePage(
+    durableObject,
+    session,
+    "preparing",
+    {
+      finalize_old_manifest_cursor: nextCursor,
+      finalize_phase: hasMore ? "preparing" : "publishing",
+    },
+    () => {
+      for (const shardIndex of new Set(page.map((row) => row.shard_index))) {
+        durableObject.sql.exec(
+          `INSERT OR IGNORE INTO upload_cleanup_routes
+             (upload_id, cleanup_kind, shard_index) VALUES (?, ?, ?)`,
+          session.upload_id,
+          ChunkCleanupKind.Chunks,
+          shardIndex
+        );
+      }
+    }
+  );
+  return hasMore
+    ? displacedManifestProgress("preparing", nextCursor + 1)
+    : {
+        done: false,
+        phase: "publishing",
+        cursor: session.total_chunks,
+        total: session.total_chunks,
+      };
+}
+
+/**
+ * Progress over a displaced file's manifest, whose length a page only learns
+ * by reaching the end of it: `total` is what is known so far, which is one
+ * past `cursor` for as long as another page remains.
+ */
+function displacedManifestProgress(
+  phase: "preparing" | "cleaning",
+  handled: number
+): MultipartFinalizeProgress {
+  return { done: false, phase, cursor: handled, total: handled + 1 };
+}
+
+/**
+ * Publish the verified manifest as a live file, in constant size.
+ *
+ * Verification already wrote every chunk row and preparation already routed
+ * every shard the switch orphans, so this reads no shard, materialises no
+ * manifest, and issues a fixed number of statements over a fixed number of
+ * rows however many chunks the upload has. What it does is decide: every
+ * choice `finalize_context` froze is re-derived from live state and the
+ * publication is refused rather than applied against a destination, a
+ * versioning setting, a metadata blob, a tag set or an encryption stamp that
+ * moved since the freeze.
+ *
+ * The head switch, the conversion of the frozen routing into executable
+ * cleanup intents, and the terminal transition that records
+ * `finalize_result` all commit together, so a caller can never observe a
+ * published file whose cleanup nobody owes or whose result nobody recorded.
  *
  * Visibility intent: failures before the commit path leave the temporary row
  * uploading so callers can resume or abort. Full SQL/cross-DO failure atomicity
@@ -1546,441 +2199,576 @@ function acceptMultipartManifestPage(
 async function publishMultipart(
   durableObject: UserDO,
   scope: VFSScope,
-  session: UploadSessionRow
+  session: UploadSessionRow,
+  context: MultipartFinalizeContext
 ): Promise<MultipartFinalizeProgress> {
   const uploadId = session.upload_id;
   const userId = session.user_id;
-  const manifestRows = durableObject.sql
-    .exec<VerifiedChunkRow>(
-      `SELECT chunk_index, chunk_hash, chunk_size, shard_index
-         FROM upload_verified_chunks
-        WHERE upload_id = ? ORDER BY chunk_index`,
-      uploadId
-    )
-    .toArray();
-  if (manifestRows.length !== session.total_chunks) {
+  if (session.finalize_chunk_cursor !== session.total_chunks) {
     throw new VFSError(
       "EBUSY",
-      `finalizeMultipart: verified ${manifestRows.length} of ${session.total_chunks} chunks`
+      `finalizeMultipart: verified ${session.finalize_chunk_cursor} of ${session.total_chunks} chunks`
     );
   }
-  const touched = readMultipartCleanupRoutes(durableObject, uploadId);
-  const totalSize = session.finalize_total_size;
+  await scheduleStaleUploadSweep(durableObject);
+
   // file_hash := SHA-256(concat-as-utf8 of chunk_hashes), matches the
   // existing vfsWriteFile / vfsCommitWriteStream formula — verification fed
   // the accumulator the same bytes in the same order.
-  const fileHash = bytesToHex(digestSha256(restoreFinalizeDigest(session)));
-
-  const destinationRow = durableObject.sql
-    .exec<{ file_id: string; head_version_id: string | null }>(
-      `SELECT file_id, head_version_id FROM files
-        WHERE user_id = ? AND IFNULL(parent_id, '') = IFNULL(?, '')
-          AND file_name = ? AND status = 'complete'`,
-      userId,
-      session.parent_id,
-      session.leaf
-    )
-    .toArray()
-    .at(0);
-  const assertSessionState = (): void => {
-    const currentSession = durableObject.sql
-      .exec(
-        `SELECT 1 FROM upload_sessions
-          WHERE upload_id = ? AND user_id = ? AND status = 'finalizing'
-            AND created_at = ? AND expires_at = ?`,
-        uploadId,
-        userId,
-        session.created_at,
-        session.expires_at
-      )
-      .toArray();
-    const currentTemp = durableObject.sql
-      .exec(
-        `SELECT 1 FROM files
-          WHERE file_id = ? AND user_id = ? AND status = 'uploading'
-            AND IFNULL(parent_id, '') = IFNULL(?, '')`,
-        uploadId,
-        userId,
-        session.parent_id
-      )
-      .toArray();
-    if (currentSession.length !== 1 || currentTemp.length !== 1) {
-      throw new VFSError(
-        "EBUSY",
-        "finalizeMultipart: session changed during publication"
-      );
-    }
-  };
-
-  // Multipart × versioning. When versioning is enabled for this
-  // tenant, finalize must:
-  //   (a) write `version_chunks` (NOT `file_chunks`) keyed by a fresh
-  //       version id, recording shard_ref_id = uploadId so a future
-  //       `dropVersionRows` fan-out keys ShardDO `deleteChunks` with
-  //       the same refId the chunk PUTs used at upload time;
-  //   (b) call `commitVersion` to insert the file_versions row and
-  //       move `files.head_version_id` ATOMICALLY — the prior
-  //       version's row + chunks survive;
-  //   (c) reuse an existing path identity without `commitRename`; a
-  //       no-prior-path finalize uses its vacancy-guarded publication hook.
-  // The non-versioned branch keeps `commitRename`'s hard-delete
-  // supersede — correct semantics for versioning-off tenants.
-  const versioning = isVersioningEnabled(durableObject, userId);
-  const now = Date.now();
-  const commitTags =
-    session.tags_json === null
-      ? undefined
-      : (JSON.parse(session.tags_json) as string[]);
-  const commitMetadata =
-    session.metadata_blob === null
-      ? undefined
-      : session.metadata_blob.byteLength === 0
-        ? null
-        : new Uint8Array(session.metadata_blob);
-  // A versioned overwrite attaches to the existing path's identity; every
-  // other publication keeps the upload's own id.
-  const pathId = versioning && destinationRow ? destinationRow.file_id : uploadId;
   const result: MultipartFinalizeResponse = {
-    fileId: pathId,
-    size: totalSize,
+    fileId: context.pathId,
+    size: session.finalize_total_size,
     chunkCount: session.total_chunks,
-    fileHash,
+    fileHash: bytesToHex(digestSha256(restoreFinalizeDigest(session))),
     // Reconstructed from (parent_id, leaf) so the route layer can dispatch
     // follow-on side effects (preview pre-gen via ctx.waitUntil) without
     // re-querying.
     path: reconstructFinalizedPath(
       durableObject,
       userId,
-      session.parent_id,
-      session.leaf
+      context.parentId,
+      context.leaf
     ),
     mimeType: session.mime_type,
-    isEncrypted: session.encryption_mode !== null,
+    isEncrypted: context.encryption !== null,
   };
-  const commitTerminal = (): void => {
+  const nextPhase = firstMultipartCleaningPhase(session, context);
+
+  transactionSync(durableObject, () => {
+    assertFrozenContextHolds(durableObject, session, context);
+    const version = context.version;
+    if (version === null) {
+      publishMultipartOverwrite(durableObject, session, context, result);
+    } else {
+      publishMultipartVersion(durableObject, session, context, version, result);
+    }
+    bumpFolderRevision(durableObject, userId, context.parentId);
     commitFinalizeAdvance(durableObject, session, "publishing", {
       status: "finalized",
-      finalize_phase: "done",
+      finalize_phase: nextPhase,
       finalize_result: JSON.stringify(result),
+      ...(nextPhase === "done" ? MULTIPART_TERMINAL_COMPACTION : {}),
     });
-    discardMultipartFinalizeScratch(durableObject, uploadId);
-    if (touched.length > 0) {
-      retainMultipartStagingCleanup(durableObject, uploadId, Date.now());
-    }
+    stageRoutedMultipartCleanup(durableObject, session, context);
+  });
+
+  const displaced = displacedManifestOwner(context);
+  await drainChunkCleanupIntents(
+    durableObject,
+    scope,
+    displaced === null ? uploadId : [uploadId, displaced]
+  );
+  if (nextPhase === "done") return { done: true, result, fresh: true };
+  // Nobody is obliged to come back for the cleaning the switch left owed.
+  await scheduleAlarmAt(
+    durableObject,
+    Date.now() + MULTIPART_CLEANING_RESUME_DELAY_MS
+  );
+  return {
+    done: false,
+    phase: "cleaning",
+    cursor: 0,
+    total: session.total_chunks,
   };
-
-  const cleanupFailedPublication = async (
-    versionId?: string
-  ): Promise<void> => {
-    let shouldDrain = false;
-    transactionSync(durableObject, () => {
-      if (versionId !== undefined) {
-        durableObject.sql.exec(
-          "DELETE FROM version_chunks WHERE version_id = ?",
-          versionId
-        );
-      }
-      const current = durableObject.sql
-        .exec<{ status: string; created_at: number; expires_at: number }>(
-          `SELECT status, created_at, expires_at FROM upload_sessions
-            WHERE upload_id = ? AND user_id = ?`,
-          uploadId,
-          userId
-        )
-        .toArray()
-        .at(0);
-      const sameOpenSession =
-        current?.status === "finalizing" &&
-        current.created_at === session.created_at &&
-        current.expires_at === session.expires_at;
-      if (sameOpenSession) {
-        const now = Date.now();
-        for (let shardIndex = 0; shardIndex < session.pool_size; shardIndex++) {
-          stageChunkCleanupIntent(
-            durableObject,
-            uploadId,
-            shardIndex,
-            now,
-            now,
-            ChunkCleanupKind.Multipart
-          );
-        }
-        durableObject.sql.exec(
-          `UPDATE upload_sessions SET status = 'aborted'
-            WHERE upload_id = ? AND user_id = ? AND status = 'finalizing'
-              AND created_at = ? AND expires_at = ?`,
-          uploadId,
-          userId,
-          session.created_at,
-          session.expires_at
-        );
-        if (lastSqlChanges(durableObject) !== 1) {
-          throw new VFSError(
-            "EBUSY",
-            "finalizeMultipart: session changed during cleanup"
-          );
-        }
-        dropTmpRowAfterVersionCommit(durableObject, uploadId, {
-          hasChunks: true,
-        });
-        discardMultipartFinalizeScratch(durableObject, uploadId);
-        shouldDrain = true;
-      } else if (
-        current?.status === "aborted" ||
-        current?.status === "poisoned"
-      ) {
-        const now = Date.now();
-        for (let shardIndex = 0; shardIndex < session.pool_size; shardIndex++) {
-          stageChunkCleanupIntent(
-            durableObject,
-            uploadId,
-            shardIndex,
-            now,
-            now,
-            ChunkCleanupKind.Multipart
-          );
-        }
-        dropTmpRowAfterVersionCommit(durableObject, uploadId, {
-          hasChunks: true,
-        });
-        discardMultipartFinalizeScratch(durableObject, uploadId);
-        shouldDrain = true;
-      } else {
-        if (touched.length > 0) {
-          retainMultipartStagingCleanup(durableObject, uploadId, Date.now());
-        }
-      }
-    });
-    if (shouldDrain) {
-      await drainChunkCleanupIntents(durableObject, scope, uploadId);
-    }
-  };
-
-  if (versioning) {
-    const expectedHead: VersionedFileExpectation = {
-      fileId: pathId,
-      userId,
-      parentId: session.parent_id,
-      fileName: session.leaf,
-      headVersionId: destinationRow?.head_version_id ?? null,
-    };
-    const versionId = generateId();
-    const metadataForVersion =
-      commitMetadata !== undefined
-        ? commitMetadata
-        : destinationRow
-          ? readMetadataBytes(durableObject, pathId)
-          : null;
-    const finalizeVersion = (): void => {
-      for (const row of manifestRows) {
-        insertVersionChunk(durableObject, versionId, {
-          chunk_index: row.chunk_index,
-          chunk_hash: row.chunk_hash,
-          chunk_size: row.chunk_size,
-          shard_index: row.shard_index,
-        });
-      }
-      if (commitMetadata !== undefined) {
-        durableObject.sql.exec(
-          "UPDATE files SET metadata = ? WHERE file_id = ?",
-          commitMetadata,
-          pathId
-        );
-      }
-      if (commitTags !== undefined) {
-        replaceTags(durableObject, userId, pathId, commitTags);
-      }
-      commitVersionChecked(
-        durableObject,
-        {
-          pathId,
-          versionId,
-          userId,
-          size: totalSize,
-          mode: session.mode,
-          mtimeMs: now,
-          chunkSize: session.chunk_size,
-          chunkCount: session.total_chunks,
-          fileHash,
-          mimeType: session.mime_type,
-          inlineData: null,
-          userVisible: session.version_user_visible !== 0,
-          label: session.version_label,
-          metadata: metadataForVersion,
-          shardRefId: uploadId,
-          encryption:
-            session.encryption_mode !== null
-              ? {
-                  mode: session.encryption_mode as "convergent" | "random",
-                  keyId: session.encryption_key_id ?? undefined,
-                }
-              : undefined,
-        },
-        expectedHead,
-        "finalizeMultipart"
-      );
-      commitTerminal();
-    };
-
-    let cleanupArmed = false;
-    try {
-      await stageChunkCleanupIntents(durableObject, uploadId, touched);
-      cleanupArmed = true;
-      if (destinationRow) {
-        await scheduleStaleUploadSweep(durableObject);
-        transactionSync(durableObject, () => {
-          assertSessionState();
-          finalizeVersion();
-          dropTmpRowAfterVersionCommit(durableObject, uploadId, {
-            hasChunks: true,
-          });
-          bumpFolderRevision(durableObject, userId, session.parent_id);
-        });
-      } else {
-        await commitRename(
-          durableObject,
-          userId,
-          scope,
-          uploadId,
-          session.parent_id,
-          session.leaf,
-          {
-            requireVacantDestination: true,
-            preconditionLocal: assertSessionState,
-            finalizeLocal: finalizeVersion,
-          }
-        );
-      }
-    } catch (err) {
-      if (!cleanupArmed) throw err;
-      await cleanupFailedPublication(versionId);
-      throw err;
-    }
-  } else {
-    // Non-versioned tenant — commitRename hard-deletes any prior
-    // live row, which is correct semantics for versioning-off (no
-    // history to keep).
-
-    let cleanupArmed = false;
-    try {
-      await stageChunkCleanupIntents(durableObject, uploadId, touched);
-      cleanupArmed = true;
-      await commitRename(
-        durableObject,
-        userId,
-        scope,
-        uploadId,
-        session.parent_id,
-        session.leaf,
-        {
-          requireVacantDestination: destinationRow === undefined,
-          expectedDestination: destinationRow
-            ? {
-                fileId: destinationRow.file_id,
-                headVersionId: destinationRow.head_version_id,
-              }
-            : undefined,
-          publicationEncryption:
-            session.encryption_mode === null
-              ? null
-              : {
-                  mode: session.encryption_mode as "convergent" | "random",
-                  ...(session.encryption_key_id === null
-                    ? {}
-                    : { keyId: session.encryption_key_id }),
-                },
-          preconditionLocal: assertSessionState,
-          finalizeLocal: () => {
-            for (const row of manifestRows) {
-              durableObject.sql.exec(
-                `INSERT INTO file_chunks (file_id, chunk_index, chunk_hash, chunk_size, shard_index)
-                 VALUES (?, ?, ?, ?, ?)`,
-                uploadId,
-                row.chunk_index,
-                row.chunk_hash,
-                row.chunk_size,
-                row.shard_index
-              );
-            }
-            durableObject.sql.exec(
-              `UPDATE files
-                  SET file_size = ?, chunk_count = ?, file_hash = ?, updated_at = ?
-                WHERE file_id = ?`,
-              totalSize,
-              session.total_chunks,
-              fileHash,
-              now,
-              uploadId
-            );
-            if (commitMetadata !== undefined) {
-              durableObject.sql.exec(
-                "UPDATE files SET metadata = ? WHERE file_id = ?",
-                commitMetadata,
-                uploadId
-              );
-            }
-            if (commitTags !== undefined) {
-              replaceTags(durableObject, userId, uploadId, commitTags);
-            }
-            if (session.encryption_mode !== null) {
-              stampFileEncryption(durableObject, uploadId, {
-                mode: session.encryption_mode as "convergent" | "random",
-                keyId: session.encryption_key_id ?? undefined,
-              });
-            }
-            recordWriteUsage(durableObject, userId, totalSize, 1);
-            commitTerminal();
-          },
-        }
-      );
-    } catch (err) {
-      if (cleanupArmed) {
-        await cleanupFailedPublication();
-      }
-      throw err;
-    }
-  }
-
-  // Clear staging across touched shards after local publication commits.
-  await drainChunkCleanupIntents(durableObject, scope, uploadId);
-
-  return { done: true, result, fresh: true };
 }
 
 /**
- * Pages the one-request finalize may run before giving up.
+ * Refuse a publication whose frozen decision no longer describes live state.
  *
- * Fencing costs one page per shard page, verification one per shard page of
- * every chunk page, and publication one more — so this is the exact work the
- * session in hand implies, not a guess that would silently truncate a large
- * upload.
+ * The session row is re-read here rather than trusted from the page that
+ * entered publication: the phase, cursors and context are fenced by the
+ * transition's compare-and-set, but the payload columns the decision was
+ * derived from are not.
  */
-function multipartFinalizePageBudget(session: UploadSessionRow): number {
-  const shardPages = Math.max(
-    1,
-    Math.ceil(session.pool_size / MULTIPART_FENCE_PAGE_SIZE)
+function assertFrozenContextHolds(
+  durableObject: UserDO,
+  session: UploadSessionRow,
+  context: MultipartFinalizeContext
+): void {
+  const userId = session.user_id;
+  const current = readUploadSessionOrThrow(
+    durableObject,
+    userId,
+    session.upload_id,
+    "finalizeMultipart"
   );
-  const chunkPages = Math.max(
-    1,
-    Math.ceil(session.total_chunks / MULTIPART_HASH_PAGE_SIZE)
+  const refuse = (what: string): never => {
+    throw new VFSError(
+      "EBUSY",
+      `finalizeMultipart: ${what} changed since the finalize froze`
+    );
+  };
+  if (current.parent_id !== context.parentId || current.leaf !== context.leaf) {
+    refuse("the destination path");
+  }
+  if (!sameFrozenValue(sessionEncryption(current), context.encryption)) {
+    refuse("the encryption stamp");
+  }
+  if (!sameFrozenValue(sessionMetadata(current), context.metadata)) {
+    refuse("the metadata");
+  }
+  if (!sameFrozenValue(sessionTags(current), context.tags)) {
+    refuse("the tag set");
+  }
+  if (isVersioningEnabled(durableObject, userId) !== (context.version !== null)) {
+    refuse("versioning");
+  }
+  const live = readFinalizeDestination(
+    durableObject,
+    userId,
+    context.parentId,
+    context.leaf
   );
-  return shardPages * (1 + chunkPages) + 1;
+  if (!sameFrozenValue(live, context.destination)) {
+    refuse("the destination");
+  }
+  assertTemporaryRowPresent(durableObject, session);
+  enforceModeMonotonic(
+    durableObject,
+    userId,
+    context.parentId,
+    context.leaf,
+    encryptionStamp(context.encryption)
+  );
+}
+
+/**
+ * Structural equality for the values a frozen decision is compared against.
+ * Both sides come out of the same builders, so their key order is fixed and a
+ * serialized comparison is exact.
+ */
+function sameFrozenValue(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+/**
+ * Attach a fresh version to the path and move its head.
+ *
+ * Verification already wrote `version_chunks`; the prior version's rows
+ * survive, which is what versioning is for, so nothing here is proportional to
+ * either file.
+ */
+function publishMultipartVersion(
+  durableObject: UserDO,
+  session: UploadSessionRow,
+  context: MultipartFinalizeContext,
+  version: { readonly versionId: string },
+  result: MultipartFinalizeResponse
+): void {
+  const userId = session.user_id;
+  const pathId = context.pathId;
+  const metadata = frozenMetadataBytes(context);
+  if (context.destination === null) {
+    // The temporary row is the path: name it and complete it in place.
+    completeTemporaryRow(durableObject, session, context, result);
+  }
+  if (metadata !== undefined) {
+    durableObject.sql.exec(
+      "UPDATE files SET metadata = ? WHERE file_id = ?",
+      metadata,
+      pathId
+    );
+  }
+  if (context.tags !== null) {
+    replaceTags(durableObject, userId, pathId, context.tags);
+  }
+  const expectation: VersionedFileExpectation = {
+    fileId: pathId,
+    userId,
+    parentId: context.parentId,
+    fileName: context.leaf,
+    headVersionId: context.destination?.headVersionId ?? null,
+  };
+  commitVersionChecked(
+    durableObject,
+    {
+      pathId,
+      versionId: version.versionId,
+      userId,
+      size: result.size,
+      mode: session.mode,
+      mtimeMs: context.committedAt,
+      chunkSize: session.chunk_size,
+      chunkCount: session.total_chunks,
+      fileHash: result.fileHash,
+      mimeType: session.mime_type,
+      inlineData: null,
+      userVisible: session.version_user_visible !== 0,
+      label: session.version_label,
+      metadata:
+        metadata !== undefined
+          ? metadata
+          : context.destination === null
+            ? null
+            : readMetadataBytes(durableObject, pathId),
+      shardRefId: session.upload_id,
+      encryption: encryptionStamp(context.encryption),
+    },
+    expectation,
+    "finalizeMultipart"
+  );
+  if (context.destination !== null) {
+    // The bytes belong to the version now, so the temporary row is redundant.
+    // Its chunk rows were never written: verification wrote `version_chunks`.
+    dropTmpRowAfterVersionCommit(durableObject, session.upload_id, {
+      hasChunks: false,
+    });
+  }
+}
+
+/**
+ * Switch the path onto the temporary row, discarding any row it displaces.
+ *
+ * The displaced row's own manifest is deliberately left behind: it is as large
+ * as the file it described, and `cleaning_old_manifest` reaps it in pages once
+ * the switch is durable. Everything else the row owned — its tags, its stream
+ * session, its byte accounting — is bounded and goes here.
+ */
+function publishMultipartOverwrite(
+  durableObject: UserDO,
+  session: UploadSessionRow,
+  context: MultipartFinalizeContext,
+  result: MultipartFinalizeResponse
+): void {
+  const userId = session.user_id;
+  const uploadId = session.upload_id;
+  const displaced = context.destination;
+  if (displaced !== null) {
+    // Metadata and tags are properties of the path, not of the file id, so an
+    // overwrite that stated neither inherits both rather than dropping them.
+    if (context.metadata === null) {
+      durableObject.sql.exec(
+        `UPDATE files SET metadata = (SELECT metadata FROM files WHERE file_id = ?)
+          WHERE file_id = ? AND metadata IS NULL`,
+        displaced.fileId,
+        uploadId
+      );
+    }
+    if (context.tags === null) {
+      durableObject.sql.exec(
+        `INSERT OR IGNORE INTO file_tags (path_id, tag, user_id, mtime_ms)
+         SELECT ?, tag, user_id, ? FROM file_tags WHERE path_id = ?`,
+        uploadId,
+        context.committedAt,
+        displaced.fileId
+      );
+    }
+    const accounting = durableObject.sql
+      .exec<{ file_size: number; inline_data: ArrayBuffer | null }>(
+        "SELECT file_size, inline_data FROM files WHERE file_id = ?",
+        displaced.fileId
+      )
+      .toArray()
+      .at(0);
+    durableObject.sql.exec(
+      "DELETE FROM file_tags WHERE path_id = ?",
+      displaced.fileId
+    );
+    durableObject.sql.exec(
+      "DELETE FROM write_stream_sessions WHERE tmp_id = ?",
+      displaced.fileId
+    );
+    durableObject.sql.exec(
+      "DELETE FROM files WHERE file_id = ?",
+      displaced.fileId
+    );
+    if (accounting !== undefined) {
+      recordWriteUsage(
+        durableObject,
+        userId,
+        -accounting.file_size,
+        -1,
+        accounting.inline_data === null ? 0 : -accounting.inline_data.byteLength
+      );
+    }
+  }
+  completeTemporaryRow(durableObject, session, context, result);
+  const metadata = frozenMetadataBytes(context);
+  if (metadata !== undefined) {
+    durableObject.sql.exec(
+      "UPDATE files SET metadata = ? WHERE file_id = ?",
+      metadata,
+      uploadId
+    );
+  }
+  if (context.tags !== null) {
+    replaceTags(durableObject, userId, uploadId, context.tags);
+  }
+  stampFileEncryption(
+    durableObject,
+    uploadId,
+    encryptionStamp(context.encryption)
+  );
+  recordWriteUsage(durableObject, userId, result.size, 1);
+}
+
+/** Name the temporary row and complete it, or refuse if it moved. */
+function completeTemporaryRow(
+  durableObject: UserDO,
+  session: UploadSessionRow,
+  context: MultipartFinalizeContext,
+  result: MultipartFinalizeResponse
+): void {
+  durableObject.sql.exec(
+    `UPDATE files
+        SET file_name = ?, status = 'complete', file_size = ?, chunk_count = ?,
+            file_hash = ?, updated_at = ?
+      WHERE file_id = ? AND user_id = ? AND status = 'uploading'
+        AND IFNULL(parent_id, '') = IFNULL(?, '')`,
+    context.leaf,
+    result.size,
+    result.chunkCount,
+    result.fileHash,
+    context.committedAt,
+    session.upload_id,
+    session.user_id,
+    context.parentId
+  );
+  if (lastSqlChanges(durableObject) !== 1) {
+    throw new VFSError(
+      "EBUSY",
+      "finalizeMultipart: the upload's temporary file changed"
+    );
+  }
+}
+
+/** Frozen metadata bytes, or `undefined` when the upload stated none. */
+function frozenMetadataBytes(
+  context: MultipartFinalizeContext
+): Uint8Array | null | undefined {
+  if (context.metadata === null) return undefined;
+  return context.metadata.base64 === null
+    ? null
+    : base64ToBytes(context.metadata.base64);
+}
+
+/**
+ * Turn the routing verification and preparation recorded into cleanup the
+ * outbox will execute, one statement per reference.
+ *
+ * This is what makes the head switch and the obligation it creates the same
+ * event: after the transaction, either the file is published and every shard
+ * that owes bytes has a durable intent, or neither happened. An intent another
+ * drain already claimed is fenced by `generation`, so re-arming it here costs
+ * that drain its acknowledgement rather than the work.
+ */
+function stageRoutedMultipartCleanup(
+  durableObject: UserDO,
+  session: UploadSessionRow,
+  context: MultipartFinalizeContext
+): void {
+  const now = Date.now();
+  const stage = (cleanupKind: ChunkCleanupKind, refId: string): void => {
+    durableObject.sql.exec(
+      `INSERT INTO chunk_cleanup_intents
+         (ref_id, shard_index, cleanup_kind, state, generation, provisional,
+          created_at, updated_at, next_attempt_at, attempts, last_error)
+       SELECT ?, shard_index, ?, 'pending', 0, 0, ?, ?, ?, 0, NULL
+         FROM upload_cleanup_routes
+        WHERE upload_id = ? AND cleanup_kind = ?
+       ON CONFLICT(ref_id, shard_index) DO UPDATE SET
+         state = 'pending',
+         generation = chunk_cleanup_intents.generation + 1,
+         provisional = 0,
+         updated_at = excluded.updated_at,
+         next_attempt_at = MIN(chunk_cleanup_intents.next_attempt_at,
+                               excluded.next_attempt_at),
+         attempts = 0,
+         last_error = NULL`,
+      refId,
+      cleanupKind,
+      now,
+      now,
+      now,
+      session.upload_id,
+      cleanupKind
+    );
+  };
+  stage(ChunkCleanupKind.MultipartStaging, session.upload_id);
+  const displaced = displacedManifestOwner(context);
+  if (displaced !== null) stage(ChunkCleanupKind.Chunks, displaced);
+  durableObject.sql.exec(
+    "DELETE FROM upload_cleanup_routes WHERE upload_id = ?",
+    session.upload_id
+  );
+}
+
+/**
+ * Columns a terminal session stops needing. Written by whichever transition
+ * reaches `done`, because no transition may follow it.
+ */
+const MULTIPART_TERMINAL_COMPACTION: Readonly<
+  Record<string, SqlStorageValue>
+> = {
+  metadata_blob: null,
+  tags_json: null,
+  finalize_context: null,
+  finalize_sha_state: null,
+};
+
+/** The first cleaning a published session owes, or `done` when it owes none. */
+function firstMultipartCleaningPhase(
+  session: UploadSessionRow,
+  context: MultipartFinalizeContext
+): MultipartFinalizePhase {
+  if (displacedManifestOwner(context) !== null) return "cleaning_old_manifest";
+  return session.total_chunks > 0 ? "cleaning" : "done";
+}
+
+/**
+ * Advance one bounded page of the cleaning a published session still owes, or
+ * answer from what publication recorded once it owes none.
+ *
+ * Every page here runs after the head switch committed, so none of it can fail
+ * the finalize: the worst a refused page costs is a later retry, and the
+ * result the caller gets is the one publication persisted either way.
+ */
+function advanceMultipartCleaning(
+  durableObject: UserDO,
+  session: UploadSessionRow
+): MultipartFinalizeProgress {
+  const result = parseFinalizeResult(session);
+  switch (session.finalize_phase) {
+    case "cleaning_old_manifest":
+      return reapDisplacedManifestPage(durableObject, session, result);
+    case "cleaning":
+      return reapFinalizeScratchPage(durableObject, session, result);
+    // `done`, or a session finalized before this machine existed, which the
+    // schema migration adopted as terminal.
+    case "done":
+    case null:
+      return { done: true, result, fresh: false };
+    default:
+      // Publication is the only transition into a finalized status and it
+      // always names one of the three above, so this is a corrupt row rather
+      // than an unfinished one — say so instead of calling it done and
+      // stranding the scratch.
+      throw new VFSError(
+        "EBUSY",
+        `finalizeMultipart: published session is in phase '${session.finalize_phase}'`
+      );
+  }
+}
+
+function reapDisplacedManifestPage(
+  durableObject: UserDO,
+  session: UploadSessionRow,
+  result: MultipartFinalizeResponse
+): MultipartFinalizeProgress {
+  const context = parseFinalizeContext(session);
+  const displaced = displacedManifestOwner(context);
+  if (displaced === null) {
+    throw new VFSError(
+      "EBUSY",
+      "finalizeMultipart: a displaced manifest cleanup has no displaced file"
+    );
+  }
+  const cursor = session.finalize_old_cleanup_cursor;
+  const rows = durableObject.sql
+    .exec<{ chunk_index: number }>(
+      `SELECT chunk_index FROM file_chunks
+        WHERE file_id = ? AND chunk_index > ?
+        ORDER BY chunk_index LIMIT ?`,
+      displaced,
+      cursor,
+      MULTIPART_HASH_PAGE_SIZE + 1
+    )
+    .toArray();
+  const page = rows.slice(0, MULTIPART_HASH_PAGE_SIZE);
+  const hasMore = rows.length > MULTIPART_HASH_PAGE_SIZE;
+  const nextCursor = page.at(-1)?.chunk_index ?? cursor;
+  const nextPhase = hasMore
+    ? "cleaning_old_manifest"
+    : session.total_chunks > 0
+      ? "cleaning"
+      : "done";
+  commitFinalizePage(
+    durableObject,
+    session,
+    "cleaning_old_manifest",
+    {
+      finalize_old_cleanup_cursor: nextCursor,
+      finalize_phase: nextPhase,
+      ...(nextPhase === "done" ? MULTIPART_TERMINAL_COMPACTION : {}),
+    },
+    () => {
+      durableObject.sql.exec(
+        `DELETE FROM file_chunks
+          WHERE file_id = ? AND chunk_index > ? AND chunk_index <= ?`,
+        displaced,
+        cursor,
+        nextCursor
+      );
+    }
+  );
+  return nextPhase === "done"
+    ? { done: true, result, fresh: true }
+    : displacedManifestProgress("cleaning", nextCursor + 1);
+}
+
+function reapFinalizeScratchPage(
+  durableObject: UserDO,
+  session: UploadSessionRow,
+  result: MultipartFinalizeResponse
+): MultipartFinalizeProgress {
+  const startIndex = session.finalize_cleanup_cursor;
+  const endIndex = Math.min(
+    startIndex + MULTIPART_HASH_PAGE_SIZE,
+    session.total_chunks
+  );
+  const finished = endIndex >= session.total_chunks;
+  commitFinalizePage(
+    durableObject,
+    session,
+    "cleaning",
+    {
+      finalize_cleanup_cursor: endIndex,
+      finalize_phase: finished ? "done" : "cleaning",
+      ...(finished ? MULTIPART_TERMINAL_COMPACTION : {}),
+    },
+    () => {
+      durableObject.sql.exec(
+        `DELETE FROM upload_expected_chunks
+          WHERE upload_id = ? AND chunk_index >= ? AND chunk_index < ?`,
+        session.upload_id,
+        startIndex,
+        endIndex
+      );
+      durableObject.sql.exec(
+        `DELETE FROM upload_verified_chunks
+          WHERE upload_id = ? AND chunk_index >= ? AND chunk_index < ?`,
+        session.upload_id,
+        startIndex,
+        endIndex
+      );
+    }
+  );
+  return finished
+    ? { done: true, result, fresh: true }
+    : {
+        done: false,
+        phase: "cleaning",
+        cursor: endIndex,
+        total: session.total_chunks,
+      };
 }
 
 /**
  * Finalize a multipart upload in one request.
  *
  * The caller hands over the whole declared manifest, so this stages it and
- * then drives the same durable machine `vfsFinalizeMultipartStep` exposes to
- * completion inside this turn. A caller that already staged its manifest in
- * pages, or that lost the response to an earlier attempt, is answered from
- * what the session persisted rather than from the list it just re-sent.
+ * then drives the same durable machine `vfsFinalizeMultipartStep` exposes. A
+ * caller that already staged its manifest in pages, or that lost the response
+ * to an earlier attempt, is answered from what the session persisted rather
+ * than from the list it just re-sent.
  *
- * Every page it runs costs the invocation its shard fan-out, so an upload big
- * enough to exhaust the subrequest budget cannot finish in one request. That
- * is not a failure: the pages it did complete are durable, the refusal is
- * `EBUSY`, and repeating the call resumes from the cursor rather than
- * restarting.
+ * Publication is the point of no return: past it the caller owns a published
+ * file, so this returns the recorded result the moment the session is
+ * finalized and leaves whatever cleaning is still owed to the alarm. Before
+ * it, an upload too large to finish inside one invocation's shard budget was
+ * already refused at begin, and a session that still runs out of pages is
+ * refused with `EBUSY` — the pages it did complete are durable, so repeating
+ * the call resumes from the cursor rather than restarting.
  */
 export async function vfsFinalizeMultipart(
   durableObject: UserDO,
@@ -1989,13 +2777,13 @@ export async function vfsFinalizeMultipart(
   chunkHashList: readonly string[]
 ): Promise<MultipartFinalizeResponse> {
   const userId = userIdFor(scope);
-  const session = readUploadSession(durableObject, userId, uploadId);
-  if (!session) {
-    throw new VFSError(
-      "ENOENT",
-      `finalizeMultipart: session not found: ${uploadId}`
-    );
-  }
+  const session = readUploadSessionOrThrow(
+    durableObject,
+    userId,
+    uploadId,
+    "finalizeMultipart"
+  );
+  if (session.status === "finalized") return parseFinalizeResult(session);
   if (session.status !== "open" && session.status !== "finalizing") {
     throw new VFSError(
       "EBUSY",
@@ -2008,6 +2796,11 @@ export async function vfsFinalizeMultipart(
       `finalizeMultipart: session expired at ${session.expires_at}`
     );
   }
+  assertFinalizeFitsOneRequest(
+    "finalizeMultipart",
+    session.total_chunks,
+    session.pool_size
+  );
   if (chunkHashList.length !== session.total_chunks) {
     throw new VFSError(
       "EINVAL",
@@ -2026,10 +2819,10 @@ export async function vfsFinalizeMultipart(
   // A finalize already owns a session past 'open', so the manifest it verifies
   // is the staged one; answering a caller who changed the list would report on
   // an upload this server never agreed to publish. A finalizing session with
-  // no phase predates the durable machine and staged nothing at all — the step
-  // below releases it instead.
+  // no frozen context predates the durable machine and staged nothing at all —
+  // the step below releases it instead.
   const staging = session.status === "open";
-  if (staging || session.finalize_phase !== null) {
+  if (staging || session.finalize_context !== null) {
     for (
       let start = 0;
       start < chunkHashList.length;
@@ -2051,26 +2844,40 @@ export async function vfsFinalizeMultipart(
   }
 
   let result: MultipartFinalizeResponse | undefined;
-  const { done } = await runOperationPages(
-    multipartFinalizePageBudget(session),
-    async () => {
-      const progress = await vfsFinalizeMultipartStep(
-        durableObject,
-        scope,
-        uploadId
-      );
-      if (!progress.done) return { kind: "advanced" };
-      result = progress.result;
-      return { kind: "completed" };
-    }
-  );
-  if (!done || result === undefined) {
-    throw new VFSError(
-      "EBUSY",
-      "finalizeMultipart: bounded finalize did not finish"
+  const publishedResult = (): MultipartFinalizeResponse | undefined => {
+    const current = readUploadSession(durableObject, userId, uploadId);
+    return current?.status === "finalized"
+      ? parseFinalizeResult(current)
+      : undefined;
+  };
+  try {
+    await runOperationPages(
+      MULTIPART_ONE_REQUEST_FINALIZE_MAX_PAGES,
+      async () => {
+        const progress = await vfsFinalizeMultipartStep(
+          durableObject,
+          scope,
+          uploadId
+        );
+        if (progress.done) {
+          result = progress.result;
+          return { kind: "completed" };
+        }
+        result = publishedResult();
+        return result === undefined
+          ? { kind: "advanced" }
+          : { kind: "completed" };
+      }
     );
+  } catch (err) {
+    result = publishedResult();
+    if (result === undefined) throw err;
   }
-  return result;
+  if (result !== undefined) return result;
+  throw new VFSError(
+    "EBUSY",
+    "finalizeMultipart: bounded finalize did not finish"
+  );
 }
 
 /**
@@ -2169,6 +2976,71 @@ export async function vfsGetMultipartStatus(
  * the typical failure mode is a transient ShardDO error.
  */
 export const MULTIPART_MAX_ABORT_ATTEMPTS = 5;
+
+/** Published sessions one alarm resumes, and pages it runs on each. */
+export const MULTIPART_CLEANING_SESSION_LIMIT = 4;
+export const MULTIPART_CLEANING_PAGES_PER_SESSION = 8;
+
+/**
+ * Alarm-driven cleaning of sessions that published but still owe the bounded
+ * reaping the head switch left behind.
+ *
+ * Publication is terminal for the caller — it has its result and may never
+ * call again — so nothing but the alarm is guaranteed to come back for the
+ * displaced manifest and the upload's scratch. Bounded twice over: at most
+ * `MULTIPART_CLEANING_SESSION_LIMIT` sessions, at most
+ * `MULTIPART_CLEANING_PAGES_PER_SESSION` pages each. `remaining` keeps the
+ * alarm cadence tight until every one of them reaches `done`.
+ */
+export async function resumeCleaningMultipartSessions(
+  durableObject: UserDO,
+  scopeForUser: (userId: string) => VFSScope
+): Promise<{ resumed: number; remaining: boolean }> {
+  const owed = durableObject.sql
+    .exec<{ upload_id: string; user_id: string }>(
+      `SELECT upload_id, user_id FROM upload_sessions
+        WHERE status = 'finalized' AND finalize_phase IS NOT NULL
+          AND finalize_phase != 'done'
+        ORDER BY created_at, upload_id
+        LIMIT ?`,
+      MULTIPART_CLEANING_SESSION_LIMIT
+    )
+    .toArray();
+
+  for (const row of owed) {
+    try {
+      await runOperationPages(
+        MULTIPART_CLEANING_PAGES_PER_SESSION,
+        async () => {
+          const progress = await vfsFinalizeMultipartStep(
+            durableObject,
+            scopeForUser(row.user_id),
+            row.upload_id
+          );
+          return progress.done ? { kind: "completed" } : { kind: "advanced" };
+        }
+      );
+    } catch (err) {
+      // The file is published either way; the reaping stays owed and the next
+      // alarm retries it from the cursor.
+      logError("multipart finalize cleaning failed", {}, err, {
+        event: "multipart_cleaning_failed",
+        uploadId: row.upload_id,
+      });
+    }
+  }
+
+  const remaining =
+    durableObject.sql
+      .exec(
+        `SELECT 1 FROM upload_sessions
+          WHERE status = 'finalized' AND finalize_phase IS NOT NULL
+            AND finalize_phase != 'done'
+          LIMIT 1`
+      )
+      .toArray().length > 0;
+  return { resumed: owed.length, remaining };
+}
 
 /**
  * Alarm-driven sweep of expired open sessions. Called from

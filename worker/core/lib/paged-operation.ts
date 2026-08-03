@@ -55,22 +55,23 @@
  * multipart finalize (`vfsFinalizeMultipartStep`)
  *   table    upload_sessions, key (upload_id, user_id)
  *   phase    finalize_phase: fencing → verifying → preparing → publishing →
- *            cleaning_upload_intents → cleaning_old_intents →
- *            cleaning_old_manifest → cleaning → done (terminal). Declared so
- *            far: fencing → verifying → publishing → done, publication being
- *            the one step still synchronous.
+ *            cleaning_old_manifest → cleaning → done (terminal). Publication
+ *            is constant-size: verification copies each verified page into the
+ *            destination manifest, preparation routes the shards the switch
+ *            orphans, and what the switch leaves owed is paged off after it.
  *   cursors  finalize_fence_cursor, finalize_chunk_cursor,
- *            finalize_verify_shard_cursor, finalize_intent_cursor,
- *            finalize_old_intent_cursor, finalize_old_cleanup_cursor,
- *            finalize_cleanup_cursor. Declared so far: the first three, which
- *            are the ones the paged phases move. Only one pair has to be
- *            ordered: finalize_verify_shard_cursor sits inside
+ *            finalize_verify_shard_cursor, finalize_old_manifest_cursor,
+ *            finalize_old_cleanup_cursor, finalize_cleanup_cursor. Only one
+ *            pair has to be ordered: finalize_verify_shard_cursor sits inside
  *            finalize_chunk_cursor, because finishing a chunk page restarts
- *            the shard fan-out at zero. The rest only ever advance.
- *   fence    `status` ('finalizing' / 'finalized') passed in `expected`, so a
- *            session that aborted underneath the page changes zero rows
+ *            the shard fan-out at zero. The rest belong to one phase each and
+ *            only ever advance.
+ *   fence    `status` ('finalizing' / 'finalized') and `finalize_context`
+ *            passed in `expected`, so a session that aborted, or whose frozen
+ *            decision was rewritten, changes zero rows
  *   terminal phase `done`; result decoded from `finalize_result`
- *   bounded  one shard page or one chunk page per invocation
+ *   bounded  one shard page, one chunk page, one displaced-manifest page or
+ *            one scratch page per invocation
  *
  * multipart abort (`vfsAbortMultipartStep`, `advanceMultipartAbortPage`)
  *   table    upload_sessions, key (upload_id, user_id)

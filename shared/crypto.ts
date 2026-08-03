@@ -53,3 +53,18 @@ export function hexToBytes(hex: string): Uint8Array {
   return out;
 }
 
+/** Base64-encode bytes in 8 KiB slices to stay under V8's spread-arg limit. */
+export function bytesToBase64(bytes: Uint8Array): string {
+  const SLICE = 0x2000;
+  let out = "";
+  for (let i = 0; i < bytes.byteLength; i += SLICE) {
+    out += String.fromCharCode(...bytes.subarray(i, i + SLICE));
+  }
+  return btoa(out);
+}
+
+/** Base64-decode. Throws on malformed input, as `atob` does. */
+export function base64ToBytes(value: string): Uint8Array {
+  return Uint8Array.from(atob(value), (char) => char.charCodeAt(0));
+}
+

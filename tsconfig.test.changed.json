@@ -9,6 +9,7 @@
 		"tests/integration/cleanup-outbox-remaining-paths.test.ts",
 		"tests/integration/internal-rpc-surface.test.ts",
 		"tests/integration/migration.test.ts",
+		"tests/integration/multipart-constant-publication.test.ts",
 		"tests/integration/multipart-finalize-steps.test.ts",
 		"tests/integration/multipart-hash-pages.test.ts",
 		"tests/integration/multipart-placement-authority.test.ts",

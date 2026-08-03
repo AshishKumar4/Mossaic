@@ -27,6 +27,7 @@ import { ShardDO } from "../worker/core/objects/shard/index";
 import { UserDO } from "../worker/app/objects/user/index";
 import type { EnvCore } from "../shared/types";
 import type { VFSScope } from "../shared/vfs-types";
+import { CountingSqlStorage, type SqlMetrics } from "./bench/counting-sql-storage";
 
 export { default } from "../worker/app/index";
 export { SearchDO } from "../worker/app/objects/search/index";
@@ -39,6 +40,7 @@ export type PutChunkFailurePhase = "before" | "after";
 
 export class FaultInjectingUserDO extends UserDO {
   private maintenanceAlarmFailuresRemaining = 0;
+  private sqlCounter: CountingSqlStorage | undefined;
 
   constructor(ctx: DurableObjectState, env: EnvCore) {
     super(ctx, env);
@@ -65,6 +67,22 @@ export class FaultInjectingUserDO extends UserDO {
   async testConfigureMaintenanceAlarmFailure(remaining: number): Promise<void> {
     await this.storage.deleteAlarm();
     this.maintenanceAlarmFailuresRemaining = remaining;
+  }
+
+  /** Start (or restart) counting the SQL this object issues. */
+  async testResetSqlMetrics(): Promise<void> {
+    if (this.sqlCounter === undefined) {
+      this.sqlCounter = new CountingSqlStorage();
+      this.sql = this.sqlCounter.wrap(this.sql);
+    }
+    this.sqlCounter.reset();
+  }
+
+  async testSqlMetrics(): Promise<SqlMetrics> {
+    if (this.sqlCounter === undefined) {
+      throw new Error("SQL metrics were not started");
+    }
+    return this.sqlCounter.snapshot();
   }
 
   async testEvict(): Promise<void> {

@@ -9,7 +9,9 @@ import { env, runInDurableObject } from "cloudflare:test";
  * chunk_size, shard_index)` block:
  *
  *   1. streams.ts (commitWriteStream, versioning-on branch)
- *   2. multipart-upload.ts (vfsFinalizeMultipart, versioning-on)
+ *   2. multipart-upload.ts (vfsFinalizeMultipart, versioning-on) — since
+ *      moved off the helper: a paged finalize copies each verified page in
+ *      with set-based SQL rather than a row at a time
  *   3. copy-file.ts (copyVersioned, chunked tier)
  *   4. mutations.ts (renameOverwriteVersioned)
  *

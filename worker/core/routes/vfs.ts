@@ -11,6 +11,7 @@ import {
   type PatchMetadataIfHeadRequest,
 } from "../../../shared/patch-metadata-if-head";
 import { parseRequestBody } from "../../../shared/schemas/parse";
+import { bytesToBase64 } from "../../../shared/crypto";
 import { edgeCacheServe } from "../lib/edge-cache";
 import { userIdFor } from "../objects/user/vfs/helpers";
 
@@ -184,16 +185,6 @@ function vfsJsonErrorResponse(r: ReturnType<typeof errToResponse>): Response {
     status: r.status,
     headers: { "Content-Type": "application/json" },
   });
-}
-
-/** Base64-encode bytes in 8 KiB chunks to avoid V8's spread-arg limit. */
-function bytesToBase64(b: Uint8Array): string {
-  const CHUNK = 0x2000;
-  let out = "";
-  for (let i = 0; i < b.length; i += CHUNK) {
-    out += String.fromCharCode(...b.subarray(i, i + CHUNK));
-  }
-  return btoa(out);
 }
 
 /**

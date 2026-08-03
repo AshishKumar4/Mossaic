@@ -89,9 +89,9 @@ export function applyUploadSessionIndexes(sql: SqlStorage): void {
  *     contiguous high-water mark, so a page checks its position in O(1)
  *     instead of counting what came before it.
  *   - `upload_verified_chunks` is what the shards actually hold, appended a
- *     page at a time as verification advances. It is the manifest publication
- *     reads with set-based SQL, which is what keeps publication constant-size
- *     no matter how many chunks the upload has.
+ *     page at a time as verification advances. The same page copies it into
+ *     the destination manifest with set-based SQL, which is what leaves
+ *     publication constant-size no matter how many chunks the upload has.
  *   - `upload_cleanup_routes` is inert routing: the shards a finished upload
  *     will have to clean, recorded while the rows that name them are still
  *     there. Publication turns them into executable outbox intents, and an
@@ -144,8 +144,6 @@ export function applyMultipartFinalizeSchema(sql: SqlStorage): void {
   // Cursors that seek by a key which legitimately starts at zero begin one
   // step before it, so the first page selects `> -1` and takes row zero.
   addColumn("finalize_old_manifest_cursor", "INTEGER NOT NULL DEFAULT -1");
-  addColumn("finalize_intent_cursor", "INTEGER NOT NULL DEFAULT -1");
-  addColumn("finalize_old_intent_cursor", "INTEGER NOT NULL DEFAULT -1");
   addColumn("finalize_old_cleanup_cursor", "INTEGER NOT NULL DEFAULT -1");
   addColumn("finalize_cleanup_cursor", "INTEGER NOT NULL DEFAULT 0");
   addColumn("finalize_total_size", "INTEGER NOT NULL DEFAULT 0");

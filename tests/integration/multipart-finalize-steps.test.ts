@@ -416,10 +416,16 @@ describe("paged multipart finalize", () => {
       routes: ownerShards(upload),
     });
 
-    const published = await step(upload);
-    expect(published).toMatchObject({ done: true, fresh: true });
-    if (published.done !== true) throw new Error("expected a terminal step");
-    expect(published.result).toEqual({
+    // Publication is constant-size: it leaves the scratch it no longer reads
+    // for the bounded cleaning that follows it rather than dropping the whole
+    // manifest in its own transaction.
+    await expect(step(upload)).resolves.toEqual({
+      done: false,
+      phase: "cleaning",
+      cursor: 0,
+      total: totalChunks,
+    });
+    const expected: MultipartFinalizeResponse = {
       fileId: upload.uploadId,
       size: totalChunks * CHUNK_BYTES,
       chunkCount: totalChunks,
@@ -427,10 +433,24 @@ describe("paged multipart finalize", () => {
       path: "/paged.bin",
       mimeType: "application/octet-stream",
       isEncrypted: false,
+    };
+    expect(await readFinalizeState(upload)).toMatchObject({
+      status: "finalized",
+      phase: "cleaning",
+      verified: totalChunks,
+      routes: [],
     });
     await expect(
       userStub(tenant).vfsReadFile(scopeFor(tenant), "/paged.bin")
     ).resolves.toEqual(expectedBytes(totalChunks));
+
+    const published = await stepToDone(upload);
+    expect(published).toEqual(expected);
+    expect(await readFinalizeState(upload)).toMatchObject({
+      phase: "done",
+      verified: 0,
+      expected: 0,
+    });
   });
 
   it("replays a finished step without publishing again", async () => {
@@ -460,15 +480,16 @@ describe("paged multipart finalize", () => {
     await expect(
       userStub(tenant).vfsReadFile(scopeFor(tenant), "/replay.bin")
     ).resolves.toEqual(expectedBytes(4));
-    // The one-request entry point keeps refusing a session it already
-    // finished, exactly as it did before finalize was paged.
+    // The one-request entry point answers a session it already finished from
+    // what publication recorded: a caller whose response was lost has a
+    // published file, and telling it EBUSY would be a lie.
     await expect(
       userStub(tenant).vfsFinalizeMultipart(
         scopeFor(tenant),
         upload.uploadId,
         upload.hashes
       )
-    ).rejects.toThrow(/EBUSY.*status='finalized'/);
+    ).resolves.toEqual(result);
   });
 
   it("resumes a verification page whose shard response was lost", async () => {

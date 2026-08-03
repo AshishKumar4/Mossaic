@@ -784,7 +784,7 @@ describe("multipart routes", () => {
     expect(got).toEqual(c2);
   });
 
-  it("finalize cannot be replayed (second finalize on same uploadId fails)", async () => {
+  it("finalize replays its recorded result instead of publishing twice", async () => {
     const tenant = "mp-replay-1";
     const begin = await beginMP({
       tenant,
@@ -794,8 +794,9 @@ describe("multipart routes", () => {
     });
     const c0 = chunkOf(0, 100);
     const r0 = await putMP(begin.bearer, begin.uploadId, 0, c0, begin.sessionToken);
-    await finalizeMP(begin.bearer, begin.uploadId, [r0.hash]);
-    // Second finalize.
+    const first = await finalizeMP(begin.bearer, begin.uploadId, [r0.hash]);
+    // A caller that lost the first response repeats the call: it already owns
+    // a published file, so it gets that file's result back rather than EBUSY.
     const r = await SELF.fetch("https://test/api/vfs/multipart/finalize", {
       method: "POST",
       headers: {
@@ -807,9 +808,8 @@ describe("multipart routes", () => {
         chunkHashList: [r0.hash],
       }),
     });
-    expect(r.status).toBe(409); // EBUSY (status='finalized')
-    const body = (await r.json()) as { code: string };
-    expect(body.code).toBe("EBUSY");
+    expect(r.status).toBe(200);
+    expect(await r.json()).toEqual(first);
   });
 
   // ───────────────────────────────────────────────────────────────────

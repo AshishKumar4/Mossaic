@@ -127,36 +127,3 @@ export function stageChunkCleanupIntent(
 export function lastSqlChanges(durableObject: StorageCapability): number {
   return sqlRowsChanged(durableObject.sql);
 }
-
-/** Convert pre-publication multipart rollback intents into staging-only work. */
-export function retainMultipartStagingCleanup(
-  durableObject: StorageCapability,
-  uploadId: string,
-  now: number
-): void {
-  const guards = durableObject.sql
-    .exec(
-      `SELECT state, provisional FROM chunk_cleanup_intents
-        WHERE ref_id = ?`,
-      uploadId
-    )
-    .toArray() as { state: string; provisional: number }[];
-  if (
-    guards.length === 0 ||
-    guards.some((guard) => guard.state !== "pending" || guard.provisional === 0)
-  ) {
-    throw new Error("multipart cleanup guard unavailable for publication");
-  }
-  durableObject.sql.exec(
-    `UPDATE chunk_cleanup_intents
-        SET cleanup_kind = ?, state = 'pending', generation = generation + 1,
-            provisional = 0,
-            updated_at = ?, next_attempt_at = ?,
-            attempts = 0, last_error = NULL
-      WHERE ref_id = ?`,
-    ChunkCleanupKind.MultipartStaging,
-    now,
-    now,
-    uploadId
-  );
-}

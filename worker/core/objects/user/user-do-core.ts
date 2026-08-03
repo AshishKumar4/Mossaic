@@ -463,6 +463,21 @@ export class UserDOCore extends DurableObject<Env> {
       this.recordAlarmFailure("multipart_sweep", "", err);
     }
 
+    // A multipart finalize that published still owes the bounded reaping its
+    // head switch left behind, and its caller already has the result it came
+    // for — so nothing but this alarm is guaranteed to come back for it.
+    // Separate from the sweep above: a failed sweep must not strand it.
+    let multipartCleaningHasMore = false;
+    try {
+      const { resumeCleaningMultipartSessions } = await import(
+        "./multipart-upload"
+      );
+      const r = await resumeCleaningMultipartSessions(this, () => scope);
+      multipartCleaningHasMore = r.remaining;
+    } catch (err) {
+      this.recordAlarmFailure("multipart_cleaning", "", err);
+    }
+
     // Shard capacity warning poll. Throttled (once per cadence) by
     // the helper itself; reads `quota.pool_size` and fans out a
     // `getStorageBytes` RPC per shard. Logs a structured warning
@@ -536,7 +551,10 @@ export class UserDOCore extends DurableObject<Env> {
 
     // Reschedule while any bounded maintenance queue still has work.
     const maintenanceHasMore =
-      rows.length === 200 || staleSweepFailed || multipartHasMore;
+      rows.length === 200 ||
+      staleSweepFailed ||
+      multipartHasMore ||
+      multipartCleaningHasMore;
     if (
       maintenanceHasMore ||
       (nextCleanupAttempt !== null && nextCleanupAttempt !== undefined) ||
