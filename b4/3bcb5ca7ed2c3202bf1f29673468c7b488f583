@@ -1,0 +1,55 @@
+shared/crypto.ts
+  s_4d44abf13c0d3b::t_8db9a08ac278e2 56-70
+tests/integration/multipart-routes.test.ts
+  s_e5ac85fca2ef43::t_cd20ec4f5fb0e9 787,797-799,811-812
+tests/test-worker.ts
+  s_e5ac85fca2ef43::t_705853c4c7cba7 30,43,72-87
+tsconfig.test.changed.json
+  s_ac611608e100a8::t_88f30fe7eb92b0 12
+vitest.config.ts
+  s_ac611608e100a8::t_e235661e81bb99 34
+vitest.fault.config.ts
+  s_ac611608e100a8::t_b0be8be8c59aa0 7
+worker/core/objects/user/multipart-upload.ts
+  s_32922f349ace79::t_f676df6b7b89c4 20-23,26-31,59,101-106,119,127-132,176-178,181,345-350,449-451,455-512,554-561,632-634,742-743,745,928-937,942,944-945,953-962,975-976,993-995,1000-1306,1312-1315,1329-1330,1342-1347,1352-1353,1356-1357,1362-1372,1376,1378,1391-1397,1400-1409,1427-1434,1442-1447,1449,1464-1470,1472-1475,1482,1488-1493,1504-1505,1507-1516,1526-1527,1533,1546,1548-1551,1553-1591,1597-1599,1604,1616-1665,1709,1712,1739-1740,1744-1748,1753-1754,1862-1868,1878-1883,1917,1923-1930,1940-1982,2097,2099-2189,2202-2203,2207,2210,2213-2214,2219-2220,2222,2229-2230,2233,2235-2245,2248,2250,2252-2271,2273,2275-2299,2301-2342,2344-2386,2388-2417,2419-2445,2447-2476,2479-2481,2485-2503,2505-2533,2535-2542,2546-2547,2549-2553,2555-2592,2594-2744,2746-2753,2760-2763,2765-2771,2780-2786,2799-2803,2822-2823,2825,2847-2870,2872-2874,2876-2880,2980-3044
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b43bcb5ca7ed2c3202bf1f29673468c7b488f583",
+  "prompts": {},
+  "sessions": {
+    "s_32922f349ace79": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_037073ea9ffeCEeZwIP32OYQqk",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ashish Kumar Singh <ashishsingh@cloudflare.com>"
+    },
+    "s_4d44abf13c0d3b": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_05dc528e0ffevO0MDl5xsFVln1",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ashish Kumar Singh <ashishsingh@cloudflare.com>"
+    },
+    "s_ac611608e100a8": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0372f74d5ffeQ88BIHNKx2VMa7",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ashish Kumar Singh <ashishsingh@cloudflare.com>"
+    },
+    "s_e5ac85fca2ef43": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0520ee52affeJH69RpWzRRdY52",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ashish Kumar Singh <ashishsingh@cloudflare.com>"
+    }
+  }
+}
