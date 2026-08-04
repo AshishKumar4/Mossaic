@@ -66,6 +66,7 @@ import { dedupePaths, type DedupeResult } from "./admin";
 import {
   encodeVariantKey,
   findVariantRow,
+  findVariantRowForRenderer,
   renderAndStoreVariant,
 } from "./preview-variants";
 import { defaultRegistry } from "../../lib/preview-pipeline";
@@ -1918,14 +1919,15 @@ export class UserDOCore extends DurableObject<Env> {
     // Try the variant cache. If hit, we know the chunkHash + dims
     // immediately. Same fallback chain as vfs/preview.ts so a
     // pre-rendered icon-card or image-passthrough row counts.
-    let row = findVariantRow(
+    const primaryHit = findVariantRowForRenderer(
       this,
       fileId,
       variantKey,
       primaryRenderer.kind,
       headVersionForCache
     );
-    let rowRendererKind = primaryRenderer.kind;
+    let row = primaryHit?.row ?? null;
+    let rowRendererKind = primaryHit?.rendererKind ?? primaryRenderer.kind;
     if (row === null) {
       const fallbackKinds = mimeType.startsWith("image/")
         ? ["image-passthrough", "icon-card"]
@@ -1962,16 +1964,16 @@ export class UserDOCore extends DurableObject<Env> {
       // Resolve which renderer kind was actually persisted (the
       // EMOSSAIC_UNAVAILABLE fallback in renderAndStoreVariant
       // could have chosen image-passthrough or icon-card).
-      const persistedRow = findVariantRow(
+      const persistedHit = findVariantRowForRenderer(
         this,
         fileId,
         variantKey,
         primaryRenderer.kind,
         headVersionForCache
       );
-      if (persistedRow !== null) {
-        row = persistedRow;
-        rowRendererKind = primaryRenderer.kind;
+      if (persistedHit !== null) {
+        row = persistedHit.row;
+        rowRendererKind = persistedHit.rendererKind;
       } else {
         const fallbackKinds = mimeType.startsWith("image/")
           ? ["image-passthrough", "icon-card"]

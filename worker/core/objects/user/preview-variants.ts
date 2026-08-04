@@ -79,6 +79,57 @@ export type VariantRow = {
  * and the `INSERT OR REPLACE` semantics in `renderAndStoreVariant`
  * supersede the stale row by composite PK on the way back.
  */
+/**
+ * The renderer kind a variant is stored under. The resize path stamps
+ * "image" when it produces webp, so the stored kind is not always the
+ * renderer's canonical `kind`.
+ *
+ * Writers and readers MUST both go through this pair. When they drifted
+ * apart, every successful webp resize wrote a row under "image" that no
+ * lookup ever asked for, so the variant was re-rendered on every request
+ * and minting a signed URL failed with EBUSY right after storing the row.
+ */
+export function persistedRendererKind(
+  usedRendererKind: string,
+  mimeType: string
+): string {
+  return usedRendererKind === "image-resize" && mimeType === "image/webp"
+    ? "image"
+    : usedRendererKind;
+}
+
+/** Every kind a row written by `rendererKind` may be persisted under. */
+export function persistedRendererKindsFor(rendererKind: string): string[] {
+  return rendererKind === "image-resize"
+    ? [rendererKind, "image"]
+    : [rendererKind];
+}
+
+/**
+ * `findVariantRow` for a renderer, covering every kind that renderer's
+ * output may have been stored under. Returns the row and the kind it was
+ * actually found under, so stale-chunk recovery can target the right row.
+ */
+export function findVariantRowForRenderer(
+  durableObject: UserDOCore,
+  fileId: string,
+  variantKind: string,
+  rendererKind: string,
+  headVersionId: string | null
+): { row: VariantRow; rendererKind: string } | null {
+  for (const kind of persistedRendererKindsFor(rendererKind)) {
+    const row = findVariantRow(
+      durableObject,
+      fileId,
+      variantKind,
+      kind,
+      headVersionId
+    );
+    if (row !== null) return { row, rendererKind: kind };
+  }
+  return null;
+}
+
 export function findVariantRow(
   durableObject: UserDOCore,
   fileId: string,
@@ -291,16 +342,13 @@ export async function renderAndStoreVariant(
     : scope.tenant;
   await shardStub.putChunk(variantHash, variantBytes, refId, 0, userId);
 
-  // Resolve the actual stored renderer kind (could be the
-  // fallback if the primary failed). Legacy quirk: the resize
-  // path stamps "image" when the result is webp — existing rows
-  // and cache lookups depend on it. Other paths (icon-card, code,
-  // waveform, video-poster, image-passthrough) stamp their
-  // renderer's canonical `kind` so cache lookups can find them.
-  const rendererKind =
-    usedRendererKind === "image-resize" && result.mimeType === "image/webp"
-      ? "image"
-      : usedRendererKind;
+  // Resolve the actual stored renderer kind (could be the fallback if the
+  // primary failed). Readers resolve the same set via
+  // `persistedRendererKindsFor`, which is what keeps the two in step.
+  const rendererKind = persistedRendererKind(
+    usedRendererKind,
+    result.mimeType
+  );
 
   // `INSERT OR REPLACE` (NOT `OR IGNORE`) so a re-render on a NEW
   // head version supersedes the stale cache row by composite PK.

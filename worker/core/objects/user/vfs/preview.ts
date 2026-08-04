@@ -34,6 +34,7 @@ import { vfsShardDOName } from "../../../lib/utils";
 import {
   encodeVariantKey,
   findVariantRow,
+  findVariantRowForRenderer,
   renderAndStoreVariant,
 } from "../preview-variants";
 import { defaultRegistry } from "../../../lib/preview-pipeline";
@@ -161,14 +162,15 @@ export async function vfsReadPreview(
   //   non-image      → icon-card only
   // Track which kind we hit so a stale-chunk recovery can target
   // the correct row.
-  let row = findVariantRow(
+  const primaryHit = findVariantRowForRenderer(
     durableObject,
     fileId,
     variantKey,
     primaryRenderer.kind,
     headVersionForCache
   );
-  let rowRendererKind = primaryRenderer.kind;
+  let row = primaryHit?.row ?? null;
+  let rowRendererKind = primaryHit?.rendererKind ?? primaryRenderer.kind;
   if (row === null) {
     const fallbackKinds = mimeType.startsWith("image/")
       ? ["image-passthrough", "icon-card"]
@@ -235,7 +237,7 @@ export async function vfsReadPreview(
   // EMOSSAIC_UNAVAILABLE branch in renderAndStoreVariant could have
   // chosen image-passthrough (image/* sources) or icon-card
   // (others).
-  const persistedRow = findVariantRow(
+  const persistedHit = findVariantRowForRenderer(
     durableObject,
     fileId,
     variantKey,
@@ -243,8 +245,8 @@ export async function vfsReadPreview(
     headVersionForCache
   );
   let persistedKind: string;
-  if (persistedRow !== null) {
-    persistedKind = primaryRenderer.kind;
+  if (persistedHit !== null) {
+    persistedKind = persistedHit.rendererKind;
   } else {
     const fallbackKinds = mimeType.startsWith("image/")
       ? ["image-passthrough", "icon-card"]
