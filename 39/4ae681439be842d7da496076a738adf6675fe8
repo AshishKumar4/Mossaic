@@ -1,0 +1,31 @@
+tests/integration/preview-renderer-kind.test.ts
+  s_5756a9fc9bf513::t_791c7d460f5b84 22,85-118
+tests/test-worker.ts
+  s_486ad7a22bc605::t_22fd2d66b0d69a 35-73
+tests/wrangler.test.jsonc
+  s_486ad7a22bc605::t_8c47e15aab1d52 10-11,15
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "394ae681439be842d7da496076a738adf6675fe8",
+  "prompts": {},
+  "sessions": {
+    "s_486ad7a22bc605": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0c2f97a9affeoRq9E8N5cKE0X8",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ashish Kumar Singh <ashishsingh@cloudflare.com>"
+    },
+    "s_5756a9fc9bf513": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_03142c945ffeGn3UaZBXahixE0",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ashish Kumar Singh <ashishsingh@cloudflare.com>"
+    }
+  }
+}
