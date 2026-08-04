@@ -32,6 +32,45 @@ export { default } from "../worker/app/index";
 export { SearchDO } from "../worker/app/objects/search/index";
 export { ShardDO, UserDO };
 
+/**
+ * `tests/wrangler.test.jsonc` deliberately omits the IMAGES binding, so the
+ * `image-resize` renderer always fails here and only the fallback renderers
+ * ever run. That left the SUCCESSFUL resize path — the one that persists a
+ * variant under renderer_kind "image" — with no coverage at all.
+ *
+ * This subclass injects a minimal stand-in that satisfies the slice of the
+ * Images API the renderer uses: input().transform().output().response().
+ * It re-encodes nothing; it just returns bytes with the requested MIME,
+ * which is all the variant-cache bookkeeping depends on.
+ */
+export class ImagesUserDO extends UserDO {
+  constructor(ctx: DurableObjectState, env: EnvCore) {
+    super(ctx, env);
+    this.envPublic = {
+      ...env,
+      IMAGES: {
+        input(bytes: Uint8Array) {
+          return {
+            transform() {
+              return {
+                async output(opts: { format?: string }) {
+                  const mime = opts.format ?? "image/webp";
+                  return {
+                    response: () =>
+                      new Response(bytes, {
+                        headers: { "Content-Type": mime },
+                      }),
+                  };
+                },
+              };
+            },
+          };
+        },
+      },
+    } as unknown as EnvCore;
+  }
+}
+
 export type DeleteChunksFailurePhase = "before" | "after";
 export type DeleteManyChunksFailurePhase = "before" | "mid" | "after";
 export type ClearMultipartStagingFailurePhase = "before" | "after";

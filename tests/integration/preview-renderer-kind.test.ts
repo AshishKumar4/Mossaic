@@ -19,6 +19,7 @@ import type { ShardDO } from "@core/objects/shard/shard-do";
 
 interface TestEnv {
   MOSSAIC_USER: DurableObjectNamespace<UserDO>;
+  MOSSAIC_USER_IMAGES: DurableObjectNamespace<UserDO>;
   MOSSAIC_SHARD: DurableObjectNamespace<ShardDO>;
 }
 const E = env as unknown as TestEnv;
@@ -79,6 +80,40 @@ describe("preview renderer-kind round-trip", () => {
     // readers never ask for that kind, so this comes back as a fresh render.
     expect(cached.fromVariantTable).toBe(true);
     expect(cached.rendererKind).toBe("image");
+  });
+
+  it("caches a genuinely successful resize instead of re-rendering it", async () => {
+    // Runs against a UserDO with a working IMAGES binding, so image-resize
+    // actually succeeds and persists under renderer_kind "image" — the exact
+    // production shape no other test reaches.
+    const stub = E.MOSSAIC_USER_IMAGES.get(
+      E.MOSSAIC_USER_IMAGES.idFromName("preview:kind-live-resize")
+    );
+    const userId = await seedUser(stub, "kind-live-resize@e.com");
+    const scope = { ns: "default", tenant: userId };
+
+    const src = new Uint8Array(4096);
+    for (let i = 0; i < src.length; i++) src[i] = (i * 29) & 0xff;
+    await stub.vfsWriteFile(scope, "/live.jpg", src, {
+      mimeType: "image/jpeg",
+    });
+
+    const first = await stub.vfsReadPreview(scope, "/live.jpg", {
+      variant: "thumb",
+    });
+    expect(first.rendererKind).toBe("image");
+    expect(first.fromVariantTable).toBe(false);
+
+    const second = await stub.vfsReadPreview(scope, "/live.jpg", {
+      variant: "thumb",
+    });
+    expect(second.fromVariantTable).toBe(true);
+    expect(second.rendererKind).toBe("image");
+
+    const minted = await stub.vfsMintPreviewToken(scope, "/live.jpg", {
+      variant: "thumb",
+    });
+    expect(minted.rendererKind).toBe("image");
   });
 
   it("mints a signed preview url against that same row", async () => {
