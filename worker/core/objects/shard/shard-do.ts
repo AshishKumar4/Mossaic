@@ -391,6 +391,12 @@ export class ShardDO extends DurableObject<Env> {
   // Returns one of "created" / "deduplicated" / "superseded" so the
   // caller (and tests) can observe which branch fired.
   //
+  // Supersession drops a ref, moves two refcounts, registers a chunk and
+  // replaces a staging row. Those four are one fact about the upload, so
+  // they commit as one transaction: a failure part-way through leaves
+  // the prior chunk referenced and staged exactly as it was, and the
+  // client's retry supersedes it from a state that still adds up.
+  //
   // @lean-invariant Mossaic.Vfs.Multipart.putChunkMultipart_idempotent
   //   Repeating the same abstract chunk/ref transition produces exactly
   //   the same modeled ShardState. This does not refine the SQL or staging
@@ -432,10 +438,31 @@ export class ShardDO extends DurableObject<Env> {
       await this.scheduleSweep();
     }
 
-    // This is the final fence check. There are no awaits after it, so a
-    // terminal fence cannot interleave before the staging/ref mutation.
-    this.assertMultipartFenceOpen(uploadId, fenceId);
+    return this.ctx.storage.transactionSync(() => {
+      // This is the final fence check. It shares a transaction with the
+      // mutation it guards, so a terminal fence cannot interleave
+      // between them and a rolled-back put leaves no fence behind.
+      this.assertMultipartFenceOpen(uploadId, fenceId);
+      return this.putChunkMultipartInternal(
+        chunkHash,
+        data,
+        uploadId,
+        chunkIndex,
+        userId
+      );
+    });
+  }
 
+  private putChunkMultipartInternal(
+    chunkHash: string,
+    data: Uint8Array,
+    uploadId: string,
+    chunkIndex: number,
+    userId: string
+  ): {
+    status: "created" | "deduplicated" | "superseded";
+    bytesStored: number;
+  } {
     // Supersession check — does a prior staging row exist with a
     // different hash? If so, drop the prior `(oldHash, uploadId,
     // chunkIndex)` chunk_refs row and decrement the prior chunk's
