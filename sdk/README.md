@@ -380,14 +380,14 @@ const bytes = await parallelDownload(client, "/photo.jpg", {
 
 The HTTP client always addresses canonical Mossaic routes:
 
-- multipart upload session: `POST /api/vfs/multipart/{begin, finalize, abort, download-token}` and `PUT /api/vfs/multipart/:uploadId/{chunk/:idx, status}`
+- multipart upload session: `POST /api/vfs/multipart/{begin, finalize, abort, download-token}`, `PUT /api/vfs/multipart/:uploadId/chunk/:idx`, and `GET /api/vfs/multipart/:uploadId/status`
 - per-chunk read: `POST /api/vfs/readChunk` keyed by `(path, chunkIndex)`
 
 Every SDK consumer (SPA, CLI, third-party Worker) hits the same surface; there is no override for routing through alternative endpoints. Apps that want their own auth boundary in front of Mossaic mint VFS Bearer tokens at their own auth route (e.g. the photo-library's `POST /api/auth/vfs-token`) and pass the resulting token as `apiKey`.
 
 ### Manual multipart upload (advanced)
 
-For callers that need direct control over chunk submission — custom backpressure, hand-rolled retries, resumable batchers, multi-process upload coordination — the SDK exposes the four multipart primitives directly on the HTTP client:
+For callers that need direct control over chunk submission — custom backpressure, hand-rolled retries, resumable batchers, multi-process upload coordination — the SDK exposes the multipart primitives directly on both clients:
 
 ```ts
 import {
@@ -399,7 +399,7 @@ import { hashChunk } from "@mossaic/sdk/http";
 const client = createMossaicHttpClient({ url: "https://...", apiKey: token });
 
 // 1. Begin — server picks chunkSize, returns expectedChunks count.
-const handle: MultipartUploadHandle = await client.beginMultipartUpload(
+let handle: MultipartUploadHandle = await client.beginMultipartUpload(
   "/large.bin",
   { size: source.byteLength, mimeType: "application/octet-stream" }
 );
@@ -414,14 +414,56 @@ for (let i = 0; i < handle.expectedChunks; i++) {
   hashes.push(r.chunkHash);
 }
 
-// 3. Finalize — atomic commit.
+// 3. Finalize — completion-only for work within the default request budget.
 const result = await client.finalizeMultipartUpload(handle, hashes);
 console.log(`uploaded ${result.size} bytes to ${result.path}`);
+
+// Status and resume complete when their server-issued handle fits the budget.
+const status = await client.getMultipartUploadStatus(handle);
+
+// Low-level callers can advance one opaque continuation at a time.
+const page = await client.getMultipartUploadStatusPage(handle);
+const next = page.continuation
+  ? await client.getMultipartUploadStatusPage(handle, {
+      continuation: page.continuation,
+    })
+  : undefined;
 
 // On failure, ALWAYS abort to release the session (chunks GC via the
 // existing alarm sweeper).
 // await client.abortMultipartUpload(handle);
 ```
+
+`finalizeMultipartUpload`, `abortMultipartUpload`, `getMultipartUploadStatus`, `resumeMultipartUpload`, and `dropVersions` keep their completion-only result shapes and issue at most `DEFAULT_COMPLETION_REQUEST_BUDGET` (currently 16) page/RPC requests. Multipart defaults preflight server-issued handle dimensions and throw typed `EFBIG` before mutation when the known work can exceed that budget. Use the explicitly bounded methods for large operations:
+
+```ts
+let finalize = await client.startFinalizeMultipartUpload(handle, hashes);
+while ("operation" in finalize) {
+  finalize = await client.stepFinalizeMultipartUpload(
+    handle,
+    hashes,
+    finalize.operation,
+  );
+}
+
+let aborted = await client.startAbortMultipartUpload(handle);
+while ("operation" in aborted) {
+  aborted = await client.stepAbortMultipartUpload(handle, aborted.operation);
+}
+
+let retention = await client.startDropVersions("/notes.md", { keepLast: 9 });
+while ("operation" in retention) {
+  retention = await client.stepDropVersions(
+    "/notes.md",
+    { keepLast: 9 },
+    retention.operation,
+  );
+}
+```
+
+Each start/step call issues at most `DEFAULT_COMPLETION_REQUEST_BUDGET` control requests. Persist the returned operation handle before scheduling the next request. Status and resume use `getMultipartUploadStatusPage()` and `resumeMultipartUploadPage()` plus their opaque continuations. If an operation whose size could not be known during preflight reaches the default budget, `CompletionBudgetExceededError` is an `EFBIG` and exposes the durable operation as `error.checkpoint`; no completed protocol progress is discarded. `MULTIPART_OPERATION_RPC_BUDGET` remains an alias for the shared constant.
+
+`parallelUpload`, the CLI transfer commands, and `versions drop` drive these bounded APIs explicitly, so large operations retain their operation handle or continuation between batches instead of relying on a completion wrapper.
 
 **This is a manual surface for advanced clients.** `writeFile()` autopilots multipart internally with adaptive concurrency, retries, and the AIMD controller; `parallelUpload()` exposes the same engine with progress events. Reach for the manual surface when you need:
 
@@ -429,9 +471,28 @@ console.log(`uploaded ${result.size} bytes to ${result.path}`);
 - **Custom upload schedulers**: feed handle.chunkSize-sized buffers from a producer queue with non-default concurrency policy.
 - **Out-of-band chunk validation**: PUT a chunk, validate its `chunkHash` against your own SHA-256, queue retries on mismatch.
 
+Binding-mode chunk routing treats `handle.poolSize` and `handle.expectedChunks` as informational only. The SDK decodes the pool size and placement version from `handle.sessionToken`; `ShardDO` remains authoritative and verifies the token signature before writing any chunk state. Protocol v2 uses jump consistent hash with fixed hash work per chunk. Tokens without `placementVersion` keep the exact legacy rendezvous result.
+
+Persisted handles containing multipart tokens minted before routing identity and terminal-fence claims were introduced cannot submit chunks after upgrading. Use the explicit upgrade flow to remint a current token. Pre-v2 handles do not contain `size`, so provide it once:
+
+```ts
+const resumed = await vfs.resumeMultipartUpload(handle, {
+  size: source.byteLength,
+});
+handle = resumed.handle;
+// resumed.landed is complete when the session fits the default budget.
+
+// Request-scoped callers can remint the handle and scan one page at a time.
+const resumedPage = await vfs.resumeMultipartUploadPage(handle);
+```
+
+Using a token that lacks the required routing identity claims fails with an `EACCES` error naming `resumeMultipartUpload`. Resuming preserves the upload ID, already-landed chunks, frozen pool size, and frozen placement version while returning a fresh token. A new SDK also remains rollout-safe with an old server: paging is used only when the begin response selects `paged-control-v2`; otherwise the SDK uses the legacy endpoints.
+
 `abortMultipartUpload` is idempotent — aborting an already-finalized or already-aborted session returns `{aborted: false}` rather than throwing.
 
 Both SDK clients support these methods: `createMossaicHttpClient(...)` routes through the public multipart HTTP endpoints, while binding-mode `createVFS(env, opts)` exposes the same surface for Workers with Mossaic bindings.
+
+Each status/resume RPC inspects at most 64 shards and returns at most 256 landed indices. Continuations are signed, opaque, and bound to the upload and tenant. `getMultipartUploadStatus()` and `resumeMultipartUpload()` follow continuations only within the shared completion budget; handles that can require more are rejected before the first request. `getMultipartUploadStatusPage()` and `resumeMultipartUploadPage()` expose explicit bounded progress.
 
 ---
 
@@ -685,7 +746,7 @@ await vfs.dropVersions("/notes.md", {
 await vfs.dropVersions("/notes.md", {});
 ```
 
-Returns `{ dropped, kept }`. Chunks whose last reference was dropped become eligible for the alarm sweeper after its 30s grace.
+`dropVersions()` resolves to `{ dropped, kept }` when retention finishes within the shared 16-request completion budget. Use `startDropVersions()` and `stepDropVersions()` for large histories. If the default reaches the cap, its typed `EFBIG` carries the durable operation in `error.checkpoint`. Chunks whose last reference was dropped become eligible for the alarm sweeper after its 30s grace.
 
 ### Cross-version dedup
 
@@ -1082,7 +1143,7 @@ The compaction snapshot captures whatever the live `Y.Doc` holds at the moment o
 
 ## Subrequest model
 
-> **Each VFS method = exactly 1 outbound DO RPC subrequest in the consumer's Worker invocation, regardless of internal chunk fan-out.**
+> **Single-step VFS methods use exactly one outbound DO RPC. Default completion methods use at most 16 page/RPC requests and fail with typed `EFBIG` rather than loop beyond that cap. Explicit multipart/retention start and step methods use the same cap and return checkpointable operation state when unfinished.**
 
 Cloudflare Workers cap subrequests per invocation at 50 (free) / 10,000 (paid). A `readFile` of a 100-chunk file would otherwise burn 100 subrequests in the consumer's budget. With Mossaic's typed-DO-RPC architecture:
 
@@ -1094,6 +1155,8 @@ Cloudflare Workers cap subrequests per invocation at 50 (free) / 10,000 (paid). 
 | `vfs.writeFile(N-chunk payload)` | 1 | N (to ShardDOs) |
 | `vfs.readManyStat(10k paths)` | 1 | 0 |
 | `vfs.unlink(file)` | 1 | U (one per touched shard) |
+| default multipart/retention completion | 1..16 | completes or throws `EFBIG` |
+| multipart/retention bounded start or step | 1..16 | checkpointable work per caller invocation |
 
 The internal fan-out is billed against Mossaic's per-DO-invocation budget (10,000 paid). Consumer Workers stay well under their own cap. This is the load-bearing efficiency property of the as-Library architecture, pinned by `tests/integration/consumer-fixture.test.ts`.
 

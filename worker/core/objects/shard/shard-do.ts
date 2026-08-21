@@ -1,14 +1,51 @@
 import { DurableObject } from "cloudflare:workers";
 import type { EnvCore as Env } from "../../../../shared/types";
 import {
+  advanceSchemaMaintenance,
   applyMigrationOnce,
+  ensureSchemaMaintenance,
   ensureMigrationsTable,
 } from "../../lib/migrations";
 import { verifyVFSMultipartToken } from "../../lib/auth";
+import {
+  MULTIPART_FENCE_GC_GRACE_MS,
+  MULTIPART_MAX_TTL_MS,
+  MULTIPART_STATUS_ENTRY_PAGE_SIZE,
+} from "../../../../shared/multipart";
+
+export const SHARD_CLEANUP_PAGE_SIZE = 256;
+export const SHARD_CLEANUP_JOURNAL_TTL_MS =
+  MULTIPART_MAX_TTL_MS + MULTIPART_FENCE_GC_GRACE_MS;
+const LEGACY_CLEANUP_MAX_ROWS = SHARD_CLEANUP_PAGE_SIZE - 1;
+const SHARD_SCHEMA_MAINTENANCE_PAGE_SIZE = 256;
+const CLEANUP_JOURNAL_MAINTENANCE = "shard_cleanup_journal_lifecycle_v2";
+const FENCE_EXPIRY_MAINTENANCE = "multipart_fence_expiry_v1";
+
+export interface DeleteChunksPageResult {
+  cursor: number;
+  done: boolean;
+  processed: number;
+  marked: number;
+}
+
+export interface ClearMultipartStagingPageResult {
+  cursor: number;
+  done: boolean;
+  dropped: number;
+}
+
+const ShardCleanupKind = Object.freeze({
+  Refs: "refs",
+  Staging: "staging",
+} as const);
+type ShardCleanupKind =
+  (typeof ShardCleanupKind)[keyof typeof ShardCleanupKind];
 
 export class ShardDO extends DurableObject<Env> {
   sql: SqlStorage;
   private initialized = false;
+
+  protected recordRpc(): void {}
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -18,8 +55,15 @@ export class ShardDO extends DurableObject<Env> {
   private ensureInit(): void {
     if (this.initialized) return;
 
-    this.ctx.storage.transactionSync(() => this.initializeSchema());
+    const maintenance = this.ctx.storage.transactionSync(() => {
+      this.initializeSchema();
+      return this.runSchemaMaintenancePage();
+    });
     this.initialized = true;
+    const nextAlarm = this.nextMaintenanceAlarm(maintenance);
+    if (nextAlarm !== null) {
+      this.ctx.waitUntil(this.armAlarmAt(nextAlarm));
+    }
   }
 
   private initializeSchema(): void {
@@ -68,6 +112,46 @@ export class ShardDO extends DurableObject<Env> {
       CREATE INDEX IF NOT EXISTS idx_chunk_refs_file
         ON chunk_refs(file_id)
     `);
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS shard_cleanup_pages (
+        cleanup_kind       TEXT NOT NULL,
+        ref_id             TEXT NOT NULL,
+        cleanup_generation TEXT NOT NULL,
+        request_cursor     INTEGER NOT NULL,
+        next_cursor        INTEGER NOT NULL,
+        processed          INTEGER NOT NULL,
+        marked             INTEGER NOT NULL,
+        done               INTEGER NOT NULL,
+        created_at         INTEGER NOT NULL,
+        PRIMARY KEY (
+          cleanup_kind, ref_id, cleanup_generation, request_cursor
+        )
+      )
+    `);
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS shard_cleanup_progress (
+        cleanup_kind       TEXT NOT NULL,
+        ref_id             TEXT NOT NULL,
+        cleanup_generation TEXT NOT NULL,
+        next_cursor        INTEGER NOT NULL,
+        done               INTEGER NOT NULL,
+        updated_at         INTEGER NOT NULL,
+        PRIMARY KEY (cleanup_kind, ref_id, cleanup_generation)
+      )
+    `);
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS shard_cleanup_page_expirations (
+        expires_at         INTEGER NOT NULL,
+        cleanup_kind       TEXT NOT NULL,
+        ref_id             TEXT NOT NULL,
+        cleanup_generation TEXT NOT NULL,
+        request_cursor     INTEGER NOT NULL,
+        PRIMARY KEY (
+          expires_at, cleanup_kind, ref_id, cleanup_generation, request_cursor
+        ),
+        UNIQUE (cleanup_kind, ref_id, cleanup_generation, request_cursor)
+      ) WITHOUT ROWID
+    `);
 
     // ── multipart staging table ───────────────────────────────
     //
@@ -109,6 +193,197 @@ export class ShardDO extends DurableObject<Env> {
         updated_at INTEGER NOT NULL
       )
     `);
+    applyMigrationOnce(this.sql, "multipart_fences_add_expires_at", () =>
+      this.sql.exec("ALTER TABLE multipart_fences ADD COLUMN expires_at INTEGER")
+    );
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS multipart_fence_expirations (
+        expires_at INTEGER NOT NULL,
+        upload_id  TEXT NOT NULL,
+        PRIMARY KEY (expires_at, upload_id),
+        UNIQUE (upload_id)
+      ) WITHOUT ROWID
+    `);
+    this.sql.exec(`
+      CREATE TRIGGER IF NOT EXISTS multipart_fence_expiry_insert
+      AFTER INSERT ON multipart_fences WHEN NEW.expires_at IS NOT NULL BEGIN
+        DELETE FROM multipart_fence_expirations WHERE upload_id = NEW.upload_id;
+        INSERT INTO multipart_fence_expirations (expires_at, upload_id)
+        VALUES (NEW.expires_at, NEW.upload_id);
+      END
+    `);
+    this.sql.exec(`
+      CREATE TRIGGER IF NOT EXISTS multipart_fence_expiry_update
+      AFTER UPDATE OF expires_at ON multipart_fences
+      WHEN NEW.expires_at IS NOT NULL BEGIN
+        DELETE FROM multipart_fence_expirations WHERE upload_id = NEW.upload_id;
+        INSERT INTO multipart_fence_expirations (expires_at, upload_id)
+        VALUES (NEW.expires_at, NEW.upload_id);
+      END
+    `);
+    this.sql.exec(`
+      CREATE TRIGGER IF NOT EXISTS multipart_fence_expiry_delete
+      AFTER DELETE ON multipart_fences BEGIN
+        DELETE FROM multipart_fence_expirations WHERE upload_id = OLD.upload_id;
+      END
+    `);
+  }
+
+  private maintainRows(
+    name: string,
+    page: (cursor: number) => number[]
+  ): boolean {
+    const maintenance = ensureSchemaMaintenance(this.sql, name);
+    if (maintenance.state === "ready") return false;
+    const cursor = Number(maintenance.cursor || "0");
+    const rows = page(cursor);
+    const nextCursor = rows.at(-1) ?? cursor;
+    const done = rows.length < SHARD_SCHEMA_MAINTENANCE_PAGE_SIZE;
+    advanceSchemaMaintenance(this.sql, name, String(nextCursor), done);
+    return !done;
+  }
+
+  private runSchemaMaintenancePage(): boolean {
+    const journalPending = this.maintainRows(
+      CLEANUP_JOURNAL_MAINTENANCE,
+      (cursor) => {
+        const rows = this.sql
+          .exec<{
+            rowid: number;
+            cleanup_kind: string;
+            ref_id: string;
+            cleanup_generation: string;
+            request_cursor: number;
+            next_cursor: number;
+            done: number;
+            created_at: number;
+          } & Record<string, SqlStorageValue>>(
+            `SELECT rowid, cleanup_kind, ref_id, cleanup_generation,
+                    request_cursor, next_cursor, done, created_at
+               FROM shard_cleanup_pages
+              WHERE rowid > ? ORDER BY rowid LIMIT ?`,
+            cursor,
+            SHARD_SCHEMA_MAINTENANCE_PAGE_SIZE
+          )
+          .toArray();
+        for (const row of rows) {
+          this.sql.exec(
+            `INSERT INTO shard_cleanup_progress
+               (cleanup_kind, ref_id, cleanup_generation, next_cursor, done, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(cleanup_kind, ref_id, cleanup_generation) DO UPDATE SET
+               next_cursor = excluded.next_cursor,
+               done = excluded.done,
+               updated_at = excluded.updated_at
+             WHERE excluded.next_cursor > shard_cleanup_progress.next_cursor
+                OR (excluded.next_cursor = shard_cleanup_progress.next_cursor
+                    AND excluded.done > shard_cleanup_progress.done)`,
+            row.cleanup_kind,
+            row.ref_id,
+            row.cleanup_generation,
+            row.next_cursor,
+            row.done,
+            row.created_at
+          );
+          this.sql.exec(
+            `INSERT OR IGNORE INTO shard_cleanup_page_expirations
+               (expires_at, cleanup_kind, ref_id, cleanup_generation, request_cursor)
+             VALUES (?, ?, ?, ?, ?)`,
+            row.created_at + SHARD_CLEANUP_JOURNAL_TTL_MS,
+            row.cleanup_kind,
+            row.ref_id,
+            row.cleanup_generation,
+            row.request_cursor
+          );
+        }
+        return rows.map((row) => row.rowid);
+      }
+    );
+    const fencePending = this.maintainRows(
+      FENCE_EXPIRY_MAINTENANCE,
+      (cursor) => {
+        const rows = this.sql
+          .exec<{
+            rowid: number;
+            upload_id: string;
+            updated_at: number;
+            expires_at: number | null;
+          } & Record<string, SqlStorageValue>>(
+            `SELECT rowid, upload_id, updated_at, expires_at
+               FROM multipart_fences
+              WHERE rowid > ? ORDER BY rowid LIMIT ?`,
+            cursor,
+            SHARD_SCHEMA_MAINTENANCE_PAGE_SIZE
+          )
+          .toArray();
+        for (const row of rows) {
+          const expiresAt = row.expires_at ?? row.updated_at + MULTIPART_MAX_TTL_MS;
+          if (row.expires_at === null) {
+            this.sql.exec(
+              "UPDATE multipart_fences SET expires_at = ? WHERE rowid = ? AND expires_at IS NULL",
+              expiresAt,
+              row.rowid
+            );
+          } else {
+            this.recordMultipartFenceExpiry(row.upload_id, expiresAt);
+          }
+        }
+        return rows.map((row) => row.rowid);
+      }
+    );
+    return journalPending || fencePending;
+  }
+
+  private recordMultipartFenceExpiry(uploadId: string, expiresAt: number): void {
+    this.sql.exec(
+      "DELETE FROM multipart_fence_expirations WHERE upload_id = ?",
+      uploadId
+    );
+    this.sql.exec(
+      `INSERT INTO multipart_fence_expirations (expires_at, upload_id)
+       VALUES (?, ?)`,
+      expiresAt,
+      uploadId
+    );
+  }
+
+  private nextMaintenanceAlarm(maintenancePending: boolean): number | null {
+    if (maintenancePending) return Date.now() + 1_000;
+    const journal = this.sql
+      .exec<{ expires_at: number } & Record<string, SqlStorageValue>>(
+        `SELECT expiration.expires_at
+           FROM shard_cleanup_page_expirations AS expiration
+           JOIN shard_cleanup_progress AS progress
+             ON progress.cleanup_kind = expiration.cleanup_kind
+            AND progress.ref_id = expiration.ref_id
+            AND progress.cleanup_generation = expiration.cleanup_generation
+          WHERE progress.done != 0
+          ORDER BY expiration.expires_at LIMIT 1`
+      )
+      .toArray()[0]?.expires_at;
+    const fence = this.sql
+      .exec<{ expires_at: number } & Record<string, SqlStorageValue>>(
+        `SELECT expires_at FROM multipart_fence_expirations
+          ORDER BY expires_at LIMIT 1`
+      )
+      .toArray()[0]?.expires_at;
+    if (journal === undefined && fence === undefined) return null;
+    return Math.max(
+      Date.now() + 1_000,
+      Math.min(
+        journal ?? Number.POSITIVE_INFINITY,
+        fence === undefined
+          ? Number.POSITIVE_INFINITY
+          : fence + MULTIPART_FENCE_GC_GRACE_MS
+      )
+    );
+  }
+
+  private async armAlarmAt(target: number): Promise<void> {
+    const current = await this.ctx.storage.getAlarm();
+    if (current === null || current > target) {
+      await this.ctx.storage.setAlarm(target);
+    }
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -175,7 +450,7 @@ export class ShardDO extends DurableObject<Env> {
       // this endpoint (verified); the public DO RPC is preferred.
       if (path.startsWith("/refs/") && request.method === "DELETE") {
         const fileId = path.split("/")[2];
-        const result = await this.removeFileRefs(fileId);
+        const result = await this.deleteChunks(fileId);
         return Response.json({
           freedBytes: 0,
           markedChunks: result.marked,
@@ -194,13 +469,13 @@ export class ShardDO extends DurableObject<Env> {
         if (uploadId.length === 0) {
           return Response.json({ error: "upload_id required" }, { status: 400 });
         }
-        const rows = this.sql
-          .exec(
-            "SELECT chunk_index AS idx, chunk_hash AS hash, chunk_size AS size FROM upload_chunks WHERE upload_id = ? ORDER BY chunk_index",
-            uploadId
-          )
-          .toArray();
-        return Response.json({ rows });
+        const afterIndex = Number(url.searchParams.get("after_index") ?? -1);
+        const limit = Number(
+          url.searchParams.get("limit") ?? MULTIPART_STATUS_ENTRY_PAGE_SIZE
+        );
+        return Response.json(
+          await this.getMultipartManifest(uploadId, afterIndex, limit)
+        );
       }
 
       if (path === "/multipart/landed" && request.method === "GET") {
@@ -208,13 +483,13 @@ export class ShardDO extends DurableObject<Env> {
         if (uploadId.length === 0) {
           return Response.json({ error: "upload_id required" }, { status: 400 });
         }
-        const rows = this.sql
-          .exec(
-            "SELECT chunk_index FROM upload_chunks WHERE upload_id = ? ORDER BY chunk_index",
-            uploadId
-          )
-          .toArray() as { chunk_index: number }[];
-        return Response.json({ idx: rows.map((r) => r.chunk_index) });
+        const afterIndex = Number(url.searchParams.get("after_index") ?? -1);
+        const limit = Number(
+          url.searchParams.get("limit") ?? MULTIPART_STATUS_ENTRY_PAGE_SIZE
+        );
+        return Response.json(
+          await this.getMultipartLanded(uploadId, afterIndex, limit)
+        );
       }
 
       if (path === "/multipart/clear" && request.method === "DELETE") {
@@ -222,19 +497,7 @@ export class ShardDO extends DurableObject<Env> {
         if (uploadId.length === 0) {
           return Response.json({ error: "upload_id required" }, { status: 400 });
         }
-        const before = (
-          this.sql
-            .exec(
-              "SELECT COUNT(*) AS n FROM upload_chunks WHERE upload_id = ?",
-              uploadId
-            )
-            .toArray()[0] as { n: number }
-        ).n;
-        this.sql.exec(
-          "DELETE FROM upload_chunks WHERE upload_id = ?",
-          uploadId
-        );
-        return Response.json({ dropped: before });
+        return Response.json(await this.clearMultipartStaging(uploadId));
       }
 
       return new Response("Not found", { status: 404 });
@@ -406,6 +669,7 @@ export class ShardDO extends DurableObject<Env> {
     status: "created" | "deduplicated" | "superseded";
     bytesStored: number;
   }> {
+    this.recordRpc();
     this.ensureInit();
 
     const payload = await verifyVFSMultipartToken(this.env, sessionToken);
@@ -432,15 +696,30 @@ export class ShardDO extends DurableObject<Env> {
       await this.scheduleSweep();
     }
 
-    // This is the final fence check. There are no awaits after it, so a
-    // terminal fence cannot interleave before the staging/ref mutation.
-    this.assertMultipartFenceOpen(uploadId, fenceId);
+    return this.ctx.storage.transactionSync(() => {
+      // This is the final fence check. There are no awaits after it, so a
+      // terminal fence cannot interleave before the staging/ref mutation.
+      this.assertMultipartFenceOpen(uploadId, fenceId, payload.exp * 1000);
+      return this.putChunkMultipartInternal(
+        chunkHash,
+        data,
+        uploadId,
+        chunkIndex,
+        userId
+      );
+    });
+  }
 
-    // Supersession check — does a prior staging row exist with a
-    // different hash? If so, drop the prior `(oldHash, uploadId,
-    // chunkIndex)` chunk_refs row and decrement the prior chunk's
-    // ref_count. Soft-mark on hit-zero is handled by the existing
-    // alarm GC — same path as `removeFileRefs` for consistency.
+  private putChunkMultipartInternal(
+    chunkHash: string,
+    data: Uint8Array,
+    uploadId: string,
+    chunkIndex: number,
+    userId: string
+  ): {
+    status: "created" | "deduplicated" | "superseded";
+    bytesStored: number;
+  } {
     const prior = this.sql
       .exec(
         "SELECT chunk_hash FROM upload_chunks WHERE upload_id = ? AND chunk_index = ?",
@@ -451,7 +730,6 @@ export class ShardDO extends DurableObject<Env> {
 
     let supersededOldRef = false;
     if (prior && prior.chunk_hash !== chunkHash) {
-      // Drop the old ref row.
       this.sql.exec(
         "DELETE FROM chunk_refs WHERE chunk_hash = ? AND file_id = ? AND chunk_index = ?",
         prior.chunk_hash,
@@ -483,8 +761,6 @@ export class ShardDO extends DurableObject<Env> {
       supersededOldRef = true;
     }
 
-    // Register the new chunk + ref via the existing path. Preserves
-    // the dedup branch if `chunkHash` already exists on the shard.
     const writeResult = this.writeChunkInternal(
       chunkHash,
       data,
@@ -493,8 +769,6 @@ export class ShardDO extends DurableObject<Env> {
       userId
     );
 
-    // Stamp the staging row. INSERT OR REPLACE absorbs same-hash retry
-    // (no-op) and the supersession branch (overwrite with new hash).
     this.sql.exec(
       `INSERT OR REPLACE INTO upload_chunks
          (upload_id, chunk_index, chunk_hash, chunk_size, user_id, created_at)
@@ -516,16 +790,20 @@ export class ShardDO extends DurableObject<Env> {
   async fenceMultipart(
     uploadId: string,
     fenceId: string,
-    state: "finalizing" | "aborting"
+    state: "finalizing" | "aborting",
+    expiresAt: number
   ): Promise<void> {
+    this.recordRpc();
     this.ensureInit();
     this.ctx.storage.transactionSync(() => {
       const current = this.sql
         .exec(
-          "SELECT fence_id, state FROM multipart_fences WHERE upload_id = ?",
+          "SELECT fence_id, state, expires_at FROM multipart_fences WHERE upload_id = ?",
           uploadId
         )
-        .toArray()[0] as { fence_id: string; state: string } | undefined;
+        .toArray()[0] as
+        | { fence_id: string; state: string; expires_at: number | null }
+        | undefined;
       if (current && current.fence_id !== fenceId) {
         throw new Error("EACCES: multipart fence capability mismatch");
       }
@@ -540,29 +818,37 @@ export class ShardDO extends DurableObject<Env> {
         );
       }
       this.sql.exec(
-        `INSERT INTO multipart_fences (upload_id, fence_id, state, updated_at)
-         VALUES (?, ?, ?, ?)
+        `INSERT INTO multipart_fences (upload_id, fence_id, state, updated_at, expires_at)
+         VALUES (?, ?, ?, ?, ?)
          ON CONFLICT(upload_id) DO UPDATE SET
            state = excluded.state,
-           updated_at = excluded.updated_at`,
+           updated_at = excluded.updated_at,
+           expires_at = MAX(COALESCE(multipart_fences.expires_at, 0), excluded.expires_at)`,
         uploadId,
         fenceId,
         state,
-        Date.now()
+        Date.now(),
+        expiresAt
       );
     });
+    await this.armAlarmAt(
+      Math.max(Date.now() + 1_000, expiresAt + MULTIPART_FENCE_GC_GRACE_MS)
+    );
   }
 
   private assertMultipartFenceOpen(
     uploadId: string,
-    fenceId: string | undefined
+    fenceId: string | undefined,
+    expiresAt: number
   ): void {
     const current = this.sql
       .exec(
-        "SELECT fence_id, state FROM multipart_fences WHERE upload_id = ?",
+        "SELECT fence_id, state, expires_at FROM multipart_fences WHERE upload_id = ?",
         uploadId
       )
-      .toArray()[0] as { fence_id: string; state: string } | undefined;
+      .toArray()[0] as
+      | { fence_id: string; state: string; expires_at: number | null }
+      | undefined;
     if (current) {
       if (current.state !== "open") {
         throw new Error(`EBUSY: multipart upload is ${current.state}`);
@@ -570,15 +856,25 @@ export class ShardDO extends DurableObject<Env> {
       if (fenceId === undefined || current.fence_id !== fenceId) {
         throw new Error("EACCES: multipart fence capability mismatch");
       }
+      if ((current.expires_at ?? 0) < expiresAt) {
+        this.sql.exec(
+          `UPDATE multipart_fences SET expires_at = ?, updated_at = ?
+            WHERE upload_id = ?`,
+          expiresAt,
+          Date.now(),
+          uploadId
+        );
+      }
       return;
     }
     if (fenceId !== undefined) {
       this.sql.exec(
-        `INSERT INTO multipart_fences (upload_id, fence_id, state, updated_at)
-         VALUES (?, ?, 'open', ?)`,
+        `INSERT INTO multipart_fences (upload_id, fence_id, state, updated_at, expires_at)
+         VALUES (?, ?, 'open', ?, ?)`,
         uploadId,
         fenceId,
-        Date.now()
+        Date.now(),
+        expiresAt
       );
     }
   }
@@ -589,13 +885,52 @@ export class ShardDO extends DurableObject<Env> {
    * shards. Read-only; never mutates state.
    */
   async getMultipartManifest(
-    uploadId: string
+    uploadId: string,
+    afterIndex = -1,
+    limit = MULTIPART_STATUS_ENTRY_PAGE_SIZE
   ): Promise<{ rows: Array<{ idx: number; hash: string; size: number }> }> {
     this.ensureInit();
+    this.validateMultipartReadPage(afterIndex, limit);
     const rows = this.sql
       .exec(
-        "SELECT chunk_index AS idx, chunk_hash AS hash, chunk_size AS size FROM upload_chunks WHERE upload_id = ? ORDER BY chunk_index",
-        uploadId
+        `SELECT chunk_index AS idx, chunk_hash AS hash, chunk_size AS size
+           FROM upload_chunks
+          WHERE upload_id = ? AND chunk_index > ?
+          ORDER BY chunk_index
+          LIMIT ?`,
+        uploadId,
+        afterIndex,
+        limit
+      )
+      .toArray() as Array<{ idx: number; hash: string; size: number }>;
+    return { rows };
+  }
+
+  async getMultipartManifestRange(
+    uploadId: string,
+    startIndex: number,
+    endIndex: number
+  ): Promise<{ rows: Array<{ idx: number; hash: string; size: number }> }> {
+    this.recordRpc();
+    this.ensureInit();
+    if (
+      !Number.isInteger(startIndex) ||
+      !Number.isInteger(endIndex) ||
+      startIndex < 0 ||
+      endIndex < startIndex ||
+      endIndex - startIndex > 256
+    ) {
+      throw new Error("EINVAL: multipart manifest range must cover <=256 chunks");
+    }
+    const rows = this.sql
+      .exec(
+        `SELECT chunk_index AS idx, chunk_hash AS hash, chunk_size AS size
+           FROM upload_chunks
+          WHERE upload_id = ? AND chunk_index >= ? AND chunk_index < ?
+          ORDER BY chunk_index`,
+        uploadId,
+        startIndex,
+        endIndex
       )
       .toArray() as Array<{ idx: number; hash: string; size: number }>;
     return { rows };
@@ -606,25 +941,57 @@ export class ShardDO extends DurableObject<Env> {
    * full manifest — used by status / resume probe.
    */
   async getMultipartLanded(
-    uploadId: string
-  ): Promise<{ idx: number[] }> {
+    uploadId: string,
+    afterIndex = -1,
+    limit = MULTIPART_STATUS_ENTRY_PAGE_SIZE
+  ): Promise<{ idx: number[]; sizes: number[] }> {
+    this.recordRpc();
     this.ensureInit();
+    this.validateMultipartReadPage(afterIndex, limit);
     const rows = this.sql
       .exec(
-        "SELECT chunk_index FROM upload_chunks WHERE upload_id = ? ORDER BY chunk_index",
-        uploadId
+        `SELECT chunk_index, chunk_size
+           FROM upload_chunks
+          WHERE upload_id = ? AND chunk_index > ?
+          ORDER BY chunk_index
+          LIMIT ?`,
+        uploadId,
+        afterIndex,
+        limit
       )
-      .toArray() as { chunk_index: number }[];
-    return { idx: rows.map((r) => r.chunk_index) };
+      .toArray() as Array<{ chunk_index: number; chunk_size: number }>;
+    return {
+      idx: rows.map((row) => row.chunk_index),
+      sizes: rows.map((row) => row.chunk_size),
+    };
+  }
+
+  private validateMultipartReadPage(afterIndex: number, limit: number): void {
+    if (
+      !Number.isSafeInteger(afterIndex) ||
+      afterIndex < -1 ||
+      !Number.isSafeInteger(limit) ||
+      limit < 1 ||
+      limit > MULTIPART_STATUS_ENTRY_PAGE_SIZE
+    ) {
+      throw new Error(
+        `EINVAL: multipart read page requires afterIndex >= -1 and limit 1..${MULTIPART_STATUS_ENTRY_PAGE_SIZE}`
+      );
+    }
   }
 
   /**
-   * drop staging rows for an upload_id. DOES NOT touch
-   * `chunk_refs` — that's the finalize/abort caller's job (finalize
-   * keeps refs alive; abort calls `deleteChunks(uploadId)`).
+   * Legacy staging cleanup for small uploads. Paged outbox cleanup uses
+   * `clearMultipartStagingPage`.
    */
   async clearMultipartStaging(uploadId: string): Promise<{ dropped: number }> {
     this.ensureInit();
+    this.assertLegacyCleanupBounded(
+      "upload_chunks",
+      "upload_id",
+      uploadId,
+      "clearMultipartStaging"
+    );
     const before = (
       this.sql
         .exec(
@@ -638,6 +1005,26 @@ export class ShardDO extends DurableObject<Env> {
       uploadId
     );
     return { dropped: before };
+  }
+
+  async clearMultipartStagingPage(
+    uploadId: string,
+    cursor: number,
+    generation: string | number
+  ): Promise<ClearMultipartStagingPageResult> {
+    this.recordRpc();
+    this.ensureInit();
+    const result = this.runCleanupPage(
+      ShardCleanupKind.Staging,
+      uploadId,
+      cursor,
+      generation
+    );
+    return {
+      cursor: result.cursor,
+      done: result.done,
+      dropped: result.processed,
+    };
   }
 
   /**
@@ -737,8 +1124,8 @@ export class ShardDO extends DurableObject<Env> {
 
   // ── VFS GC RPC surface (sdk-impl-plan §8.2) ────────────────────────────
   //
-  // Public DO RPC. Called from UserDO's vfsUnlink / vfsCommitWrite /
-  // vfsRename overwrite path. Drops every ref for the file, decrements
+  // The legacy RPC remains for callers whose cleanup is provably small.
+  // Durable UserDO cleanup uses deleteChunksPage. Both decrement
   // each chunk's `ref_count` by its grouped ref count, and soft-marks any
   // chunk that hits ref_count=0 by setting `deleted_at`. The alarm
   // sweeper (alarm() handler) hard-deletes after a 30s grace window,
@@ -750,39 +1137,72 @@ export class ShardDO extends DurableObject<Env> {
   // observability for tests + future quota reconciliation.
   async deleteChunks(fileId: string): Promise<{ marked: number }> {
     this.ensureInit();
+    this.assertLegacyCleanupBounded(
+      "chunk_refs",
+      "file_id",
+      fileId,
+      "deleteChunks"
+    );
     return this.removeFileRefs(fileId);
   }
 
+  async deleteChunksPage(
+    fileId: string,
+    cursor: number,
+    generation: string | number
+  ): Promise<DeleteChunksPageResult> {
+    this.recordRpc();
+    this.ensureInit();
+    await this.scheduleSweep();
+    const result = this.runCleanupPage(
+      ShardCleanupKind.Refs,
+      fileId,
+      cursor,
+      generation
+    );
+    return {
+      cursor: result.cursor,
+      done: result.done,
+      processed: result.processed,
+      marked: result.marked,
+    };
+  }
+
   /**
-   * Batched chunk-ref drop.
-   *
-   * Without batching, with BATCH_LIMIT=200 and poolSize=32, the
-   * per-file `vfsRemoveRecursive` loop would fan out up to
-   * 200 × 32 = 6400 subrequests — over the Workers paid cap of
-   * 1000.
-   *
-   * This RPC accepts an array of file_ids and processes them in
-   * a single DO turn. The caller groups
-   * file_ids by shard_index FIRST, then issues ONE RPC per shard
-   * with the full list — worst case poolSize subrequests
-   * regardless of BATCH_LIMIT.
+   * Legacy batched chunk-ref drop, bounded across the complete input.
    *
    * Idempotent per fileId: a file_id with no chunk_refs produces no
    * refcount change or new soft mark. Total \`marked\` is the sum across
    * input file_ids. One alarm ensure covers the bounded synchronous
    * sequence of per-file transactions.
    *
-   * Bounded input: callers should chunk arrays > 1000 into
-   * multiple RPCs to stay under any future SQLite parameter
-   * limits, but this implementation iterates rather than
-   * batching SQL so the prepared-statement parameter count is
-   * always 1.
+   * Inputs that could touch 256 refs are rejected before mutation.
    */
   async deleteManyChunks(
     fileIds: readonly string[]
   ): Promise<{ marked: number }> {
     this.ensureInit();
     if (fileIds.length === 0) return { marked: 0 };
+    if (fileIds.length > SHARD_CLEANUP_PAGE_SIZE) {
+      throw new Error(
+        `E2BIG: deleteManyChunks accepts at most ${SHARD_CLEANUP_PAGE_SIZE} file ids`
+      );
+    }
+    const fileIdsJson = JSON.stringify([...new Set(fileIds)]);
+    const overflow = this.sql
+      .exec(
+        `SELECT 1 FROM chunk_refs
+          WHERE file_id IN (SELECT CAST(value AS TEXT) FROM json_each(?))
+          LIMIT 1 OFFSET ?`,
+        fileIdsJson,
+        LEGACY_CLEANUP_MAX_ROWS
+      )
+      .toArray();
+    if (overflow.length > 0) {
+      throw new Error(
+        `E2BIG: deleteManyChunks cleanup exceeds the bounded legacy limit of ${LEGACY_CLEANUP_MAX_ROWS} refs`
+      );
+    }
 
     await this.scheduleSweep();
     let totalMarked = 0;
@@ -791,6 +1211,253 @@ export class ShardDO extends DurableObject<Env> {
       totalMarked += r.marked;
     }
     return { marked: totalMarked };
+  }
+
+  private runCleanupPage(
+    cleanupKind: ShardCleanupKind,
+    refId: string,
+    cursor: number,
+    generation: string | number
+  ): {
+    cursor: number;
+    done: boolean;
+    processed: number;
+    marked: number;
+  } {
+    if (!Number.isSafeInteger(cursor) || cursor < 0) {
+      throw new Error("EINVAL: cleanup cursor must be a non-negative integer");
+    }
+    const normalizedGeneration = String(generation) || "legacy";
+    if (normalizedGeneration.length > 256) {
+      throw new Error("EINVAL: cleanup generation must not exceed 256 characters");
+    }
+
+    let completedJournalExpiresAt: number | undefined;
+    const result = this.ctx.storage.transactionSync(() => {
+      const replay = this.sql
+        .exec(
+          `SELECT next_cursor, processed, marked, done
+             FROM shard_cleanup_pages
+            WHERE cleanup_kind = ? AND ref_id = ?
+              AND cleanup_generation = ? AND request_cursor = ?`,
+          cleanupKind,
+          refId,
+          normalizedGeneration,
+          cursor
+        )
+        .toArray()[0] as
+        | {
+            next_cursor: number;
+            processed: number;
+            marked: number;
+            done: number;
+          }
+        | undefined;
+      if (replay) {
+        return {
+          cursor: replay.next_cursor,
+          done: replay.done !== 0,
+          processed: replay.processed,
+          marked: replay.marked,
+        };
+      }
+
+      let progress = this.sql
+        .exec(
+          `SELECT next_cursor, done FROM shard_cleanup_progress
+            WHERE cleanup_kind = ? AND ref_id = ? AND cleanup_generation = ?`,
+          cleanupKind,
+          refId,
+          normalizedGeneration
+        )
+        .toArray()[0] as
+        | { next_cursor: number; done: number }
+        | undefined;
+      if (progress === undefined) {
+        progress = this.sql
+          .exec(
+            `SELECT next_cursor, done FROM shard_cleanup_pages
+              WHERE cleanup_kind = ? AND ref_id = ? AND cleanup_generation = ?
+              ORDER BY request_cursor DESC LIMIT 1`,
+            cleanupKind,
+            refId,
+            normalizedGeneration
+          )
+          .toArray()[0] as
+          | { next_cursor: number; done: number }
+          | undefined;
+        if (progress !== undefined) {
+          this.sql.exec(
+            `INSERT INTO shard_cleanup_progress
+               (cleanup_kind, ref_id, cleanup_generation, next_cursor, done, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+            cleanupKind,
+            refId,
+            normalizedGeneration,
+            progress.next_cursor,
+            progress.done,
+            Date.now()
+          );
+        }
+      }
+      const expectedCursor = progress?.next_cursor ?? 0;
+      if (
+        cursor !== expectedCursor ||
+        (progress !== undefined && progress.done !== 0)
+      ) {
+        throw new Error(
+          `EINVAL: cleanup cursor ${cursor} does not match expected cursor ${expectedCursor}`
+        );
+      }
+
+      const rows =
+        cleanupKind === ShardCleanupKind.Refs
+          ? (this.sql
+              .exec(
+                `SELECT rowid AS source_rowid, chunk_hash
+                   FROM chunk_refs WHERE file_id = ? ORDER BY rowid LIMIT ?`,
+                refId,
+                SHARD_CLEANUP_PAGE_SIZE
+              )
+              .toArray() as Array<{
+              source_rowid: number;
+              chunk_hash: string;
+            }>)
+          : (this.sql
+              .exec(
+                `SELECT chunk_index AS source_rowid, chunk_hash
+                   FROM upload_chunks
+                  WHERE upload_id = ? ORDER BY chunk_index LIMIT ?`,
+                refId,
+                SHARD_CLEANUP_PAGE_SIZE
+              )
+              .toArray() as Array<{
+              source_rowid: number;
+              chunk_hash: string;
+            }>);
+      const rowIds = JSON.stringify(rows.map((row) => row.source_rowid));
+      let marked = 0;
+
+      if (cleanupKind === ShardCleanupKind.Refs && rows.length > 0) {
+        const decrements = new Map<string, number>();
+        for (const row of rows) {
+          decrements.set(
+            row.chunk_hash,
+            (decrements.get(row.chunk_hash) ?? 0) + 1
+          );
+        }
+        for (const [hash, count] of decrements) {
+          this.sql.exec(
+            "UPDATE chunks SET ref_count = MAX(0, ref_count - ?) WHERE hash = ?",
+            count,
+            hash
+          );
+        }
+        const hashes = JSON.stringify([...decrements.keys()]);
+        this.sql.exec(
+          `UPDATE chunks SET deleted_at = ?
+            WHERE ref_count = 0 AND deleted_at IS NULL
+              AND hash IN (SELECT CAST(value AS TEXT) FROM json_each(?))`,
+          Date.now(),
+          hashes
+        );
+        marked = (
+          this.sql.exec("SELECT changes() AS n").toArray()[0] as { n: number }
+        ).n;
+        this.sql.exec(
+          `DELETE FROM chunk_refs
+            WHERE rowid IN (SELECT CAST(value AS INTEGER) FROM json_each(?))`,
+          rowIds
+        );
+      } else if (rows.length > 0) {
+        this.sql.exec(
+          `DELETE FROM upload_chunks
+            WHERE upload_id = ?
+              AND chunk_index IN (
+                SELECT CAST(value AS INTEGER) FROM json_each(?)
+              )`,
+          refId,
+          rowIds
+        );
+      }
+
+      const nextCursor = cursor + rows.length;
+      const done = rows.length < SHARD_CLEANUP_PAGE_SIZE;
+      this.sql.exec(
+        `INSERT INTO shard_cleanup_pages
+           (cleanup_kind, ref_id, cleanup_generation, request_cursor,
+            next_cursor, processed, marked, done, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        cleanupKind,
+        refId,
+        normalizedGeneration,
+        cursor,
+        nextCursor,
+        rows.length,
+        marked,
+        done ? 1 : 0,
+        Date.now()
+      );
+      const createdAt = Date.now();
+      this.sql.exec(
+        `INSERT INTO shard_cleanup_progress
+           (cleanup_kind, ref_id, cleanup_generation, next_cursor, done, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(cleanup_kind, ref_id, cleanup_generation) DO UPDATE SET
+           next_cursor = excluded.next_cursor,
+           done = excluded.done,
+           updated_at = excluded.updated_at`,
+        cleanupKind,
+        refId,
+        normalizedGeneration,
+        nextCursor,
+        done ? 1 : 0,
+        createdAt
+      );
+      this.sql.exec(
+        `INSERT OR REPLACE INTO shard_cleanup_page_expirations
+           (expires_at, cleanup_kind, ref_id, cleanup_generation, request_cursor)
+         VALUES (?, ?, ?, ?, ?)`,
+        createdAt + SHARD_CLEANUP_JOURNAL_TTL_MS,
+        cleanupKind,
+        refId,
+        normalizedGeneration,
+        cursor
+      );
+      if (done) {
+        completedJournalExpiresAt = createdAt + SHARD_CLEANUP_JOURNAL_TTL_MS;
+      }
+      return {
+        cursor: nextCursor,
+        done,
+        processed: rows.length,
+        marked,
+      };
+    });
+    if (completedJournalExpiresAt !== undefined) {
+      this.ctx.waitUntil(this.armAlarmAt(completedJournalExpiresAt));
+    }
+    return result;
+  }
+
+  private assertLegacyCleanupBounded(
+    table: "chunk_refs" | "upload_chunks",
+    column: "file_id" | "upload_id",
+    refId: string,
+    operation: "deleteChunks" | "clearMultipartStaging"
+  ): void {
+    const overflow = this.sql
+      .exec(
+        `SELECT 1 FROM ${table} WHERE ${column} = ? LIMIT 1 OFFSET ?`,
+        refId,
+        LEGACY_CLEANUP_MAX_ROWS
+      )
+      .toArray();
+    if (overflow.length > 0) {
+      throw new Error(
+        `E2BIG: ${operation} cleanup exceeds the bounded legacy limit of ${LEGACY_CLEANUP_MAX_ROWS} rows; use the paged RPC`
+      );
+    }
   }
 
   /**
@@ -1021,7 +1688,7 @@ export class ShardDO extends DurableObject<Env> {
    * Ensure an alarm is scheduled for the next sweep. If one is already
    * set sooner than our target, leave it alone — single alarm per DO.
    */
-  private async scheduleSweep(): Promise<void> {
+  protected async scheduleSweep(): Promise<void> {
     const cur = await this.ctx.storage.getAlarm();
     const next = Date.now() + 5 * 60 * 1000; // 5 min default cadence
     if (cur === null || cur > next) {
@@ -1051,8 +1718,13 @@ export class ShardDO extends DurableObject<Env> {
    *   claimed.
    */
   async alarm(): Promise<void> {
+    this.recordRpc();
     this.ensureInit();
-    const cutoff = Date.now() - 30_000; // 30s grace
+    const maintenancePending = this.ctx.storage.transactionSync(() =>
+      this.runSchemaMaintenancePage()
+    );
+    const now = Date.now();
+    const cutoff = now - 30_000; // 30s grace
     const rows = this.sql
       .exec(
         "SELECT hash, size FROM chunks WHERE deleted_at IS NOT NULL AND deleted_at < ? LIMIT 500",
@@ -1083,12 +1755,95 @@ export class ShardDO extends DurableObject<Env> {
     }
     if (freed > 0) this.updateCapacity(-freed);
 
+    const expiredJournal = this.sql
+      .exec<{
+        cleanup_kind: string;
+        ref_id: string;
+        cleanup_generation: string;
+        request_cursor: number;
+      } & Record<string, SqlStorageValue>>(
+        `SELECT expiration.cleanup_kind, expiration.ref_id,
+                expiration.cleanup_generation, expiration.request_cursor
+           FROM shard_cleanup_page_expirations AS expiration
+           JOIN shard_cleanup_progress AS progress
+             ON progress.cleanup_kind = expiration.cleanup_kind
+            AND progress.ref_id = expiration.ref_id
+            AND progress.cleanup_generation = expiration.cleanup_generation
+          WHERE expiration.expires_at <= ? AND progress.done != 0
+          ORDER BY expiration.expires_at LIMIT ?`,
+        now,
+        SHARD_CLEANUP_PAGE_SIZE
+      )
+      .toArray();
+    this.ctx.storage.transactionSync(() => {
+      for (const page of expiredJournal) {
+        this.sql.exec(
+          `DELETE FROM shard_cleanup_pages
+            WHERE cleanup_kind = ? AND ref_id = ?
+              AND cleanup_generation = ? AND request_cursor = ?`,
+          page.cleanup_kind,
+          page.ref_id,
+          page.cleanup_generation,
+          page.request_cursor
+        );
+        this.sql.exec(
+          `DELETE FROM shard_cleanup_page_expirations
+            WHERE cleanup_kind = ? AND ref_id = ?
+              AND cleanup_generation = ? AND request_cursor = ?`,
+          page.cleanup_kind,
+          page.ref_id,
+          page.cleanup_generation,
+          page.request_cursor
+        );
+        this.sql.exec(
+          `DELETE FROM shard_cleanup_progress
+            WHERE cleanup_kind = ? AND ref_id = ? AND cleanup_generation = ?
+              AND done != 0
+              AND NOT EXISTS (
+                SELECT 1 FROM shard_cleanup_pages
+                 WHERE cleanup_kind = ? AND ref_id = ? AND cleanup_generation = ?
+              )`,
+          page.cleanup_kind,
+          page.ref_id,
+          page.cleanup_generation,
+          page.cleanup_kind,
+          page.ref_id,
+          page.cleanup_generation
+        );
+      }
+    });
+
+    const expiredFences = this.sql
+      .exec<{ upload_id: string } & Record<string, SqlStorageValue>>(
+        `SELECT upload_id FROM multipart_fence_expirations
+          WHERE expires_at < ? ORDER BY expires_at LIMIT ?`,
+        now - MULTIPART_FENCE_GC_GRACE_MS,
+        SHARD_SCHEMA_MAINTENANCE_PAGE_SIZE
+      )
+      .toArray();
+    this.ctx.storage.transactionSync(() => {
+      for (const fence of expiredFences) {
+        this.sql.exec("DELETE FROM multipart_fences WHERE upload_id = ?", fence.upload_id);
+        this.sql.exec(
+          "DELETE FROM multipart_fence_expirations WHERE upload_id = ?",
+          fence.upload_id
+        );
+      }
+    });
+
     // Reschedule if the sweep was capped at LIMIT 500.
     const more = this.sql
       .exec("SELECT 1 FROM chunks WHERE deleted_at IS NOT NULL LIMIT 1")
       .toArray();
     if (more.length > 0) {
       await this.ctx.storage.setAlarm(Date.now() + 60_000);
+    } else {
+      const nextAlarm = this.nextMaintenanceAlarm(
+        maintenancePending ||
+          expiredJournal.length === SHARD_CLEANUP_PAGE_SIZE ||
+          expiredFences.length === SHARD_SCHEMA_MAINTENANCE_PAGE_SIZE
+      );
+      if (nextAlarm !== null) await this.ctx.storage.setAlarm(nextAlarm);
     }
   }
 

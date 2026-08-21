@@ -1010,10 +1010,41 @@ vfs.post("/dropVersions", async (c) => {
       path,
       body.policy ?? {}
     );
-    return c.json(r);
+    return "accepted" in r ? c.json(r, 202) : c.json(r);
   } catch (err) {
     const r = errToResponse(err);
     return vfsJsonErrorResponse(r);
+  }
+});
+
+vfs.post("/dropVersionsStep", async (c) => {
+  try {
+    const body = await c.req.json<{
+      path: string;
+      policy?: {
+        olderThan?: number;
+        keepLast?: number;
+        exceptVersions?: string[];
+      };
+      operationId: string;
+    }>();
+    const path = expectPath(body);
+    if (typeof body.operationId !== "string") {
+      return c.json(
+        { code: "EINVAL", message: "body.operationId must be a string" },
+        400
+      );
+    }
+    return c.json(
+      await userStub(c).vfsDropVersionsStep(
+        c.var.scope,
+        path,
+        body.policy ?? {},
+        body.operationId
+      )
+    );
+  } catch (err) {
+    return vfsJsonErrorResponse(errToResponse(err));
   }
 });
 

@@ -15,6 +15,7 @@ import type { UserDO } from "@app/objects/user/user-do";
 
 import {
   signVFSMultipartToken,
+  signScopedJwt,
   verifyVFSMultipartToken,
   signVFSDownloadToken,
   verifyVFSDownloadToken,
@@ -22,7 +23,11 @@ import {
   verifyVFSToken,
   VFSConfigError,
 } from "@core/lib/auth";
-import { VFS_MP_SCOPE, VFS_DL_SCOPE } from "@shared/multipart";
+import {
+  MULTIPART_PLACEMENT_VERSION,
+  VFS_MP_SCOPE,
+  VFS_DL_SCOPE,
+} from "@shared/multipart";
 
 // Phase 29 — auth helpers require the full EnvCore shape (MOSSAIC_USER +
 // MOSSAIC_SHARD + JWT_SECRET). The test bindings provide all three;
@@ -51,6 +56,44 @@ describe("multipart session token", () => {
     expect(v!.totalChunks).toBe(16);
     expect(v!.chunkSize).toBe(1024 * 1024);
     expect(v!.totalSize).toBe(16 * 1024 * 1024);
+    expect(v!.placementVersion).toBeUndefined();
+  });
+
+  it("round-trips the frozen placement version", async () => {
+    const { token } = await signVFSMultipartToken(TEST_ENV, {
+      uploadId: "u-placement-v2",
+      ns: "default",
+      tn: "tenant-a",
+      poolSize: 256,
+      placementVersion: MULTIPART_PLACEMENT_VERSION,
+      totalChunks: 4,
+      chunkSize: 1024,
+      totalSize: 4096,
+    });
+
+    await expect(verifyVFSMultipartToken(TEST_ENV, token)).resolves.toMatchObject({
+      placementVersion: MULTIPART_PLACEMENT_VERSION,
+    });
+  });
+
+  it("rejects a validly signed unsupported placement version", async () => {
+    const token = await signScopedJwt(
+      new TextEncoder().encode("test-secret-for-vitest-only"),
+      {
+        scope: VFS_MP_SCOPE,
+        uploadId: "u-placement-unsupported",
+        ns: "default",
+        tn: "tenant-a",
+        poolSize: 32,
+        placementVersion: 99,
+        totalChunks: 1,
+        chunkSize: 1,
+        totalSize: 1,
+      },
+      Date.now() + 60_000
+    );
+
+    await expect(verifyVFSMultipartToken(TEST_ENV, token)).resolves.toBeNull();
   });
 
   it("preserves optional sub", async () => {

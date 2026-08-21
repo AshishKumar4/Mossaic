@@ -281,7 +281,7 @@ export async function verifyVFSToken(
 
 // ── multipart session + download tokens ──────────────────────
 //
-// Two new HMAC token shapes layered onto the same `JWT_SECRET` via
+// Scope-separated HMAC token shapes layered onto the same `JWT_SECRET` via
 // scope-discrimination claims:
 //
 //   - `scope: "vfs-mp"` — multipart upload session token. Mints at
@@ -294,18 +294,24 @@ export async function verifyVFSToken(
 //     `mintDownloadToken`, validates per-chunk GETs against the
 //     browser-direct cacheable endpoint. Short-lived (1h default).
 //
-// Same JWT_SECRET signs all three (`vfs`, `vfs-mp`, `vfs-dl`); each
+//   - `scope: "vfs-mp-status"` — opaque multipart status continuation,
+//     bound to tenant, upload, shard, and row seek state.
+//
+// The same JWT_SECRET signs every scope; each
 // verify function rejects tokens lacking its sentinel — RFC 8725 §2.8
 // scope-binding pattern. Cross-purpose forgery is impossible without
 // the secret.
 
 import {
   VFS_MP_SCOPE,
+  VFS_MP_STATUS_SCOPE,
   VFS_DL_SCOPE,
   MULTIPART_DEFAULT_TTL_MS,
   MULTIPART_MAX_TTL_MS,
   DOWNLOAD_TOKEN_DEFAULT_TTL_MS,
+  isMultipartPlacementVersion,
   type MultipartSessionTokenPayload,
+  type MultipartStatusCursorPayload,
   type DownloadTokenPayload,
 } from "../../../shared/multipart";
 
@@ -314,10 +320,8 @@ import {
  * the resulting token is presented on every subsequent chunk PUT to
  * authorise it without a UserDO round-trip.
  *
- * `poolSize` is the snapshotted-at-begin pool size; freezing it in
- * the token guarantees `placeChunk(uid, uploadId, idx, poolSize)`
- * stays stable across the session even if the tenant's pool grows
- * between begin and finalize.
+ * `poolSize` and `placementVersion` are snapshotted at begin. Freezing both
+ * keeps placement stable if the tenant's pool or the current algorithm changes.
  */
 export async function signVFSMultipartToken(
   env: Env,
@@ -336,6 +340,9 @@ export async function signVFSMultipartToken(
     chunkSize: payload.chunkSize,
     totalSize: payload.totalSize,
   };
+  if (payload.placementVersion !== undefined) {
+    claims.placementVersion = payload.placementVersion;
+  }
   if (payload.fenceId !== undefined) claims.fenceId = payload.fenceId;
   if (payload.userId !== undefined) claims.userId = payload.userId;
   if (payload.sub !== undefined) claims.sub = payload.sub;
@@ -372,6 +379,11 @@ export async function verifyVFSMultipartToken(
       typeof payload.poolSize !== "number" ||
       !Number.isInteger(payload.poolSize) ||
       payload.poolSize < 1
+    )
+      return null;
+    if (
+      payload.placementVersion !== undefined &&
+      !isMultipartPlacementVersion(payload.placementVersion)
     )
       return null;
     if (
@@ -415,6 +427,9 @@ export async function verifyVFSMultipartToken(
       tn: payload.tn,
       sub,
       poolSize: payload.poolSize,
+      ...(payload.placementVersion === undefined
+        ? {}
+        : { placementVersion: payload.placementVersion }),
       totalChunks: payload.totalChunks,
       chunkSize: payload.chunkSize,
       totalSize: payload.totalSize,
@@ -424,6 +439,71 @@ export async function verifyVFSMultipartToken(
   } catch {
     return null;
   }
+}
+
+export async function signVFSMultipartStatusCursor(
+  env: Env,
+  payload: Omit<MultipartStatusCursorPayload, "scope" | "iat" | "exp">
+): Promise<string> {
+  const claims: Record<string, unknown> = {
+    scope: VFS_MP_STATUS_SCOPE,
+    uploadId: payload.uploadId,
+    userId: payload.userId,
+    ns: payload.ns,
+    tn: payload.tn,
+    shardIndex: payload.shardIndex,
+    afterIndex: payload.afterIndex,
+  };
+  if (payload.sub !== undefined) claims.sub = payload.sub;
+  return signScopedJwt(
+    getSecret(env),
+    claims,
+    Date.now() + MULTIPART_DEFAULT_TTL_MS
+  );
+}
+
+export async function verifyVFSMultipartStatusCursor(
+  env: Env,
+  token: string
+): Promise<MultipartStatusCursorPayload | null> {
+  const result = await verifyAgainstSecrets(env, token);
+  if (result === null) return null;
+  const { payload } = result;
+  if (payload.scope !== VFS_MP_STATUS_SCOPE) return null;
+  if (typeof payload.uploadId !== "string" || payload.uploadId.length === 0)
+    return null;
+  if (typeof payload.userId !== "string" || payload.userId.length === 0)
+    return null;
+  if (typeof payload.ns !== "string" || payload.ns.length === 0) return null;
+  if (typeof payload.tn !== "string" || payload.tn.length === 0) return null;
+  if (
+    typeof payload.shardIndex !== "number" ||
+    !Number.isSafeInteger(payload.shardIndex) ||
+    payload.shardIndex < 0
+  )
+    return null;
+  if (
+    typeof payload.afterIndex !== "number" ||
+    !Number.isSafeInteger(payload.afterIndex) ||
+    payload.afterIndex < -1
+  )
+    return null;
+  const sub =
+    typeof payload.sub === "string" && payload.sub.length > 0
+      ? payload.sub
+      : undefined;
+  return {
+    scope: VFS_MP_STATUS_SCOPE,
+    uploadId: payload.uploadId,
+    userId: payload.userId,
+    ns: payload.ns,
+    tn: payload.tn,
+    sub,
+    shardIndex: payload.shardIndex,
+    afterIndex: payload.afterIndex,
+    iat: typeof payload.iat === "number" ? payload.iat : 0,
+    exp: typeof payload.exp === "number" ? payload.exp : 0,
+  };
 }
 
 /**

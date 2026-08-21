@@ -8,7 +8,8 @@ import { describe, expect, it } from "vitest";
 import { vfsShardDOName, vfsUserDOName } from "@core/lib/utils";
 import type { ShardDO } from "@core/objects/shard/shard-do";
 import { hashChunk } from "@shared/crypto";
-import { placeChunk } from "@shared/placement";
+import { MULTIPART_PLACEMENT_VERSION } from "@shared/multipart";
+import { placeChunk, placeMultipartChunk } from "@shared/placement";
 import { createVFS, type MossaicEnv, type UserDO } from "../../sdk/src/index";
 import type {
   DeleteChunksFailurePhase,
@@ -46,6 +47,7 @@ type TestShardDO = ShardDO & FaultControls;
 
 interface UserFaultControls {
   testConfigureMaintenanceAlarmFailure(remaining: number): Promise<void>;
+  testEvict(): Promise<void>;
   testDropVersionRows(
     scope: { ns: string; tenant: string; sub?: string },
     userId: string,
@@ -493,11 +495,12 @@ describe("stale version publication", () => {
       chunkSize: payload.byteLength,
     });
     const put = await vfs.putMultipartChunk(handle, 0, payload);
-    const shardIndex = placeChunk(
+    const shardIndex = placeMultipartChunk(
       tenant,
       handle.uploadId,
       0,
-      handle.poolSize
+      handle.poolSize,
+      MULTIPART_PLACEMENT_VERSION
     );
     const shard = shardStub(tenant, shardIndex);
     await shard.testConfigureMultipartManifestBlock(handle.uploadId);
@@ -639,6 +642,71 @@ describe("version retention cleanup outbox", () => {
       vfs.dropVersions("/history.bin", { keepLast: 1 })
     ).rejects.toThrow(/injected maintenance alarm failure/);
     expect(await readUserState(tenant)).toEqual(before);
+  });
+
+  it("resumes the persistent retention cursor after UserDO eviction", async () => {
+    const tenant = "drop-version-operation-eviction";
+    const vfs = createVFS(envFor(), { tenant, versioning: "enabled" });
+    await vfs.writeFile("/history.txt", "head");
+    let stub = userStub(tenant);
+    await runInDurableObject(stub, async (_instance, state) => {
+      const sql = state.storage.sql;
+      const file = sql
+        .exec(
+          `SELECT file_id, updated_at FROM files
+            WHERE user_id = ? AND file_name = 'history.txt'`,
+          tenant
+        )
+        .toArray()[0] as { file_id: string; updated_at: number };
+      for (let i = 0; i < 260; i++) {
+        sql.exec(
+          `INSERT INTO file_versions
+             (path_id, version_id, user_id, size, mode, mtime_ms, deleted,
+              inline_data, chunk_size, chunk_count, file_hash, mime_type,
+              user_visible)
+           VALUES (?, ?, ?, 1, 420, ?, 0, ?, 0, 0, '', 'text/plain', 1)`,
+          file.file_id,
+          `eviction-${i.toString().padStart(6, "0")}`,
+          tenant,
+          file.updated_at - i - 1,
+          new Uint8Array([i & 0xff])
+        );
+      }
+      sql.exec(
+        `UPDATE quota
+            SET storage_used = storage_used + 260,
+                inline_bytes_used = inline_bytes_used + 260
+          WHERE user_id = ?`,
+        tenant
+      );
+    });
+
+    const scope = { ns: NS, tenant };
+    const operationId = "eviction-retention-operation";
+    expect(
+      await stub.vfsDropVersionsStep(scope, "/history.txt", {}, operationId)
+    ).toEqual({ done: false });
+    await expect(stub.testEvict()).rejects.toThrow(/injected UserDO eviction/);
+    stub = userStub(tenant);
+
+    let step = await stub.vfsDropVersionsStep(
+      scope,
+      "/history.txt",
+      {},
+      operationId
+    );
+    while (!step.done) {
+      step = await stub.vfsDropVersionsStep(
+        scope,
+        "/history.txt",
+        {},
+        operationId
+      );
+    }
+    expect(step).toEqual({ done: true, dropped: 260, kept: 1 });
+    expect(await vfs.readFile("/history.txt", { encoding: "utf8" })).toBe(
+      "head"
+    );
   });
 
   it("repairs a removed head and keeps accounting aligned", async () => {

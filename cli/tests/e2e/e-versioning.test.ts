@@ -136,6 +136,7 @@ describe.skipIf(!hasSecret())("E — Versioning", () => {
     const before = await ctx.vfs.listVersions("/d.txt");
     expect(before.length).toBeGreaterThanOrEqual(4);
     const r = await ctx.vfs.dropVersions("/d.txt", {});
+    if ("operation" in r) throw new Error("unexpected pending retention");
     expect(r.dropped).toBeGreaterThanOrEqual(3);
     expect(r.kept).toBe(1);
   });

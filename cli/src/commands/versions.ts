@@ -74,7 +74,10 @@ export function registerVersions(program: Command): void {
           : new Date(local.olderThan).getTime();
       }
       if (local.except !== undefined) policy.exceptVersions = local.except;
-      const r = await ctx.client.vfs.dropVersions(p, policy);
+      let r = await ctx.client.vfs.startDropVersions(p, policy);
+      while ("operation" in r) {
+        r = await ctx.client.vfs.stepDropVersions(p, policy, r.operation);
+      }
       if (ctx.globals.json) {
         process.stdout.write(JSON.stringify(r) + "\n");
       } else {

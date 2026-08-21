@@ -5,7 +5,10 @@
  *
  * Endpoint inventory:
  *   POST   /api/vfs/multipart/begin              → mint session + token
- *   POST   /api/vfs/multipart/finalize           → atomic commit
+ *   POST   /api/vfs/multipart/hash-page          → persist ≤256 hashes
+ *   POST   /api/vfs/multipart/finalize-step      → bounded finalize work
+ *   POST   /api/vfs/multipart/finalize           → bounded legacy commit
+ *   POST   /api/vfs/multipart/abort-step         → bounded abort work
  *   POST   /api/vfs/multipart/abort              → drop session
  *   GET    /api/vfs/multipart/:uploadId/status   → landed[] for resume
  *   PUT    /api/vfs/multipart/:uploadId/chunk/:idx
@@ -42,17 +45,25 @@ import {
 import { errToResponse } from "./vfs";
 import { parseRange, rangeResponse, rangeNotSatisfiableResponse } from "../lib/http-range";
 import {
+  MULTIPART_HASH_PAGE_MAX_BODY_BYTES,
+  MULTIPART_HASH_PAGE_SIZE,
   MULTIPART_MAX_CHUNK_BYTES,
+  MULTIPART_PAGED_CONTROL_CAPABILITY,
+  MULTIPART_PROTOCOL_VERSION,
+  MULTIPART_STATUS_CURSOR_MAX_BYTES,
   type MultipartBeginRequest,
   type MultipartFinalizeRequest,
+  type MultipartFinalizeStepRequest,
+  type MultipartHashPageRequest,
+  type MultipartHashPageResponse,
   type MultipartAbortRequest,
   type MultipartPutChunkResponse,
-  type MultipartStatusResponse,
+  type MultipartStatusPageResponse,
   type DownloadTokenRequest,
   type DownloadTokenResponse,
 } from "../../../shared/multipart";
 import { hashChunk } from "../../../shared/crypto";
-import { placeChunk } from "../../../shared/placement";
+import { placeMultipartChunk } from "../../../shared/placement";
 import { userIdFor } from "../objects/user/vfs/helpers";
 import { edgeCacheLookup, edgeCachePut } from "../lib/edge-cache";
 
@@ -110,6 +121,43 @@ function shardStub(
   return ns.get(ns.idFromName(name));
 }
 
+class MultipartHashPageBodyTooLargeError extends Error {}
+
+async function readMultipartHashPageBody(
+  request: Request
+): Promise<MultipartHashPageRequest> {
+  const declaredLength = request.headers.get("Content-Length");
+  if (
+    declaredLength !== null &&
+    Number.isFinite(Number(declaredLength)) &&
+    Number(declaredLength) > MULTIPART_HASH_PAGE_MAX_BODY_BYTES
+  ) {
+    throw new MultipartHashPageBodyTooLargeError();
+  }
+  if (request.body === null) throw new SyntaxError("missing JSON body");
+
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > MULTIPART_HASH_PAGE_MAX_BODY_BYTES) {
+      await reader.cancel();
+      throw new MultipartHashPageBodyTooLargeError();
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return JSON.parse(new TextDecoder().decode(bytes)) as MultipartHashPageRequest;
+}
+
 // errToResponse is imported from ./vfs (canonical). A local
 // re-implementation would drift — e.g. lack EAGAIN → 429, so a
 // per-tenant rate-limit hit would return 500 instead of "retry-
@@ -141,8 +189,34 @@ mp.post("/begin", async (c) => {
         400
       );
     }
+    if (
+      body.capabilities !== undefined &&
+      (!Array.isArray(body.capabilities) ||
+        body.capabilities.some((capability) => typeof capability !== "string"))
+    ) {
+      return c.json(
+        { code: "EINVAL", message: "body.capabilities must be a string[]" },
+        400
+      );
+    }
+    if (
+      body.protocolVersion !== undefined &&
+      body.protocolVersion !== MULTIPART_PROTOCOL_VERSION
+    ) {
+      return c.json(
+        {
+          code: "EINVAL",
+          message: `unsupported multipart protocolVersion ${body.protocolVersion}`,
+        },
+        400
+      );
+    }
+    const pagedControl =
+      body.capabilities?.includes(MULTIPART_PAGED_CONTROL_CAPABILITY) === true ||
+      body.protocolVersion === MULTIPART_PROTOCOL_VERSION;
     const r = await userStub(c).vfsBeginMultipart(c.var.scope, body.path, {
       size: body.size,
+      protocolVersion: pagedControl ? MULTIPART_PROTOCOL_VERSION : undefined,
       chunkSize: body.chunkSize,
       mode: body.mode,
       mimeType: body.mimeType,
@@ -153,10 +227,108 @@ mp.post("/begin", async (c) => {
       resumeFrom: body.resumeFrom,
       ttlMs: body.ttlMs,
     });
-    return c.json(r);
+    if (pagedControl) {
+      return c.json({
+        ...r,
+        capabilities: [MULTIPART_PAGED_CONTROL_CAPABILITY],
+        protocolVersion: MULTIPART_PROTOCOL_VERSION,
+      });
+    }
+    const {
+      capabilities: _capabilities,
+      protocolVersion: _protocolVersion,
+      ...legacyResponse
+    } = r;
+    return c.json(legacyResponse);
   } catch (err) {
     const r = errToResponse(err);
     return c.json(r.body, r.status as 400);
+  }
+});
+
+mp.post("/hash-page", async (c) => {
+  try {
+    const body = await readMultipartHashPageBody(c.req.raw);
+    if (
+      body === null ||
+      typeof body !== "object" ||
+      typeof body.uploadId !== "string" ||
+      body.uploadId.length === 0 ||
+      !Number.isInteger(body.startIndex) ||
+      !Array.isArray(body.hashes) ||
+      body.hashes.length === 0 ||
+      body.hashes.length > MULTIPART_HASH_PAGE_SIZE
+    ) {
+      return c.json(
+        {
+          code: "EINVAL",
+          message: `uploadId, integer startIndex, and 1..${MULTIPART_HASH_PAGE_SIZE} hashes are required`,
+        },
+        400
+      );
+    }
+    const result = await userStub(c).vfsStageMultipartHashes(
+      c.var.scope,
+      body.uploadId,
+      body.startIndex,
+      body.hashes
+    );
+    return c.json(result satisfies MultipartHashPageResponse);
+  } catch (err) {
+    if (err instanceof MultipartHashPageBodyTooLargeError) {
+      return c.json(
+        { code: "EFBIG", message: "multipart hash page body is too large" },
+        413
+      );
+    }
+    if (err instanceof SyntaxError) {
+      return c.json(
+        { code: "EINVAL", message: "multipart hash page body must be valid JSON" },
+        400
+      );
+    }
+    const response = errToResponse(err);
+    return c.json(response.body, response.status as 400);
+  }
+});
+
+mp.post("/finalize-step", async (c) => {
+  try {
+    const body = await c.req.json<MultipartFinalizeStepRequest>();
+    if (typeof body.uploadId !== "string" || body.uploadId.length === 0) {
+      return c.json(
+        { code: "EINVAL", message: "body.uploadId must be a non-empty string" },
+        400
+      );
+    }
+    const stub = userStub(c);
+    const progress = await stub.vfsFinalizeMultipartStep(
+      c.var.scope,
+      body.uploadId
+    );
+    if (progress.done && progress.fresh) {
+      const result = progress.result;
+      if (
+        result.size > 0 &&
+        !result.isEncrypted &&
+        result.mimeType.startsWith("image/")
+      ) {
+        c.executionCtx.waitUntil(
+          stub.adminPreGenerateStandardVariants(c.var.scope, {
+            fileId: result.fileId,
+            path: result.path,
+            mimeType: result.mimeType,
+            fileName: result.path.split("/").pop() ?? result.fileId,
+            fileSize: result.size,
+            isEncrypted: result.isEncrypted,
+          })
+        );
+      }
+    }
+    return c.json(progress);
+  } catch (err) {
+    const response = errToResponse(err);
+    return c.json(response.body, response.status as 400);
   }
 });
 
@@ -208,6 +380,27 @@ mp.post("/finalize", async (c) => {
   }
 });
 
+// POST /abort-step
+mp.post("/abort-step", async (c) => {
+  try {
+    const body = await c.req.json<MultipartAbortRequest>();
+    if (typeof body.uploadId !== "string" || body.uploadId.length === 0) {
+      return c.json(
+        { code: "EINVAL", message: "body.uploadId must be a non-empty string" },
+        400
+      );
+    }
+    const progress = await userStub(c).vfsAbortMultipartStep(
+      c.var.scope,
+      body.uploadId
+    );
+    return c.json(progress);
+  } catch (err) {
+    const response = errToResponse(err);
+    return c.json(response.body, response.status as 400);
+  }
+});
+
 // POST /abort
 mp.post("/abort", async (c) => {
   try {
@@ -230,18 +423,36 @@ mp.post("/abort", async (c) => {
 mp.get("/:uploadId/status", async (c) => {
   try {
     const uploadId = c.req.param("uploadId");
+    const continuation = c.req.query("continuation");
     if (typeof uploadId !== "string" || uploadId.length === 0) {
       return c.json(
         { code: "EINVAL", message: "uploadId required" },
         400
       );
     }
-    const r = await userStub(c).vfsGetMultipartStatus(c.var.scope, uploadId);
-    const out: MultipartStatusResponse = {
+    if (
+      continuation !== undefined &&
+      (continuation.length === 0 ||
+        continuation.length > MULTIPART_STATUS_CURSOR_MAX_BYTES)
+    ) {
+      return c.json(
+        { code: "EINVAL", message: "invalid multipart status continuation" },
+        400
+      );
+    }
+    const r = await userStub(c).vfsGetMultipartStatus(
+      c.var.scope,
+      uploadId,
+      continuation
+    );
+    const out: MultipartStatusPageResponse = {
       landed: r.landed,
       total: r.total,
       bytesUploaded: r.bytesUploaded,
       expiresAtMs: r.expiresAtMs,
+      ...(r.continuation === undefined
+        ? {}
+        : { continuation: r.continuation }),
     };
     return c.json(out);
   } catch (err) {
@@ -375,19 +586,15 @@ mp.put("/:uploadId/chunk/:idx", async (c) => {
 
     const hash = await hashChunk(bytes);
     const userId = userIdFor(c.var.scope);
-    // Multipart placement is intentionally pure-rendezvous (no
-    // `fullShards` skip-set). The per-chunk PUT here and
-    // `vfsFinalizeMultipart`'s touched-shard fan-out
-    // (multipart-upload.ts:573-587) MUST use the SAME placement
-    // decision; the `fullShards` set at finalize time may differ
-    // from the set at upload time, and the server has no reliable
-    // way to replay the upload-time snapshot. The signed
-    // `payload.poolSize` is server-authoritative (HMAC at begin) so
-    // adversarial clients can't tamper. Multipart cap-awareness is
-    // deferred until we persist a per-session full-shards snapshot.
-    // Reads work either way; only the write "prefer less-full
-    // shards" optimization is missing here.
-    const sIdx = placeChunk(userId, uploadId, idx, payload.poolSize);
+    // Pool size and placement version are signed session claims. The same
+    // shared function is used by binding-mode PUT and UserDO verification.
+    const sIdx = placeMultipartChunk(
+      userId,
+      uploadId,
+      idx,
+      payload.poolSize,
+      payload.placementVersion
+    );
     const stub = shardStub(c.env, c.var.scope, sIdx);
     let putResult;
     try {

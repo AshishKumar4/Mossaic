@@ -126,6 +126,8 @@ Global flags (every command):
 | `mossaic versions drop <path> [--keep-last] [--older-than] [--except <id>...]` | retention sweep (head always preserved) |
 | `mossaic versions mark <path> <versionId> [--label] [--user-visible]` | set label + monotonic visible flag |
 
+Multipart upload/resume/finalize commands and `versions drop` advance the SDK's bounded page/start/step APIs. Large operations continue across fixed 16-request batches without discarding a status continuation or durable operation handle.
+
 ### Yjs (live CRDT editing)
 
 | Command | Description |

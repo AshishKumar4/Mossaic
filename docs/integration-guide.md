@@ -533,7 +533,52 @@ The same `includeContentHash: true` knob exists on `listFiles` since both surfac
 
 ---
 
-## 10. Wire schema conventions
+## 10. Multipart placement compatibility
+
+Multipart protocol v2 freezes `placementVersion = 2` and `poolSize` in both the
+signed session token and `upload_sessions`. HTTP PUT, binding-mode PUT, resume,
+status, and finalize all use the shared `placeMultipartChunk` implementation.
+Version 2 hashes the stable `(userId, uploadId, chunkIndex)` identity once and
+uses jump consistent hash, so hash work does not scale with the shard pool.
+
+Placement version 1 remains the original rendezvous implementation. Existing
+rows migrate to version 1, and existing signed tokens without a
+`placementVersion` claim are interpreted as version 1. Resuming a session keeps
+its persisted placement version; it never upgrades placement in place. Callers
+must treat handle routing fields as informational and must not rewrite token
+claims.
+
+Clients advertise `paged-control-v2` during begin and use paged control routes
+only when the server selects it. Missing capabilities mean legacy behavior, so
+old SDK/new server and new SDK/old server rollouts remain safe.
+
+Resume and status scans are cursor-paged independently of placement. One
+UserDO invocation inspects at most 64 shards and returns at most 256 landed
+indices. The continuation is signed and bound to the upload, namespace, tenant,
+and sub-tenant. `getMultipartUploadStatus()` and `resumeMultipartUpload()`
+follow continuations up to the shared 16-request completion budget. The SDK
+preflights the server-issued chunk and pool dimensions and throws typed `EFBIG`
+before the first request when a complete scan can exceed that budget.
+`getMultipartUploadStatusPage()` and `resumeMultipartUploadPage()` expose
+bounded progress for explicit scheduling; callers continue with the opaque
+cursor instead of restarting the scan.
+
+`finalizeMultipartUpload()`, `abortMultipartUpload()`, and `dropVersions()`
+retain their completion-only result contracts, but never issue more than
+`DEFAULT_COMPLETION_REQUEST_BUDGET` requests. Known over-budget multipart work
+fails before mutation. If work that could not be established during preflight
+reaches the cap, `CompletionBudgetExceededError` is an `EFBIG` and carries the
+durable operation in `error.checkpoint`. Workers continue with the bounded
+pairs:
+`startFinalizeMultipartUpload()` / `stepFinalizeMultipartUpload()`,
+`startAbortMultipartUpload()` / `stepAbortMultipartUpload()`, and
+`startDropVersions()` / `stepDropVersions()`. Each start or step call uses at
+most 16 protocol requests and returns an operation handle only when more work
+remains. `parallelUpload` and the CLI use these bounded paths for large work.
+
+---
+
+## 11. Wire schema conventions
 
 Runtime boundary DTOs are schema-first. For public request, response, token, and JSON config shapes, define the Zod schema and infer the TypeScript type from it:
 
@@ -562,7 +607,7 @@ Object strictness is a domain decision: prefer `.strict()` for new request paylo
 
 ---
 
-## 11. Operations checklist for a deploy
+## 12. Operations checklist for a deploy
 
 1. `pnpm typecheck` &mdash; exit 0.
 2. `pnpm ci:check` &mdash; chained typecheck + DTS-strict SDK build + no-Phase-tag lint gate; exit 0.

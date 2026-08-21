@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { SELF, env } from "cloudflare:test";
+import { SELF, env, runInDurableObject } from "cloudflare:test";
 import type { UserDO } from "@app/objects/user/user-do";
 
 /**
@@ -22,6 +22,11 @@ import type { UserDO } from "@app/objects/user/user-do";
 
 import { signVFSToken } from "@core/lib/auth";
 import { hashChunk } from "@shared/crypto";
+import {
+  MULTIPART_HASH_PAGE_MAX_BODY_BYTES,
+  MULTIPART_PAGED_CONTROL_CAPABILITY,
+  MULTIPART_PROTOCOL_VERSION,
+} from "@shared/multipart";
 import { vfsUserDOName } from "@core/lib/utils";
 
 interface E {
@@ -55,7 +60,15 @@ async function beginMP(opts: {
   path: string;
   size: number;
   chunkSize?: number;
-}): Promise<{ uploadId: string; chunkSize: number; totalChunks: number; sessionToken: string; bearer: string }> {
+}): Promise<{
+  uploadId: string;
+  chunkSize: number;
+  totalChunks: number;
+  sessionToken: string;
+  bearer: string;
+  capabilities?: string[];
+  protocolVersion?: number;
+}> {
   const bearer = await mint(opts.tenant);
   const r = await SELF.fetch("https://test/api/vfs/multipart/begin", {
     method: "POST",
@@ -75,6 +88,8 @@ async function beginMP(opts: {
     chunkSize: number;
     totalChunks: number;
     sessionToken: string;
+    capabilities?: string[];
+    protocolVersion?: number;
   };
   return { ...body, bearer };
 }
@@ -164,6 +179,31 @@ describe("multipart routes", () => {
     expect(r.chunkSize).toBeGreaterThan(0);
     expect(r.totalChunks).toBe(Math.ceil(totalSize / r.chunkSize));
     expect(r.sessionToken).toMatch(/\./); // JWT
+    expect(r.capabilities).toBeUndefined();
+    expect(r.protocolVersion).toBeUndefined();
+  });
+
+  it("negotiates bounded control capability without requiring it from old clients", async () => {
+    const bearer = await mint("mp-capability-negotiation");
+    const response = await SELF.fetch("https://test/api/vfs/multipart/begin", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${bearer}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        path: "/new-sdk.bin",
+        size: 1,
+        capabilities: [MULTIPART_PAGED_CONTROL_CAPABILITY, "future-capability"],
+        protocolVersion: MULTIPART_PROTOCOL_VERSION,
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      capabilities: [MULTIPART_PAGED_CONTROL_CAPABILITY],
+      protocolVersion: MULTIPART_PROTOCOL_VERSION,
+    });
   });
 
   it("begin rejects negative size with EINVAL", async () => {
@@ -191,6 +231,71 @@ describe("multipart routes", () => {
     expect(r.status).toBe(401);
     const body = (await r.json()) as { code: string };
     expect(body.code).toBe("EACCES");
+  });
+
+  it("rejects oversized hash-page bodies and arrays before UserDO dispatch", async () => {
+    const tenant = "mp-hash-page-route-bounds";
+    const bearer = await mint(tenant);
+    const request = async (body: string): Promise<Response> =>
+      SELF.fetch("https://test/api/vfs/multipart/hash-page", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${bearer}`,
+          "Content-Type": "application/json",
+        },
+        body,
+      });
+
+    const tooManyHashes = JSON.stringify({
+      uploadId: "not-created",
+      startIndex: 0,
+      hashes: Array.from({ length: 257 }, () => "0".repeat(64)),
+    });
+    await expect(request(tooManyHashes)).resolves.toMatchObject({ status: 400 });
+
+    const oversizedBody = JSON.stringify({
+      uploadId: "not-created",
+      startIndex: 0,
+      hashes: ["0".repeat(MULTIPART_HASH_PAGE_MAX_BODY_BYTES)],
+    });
+    await expect(request(oversizedBody)).resolves.toMatchObject({ status: 413 });
+
+  });
+
+  it("rejects a legacy client before creating an upload it cannot finalize", async () => {
+    const tenant = "mp-begin-legacy-large";
+    const tok = await mint(tenant);
+    const response = await SELF.fetch("https://test/api/vfs/multipart/begin", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${tok}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ path: "/too-many.bin", size: 257, chunkSize: 1 }),
+    });
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      code: "EINVAL",
+      message: expect.stringMatching(/upgrade.*before uploading chunks/i),
+    });
+    const user = TEST_ENV.MOSSAIC_USER.get(
+      TEST_ENV.MOSSAIC_USER.idFromName(vfsUserDOName("default", tenant))
+    );
+    await expect(
+      runInDurableObject(user, (_instance, state) => ({
+        sessions: (
+          state.storage.sql
+            .exec("SELECT COUNT(*) AS n FROM upload_sessions")
+            .toArray()[0] as { n: number }
+        ).n,
+        files: (
+          state.storage.sql
+            .exec("SELECT COUNT(*) AS n FROM files")
+            .toArray()[0] as { n: number }
+        ).n,
+      }))
+    ).resolves.toEqual({ sessions: 0, files: 0 });
   });
 
   it("happy path: 3-chunk file round-trips via begin → put × 3 → finalize → readFile", async () => {
@@ -784,7 +889,7 @@ describe("multipart routes", () => {
     expect(got).toEqual(c2);
   });
 
-  it("finalize cannot be replayed (second finalize on same uploadId fails)", async () => {
+  it("replays the persisted result after finalize response loss", async () => {
     const tenant = "mp-replay-1";
     const begin = await beginMP({
       tenant,
@@ -794,7 +899,7 @@ describe("multipart routes", () => {
     });
     const c0 = chunkOf(0, 100);
     const r0 = await putMP(begin.bearer, begin.uploadId, 0, c0, begin.sessionToken);
-    await finalizeMP(begin.bearer, begin.uploadId, [r0.hash]);
+    const first = await finalizeMP(begin.bearer, begin.uploadId, [r0.hash]);
     // Second finalize.
     const r = await SELF.fetch("https://test/api/vfs/multipart/finalize", {
       method: "POST",
@@ -807,9 +912,8 @@ describe("multipart routes", () => {
         chunkHashList: [r0.hash],
       }),
     });
-    expect(r.status).toBe(409); // EBUSY (status='finalized')
-    const body = (await r.json()) as { code: string };
-    expect(body.code).toBe("EBUSY");
+    expect(r.status).toBe(200);
+    await expect(r.json()).resolves.toEqual(first);
   });
 
   // ───────────────────────────────────────────────────────────────────

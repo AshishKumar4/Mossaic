@@ -7,7 +7,7 @@ const VFS_ERROR_MESSAGE = new RegExp(`^(?:VFSError: )?${VFS_ERROR_CODE}:`);
 const INTERNAL_RPC_SURFACE_ERROR =
   /^The RPC receiver(?:'s prototype)? does not implement "(?:lastSqlChanges|runWithConcurrencyBlocked|scheduleChunkCleanupSweep|scheduleStaleUploadSweep|stageChunkCleanupIntent|transactionSync|state|storage)"(?:\.|,)/;
 const INJECTED_TEST_ERROR =
-  /^injected (?:initial |chunk |putChunk |deleteChunks |deleteManyChunks |clearMultipartStaging |maintenance alarm |version |publication |session |multipart |stream |copy |UserDO eviction)/;
+  /^injected (?:initial |chunk |putChunk |deleteChunks |deleteManyChunks |clearMultipartStaging |finalize-step |maintenance alarm |version |publication |session |multipart |stream |copy |UserDO eviction)/;
 const SERIALIZED_RPC_LIMIT_ERROR =
   /^Serialized RPC arguments or return values are limited to 32MiB/;
 

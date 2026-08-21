@@ -11,23 +11,22 @@ import { env, runInDurableObject } from "cloudflare:test";
  * shards stayed refcounted forever. Permanent shard storage leak
  * per transient error.
  *
- * The fix tracks an `attempts` counter per session row. The catch
- * BUMPS attempts and leaves status='open' for retry; only after
- * `MULTIPART_MAX_ABORT_ATTEMPTS` (5) does the row flip to a NEW
- * status `'poisoned'` (distinct from 'aborted') so an operator
- * can find it via Logpush and reconcile manually.
+ * The fix tracks an `attempts` counter per session row. Transient failures
+ * remain recoverable; only repeated deterministic local corruption becomes
+ * `'poisoned'` so an operator can inspect it during the retention window.
  *
  * Tests pin:
  *   M1 — `attempts` column exists on `upload_sessions` (schema
  *        migration ran).
  *   M2 — sweep failure bumps `attempts` and leaves status='open'.
- *   M3 — after 5 failures the row flips to status='poisoned'
- *        (NOT 'aborted'); subsequent sweeps don't pick it up.
+ *   M3 — poisoned terminal rows are not retried as active sessions.
  */
 
 import {
   sweepExpiredMultipartSessions,
   MULTIPART_MAX_ABORT_ATTEMPTS,
+  MULTIPART_SWEEP_MAX_PHASE_PAGES,
+  MULTIPART_SWEEP_SESSION_LIMIT,
 } from "@core/objects/user/multipart-upload";
 import { vfsUserDOName } from "@core/lib/utils";
 import type { UserDO } from "@app/objects/user/user-do";
@@ -100,6 +99,130 @@ async function readSession(
 }
 
 describe("multipart poison-row retry cap (P1-5)", () => {
+  it("poisons only a repeatedly observed deterministic local state corruption", async () => {
+    const tenant = "mp-deterministic-local-poison";
+    const uploadId = "mp-deterministic-local-poison-upload";
+    const stub = E.MOSSAIC_USER.get(
+      E.MOSSAIC_USER.idFromName(vfsUserDOName("default", tenant))
+    );
+    await stub.appGetQuota(tenant);
+    await runInDurableObject(stub, (_instance, state) => {
+      state.storage.sql.exec(
+        `INSERT INTO upload_sessions
+           (upload_id, user_id, parent_id, leaf, total_size, total_chunks,
+            chunk_size, pool_size, expires_at, status, mode, mime_type,
+            created_at, attempts, abort_phase)
+         VALUES (?, ?, NULL, 'corrupt.bin', 0, 0, 0, 0, 0, 'aborting',
+                 420, 'application/octet-stream', 0, ?, 'corrupt')`,
+        uploadId,
+        tenant,
+        MULTIPART_MAX_ABORT_ATTEMPTS - 1
+      );
+    });
+
+    await runInDurableObject(stub, (instance) =>
+      sweepExpiredMultipartSessions(instance, () => ({
+        ns: "default",
+        tenant,
+      }))
+    );
+    await expect(
+      runInDurableObject(stub, (_instance, state) =>
+        state.storage.sql
+          .exec(
+            `SELECT status, attempts, terminal_at FROM upload_sessions
+              WHERE upload_id = ?`,
+            uploadId
+          )
+          .toArray()[0]
+      )
+    ).resolves.toMatchObject({
+      status: "poisoned",
+      attempts: MULTIPART_MAX_ABORT_ATTEMPTS,
+      terminal_at: expect.any(Number),
+    });
+  });
+
+  it("caps each expiry sweep by persisted session and phase-page budgets", async () => {
+    const tenant = "mp-expiry-work-bound";
+    const stub = E.MOSSAIC_USER.get(
+      E.MOSSAIC_USER.idFromName(vfsUserDOName("default", tenant))
+    );
+    await stub.appGetQuota(tenant);
+    await runInDurableObject(stub, (_instance, state) => {
+      state.storage.sql.exec("CREATE TABLE sweep_phase_pages (n INTEGER NOT NULL)");
+      state.storage.sql.exec("INSERT INTO sweep_phase_pages VALUES (0)");
+      state.storage.sql.exec(`
+        CREATE TRIGGER count_sweep_phase_pages
+        AFTER UPDATE ON upload_sessions
+        WHEN OLD.status = 'aborting' AND NEW.upload_id LIKE 'expiry-bound-%'
+        BEGIN
+          UPDATE sweep_phase_pages SET n = n + 1;
+        END
+      `);
+      for (let index = 0; index < MULTIPART_SWEEP_SESSION_LIMIT + 2; index++) {
+        state.storage.sql.exec(
+          `INSERT INTO upload_sessions
+             (upload_id, user_id, parent_id, leaf, total_size, total_chunks,
+               chunk_size, pool_size, expires_at, status, mode, mime_type,
+               created_at, finalize_context)
+           VALUES (?, ?, NULL, ?, 0, 0, 0, 0, ?, 'open', 420,
+                   'application/octet-stream', ?, ?)`,
+          `expiry-bound-${index}`,
+          tenant,
+          `file-${index}`,
+          Date.now() - 1_000,
+          Date.now() - 2_000,
+          JSON.stringify({
+            schema: 1,
+            versioning: false,
+            pathId: `expiry-bound-${index}`,
+            versionId: null,
+            expectedDestination: {
+              fileId: `old-expiry-bound-${index}`,
+              headVersionId: null,
+            },
+            committedAt: Date.now() - 2_000,
+            metadataPresent: false,
+            metadataBase64: null,
+            tagsPresent: false,
+            tags: [],
+          })
+        );
+      }
+    });
+
+    const result = await runInDurableObject(stub, (instance) =>
+      sweepExpiredMultipartSessions(instance, (userId) => ({
+        ns: "default",
+        tenant: userId,
+      }))
+    );
+    expect(MULTIPART_SWEEP_MAX_PHASE_PAGES).toBe(20);
+    expect(result).toEqual({
+      swept: MULTIPART_SWEEP_SESSION_LIMIT,
+      remaining: true,
+    });
+    await expect(
+      runInDurableObject(stub, (_instance, state) => ({
+        sessions: state.storage.sql
+          .exec("SELECT status, COUNT(*) AS n FROM upload_sessions GROUP BY status")
+          .toArray(),
+        phasePages: (
+          state.storage.sql.exec("SELECT n FROM sweep_phase_pages").toArray()[0] as {
+            n: number;
+          }
+        ).n,
+      }))
+    ).resolves.toEqual({
+      sessions: [
+        { status: "aborted", n: MULTIPART_SWEEP_SESSION_LIMIT },
+        { status: "open", n: 2 },
+      ],
+      phasePages: MULTIPART_SWEEP_MAX_PHASE_PAGES,
+    });
+  });
+
   it("M1 — `attempts` column is present on upload_sessions", async () => {
     const tenant = "mp-poison-m1";
     const stub = E.MOSSAIC_USER.get(
@@ -166,7 +289,7 @@ describe("multipart poison-row retry cap (P1-5)", () => {
       // was flipped (which is now reserved for the cap-hit
       // branch). Assert that combo is impossible.
       const rowMakesSense =
-        (after.status === "aborted" && after.attempts === 2) ||
+        (after.status === "aborted" && after.attempts === 0) ||
         (after.status === "open" && after.attempts >= 2) ||
         (after.status === "poisoned" &&
           after.attempts >= MULTIPART_MAX_ABORT_ATTEMPTS);
@@ -177,35 +300,9 @@ describe("multipart poison-row retry cap (P1-5)", () => {
     // permanent open-but-unsweepable row exists.
   });
 
-  it("M3 — cap (attempts=5) flips status to 'poisoned' (NOT 'aborted')", async () => {
-    // We can't deterministically force vfsAbortMultipart to
-    // throw without intricate setup, so we directly write a row
-    // with attempts=4 + force the abort to fail by pointing
-    // file_id at a non-existent files entry. This DOES make
-    // hardDeleteFileRow safe (idempotent on missing file_id),
-    // BUT we can manipulate the row's `pool_size` to a value
-    // that the multipart abort path can't handle — actually,
-    // the simplest deterministic path: seed attempts at exactly
-    // MULTIPART_MAX_ABORT_ATTEMPTS - 1 and observe that any
-    // failure (or success) keeps the cap arithmetic correct.
-    //
-    // Instead of orchestrating a real failure, we directly assert
-    // the post-condition contract by examining the SQL after a
-    // sweep. The cap value is exported, and the column-default
-    // logic is tested in M1.
+  it("M3 — a poisoned terminal row is not retried as an active session", async () => {
     expect(MULTIPART_MAX_ABORT_ATTEMPTS).toBe(5);
 
-    // Direct assertion: simulate the cap-hit branch by seeding
-    // attempts=MULTIPART_MAX_ABORT_ATTEMPTS-1 = 4 and forcing
-    // vfsAbortMultipart to throw. We force the throw by making
-    // the row reference a non-existent userId scope for the
-    // shard fan-out (vfsAbortMultipart looks up files via the
-    // session's `upload_id`; missing tmp file row → caller path
-    // surfaces no error since hardDeleteFileRow is idempotent).
-    //
-    // For a clean cap-hit assertion, manipulate the SQL directly
-    // to simulate the post-cap state and verify subsequent sweeps
-    // skip the row.
     const tenant = "mp-poison-m3";
     const uploadId = "mp-poison-m3-upload";
     const stub = E.MOSSAIC_USER.get(
@@ -229,26 +326,19 @@ describe("multipart poison-row retry cap (P1-5)", () => {
       );
     });
 
-    // Run the sweep; verify the poisoned row is NOT picked up
-    // (sweep filters status='open' only).
     await runInDurableObject(stub, async (inst, _state) => {
       const scopeForUser = (uid: string): VFSScope => ({
         ns: "default",
         tenant: uid,
       });
       const r = await sweepExpiredMultipartSessions(inst, scopeForUser);
-      // No 'open' rows for this tenant — the poisoned row is
-      // structurally invisible to the sweep.
       expect(r.swept).toBe(0);
     });
 
-    // The poisoned row is still present (operator-visible).
     const after = await readSession(tenant, uploadId);
-    expect(after).not.toBeNull();
-    expect(after!.status).toBe("poisoned");
-    // Critically: status is NOT 'aborted' — the pre-fix bug
-    // would have flipped to 'aborted' on the first failure.
-    expect(after!.status).not.toBe("aborted");
-    expect(after!.attempts).toBe(MULTIPART_MAX_ABORT_ATTEMPTS);
+    if (after === null) throw new Error("poisoned row was pruned before retention");
+    expect(after.status).toBe("poisoned");
+    expect(after.status).not.toBe("aborted");
+    expect(after.attempts).toBe(MULTIPART_MAX_ABORT_ATTEMPTS);
   });
 });

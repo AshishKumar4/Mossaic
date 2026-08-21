@@ -8,9 +8,10 @@ import { env } from "cloudflare:test";
  * which is what an actual customer's Worker looks like) and proves
  * the architectural promise:
  *
- *     "Each VFS method on the SDK = exactly 1 DO RPC subrequest from
- *      the consumer's perspective, regardless of internal chunk
- *      fan-out inside Mossaic's UserDO."
+ *     "Each single-step VFS method exercised here = exactly 1 DO RPC
+ *      subrequest from the consumer's perspective, regardless of internal
+ *      chunk fan-out inside Mossaic's UserDO. Paged operation methods have
+ *      their own documented fixed per-call budget."
  *
  * The vitest pool harness only spins up one Worker, so we don't have
  * a separate consumer-Worker invocation to count subrequests on

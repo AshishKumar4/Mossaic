@@ -296,9 +296,10 @@ class BatchedLstatFs implements VFSClient {
   }
   dropVersions(
     p: string,
-    policy: Parameters<VFSClient["dropVersions"]>[1]
+    policy: Parameters<VFSClient["dropVersions"]>[1],
+    opts?: Parameters<VFSClient["dropVersions"]>[2]
   ) {
-    return this.inner.dropVersions(p, policy);
+    return this.inner.dropVersions(p, policy, opts);
   }
   // pass-throughs.
   patchMetadata(

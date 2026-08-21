@@ -20,7 +20,7 @@
 
 ## What is Mossaic?
 
-A horizontally-scalable, content-addressed filesystem that runs entirely on Cloudflare's edge &mdash; no origin servers, no S3, no external databases. Files are split into 1 MB chunks, SHA-256 hashed, distributed across a dynamic pool of Durable Object shards via rendezvous hashing, and transferred in parallel.
+A horizontally-scalable, content-addressed filesystem that runs entirely on Cloudflare's edge &mdash; no origin servers, no S3, no external databases. Files are split into 1 MB chunks, SHA-256 hashed, deterministically distributed across a dynamic pool of Durable Object shards, and transferred in parallel.
 
 Use it for photo libraries, ML datasets, build artifacts, isomorphic-git filesystem layers, attachments, container layers, or **live collaborative documents** (per-file Yjs CRDT mode at $0 idle billing). The repository includes Lean 4 proofs about hand-written abstract models; these are not a mechanical verification of the TypeScript/SQL implementation. The exact corpus is generated in [`lean/THEOREM_INVENTORY.md`](./lean/THEOREM_INVENTORY.md).
 
@@ -96,9 +96,9 @@ flowchart LR
     UserDO --> Sn
 ```
 
-Each tenant gets a dedicated **UserDO** (manifests, metadata + tags + indexed `listFiles`, HMAC pagination cursors, versioning, Yjs op-log + awareness relay, audit log) and a **dynamic pool of ShardDOs** that hold the chunk data. Chunks are placed deterministically via [rendezvous hashing](https://en.wikipedia.org/wiki/Rendezvous_hashing) &mdash; both client and server independently compute which shard holds any chunk with zero coordination.
+Each tenant gets a dedicated **UserDO** (manifests, metadata + tags + indexed `listFiles`, HMAC pagination cursors, versioning, Yjs op-log + awareness relay, audit log) and a **dynamic pool of ShardDOs** that hold the chunk data. Ordinary writes and legacy multipart sessions retain their exact [rendezvous hashing](https://en.wikipedia.org/wiki/Rendezvous_hashing) placement. Multipart protocol v2 uses jump consistent hash from the same stable `(userId, uploadId, chunkIndex)` identity, avoiding a scan of every shard on each PUT. Both client and server compute the same result with zero coordination.
 
-The pool starts at **32 ShardDOs per tenant** and grows by **+1 ShardDO per 5 GB stored**, so a tenant accumulating data widens its rendezvous space organically. **Cap-aware placement** skips shards over the 9 GiB soft cap and falls through to the next-best rendezvous score; on all-full, the caller force-bumps `pool_size` to acquire fresh capacity. Existing chunks stay pinned to their original shard via `file_chunks.shard_index` recorded at write time, so growth never reshuffles already-stored data. Pool size is high-water-marked: deletes tick `quota.storage_used` down but never shrink the pool, because shrinking would orphan chunks pinned to the dropped shard indices.
+The pool starts at **32 ShardDOs per tenant** and grows by **+1 ShardDO per 5 GB stored**. **Cap-aware placement** for ordinary writes skips shards over the 9 GiB soft cap and falls through to the next-best rendezvous score; on all-full, the caller force-bumps `pool_size` to acquire fresh capacity. Multipart sessions freeze both `pool_size` and `placement_version` in the session row and signed token, so resume, HTTP PUT, binding PUT, status, and finalize cannot drift after pool growth or an algorithm upgrade. Resume/status scans use signed continuations: each UserDO call reads at most 64 shards and returns at most 256 landed indices. Existing chunks stay pinned to their recorded `shard_index`. Pool size is high-water-marked: deletes tick `quota.storage_used` down but never shrink the pool, because shrinking would orphan chunks pinned to the dropped shard indices.
 
 The same Hono router serves SDK consumers, the CLI, and the SPA via canonical `/api/vfs/*`. The App deployment adds a thin auth/photo-gallery surface on top; the Service deployment ships only the SDK-essential routes.
 

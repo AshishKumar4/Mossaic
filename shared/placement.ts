@@ -1,4 +1,9 @@
 import { murmurhash3 } from "./hash";
+import {
+  MULTIPART_LEGACY_PLACEMENT_VERSION,
+  MULTIPART_PLACEMENT_VERSION,
+  type MultipartPlacementVersion,
+} from "./multipart";
 
 /**
  * Build the score-key template for chunk placement. **This is NOT a
@@ -109,6 +114,95 @@ export function placeChunk(
   }
   // Every shard in the pool is full. Caller triggers pool growth.
   return POOL_FULL;
+}
+
+const UINT64_MASK = (1n << 64n) - 1n;
+const JUMP_HASH_MULTIPLIER = 2_862_933_555_777_941_757n;
+const JUMP_HASH_SCALE = 1n << 31n;
+const MULTIPART_HASH_HIGH_SEED = 0x9747b28c;
+
+export interface MultipartPlacementInstrumentation {
+  hash(): void;
+  jumpIteration(): void;
+}
+
+/**
+ * Hash the original multipart placement identity into one stable 64-bit key.
+ * The two Murmur3 words are fixed work regardless of shard-pool size.
+ */
+export function multipartPlacementHash(
+  userId: string,
+  fileId: string,
+  chunkIndex: number,
+  instrumentation?: MultipartPlacementInstrumentation
+): bigint {
+  const key = `${fileId}:${chunkIndex}:shard:${userId}`;
+  instrumentation?.hash();
+  const low = murmurhash3(key);
+  instrumentation?.hash();
+  const high = murmurhash3(key, MULTIPART_HASH_HIGH_SEED);
+  return (BigInt(high) << 32n) | BigInt(low);
+}
+
+/** Jump consistent hash over a pre-hashed unsigned 64-bit placement key. */
+export function jumpConsistentHash(
+  key: bigint,
+  bucketCount: number,
+  instrumentation?: MultipartPlacementInstrumentation
+): number {
+  if (!Number.isSafeInteger(bucketCount) || bucketCount < 1) {
+    throw new RangeError("bucketCount must be a positive safe integer");
+  }
+
+  let state = key & UINT64_MASK;
+  let bucket = -1n;
+  let next = 0n;
+  const buckets = BigInt(bucketCount);
+  while (next < buckets) {
+    instrumentation?.jumpIteration();
+    bucket = next;
+    state = (state * JUMP_HASH_MULTIPLIER + 1n) & UINT64_MASK;
+    next = ((bucket + 1n) * JUMP_HASH_SCALE) / ((state >> 33n) + 1n);
+  }
+  return Number(bucket);
+}
+
+export function resolveMultipartPlacementVersion(
+  placementVersion: number | undefined
+): MultipartPlacementVersion {
+  if (placementVersion === undefined) {
+    return MULTIPART_LEGACY_PLACEMENT_VERSION;
+  }
+  if (
+    placementVersion !== MULTIPART_LEGACY_PLACEMENT_VERSION &&
+    placementVersion !== MULTIPART_PLACEMENT_VERSION
+  ) {
+    throw new RangeError(`unsupported multipart placement version ${placementVersion}`);
+  }
+  return placementVersion;
+}
+
+/**
+ * Versioned multipart placement. Missing version is permanently pinned to the
+ * original rendezvous result so pre-version tokens and sessions remain valid.
+ */
+export function placeMultipartChunk(
+  userId: string,
+  fileId: string,
+  chunkIndex: number,
+  poolSize: number,
+  placementVersion?: number,
+  instrumentation?: MultipartPlacementInstrumentation
+): number {
+  const version = resolveMultipartPlacementVersion(placementVersion);
+  if (version === MULTIPART_LEGACY_PLACEMENT_VERSION) {
+    return placeChunk(userId, fileId, chunkIndex, poolSize);
+  }
+  return jumpConsistentHash(
+    multipartPlacementHash(userId, fileId, chunkIndex, instrumentation),
+    poolSize,
+    instrumentation
+  );
 }
 
 /**

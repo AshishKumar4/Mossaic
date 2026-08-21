@@ -4,8 +4,9 @@
  * Two consumer-facing things:
  *
  *   1. `createVFS(env, opts)` returns a `VFS` instance that exposes a
- *      thin fs/promises shape. Each method is one DO RPC subrequest in
- *      the consumer's invocation; internal chunk fan-out happens inside
+ *      thin fs/promises shape. Single-step methods use one DO RPC subrequest
+ *      in the consumer's invocation; bounded operation methods may use up to
+ *      the documented fixed budget. Internal chunk fan-out happens inside
  *      Mossaic's UserDO and is billed against Mossaic's own
  *      per-invocation subrequest budget, not the consumer's.
  *
@@ -37,6 +38,12 @@ export {
   type MossaicEnv,
   type VersionInfo,
   type DropVersionsPolicy,
+  type DropVersionsOptions,
+  type DropVersionsResult,
+  type BoundedDropVersionsResult,
+  type DropVersionsOperationHandle,
+  type DropVersionsProgress,
+  createDropVersionsOperationId,
   type WriteFileOpts,
   type CopyFileOpts,
   type PatchMetadataOpts,
@@ -54,8 +61,31 @@ export {
   type MultipartUploadHandle,
   type PutMultipartChunkResult,
   type FinalizeMultipartUploadResult,
+  type BoundedFinalizeMultipartUploadResult,
+  type FinalizedMultipartUploadResult,
+  type FinalizeMultipartUploadOpts,
+  type MultipartFinalizeOperationHandle,
   type AbortMultipartUploadResult,
+  type BoundedAbortMultipartUploadResult,
+  type AbortedMultipartUploadResult,
+  type AbortMultipartUploadOpts,
+  type MultipartAbortOperationHandle,
+  type MultipartOperationProgress,
+  type MultipartOperationRequestOpts,
+  type MultipartStatusPageOpts,
+  type MultipartStatusOpts,
+  type MultipartUploadStatusPage,
+  type MultipartUploadStatus,
+  type ResumeMultipartUploadOpts,
+  type ResumeMultipartUploadResult,
+  type VFSMultipartPagingClient,
+  type VFSBoundedOperationsClient,
 } from "./vfs";
+export {
+  DEFAULT_COMPLETION_REQUEST_BUDGET,
+  MULTIPART_OPERATION_RPC_BUDGET,
+  MULTIPART_OPERATION_RETRY_BUDGET,
+} from "./multipart-protocol";
 
 // cap constants — surfaced for client-side pre-validation
 // + so consumers know the limits without reading the README.
@@ -75,6 +105,7 @@ export {
   EISDIR,
   ENOTDIR,
   EFBIG,
+  CompletionBudgetExceededError,
   ELOOP,
   EBUSY,
   EINVAL,
@@ -187,17 +218,18 @@ export {
 
 // parallel multipart transfer engine. Built on top of the
 // HTTP client; saturates user bandwidth via N-way parallel chunk
-// uploads/downloads while keeping UserDO touches limited to session
-// boundaries (begin + finalize).
+// uploads/downloads while keeping UserDO work in bounded control pages.
 export {
   parallelUpload,
   parallelDownload,
   parallelDownloadStream,
   beginUpload,
+  beginUploadPage,
   putChunk,
   finalizeUpload,
   abortUpload,
   statusUpload,
+  statusUploadPage,
   deriveClientChunkSpec,
   THROUGHPUT_MATH,
   type BeginUploadOpts,

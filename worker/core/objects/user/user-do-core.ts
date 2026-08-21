@@ -52,10 +52,16 @@ import type {
   Variant,
 } from "../../../../shared/preview-types";
 import { VFSError } from "../../../../shared/vfs-types";
-import { vfsShardDOName } from "../../lib/utils";
+import {
+  MULTIPART_LEGACY_PLACEMENT_VERSION,
+  MULTIPART_TERMINAL_RETENTION_MS,
+} from "../../../../shared/multipart";
+import { generateId, vfsShardDOName } from "../../lib/utils";
 import { logError, logInfo } from "../../lib/logger";
 import {
+  advanceSchemaMaintenance,
   applyMigrationOnce,
+  ensureSchemaMaintenance,
   ensureMigrationsTable,
 } from "../../lib/migrations";
 import {
@@ -98,8 +104,10 @@ import type { YjsRuntime } from "./yjs";
 import { enforceRateLimit } from "./rate-limit";
 import {
   dropVersions,
+  assertLegacyDropVersionsBounded,
   isVersioningEnabled,
   listVersions,
+  resumeVersionRetentionOperations,
   resolvePathId,
   restoreVersion,
   setVersioningEnabled,
@@ -132,6 +140,10 @@ import {
  */
 const YJS_WS_HARD_CAP = 100;
 const YJS_WS_WARN_THRESHOLD = 80;
+const SCHEMA_MAINTENANCE_PAGE_SIZE = 256;
+const VERSION_RETENTION_ORDER_MAINTENANCE = "version_retention_order_v1";
+const CLEANUP_INTENTS_MAINTENANCE = "chunk_cleanup_intents_v2";
+const UPLOAD_HASH_CURSOR_MAINTENANCE = "upload_staged_hash_cursor_v1";
 
 export class UserDOCore extends DurableObject<Env> {
   sql: SqlStorage;
@@ -156,6 +168,8 @@ export class UserDOCore extends DurableObject<Env> {
    */
   private _yjsRuntime: YjsRuntime | undefined;
   private initialized = false;
+
+  protected recordRpc(): void {}
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -193,8 +207,106 @@ export class UserDOCore extends DurableObject<Env> {
   protected ensureInit(): void {
     if (this.initialized) return;
 
-    transactionSync(this, () => this.initializeSchema());
+    transactionSync(this, () => {
+      this.initializeSchema();
+      this.runSchemaMaintenancePage();
+    });
     this.initialized = true;
+  }
+
+  private maintainRows(
+    name: string,
+    page: (cursor: number) => number[]
+  ): boolean {
+    const maintenance = ensureSchemaMaintenance(this.sql, name);
+    if (maintenance.state === "ready") return false;
+    const cursor = Number(maintenance.cursor || "0");
+    const rowIds = page(cursor);
+    const nextCursor = rowIds.at(-1) ?? cursor;
+    const done = rowIds.length < SCHEMA_MAINTENANCE_PAGE_SIZE;
+    advanceSchemaMaintenance(this.sql, name, String(nextCursor), done);
+    return !done;
+  }
+
+  maintainVersionRetentionOrder(): boolean {
+    return this.maintainRows(VERSION_RETENTION_ORDER_MAINTENANCE, (cursor) => {
+      const rows = this.sql
+        .exec<{ rowid: number } & Record<string, SqlStorageValue>>(
+          `SELECT rowid FROM file_versions
+            WHERE rowid > ? ORDER BY rowid LIMIT ?`,
+          cursor,
+          SCHEMA_MAINTENANCE_PAGE_SIZE
+        )
+        .toArray();
+      for (const row of rows) {
+        this.sql.exec(
+          `INSERT OR IGNORE INTO version_retention_order
+             (path_id, mtime_ms, version_id)
+           SELECT path_id, mtime_ms, version_id FROM file_versions WHERE rowid = ?`,
+          row.rowid
+        );
+      }
+      return rows.map((row) => row.rowid);
+    });
+  }
+
+  private runSchemaMaintenancePage(): boolean {
+    const retentionPending = this.maintainVersionRetentionOrder();
+    const cleanupPending = this.maintainRows(
+      CLEANUP_INTENTS_MAINTENANCE,
+      (cursor) => {
+        const rows = this.sql
+          .exec<{ rowid: number } & Record<string, SqlStorageValue>>(
+            `SELECT rowid FROM chunk_cleanup_intents
+              WHERE rowid > ? ORDER BY rowid LIMIT ?`,
+            cursor,
+            SCHEMA_MAINTENANCE_PAGE_SIZE
+          )
+          .toArray();
+        for (const row of rows) {
+          this.sql.exec(
+            `UPDATE chunk_cleanup_intents
+                SET cleanup_generation = CASE
+                      WHEN cleanup_generation = '' THEN lower(hex(randomblob(16)))
+                      ELSE cleanup_generation
+                    END,
+                    cleanup_phase = CASE
+                      WHEN cleanup_kind = 'multipart_staging' THEN 'staging'
+                      ELSE 'chunks'
+                    END
+              WHERE rowid = ?`,
+            row.rowid
+          );
+        }
+        return rows.map((row) => row.rowid);
+      }
+    );
+    const uploadPending = this.maintainRows(
+      UPLOAD_HASH_CURSOR_MAINTENANCE,
+      (cursor) => {
+        const rows = this.sql
+          .exec<{ rowid: number } & Record<string, SqlStorageValue>>(
+            `SELECT rowid FROM upload_sessions
+              WHERE rowid > ? ORDER BY rowid LIMIT ?`,
+            cursor,
+            SCHEMA_MAINTENANCE_PAGE_SIZE
+          )
+          .toArray();
+        for (const row of rows) {
+          this.sql.exec(
+            `UPDATE upload_sessions
+                SET staged_hash_cursor = COALESCE((
+                  SELECT MAX(chunk_index) + 1 FROM upload_expected_chunks
+                   WHERE upload_id = upload_sessions.upload_id
+                ), 0)
+              WHERE rowid = ?`,
+            row.rowid
+          );
+        }
+        return rows.map((row) => row.rowid);
+      }
+    );
+    return retentionPending || cleanupPending || uploadPending;
   }
 
   private initializeSchema(): void {
@@ -471,6 +583,41 @@ export class UserDOCore extends DurableObject<Env> {
         ON file_versions(path_id, mtime_ms DESC)
     `);
     this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS version_retention_order (
+        path_id    TEXT NOT NULL,
+        mtime_ms   INTEGER NOT NULL,
+        version_id TEXT NOT NULL,
+        PRIMARY KEY (path_id, mtime_ms DESC, version_id DESC)
+      ) WITHOUT ROWID
+    `);
+    this.sql.exec(`
+      CREATE TRIGGER IF NOT EXISTS version_retention_order_insert
+      AFTER INSERT ON file_versions BEGIN
+        INSERT OR REPLACE INTO version_retention_order
+          (path_id, mtime_ms, version_id)
+        VALUES (NEW.path_id, NEW.mtime_ms, NEW.version_id);
+      END
+    `);
+    this.sql.exec(`
+      CREATE TRIGGER IF NOT EXISTS version_retention_order_update
+      AFTER UPDATE OF path_id, mtime_ms, version_id ON file_versions BEGIN
+        DELETE FROM version_retention_order
+          WHERE path_id = OLD.path_id AND mtime_ms = OLD.mtime_ms
+            AND version_id = OLD.version_id;
+        INSERT OR REPLACE INTO version_retention_order
+          (path_id, mtime_ms, version_id)
+        VALUES (NEW.path_id, NEW.mtime_ms, NEW.version_id);
+      END
+    `);
+    this.sql.exec(`
+      CREATE TRIGGER IF NOT EXISTS version_retention_order_delete
+      AFTER DELETE ON file_versions BEGIN
+        DELETE FROM version_retention_order
+          WHERE path_id = OLD.path_id AND mtime_ms = OLD.mtime_ms
+            AND version_id = OLD.version_id;
+      END
+    `);
+    this.sql.exec(`
       CREATE INDEX IF NOT EXISTS idx_file_versions_user
         ON file_versions(user_id, path_id)
     `);
@@ -503,6 +650,53 @@ export class UserDOCore extends DurableObject<Env> {
     applyMigrationOnce(this.sql, "files_add_head_version_id", () =>
       this.sql.exec("ALTER TABLE files ADD COLUMN head_version_id TEXT")
     );
+    applyMigrationOnce(this.sql, "files_add_version_generation", () =>
+      this.sql.exec(
+        "ALTER TABLE files ADD COLUMN version_generation INTEGER NOT NULL DEFAULT 0"
+      )
+    );
+
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS version_retention_operations (
+        operation_id        TEXT PRIMARY KEY,
+        user_id             TEXT NOT NULL,
+        requested_path      TEXT NOT NULL,
+        path_id             TEXT NOT NULL,
+        policy_json         TEXT NOT NULL,
+        plan_generation     INTEGER NOT NULL,
+        plan_head_version_id TEXT,
+        cursor_mtime_ms     INTEGER,
+        cursor_version_id   TEXT,
+        remaining_keep      INTEGER NOT NULL,
+        dropped             INTEGER NOT NULL DEFAULT 0,
+        kept                INTEGER NOT NULL DEFAULT 0,
+        status              TEXT NOT NULL DEFAULT 'running',
+        pending_version_id  TEXT,
+        pending_mtime_ms    INTEGER,
+        pending_ref_id      TEXT,
+        pending_metadata_deleted INTEGER NOT NULL DEFAULT 0,
+        manifest_cursor     INTEGER,
+        created_at          INTEGER NOT NULL,
+        updated_at          INTEGER NOT NULL
+      )
+    `);
+    this.sql.exec(`
+      CREATE INDEX IF NOT EXISTS idx_version_retention_operations_completed
+        ON version_retention_operations(status, updated_at)
+    `);
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS version_retention_cleanup_routes (
+        operation_id TEXT NOT NULL,
+        version_id   TEXT NOT NULL,
+        ref_id       TEXT NOT NULL,
+        shard_index  INTEGER NOT NULL,
+        PRIMARY KEY (operation_id, version_id, shard_index)
+      )
+    `);
+    this.sql.exec(`
+      CREATE INDEX IF NOT EXISTS idx_version_retention_cleanup_routes_operation
+        ON version_retention_cleanup_routes(operation_id, version_id, shard_index)
+    `);
 
     // ── Yjs per-file mode ──────────────────────────────────────
     //
@@ -563,6 +757,16 @@ export class UserDOCore extends DurableObject<Env> {
         materialized_at    INTEGER NOT NULL DEFAULT 0
       )
     `);
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS yjs_cleanup_operations (
+        path_id    TEXT PRIMARY KEY,
+        cutoff_seq INTEGER NOT NULL,
+        cursor_seq INTEGER NOT NULL DEFAULT -1,
+        purge      INTEGER NOT NULL DEFAULT 0,
+        dropped    INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL
+      )
+    `);
 
     // ── Audit H1: stale-upload sweeper bookkeeping ───────────────────────
     //
@@ -600,6 +804,9 @@ export class UserDOCore extends DurableObject<Env> {
         cleanup_kind TEXT NOT NULL DEFAULT 'chunks',
         state        TEXT NOT NULL DEFAULT 'pending',
         generation   INTEGER NOT NULL DEFAULT 0,
+        cleanup_generation TEXT NOT NULL DEFAULT '',
+        cleanup_cursor INTEGER NOT NULL DEFAULT 0,
+        cleanup_phase TEXT NOT NULL DEFAULT 'chunks',
         provisional  INTEGER NOT NULL DEFAULT 0,
         created_at   INTEGER NOT NULL,
         updated_at   INTEGER NOT NULL,
@@ -609,6 +816,21 @@ export class UserDOCore extends DurableObject<Env> {
         PRIMARY KEY (ref_id, shard_index)
       )
     `);
+    applyMigrationOnce(this.sql, "chunk_cleanup_intents_add_cleanup_generation", () =>
+      this.sql.exec(
+        "ALTER TABLE chunk_cleanup_intents ADD COLUMN cleanup_generation TEXT NOT NULL DEFAULT ''"
+      )
+    );
+    applyMigrationOnce(this.sql, "chunk_cleanup_intents_add_cleanup_cursor", () =>
+      this.sql.exec(
+        "ALTER TABLE chunk_cleanup_intents ADD COLUMN cleanup_cursor INTEGER NOT NULL DEFAULT 0"
+      )
+    );
+    applyMigrationOnce(this.sql, "chunk_cleanup_intents_add_cleanup_phase", () =>
+      this.sql.exec(
+        "ALTER TABLE chunk_cleanup_intents ADD COLUMN cleanup_phase TEXT NOT NULL DEFAULT 'chunks'"
+      )
+    );
     this.sql.exec(`
       CREATE INDEX IF NOT EXISTS idx_chunk_cleanup_intents_eligible
         ON chunk_cleanup_intents(next_attempt_at, created_at, ref_id, shard_index)
@@ -927,6 +1149,137 @@ export class UserDOCore extends DurableObject<Env> {
     applyMigrationOnce(this.sql, "upload_sessions_add_fence_id", () =>
       this.sql.exec("ALTER TABLE upload_sessions ADD COLUMN fence_id TEXT")
     );
+    applyMigrationOnce(this.sql, "upload_sessions_add_placement_version", () =>
+      this.sql.exec(
+        `ALTER TABLE upload_sessions ADD COLUMN placement_version INTEGER NOT NULL DEFAULT ${MULTIPART_LEGACY_PLACEMENT_VERSION}`
+      )
+    );
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS upload_expected_chunks (
+        upload_id    TEXT NOT NULL,
+        chunk_index  INTEGER NOT NULL,
+        chunk_hash   TEXT NOT NULL,
+        PRIMARY KEY (upload_id, chunk_index)
+      )
+    `);
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS upload_verified_chunks (
+        upload_id    TEXT NOT NULL,
+        chunk_index  INTEGER NOT NULL,
+        chunk_hash   TEXT NOT NULL,
+        chunk_size   INTEGER NOT NULL,
+        shard_index  INTEGER NOT NULL,
+        PRIMARY KEY (upload_id, chunk_index)
+      )
+    `);
+    // Inert routing metadata becomes executable outbox work only after
+    // publication, or is discarded by the paged abort state machine.
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS upload_cleanup_routes (
+        upload_id    TEXT NOT NULL,
+        cleanup_kind TEXT NOT NULL,
+        shard_index  INTEGER NOT NULL,
+        PRIMARY KEY (upload_id, cleanup_kind, shard_index)
+      )
+    `);
+    applyMigrationOnce(this.sql, "upload_sessions_add_finalize_phase", () =>
+      this.sql.exec("ALTER TABLE upload_sessions ADD COLUMN finalize_phase TEXT")
+    );
+    applyMigrationOnce(this.sql, "upload_sessions_add_finalize_fence_cursor", () =>
+      this.sql.exec(
+        "ALTER TABLE upload_sessions ADD COLUMN finalize_fence_cursor INTEGER NOT NULL DEFAULT 0"
+      )
+    );
+    applyMigrationOnce(this.sql, "upload_sessions_add_finalize_chunk_cursor", () =>
+      this.sql.exec(
+        "ALTER TABLE upload_sessions ADD COLUMN finalize_chunk_cursor INTEGER NOT NULL DEFAULT 0"
+      )
+    );
+    applyMigrationOnce(this.sql, "upload_sessions_add_finalize_verify_shard_cursor", () =>
+      this.sql.exec(
+        "ALTER TABLE upload_sessions ADD COLUMN finalize_verify_shard_cursor INTEGER NOT NULL DEFAULT 0"
+      )
+    );
+    applyMigrationOnce(this.sql, "upload_sessions_add_finalize_total_size", () =>
+      this.sql.exec(
+        "ALTER TABLE upload_sessions ADD COLUMN finalize_total_size INTEGER NOT NULL DEFAULT 0"
+      )
+    );
+    applyMigrationOnce(this.sql, "upload_sessions_add_finalize_sha_state", () =>
+      this.sql.exec("ALTER TABLE upload_sessions ADD COLUMN finalize_sha_state TEXT")
+    );
+    applyMigrationOnce(this.sql, "upload_sessions_add_finalize_context", () =>
+      this.sql.exec("ALTER TABLE upload_sessions ADD COLUMN finalize_context TEXT")
+    );
+    applyMigrationOnce(this.sql, "upload_sessions_add_finalize_cleanup_cursor", () =>
+      this.sql.exec(
+        "ALTER TABLE upload_sessions ADD COLUMN finalize_cleanup_cursor INTEGER NOT NULL DEFAULT 0"
+      )
+    );
+    applyMigrationOnce(this.sql, "upload_sessions_add_finalize_result", () =>
+      this.sql.exec("ALTER TABLE upload_sessions ADD COLUMN finalize_result TEXT")
+    );
+    applyMigrationOnce(this.sql, "upload_sessions_add_staged_hash_cursor", () =>
+      this.sql.exec(
+        "ALTER TABLE upload_sessions ADD COLUMN staged_hash_cursor INTEGER NOT NULL DEFAULT 0"
+      )
+    );
+    applyMigrationOnce(this.sql, "upload_sessions_add_finalize_old_manifest_cursor", () =>
+      this.sql.exec(
+        "ALTER TABLE upload_sessions ADD COLUMN finalize_old_manifest_cursor INTEGER NOT NULL DEFAULT -1"
+      )
+    );
+    applyMigrationOnce(this.sql, "upload_sessions_add_finalize_intent_cursor", () =>
+      this.sql.exec(
+        "ALTER TABLE upload_sessions ADD COLUMN finalize_intent_cursor INTEGER NOT NULL DEFAULT -1"
+      )
+    );
+    applyMigrationOnce(this.sql, "upload_sessions_add_finalize_old_intent_cursor", () =>
+      this.sql.exec(
+        "ALTER TABLE upload_sessions ADD COLUMN finalize_old_intent_cursor INTEGER NOT NULL DEFAULT -1"
+      )
+    );
+    applyMigrationOnce(this.sql, "upload_sessions_add_finalize_old_cleanup_cursor", () =>
+      this.sql.exec(
+        "ALTER TABLE upload_sessions ADD COLUMN finalize_old_cleanup_cursor INTEGER NOT NULL DEFAULT -1"
+      )
+    );
+    applyMigrationOnce(this.sql, "upload_sessions_add_abort_phase", () =>
+      this.sql.exec("ALTER TABLE upload_sessions ADD COLUMN abort_phase TEXT")
+    );
+    applyMigrationOnce(this.sql, "upload_sessions_add_abort_fence_cursor", () =>
+      this.sql.exec(
+        "ALTER TABLE upload_sessions ADD COLUMN abort_fence_cursor INTEGER NOT NULL DEFAULT 0"
+      )
+    );
+    applyMigrationOnce(this.sql, "upload_sessions_add_abort_intent_cursor", () =>
+      this.sql.exec(
+        "ALTER TABLE upload_sessions ADD COLUMN abort_intent_cursor INTEGER NOT NULL DEFAULT 0"
+      )
+    );
+    applyMigrationOnce(this.sql, "upload_sessions_add_abort_cleanup_cursor", () =>
+      this.sql.exec(
+        "ALTER TABLE upload_sessions ADD COLUMN abort_cleanup_cursor INTEGER NOT NULL DEFAULT 0"
+      )
+    );
+    applyMigrationOnce(this.sql, "upload_sessions_add_abort_old_intent_cursor", () =>
+      this.sql.exec(
+        "ALTER TABLE upload_sessions ADD COLUMN abort_old_intent_cursor INTEGER NOT NULL DEFAULT -1"
+      )
+    );
+    applyMigrationOnce(this.sql, "upload_sessions_add_abort_retry_at", () =>
+      this.sql.exec(
+        "ALTER TABLE upload_sessions ADD COLUMN abort_retry_at INTEGER NOT NULL DEFAULT 0"
+      )
+    );
+    applyMigrationOnce(this.sql, "upload_sessions_add_terminal_at", () =>
+      this.sql.exec("ALTER TABLE upload_sessions ADD COLUMN terminal_at INTEGER")
+    );
+    this.sql.exec(`
+      CREATE INDEX IF NOT EXISTS idx_upload_sessions_terminal_at
+        ON upload_sessions(terminal_at)
+        WHERE status IN ('finalized', 'aborted', 'poisoned')
+    `);
 
     // ── Universal preview pipeline ───────────────────────────────────────
     //
@@ -1308,7 +1661,43 @@ export class UserDOCore extends DurableObject<Env> {
       return;
     }
 
+    const schemaHasMore = transactionSync(this, () =>
+      this.runSchemaMaintenancePage()
+    );
     await drainChunkCleanupIntents(this, scope);
+
+    let yjsHasMore = false;
+    try {
+      const { resumeYjsCleanup } = await import("./yjs");
+      yjsHasMore = await resumeYjsCleanup(this, scope);
+    } catch (err) {
+      yjsHasMore = true;
+      this.recordAlarmFailure("yjs_cleanup", "", err);
+    }
+
+    let multipartHasMore = false;
+    try {
+      const {
+        pruneTerminalMultipartSessions,
+        resumeFinalizedMultipartSessions,
+      } = await import(
+        "./multipart-upload"
+      );
+      const recovery = await resumeFinalizedMultipartSessions(this, scope);
+      const terminal = pruneTerminalMultipartSessions(this);
+      multipartHasMore = recovery.remaining || terminal.remaining;
+    } catch (err) {
+      multipartHasMore = true;
+      this.recordAlarmFailure("multipart_finalize_recovery", "", err);
+    }
+
+    let retentionHasMore = false;
+    try {
+      retentionHasMore = await resumeVersionRetentionOperations(this, scope);
+    } catch (err) {
+      retentionHasMore = true;
+      this.recordAlarmFailure("version_retention", "", err);
+    }
 
     const now = Date.now();
     const legacyCutoff = now - 60 * 60 * 1000;
@@ -1319,13 +1708,11 @@ export class UserDOCore extends DurableObject<Env> {
           LEFT JOIN upload_sessions us ON us.upload_id = f.file_id
          WHERE f.status = 'uploading'
            AND f.file_name LIKE '_vfs_tmp_%'
-           AND (
-             (ws.tmp_id IS NOT NULL AND ws.expires_at <= ?)
-             OR (us.upload_id IS NOT NULL AND us.status IN ('open', 'finalizing', 'aborting') AND us.expires_at <= ?)
-             OR (ws.tmp_id IS NULL AND us.upload_id IS NULL AND f.created_at < ?)
-           )
+            AND (
+              (ws.tmp_id IS NOT NULL AND ws.expires_at <= ?)
+              OR (ws.tmp_id IS NULL AND us.upload_id IS NULL AND f.created_at < ?)
+            )
           LIMIT 200`,
-        now,
         now,
         legacyCutoff
       )
@@ -1364,15 +1751,15 @@ export class UserDOCore extends DurableObject<Env> {
     // the scope is the persisted tenant identity for THIS DO instance
     // (tenant + optional sub) — multipart sessions can't span
     // tenants, only span uploads within one tenant. Idempotent.
-    let multipartHasMore = false;
     try {
       const { sweepExpiredMultipartSessions } = await import(
         "./multipart-upload"
       );
       const r = await sweepExpiredMultipartSessions(this, () => scope);
-      multipartHasMore = r.remaining;
+      multipartHasMore ||= r.remaining;
     } catch (err) {
       // Visible failure (instead of a bare swallow).
+      multipartHasMore = true;
       this.recordAlarmFailure("multipart_sweep", "", err);
     }
 
@@ -1434,8 +1821,17 @@ export class UserDOCore extends DurableObject<Env> {
         `SELECT MIN(deadline) AS deadline FROM (
            SELECT expires_at AS deadline FROM write_stream_sessions
            UNION ALL
-            SELECT expires_at AS deadline FROM upload_sessions WHERE status IN ('open', 'finalizing', 'aborting')
-           UNION ALL
+            SELECT CASE
+                     WHEN abort_retry_at > ?
+                       THEN abort_retry_at
+                     ELSE expires_at
+                   END AS deadline
+              FROM upload_sessions WHERE status IN ('open', 'finalizing', 'aborting')
+            UNION ALL
+            SELECT COALESCE(terminal_at, created_at) + ? AS deadline
+              FROM upload_sessions
+             WHERE status IN ('finalized', 'aborted', 'poisoned')
+            UNION ALL
            SELECT f.created_at + 3600000 AS deadline
              FROM files f
              LEFT JOIN write_stream_sessions ws ON ws.tmp_id = f.file_id
@@ -1443,20 +1839,27 @@ export class UserDOCore extends DurableObject<Env> {
             WHERE f.status = 'uploading'
               AND f.file_name LIKE '_vfs_tmp_%'
               AND ws.tmp_id IS NULL AND us.upload_id IS NULL
-         )`
+         )`,
+        Date.now(),
+        MULTIPART_TERMINAL_RETENTION_MS
       )
       .toArray()[0]?.deadline;
 
     // Reschedule while any bounded maintenance queue still has work.
     const maintenanceHasMore =
-      rows.length === 200 || staleSweepFailed || multipartHasMore;
+      rows.length === 200 ||
+      staleSweepFailed ||
+      multipartHasMore ||
+      retentionHasMore ||
+      schemaHasMore ||
+      yjsHasMore;
     if (
       maintenanceHasMore ||
       (nextCleanupAttempt !== null && nextCleanupAttempt !== undefined) ||
       (nextUploadExpiry !== null && nextUploadExpiry !== undefined)
     ) {
       let target = maintenanceHasMore
-        ? Date.now() + 60_000
+        ? Date.now() + (multipartHasMore ? 1_000 : 60_000)
         : Number.POSITIVE_INFINITY;
       if (nextCleanupAttempt !== null && nextCleanupAttempt !== undefined) {
         target = Math.min(
@@ -2080,12 +2483,14 @@ export class UserDOCore extends DurableObject<Env> {
       encryption?: { mode: "convergent" | "random"; keyId?: string };
     }
   ): Promise<void> {
+    this.recordRpc();
     this.gateVfsWrite(scope);
     return vfsWriteFile(this, scope, path, data, opts);
   }
 
   /** unlink() — hard-delete file/symlink + dispatch chunk GC. EISDIR for dirs. */
   async vfsUnlink(scope: VFSScope, path: string): Promise<void> {
+    this.recordRpc();
     this.gateVfsWrite(scope);
     return vfsUnlink(this, scope, path);
   }
@@ -2143,6 +2548,7 @@ export class UserDOCore extends DurableObject<Env> {
     dst: string,
     opts?: { overwrite?: boolean }
   ): Promise<void> {
+    this.recordRpc();
     this.gateVfsWrite(scope);
     return vfsRename(this, scope, src, dst, opts);
   }
@@ -2301,12 +2707,12 @@ export class UserDOCore extends DurableObject<Env> {
   // bandwidth without bottlenecking on UserDO single-thread.
   //
   // - vfsBeginMultipart: mints session, inserts tmp row + session row,
-  //   returns HMAC token. Resume mode probes shards for landed[].
+  //   returns HMAC token. Resume mode returns one bounded landed page.
   // - vfsAbortMultipart: flips status, fans out chunk-ref drops + staging
   //   clears across the pool, hard-deletes tmp row.
   // - vfsFinalizeMultipart: verifies completeness, batch-inserts
   //   file_chunks, atomic supersede via commitRename.
-  // - vfsGetMultipartStatus: read landed[] for resume / progress.
+  // - vfsGetMultipartStatus: cursor-page landed[] for resume / progress.
   //
   // See worker/core/objects/user/multipart-upload.ts for implementation
   // details; this file just wires the RPCs to gates.
@@ -2334,6 +2740,16 @@ export class UserDOCore extends DurableObject<Env> {
     return vfsAbortMultipart(this, scope, uploadId);
   }
 
+  async vfsAbortMultipartStep(
+    scope: VFSScope,
+    uploadId: string
+  ): Promise<import("../../../../shared/multipart").MultipartAbortProgress> {
+    this.recordRpc();
+    this.gateVfs(scope);
+    const { vfsAbortMultipartStep } = await import("./multipart-upload");
+    return vfsAbortMultipartStep(this, scope, uploadId);
+  }
+
   async vfsFinalizeMultipart(
     scope: VFSScope,
     uploadId: string,
@@ -2344,19 +2760,47 @@ export class UserDOCore extends DurableObject<Env> {
     return vfsFinalizeMultipart(this, scope, uploadId, chunkHashList);
   }
 
-  async vfsGetMultipartStatus(
+  async vfsStageMultipartHashes(
+    scope: VFSScope,
+    uploadId: string,
+    startIndex: number,
+    hashes: readonly string[]
+  ): Promise<{ staged: number; total: number }> {
+    this.recordRpc();
+    this.gateVfsWrite(scope);
+    const { vfsStageMultipartHashes } = await import("./multipart-upload");
+    return vfsStageMultipartHashes(
+      this,
+      scope,
+      uploadId,
+      startIndex,
+      hashes
+    );
+  }
+
+  async vfsFinalizeMultipartStep(
     scope: VFSScope,
     uploadId: string
-  ): Promise<{
-    landed: number[];
-    total: number;
-    bytesUploaded: number;
-    expiresAtMs: number;
-    status: string;
-  }> {
+  ): Promise<import("../../../../shared/multipart").MultipartFinalizeProgress> {
+    this.recordRpc();
+    this.gateVfsWrite(scope);
+    const { vfsFinalizeMultipartStep } = await import("./multipart-upload");
+    return vfsFinalizeMultipartStep(this, scope, uploadId);
+  }
+
+  async vfsGetMultipartStatus(
+    scope: VFSScope,
+    uploadId: string,
+    continuation?: string
+  ): Promise<
+    import("../../../../shared/multipart").MultipartStatusPageResponse & {
+      status: string;
+    }
+  > {
+    this.recordRpc();
     this.gateVfs(scope);
     const { vfsGetMultipartStatus } = await import("./multipart-upload");
-    return vfsGetMultipartStatus(this, scope, uploadId);
+    return vfsGetMultipartStatus(this, scope, uploadId, continuation);
   }
 
   // ── file-level versioning RPCs ───────────────────────────────
@@ -2672,11 +3116,28 @@ export class UserDOCore extends DurableObject<Env> {
   }
 
   /**
-   * Drop versions per a retention policy. Head version is always
-   * preserved (S3 invariant). Returns counts. Chunks whose last
-   * version reference was dropped are reaped by the alarm
-   * sweeper after its 30s grace.
+   * Process one persistent retention step. The SDK repeats this RPC until
+   * completion; each invocation scans at most 128 versions.
    */
+  async vfsDropVersionsStep(
+    scope: VFSScope,
+    path: string,
+    policy: {
+      olderThan?: number;
+      keepLast?: number;
+      exceptVersions?: string[];
+    },
+    operationId: string
+  ): Promise<import("../../../../shared/vfs-types").DropVersionsStepResult> {
+    this.recordRpc();
+    this.gateVfs(scope);
+    const userId = scope.sub
+      ? `${scope.tenant}::${scope.sub}`
+      : scope.tenant;
+    return dropVersions(this, scope, userId, path, policy, operationId);
+  }
+
+  /** Legacy binding contract retained for rolling SDK upgrades. */
   async vfsDropVersions(
     scope: VFSScope,
     path: string,
@@ -2690,15 +3151,24 @@ export class UserDOCore extends DurableObject<Env> {
     const userId = scope.sub
       ? `${scope.tenant}::${scope.sub}`
       : scope.tenant;
-    const pathId = resolvePathId(this, userId, path);
-    if (!pathId) {
-      const { VFSError } = await import("../../../../shared/vfs-types");
+    assertLegacyDropVersionsBounded(this, userId, path, policy);
+    const operationId = generateId();
+    const step = await dropVersions(
+      this,
+      scope,
+      userId,
+      path,
+      policy,
+      operationId
+    );
+    if (!step.done) {
+      await scheduleAlarmAt(this, Date.now() + 1_000);
       throw new VFSError(
-        "ENOENT",
-        `dropVersions: path not found: ${path}`
+        "EBUSY",
+        "dropVersions: retention exceeded the legacy one-call capability"
       );
     }
-    return dropVersions(this, scope, userId, pathId, policy);
+    return { dropped: step.dropped, kept: step.kept };
   }
 
   /**

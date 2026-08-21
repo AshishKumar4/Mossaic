@@ -150,6 +150,56 @@ export interface OpenManifestResult {
   inlined: boolean;
 }
 
+/** Internal result for one bounded version-retention invocation. */
+export type DropVersionsStepResult =
+  | { done: false }
+  | { done: true; dropped: number; kept: number };
+
+export interface DropVersionsResult {
+  dropped: number;
+  kept: number;
+}
+
+function parseRetentionCount(value: unknown, field: string): number {
+  if (
+    typeof value !== "number" ||
+    !Number.isSafeInteger(value) ||
+    value < 0
+  ) {
+    throw new TypeError(`dropVersions.${field}: expected non-negative integer`);
+  }
+  return value;
+}
+
+export function parseDropVersionsStepResult(
+  raw: unknown
+): DropVersionsStepResult {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new TypeError("dropVersions step: expected object");
+  }
+  const value = raw as Record<string, unknown>;
+  if (value.done === false) return { done: false };
+  if (value.done !== true) {
+    throw new TypeError("dropVersions step.done: expected boolean");
+  }
+  return {
+    done: true,
+    dropped: parseRetentionCount(value.dropped, "dropped"),
+    kept: parseRetentionCount(value.kept, "kept"),
+  };
+}
+
+export function parseDropVersionsResult(raw: unknown): DropVersionsResult {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new TypeError("dropVersions result: expected object");
+  }
+  const value = raw as Record<string, unknown>;
+  return {
+    dropped: parseRetentionCount(value.dropped, "dropped"),
+    kept: parseRetentionCount(value.kept, "kept"),
+  };
+}
+
 /**
  * Path resolution result. read-side ops (vfsStat/lstat/exists/readlink/...)
  * all flow through resolvePath() and discriminate on `kind`.

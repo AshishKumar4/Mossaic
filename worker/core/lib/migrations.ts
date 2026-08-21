@@ -40,6 +40,56 @@ export function ensureMigrationsTable(sql: SqlStorage): void {
        applied_at INTEGER NOT NULL
      )`
   );
+
+  sql.exec(
+    `CREATE TABLE IF NOT EXISTS schema_maintenance (
+       name       TEXT PRIMARY KEY,
+       state      TEXT NOT NULL,
+       cursor     TEXT NOT NULL DEFAULT '',
+       updated_at INTEGER NOT NULL
+     )`
+  );
+}
+
+interface SchemaMaintenanceRow extends Record<string, SqlStorageValue> {
+  state: string;
+  cursor: string;
+}
+
+export function ensureSchemaMaintenance(
+  sql: SqlStorage,
+  name: string
+): SchemaMaintenanceRow {
+  sql.exec(
+    `INSERT OR IGNORE INTO schema_maintenance (name, state, cursor, updated_at)
+     VALUES (?, 'pending', '', ?)`,
+    name,
+    Date.now()
+  );
+  const row = sql
+    .exec<SchemaMaintenanceRow>(
+      "SELECT state, cursor FROM schema_maintenance WHERE name = ?",
+      name
+    )
+    .toArray()[0];
+  if (row === undefined) throw new Error(`missing schema maintenance state: ${name}`);
+  return row;
+}
+
+export function advanceSchemaMaintenance(
+  sql: SqlStorage,
+  name: string,
+  cursor: string,
+  done: boolean
+): void {
+  sql.exec(
+    `UPDATE schema_maintenance SET state = ?, cursor = ?, updated_at = ?
+      WHERE name = ?`,
+    done ? "ready" : "pending",
+    cursor,
+    Date.now(),
+    name
+  );
 }
 
 /**
