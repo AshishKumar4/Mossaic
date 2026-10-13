@@ -4,6 +4,7 @@ export default defineWorkersTestConfig({
 	wranglerConfigPath: "./tests/wrangler.fault.test.jsonc",
 	include: [
 		"tests/integration/alarm-maintenance-event.test.ts",
+		"tests/integration/alarm-settle.test.ts",
 		"tests/integration/cleanup-outbox-remaining-paths.test.ts",
 		"tests/integration/multipart-shard-transaction.test.ts",
 		"tests/integration/multipart-paged-faults.test.ts",

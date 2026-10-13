@@ -52,10 +52,7 @@ import type {
   Variant,
 } from "../../../../shared/preview-types";
 import { VFSError } from "../../../../shared/vfs-types";
-import {
-  MULTIPART_LEGACY_PLACEMENT_VERSION,
-  MULTIPART_TERMINAL_RETENTION_MS,
-} from "../../../../shared/multipart";
+import { MULTIPART_LEGACY_PLACEMENT_VERSION } from "../../../../shared/multipart";
 import { generateId, vfsShardDOName } from "../../lib/utils";
 import { logError, logInfo } from "../../lib/logger";
 import {
@@ -114,6 +111,8 @@ import {
   type VersionRow,
 } from "./vfs-versions";
 import {
+  alarmRunning,
+  nextPendingMaintenanceAt,
   scheduleAlarmAt,
   scheduleStaleUploadSweep,
   transactionSync,
@@ -1650,6 +1649,7 @@ export class UserDOCore extends DurableObject<Env> {
    * has work; normal VFS traffic also keeps the ten-minute alarm armed.
    */
   async alarm(): Promise<void> {
+    alarmRunning(this);
     this.ensureInit();
     const scope = this.loadScope();
     if (!scope) {
@@ -1840,41 +1840,7 @@ export class UserDOCore extends DurableObject<Env> {
       this.recordAlarmFailure("audit_log_reap", "", err);
     }
 
-    const nextCleanupAttempt = this.sql
-      .exec<{ next_attempt_at: number | null }>(
-        `SELECT MIN(next_attempt_at) AS next_attempt_at
-           FROM chunk_cleanup_intents
-          WHERE state IN ('pending', 'in_flight')`
-      )
-      .toArray()[0]?.next_attempt_at;
-    const nextUploadExpiry = this.sql
-      .exec<{ deadline: number | null }>(
-        `SELECT MIN(deadline) AS deadline FROM (
-           SELECT expires_at AS deadline FROM write_stream_sessions
-           UNION ALL
-            SELECT CASE
-                     WHEN abort_retry_at > ?
-                       THEN abort_retry_at
-                     ELSE expires_at
-                   END AS deadline
-              FROM upload_sessions WHERE status IN ('open', 'finalizing', 'aborting')
-            UNION ALL
-            SELECT COALESCE(terminal_at, created_at) + ? AS deadline
-              FROM upload_sessions
-             WHERE status IN ('finalized', 'aborted', 'poisoned')
-            UNION ALL
-           SELECT f.created_at + 3600000 AS deadline
-             FROM files f
-             LEFT JOIN write_stream_sessions ws ON ws.tmp_id = f.file_id
-             LEFT JOIN upload_sessions us ON us.upload_id = f.file_id
-            WHERE f.status = 'uploading'
-              AND f.file_name LIKE '_vfs_tmp_%'
-              AND ws.tmp_id IS NULL AND us.upload_id IS NULL
-         )`,
-        Date.now(),
-        MULTIPART_TERMINAL_RETENTION_MS
-      )
-      .toArray()[0]?.deadline;
+    const nextPending = nextPendingMaintenanceAt(this);
 
     // Reschedule while any bounded maintenance queue still has work.
     const maintenanceHasMore =
@@ -1884,27 +1850,20 @@ export class UserDOCore extends DurableObject<Env> {
       retentionHasMore ||
       schemaHasMore ||
       yjsHasMore;
-    if (
-      maintenanceHasMore ||
-      (nextCleanupAttempt !== null && nextCleanupAttempt !== undefined) ||
-      (nextUploadExpiry !== null && nextUploadExpiry !== undefined)
-    ) {
+    if (maintenanceHasMore || nextPending !== null) {
       let target = maintenanceHasMore
         ? Date.now() + (multipartHasMore ? 1_000 : 60_000)
         : Number.POSITIVE_INFINITY;
-      if (nextCleanupAttempt !== null && nextCleanupAttempt !== undefined) {
-        target = Math.min(
-          target,
-          Math.max(Date.now() + 1_000, nextCleanupAttempt)
-        );
+      if (nextPending !== null) {
+        target = Math.min(target, Math.max(Date.now() + 1_000, nextPending));
       }
-      if (nextUploadExpiry !== null && nextUploadExpiry !== undefined) {
-        target = Math.min(
-          target,
-          Math.max(Date.now() + 1_000, nextUploadExpiry)
-        );
-      }
-      await scheduleAlarmAt(this, target);
+      // Set only for what SQL shows pending, a write that leaves nothing of it
+      // pending takes it back.
+      await scheduleAlarmAt(
+        this,
+        target,
+        maintenanceHasMore ? "other" : "pending"
+      );
     }
   }
 

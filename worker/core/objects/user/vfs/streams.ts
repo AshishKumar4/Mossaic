@@ -53,6 +53,7 @@ import {
 } from "./write-commit";
 import {
   scheduleStaleUploadSweep,
+  settlePendingSweep,
   transactionSync,
 } from "../internal-storage";
 
@@ -1245,6 +1246,7 @@ export async function vfsCommitWriteStream(
       await abortTempFile(durableObject, userId, scope, handle.tmpId);
       throw err;
     }
+    await settlePendingSweep(durableObject);
     return;
   }
 

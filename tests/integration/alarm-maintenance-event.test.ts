@@ -113,7 +113,7 @@ describe("the UserDO alarm's maintenance event", () => {
   it("is not logged when the alarm found nothing to do", async () => {
     const tenant = "alarm-event-idle";
     const vfs = createVFS(envFor(), { tenant });
-    // A completed write arms the stale-upload sweep and leaves it nothing.
+    // A completed write leaves the alarm nothing to do; run anyway, it finds nothing.
     await vfs.writeFile("/kept.bin", new Uint8Array(32 * 1024).fill(0x0b));
 
     const lines = await sweptLines(() =>

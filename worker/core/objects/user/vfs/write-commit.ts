@@ -38,8 +38,10 @@ import {
   lastSqlChanges,
   scheduleChunkCleanupSweep,
   scheduleStaleUploadSweep,
+  settlePendingSweep,
   stageChunkCleanupIntent,
   transactionSync,
+  withStaleUploadSweep,
 } from "../internal-storage";
 import {
   bumpFolderRevision,
@@ -153,21 +155,22 @@ export async function stageChunkCleanupIntents(
   });
   if (unstagedShardIndexes.length === 0) return;
 
-  await scheduleStaleUploadSweep(durableObject);
   const now = Date.now();
-  transactionSync(durableObject, () => {
-    for (const shardIndex of unstagedShardIndexes) {
-      stageChunkCleanupIntent(
-        durableObject,
-        refId,
-        shardIndex,
-        now,
-        now + SYNTHETIC_REF_CLEANUP_GRACE_MS,
-        ChunkCleanupKind.Chunks,
-        true
-      );
-    }
-  });
+  await withStaleUploadSweep(durableObject, () =>
+    transactionSync(durableObject, () => {
+      for (const shardIndex of unstagedShardIndexes) {
+        stageChunkCleanupIntent(
+          durableObject,
+          refId,
+          shardIndex,
+          now,
+          now + SYNTHETIC_REF_CLEANUP_GRACE_MS,
+          ChunkCleanupKind.Chunks,
+          true
+        );
+      }
+    })
+  );
 }
 
 /** Delete only from a caller's successful local publication transaction. */
@@ -264,7 +267,13 @@ export async function hardDeleteFileRow(
     hardDeleteFileRowLocal(durableObject, userId, fileId);
     deleted = true;
   });
-  if (!deleted) return;
+  if (!deleted) {
+    await settlePendingSweep(durableObject);
+    return;
+  }
+  // Armed again now its intents exist: a write that finished since the first
+  // saw nothing pending and may have taken it back (`withStaleUploadSweep`).
+  await scheduleStaleUploadSweep(durableObject);
   await drainChunkCleanupIntents(durableObject, scope, fileId);
 }
 
@@ -718,6 +727,7 @@ export async function drainChunkCleanupIntents(
       await scheduleChunkCleanupSweep(durableObject, nextAttempt);
     }
   }
+  await settlePendingSweep(durableObject);
   return rows.length;
 }
 
@@ -811,20 +821,21 @@ async function vfsWriteFileVersioned(
 
   if (!existing) {
     tmpId = pathId;
-    await scheduleStaleUploadSweep(durableObject);
     const tmpName = `_vfs_tmp_${tmpId}`;
-    durableObject.sql.exec(
-      `INSERT INTO files (file_id, user_id, parent_id, file_name, file_size, file_hash, mime_type, chunk_size, chunk_count, pool_size, status, created_at, updated_at, mode, node_kind)
-       VALUES (?, ?, ?, ?, 0, '', ?, 0, 0, ?, 'uploading', ?, ?, ?, 'file')`,
-      pathId,
-      userId,
-      parentId,
-      tmpName,
-      mimeType,
-      poolSizeFor(durableObject, userId),
-      now,
-      now,
-      mode
+    await withStaleUploadSweep(durableObject, () =>
+      durableObject.sql.exec(
+        `INSERT INTO files (file_id, user_id, parent_id, file_name, file_size, file_hash, mime_type, chunk_size, chunk_count, pool_size, status, created_at, updated_at, mode, node_kind)
+         VALUES (?, ?, ?, ?, 0, '', ?, 0, 0, ?, 'uploading', ?, ?, ?, 'file')`,
+        pathId,
+        userId,
+        parentId,
+        tmpName,
+        mimeType,
+        poolSizeFor(durableObject, userId),
+        now,
+        now,
+        mode
+      )
     );
   }
 
@@ -1094,18 +1105,20 @@ async function publishVersionedWrite(
     return;
   }
 
-  await scheduleStaleUploadSweep(durableObject);
-  transactionSync(durableObject, () => {
-    const live = findLiveFile(durableObject, userId, parentId, leaf);
-    if (live?.file_id !== pathId) {
-      throw new VFSError(
-        "EBUSY",
-        "writeFile: versioned path changed during commit"
-      );
-    }
-    finalizeLocal();
-    bumpFolderRevision(durableObject, userId, parentId);
-  });
+  await withStaleUploadSweep(durableObject, () =>
+    transactionSync(durableObject, () => {
+      const live = findLiveFile(durableObject, userId, parentId, leaf);
+      if (live?.file_id !== pathId) {
+        throw new VFSError(
+          "EBUSY",
+          "writeFile: versioned path changed during commit"
+        );
+      }
+      finalizeLocal();
+      bumpFolderRevision(durableObject, userId, parentId);
+    })
+  );
+  await settlePendingSweep(durableObject);
 }
 
 function applyVersionedWriteSideEffects(
@@ -1914,6 +1927,7 @@ export async function commitRename(
   if (supersededId !== undefined) {
     await drainChunkCleanupIntents(durableObject, scope, supersededId);
   }
+  await settlePendingSweep(durableObject);
 }
 
 /**
