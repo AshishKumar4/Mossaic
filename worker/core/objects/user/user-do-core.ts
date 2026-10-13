@@ -1664,7 +1664,7 @@ export class UserDOCore extends DurableObject<Env> {
     const schemaHasMore = transactionSync(this, () =>
       this.runSchemaMaintenancePage()
     );
-    await drainChunkCleanupIntents(this, scope);
+    const cleanupDrained = await drainChunkCleanupIntents(this, scope);
 
     let yjsHasMore = false;
     try {
@@ -1676,6 +1676,8 @@ export class UserDOCore extends DurableObject<Env> {
     }
 
     let multipartHasMore = false;
+    let multipartResumed = 0;
+    let multipartPruned = 0;
     try {
       const {
         pruneTerminalMultipartSessions,
@@ -1685,6 +1687,8 @@ export class UserDOCore extends DurableObject<Env> {
       );
       const recovery = await resumeFinalizedMultipartSessions(this, scope);
       const terminal = pruneTerminalMultipartSessions(this);
+      multipartResumed = recovery.resumed;
+      multipartPruned = terminal.pruned;
       multipartHasMore = recovery.remaining || terminal.remaining;
     } catch (err) {
       multipartHasMore = true;
@@ -1719,6 +1723,7 @@ export class UserDOCore extends DurableObject<Env> {
       .toArray() as { file_id: string }[];
 
     let staleSweepFailed = false;
+    let staleSwept = 0;
     for (const { file_id } of rows) {
       // user_id encoding mirrors userIdFor(scope) in vfs-ops.
       const userId =
@@ -1727,6 +1732,7 @@ export class UserDOCore extends DurableObject<Env> {
         await hardDeleteFileRow(this, userId, scope, file_id, {
           staleAt: now,
         });
+        staleSwept++;
       } catch (err) {
         staleSweepFailed = true;
         // Surface alarm-handler errors via structured log +
@@ -1751,11 +1757,13 @@ export class UserDOCore extends DurableObject<Env> {
     // the scope is the persisted tenant identity for THIS DO instance
     // (tenant + optional sub) — multipart sessions can't span
     // tenants, only span uploads within one tenant. Idempotent.
+    let multipartSwept = 0;
     try {
       const { sweepExpiredMultipartSessions } = await import(
         "./multipart-upload"
       );
       const r = await sweepExpiredMultipartSessions(this, () => scope);
+      multipartSwept = r.swept;
       multipartHasMore ||= r.remaining;
     } catch (err) {
       // Visible failure (instead of a bare swallow).
@@ -1785,6 +1793,29 @@ export class UserDOCore extends DurableObject<Env> {
     } catch (err) {
       // Visible failure (instead of a bare swallow).
       this.recordAlarmFailure("shard_capacity_poll", "", err);
+    }
+
+    // One line when the alarm did maintenance work, none when it found nothing:
+    // the work runs on ShardDOs, so a reader of this object's own logs could
+    // not tell a sweep that cleaned up from an idle wake.
+    const swept = {
+      cleanupDrained,
+      staleSwept,
+      multipartResumed,
+      multipartPruned,
+      multipartSwept,
+    };
+    if (Object.values(swept).some((count) => count > 0)) {
+      logInfo(
+        "alarm maintenance swept",
+        {
+          tenantId:
+            scope.sub !== undefined
+              ? `${scope.ns}::${scope.tenant}::${scope.sub}`
+              : `${scope.ns}::${scope.tenant}`,
+        },
+        { event: "maintenance_swept", ...swept }
+      );
     }
 
     // Audit-log retention sweep. Trim oldest rows when count

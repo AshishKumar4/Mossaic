@@ -386,12 +386,13 @@ export function hardDeleteFileRowLocal(
  * Ordinary refs use deleteChunks, multipart refs also clear staging, and bulk
  * refs group into deleteManyChunks by shard. An intent is acknowledged only
  * after its complete protocol resolves; any throw retains every affected row.
+ * Returns how many intents the batch took up.
  */
 export async function drainChunkCleanupIntents(
   durableObject: UserDO,
   scope: VFSScope,
   refId?: string | readonly string[]
-): Promise<void> {
+): Promise<number> {
   const eligibleAt = Date.now();
   transactionSync(durableObject, () => {
     durableObject.sql.exec(
@@ -717,6 +718,7 @@ export async function drainChunkCleanupIntents(
       await scheduleChunkCleanupSweep(durableObject, nextAttempt);
     }
   }
+  return rows.length;
 }
 
 // ── writeFile ──────────────────────────────────────────────────────────

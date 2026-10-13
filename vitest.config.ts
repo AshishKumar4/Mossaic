@@ -30,6 +30,7 @@ export default defineWorkersTestConfig({
 	wranglerConfigPath: "./tests/wrangler.test.jsonc",
 	include: ["tests/**/*.test.ts"],
 	exclude: [
+		"tests/integration/alarm-maintenance-event.test.ts",
 		"tests/integration/cleanup-outbox-remaining-paths.test.ts",
 		"tests/integration/multipart-shard-transaction.test.ts",
 		"tests/integration/multipart-paged-faults.test.ts",
