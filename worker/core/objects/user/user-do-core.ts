@@ -87,11 +87,7 @@ import {
   FILE_HEAD_JOIN,
   assertHeadNotTombstoned,
 } from "./vfs/helpers";
-import {
-  insertAuditLog,
-  loadAuditLogMaxRows,
-  reapAuditLog,
-} from "./vfs/audit-log";
+import { insertAuditLog } from "./vfs/audit-log";
 // type-only import. The YjsRuntime class is loaded
 // lazily via `await import("./yjs")` inside `getYjsRuntime()` so
 // non-collab consumers don't pay the ~250 KB yjs + y-protocols
@@ -1842,28 +1838,6 @@ export class UserDOCore extends DurableObject<Env> {
         },
         { event: "maintenance_swept", ...swept }
       );
-    }
-
-    // Audit-log retention sweep. Trim oldest rows when count
-    // exceeds the configured cap. Cheap (one COUNT + one bounded
-    // DELETE); fires inline so retention pressure amortizes
-    // across alarm ticks.
-    try {
-      const max = loadAuditLogMaxRows(this);
-      const reaped = reapAuditLog(this, max);
-      if (reaped > 0) {
-        const tenantId =
-          scope.sub !== undefined
-            ? `${scope.ns}::${scope.tenant}::${scope.sub}`
-            : `${scope.ns}::${scope.tenant}`;
-        logInfo(
-          "audit-log retention reaped rows",
-          { tenantId },
-          { event: "audit_log_reaped", reaped, max }
-        );
-      }
-    } catch (err) {
-      this.recordAlarmFailure("audit_log_reap", "", err);
     }
 
     const nextPending = nextPendingMaintenanceAt(this);
