@@ -1002,6 +1002,9 @@ describe("UserDO alarm() — stale-upload sweeper (H1)", () => {
         fakeChunkHash,
         shard_index
       );
+      // The crashed write armed the sweep before its row and never completed
+      // to take it back; the real write above, which did, left none.
+      await state.storage.setAlarm(Date.now() + 10 * 60 * 1000);
     });
     // Plant a chunk_refs row on the shard so the alarm has something
     // to decrement. We INSERT a fake chunk row + ref so the

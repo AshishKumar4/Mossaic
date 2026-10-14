@@ -6,8 +6,8 @@ import { vfsUserDOName } from "@core/lib/utils";
  * Phase 42 \u2014 audit_log emission + retention.
  *
  * Every destructive op writes one row per call into the
- * per-tenant `audit_log` table. The alarm sweep trims oldest
- * rows when count exceeds AUDIT_LOG_MAX_ROWS (default 10K).
+ * per-tenant `audit_log` table. The insert that takes it past
+ * AUDIT_LOG_MAX_ROWS (default 10K) trims the oldest rows.
  *
  * Cases:
  *   AL1  fresh tenant: audit_log table exists and is empty.
@@ -20,8 +20,8 @@ import { vfsUserDOName } from "@core/lib/utils";
  *   AL7  removeRecursive emits one row per call (paginated).
  *   AL8  dropVersions emits one row.
  *   AL9  restoreVersion emits one row.
- *   AL10 audit_log retention sweep trims down to the floor when
- *        count exceeds the cap.
+ *   AL10 write/unlink cycles past the cap leave the log at or
+ *        under it, newest rows kept, with no alarm armed.
  *   AL11 admin* RPCs emit audit-log rows.
  *   AL12 audit_log row carries actor + target + payload + ts +
  *        op fields populated.
@@ -220,64 +220,48 @@ describe("Phase 42 \u2014 audit_log emission", () => {
     expect(typeof payload.newVersionId).toBe("string");
   });
 
-  it("AL10 \u2014 retention sweep trims to floor when over cap", async () => {
+  it("AL10 \u2014 write/unlink cycles past the cap stay under it, no alarm", async () => {
     const tenant = "al10-retention";
     const stub = E.MOSSAIC_USER.get(
       E.MOSSAIC_USER.idFromName(vfsUserDOName(NS, tenant))
     );
     const scope = { ns: NS, tenant };
     await stub.vfsExists(scope, "/"); // ensureInit
-    // Override cap to a small number for the test.
+    // The smallest cap an operator can set; its trim floor is 98.
     await runInDurableObject(stub, async (_inst, state) => {
       state.storage.sql.exec(
-        "INSERT OR REPLACE INTO vfs_meta (key, value) VALUES ('audit_log_max_rows', '20')"
+        "INSERT OR REPLACE INTO vfs_meta (key, value) VALUES ('audit_log_max_rows', '100')"
       );
-      // Backfill a bunch of rows.
-      for (let i = 0; i < 30; i++) {
-        state.storage.sql.exec(
-          "INSERT INTO audit_log (id, ts, op, actor, target, payload) VALUES (?, ?, ?, ?, ?, ?)",
-          `bulk-${String(i).padStart(4, "0")}`,
-          1_000_000_000_000 + i,
-          "test",
-          tenant,
-          tenant,
-          null
-        );
-      }
     });
-    // Use the helper directly to avoid full alarm flow.
-    const reaped = await runInDurableObject(stub, async (_inst, state) => {
-      // Re-import the helper inside the DO so we use the same module.
-      const r = state.storage.sql
-        .exec("SELECT COUNT(*) AS n FROM audit_log")
-        .toArray()[0] as { n: number };
-      return r.n;
-    });
-    expect(reaped).toBe(30);
-
-    // Trigger retention via a direct SQL trim mirroring reapAuditLog.
-    await runInDurableObject(stub, async (_inst, state) => {
-      // Floor for max=20 is 20 - 200 below zero -> clamped to 0; emulate
-      // by trimming to exactly 18 (matches reap target shape).
-      const target = 30 - Math.max(0, 30 - Math.max(0, 20 - 200));
-      // Above formula yields 30 - 30 = 0 which doesn't trim; use the
-      // production reap path instead.
-      state.storage.sql.exec(
-        `DELETE FROM audit_log
-           WHERE id IN (
-             SELECT id FROM audit_log ORDER BY ts ASC LIMIT ?
-           )`,
-        Math.max(0, 30 - 18)
-      );
-      void target;
-    });
-    const after = await runInDurableObject(stub, async (_inst, state) => {
-      const r = state.storage.sql
-        .exec("SELECT COUNT(*) AS n FROM audit_log")
-        .toArray()[0] as { n: number };
-      return r.n;
-    });
-    expect(after).toBeLessThanOrEqual(20);
+    // Each completed write and unlink takes back its alarm, so the
+    // cap holds only if the insert crossing it trims.
+    const cycles = 110;
+    for (let i = 0; i < cycles; i++) {
+      await stub.vfsWriteFile(scope, `/c${i}.bin`, new Uint8Array(8).fill(1));
+      await stub.vfsUnlink(scope, `/c${i}.bin`);
+    }
+    // Insertion order: rows written in one millisecond tie on ts.
+    const rows = await runInDurableObject(
+      stub,
+      (_inst, state) =>
+        state.storage.sql
+          .exec("SELECT * FROM audit_log ORDER BY rowid ASC")
+          .toArray() as AuditLogRow[]
+    );
+    expect(rows.every((r) => r.op === "unlink")).toBe(true);
+    expect(rows.length).toBeLessThanOrEqual(100);
+    expect(rows.length).toBeGreaterThanOrEqual(98);
+    const paths = rows.map((r) => JSON.parse(r.payload ?? "{}").path);
+    expect(paths).toEqual(
+      Array.from(
+        { length: rows.length },
+        (_, k) => `/c${cycles - rows.length + k}.bin`
+      )
+    );
+    const alarm = await runInDurableObject(stub, (_inst, state) =>
+      state.storage.getAlarm()
+    );
+    expect(alarm).toBeNull();
   });
 
   it("AL11 \u2014 admin* RPCs emit audit-log rows", async () => {

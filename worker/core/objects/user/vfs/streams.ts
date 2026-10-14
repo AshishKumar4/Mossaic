@@ -53,6 +53,7 @@ import {
 } from "./write-commit";
 import {
   scheduleStaleUploadSweep,
+  settlePendingSweep,
   transactionSync,
 } from "../internal-storage";
 
@@ -1245,6 +1246,7 @@ export async function vfsCommitWriteStream(
       await abortTempFile(durableObject, userId, scope, handle.tmpId);
       throw err;
     }
+    await settlePendingSweep(durableObject);
     return;
   }
 
@@ -1380,6 +1382,9 @@ export async function vfsCreateWriteStream(
   opts: VFSWriteFileOpts = {}
 ): Promise<{ stream: WritableStream<Uint8Array>; handle: VFSWriteHandle }> {
   const handle = vfsBeginWriteStream(durableObject, scope, path, opts);
+  // H1, as the handle RPC arms it: the sweeper reclaims a stream its caller
+  // abandons, and no other write's alarm is left to find it.
+  await scheduleStaleUploadSweep(durableObject);
   let buffer = new Uint8Array(0);
   let chunkIndex = 0;
   let aborted = false;

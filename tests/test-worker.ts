@@ -30,6 +30,8 @@ import type { VFSScope } from "../shared/vfs-types";
 
 export { default } from "../worker/app/index";
 export { SearchDO } from "../worker/app/objects/search/index";
+/** The service deployment's UserDO, without the App's layer (tests/wrangler.fault.test.jsonc). */
+export { UserDOCore as CoreUserDO } from "../worker/core/objects/user/user-do-core";
 export { ShardDO, UserDO };
 
 export type DeleteChunksFailurePhase = "before" | "after";

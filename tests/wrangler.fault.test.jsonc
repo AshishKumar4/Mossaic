@@ -7,11 +7,12 @@
     "bindings": [
       { "name": "MOSSAIC_USER", "class_name": "FaultInjectingUserDO" },
       { "name": "MOSSAIC_SHARD", "class_name": "FaultInjectingShardDO" },
-      { "name": "SEARCH_DO", "class_name": "SearchDO" }
+      { "name": "SEARCH_DO", "class_name": "SearchDO" },
+      { "name": "MOSSAIC_USER_CORE", "class_name": "CoreUserDO" }
     ]
   },
   "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["FaultInjectingUserDO", "FaultInjectingShardDO", "SearchDO"] }
+    { "tag": "v1", "new_sqlite_classes": ["FaultInjectingUserDO", "FaultInjectingShardDO", "SearchDO", "CoreUserDO"] }
   ],
   "vars": {
     "JWT_SECRET": "test-secret-for-vitest-only"

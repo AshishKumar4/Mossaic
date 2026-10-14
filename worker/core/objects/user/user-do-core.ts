@@ -52,10 +52,7 @@ import type {
   Variant,
 } from "../../../../shared/preview-types";
 import { VFSError } from "../../../../shared/vfs-types";
-import {
-  MULTIPART_LEGACY_PLACEMENT_VERSION,
-  MULTIPART_TERMINAL_RETENTION_MS,
-} from "../../../../shared/multipart";
+import { MULTIPART_LEGACY_PLACEMENT_VERSION } from "../../../../shared/multipart";
 import { generateId, vfsShardDOName } from "../../lib/utils";
 import { logError, logInfo } from "../../lib/logger";
 import {
@@ -90,11 +87,7 @@ import {
   FILE_HEAD_JOIN,
   assertHeadNotTombstoned,
 } from "./vfs/helpers";
-import {
-  insertAuditLog,
-  loadAuditLogMaxRows,
-  reapAuditLog,
-} from "./vfs/audit-log";
+import { insertAuditLog } from "./vfs/audit-log";
 // type-only import. The YjsRuntime class is loaded
 // lazily via `await import("./yjs")` inside `getYjsRuntime()` so
 // non-collab consumers don't pay the ~250 KB yjs + y-protocols
@@ -114,6 +107,9 @@ import {
   type VersionRow,
 } from "./vfs-versions";
 import {
+  alarmRunning,
+  nextPendingMaintenanceAt,
+  registerMaintenanceCheck,
   scheduleAlarmAt,
   scheduleStaleUploadSweep,
   transactionSync,
@@ -177,6 +173,31 @@ export class UserDOCore extends DurableObject<Env> {
     this.state = ctx;
     this.storage = ctx.storage;
     this.envPublic = env;
+    registerMaintenanceCheck(this, () => this.hasPendingMaintenance());
+  }
+
+  /**
+   * Maintenance the alarm still owes beyond the deadlines the SQL shows
+   * (`nextPendingMaintenanceAt`): a version-retention operation still
+   * running, a schema maintenance page (the retention order among them)
+   * still to run, a Yjs cleanup still queued. A subclass adds its own.
+   * Read only: an instance that has not opened its schema keeps its alarm
+   * rather than run schema maintenance from inside another operation.
+   */
+  protected hasPendingMaintenance(): boolean {
+    if (!this.initialized) return true;
+    return (
+      this.sql
+        .exec(
+          `SELECT 1 FROM version_retention_operations WHERE status = 'running'
+           UNION ALL
+           SELECT 1 FROM schema_maintenance WHERE state <> 'ready'
+           UNION ALL
+           SELECT 1 FROM yjs_cleanup_operations
+           LIMIT 1`
+        )
+        .toArray().length > 0
+    );
   }
 
   /**
@@ -1650,6 +1671,7 @@ export class UserDOCore extends DurableObject<Env> {
    * has work; normal VFS traffic also keeps the ten-minute alarm armed.
    */
   async alarm(): Promise<void> {
+    alarmRunning(this);
     this.ensureInit();
     const scope = this.loadScope();
     if (!scope) {
@@ -1818,63 +1840,7 @@ export class UserDOCore extends DurableObject<Env> {
       );
     }
 
-    // Audit-log retention sweep. Trim oldest rows when count
-    // exceeds the configured cap. Cheap (one COUNT + one bounded
-    // DELETE); fires inline so retention pressure amortizes
-    // across alarm ticks.
-    try {
-      const max = loadAuditLogMaxRows(this);
-      const reaped = reapAuditLog(this, max);
-      if (reaped > 0) {
-        const tenantId =
-          scope.sub !== undefined
-            ? `${scope.ns}::${scope.tenant}::${scope.sub}`
-            : `${scope.ns}::${scope.tenant}`;
-        logInfo(
-          "audit-log retention reaped rows",
-          { tenantId },
-          { event: "audit_log_reaped", reaped, max }
-        );
-      }
-    } catch (err) {
-      this.recordAlarmFailure("audit_log_reap", "", err);
-    }
-
-    const nextCleanupAttempt = this.sql
-      .exec<{ next_attempt_at: number | null }>(
-        `SELECT MIN(next_attempt_at) AS next_attempt_at
-           FROM chunk_cleanup_intents
-          WHERE state IN ('pending', 'in_flight')`
-      )
-      .toArray()[0]?.next_attempt_at;
-    const nextUploadExpiry = this.sql
-      .exec<{ deadline: number | null }>(
-        `SELECT MIN(deadline) AS deadline FROM (
-           SELECT expires_at AS deadline FROM write_stream_sessions
-           UNION ALL
-            SELECT CASE
-                     WHEN abort_retry_at > ?
-                       THEN abort_retry_at
-                     ELSE expires_at
-                   END AS deadline
-              FROM upload_sessions WHERE status IN ('open', 'finalizing', 'aborting')
-            UNION ALL
-            SELECT COALESCE(terminal_at, created_at) + ? AS deadline
-              FROM upload_sessions
-             WHERE status IN ('finalized', 'aborted', 'poisoned')
-            UNION ALL
-           SELECT f.created_at + 3600000 AS deadline
-             FROM files f
-             LEFT JOIN write_stream_sessions ws ON ws.tmp_id = f.file_id
-             LEFT JOIN upload_sessions us ON us.upload_id = f.file_id
-            WHERE f.status = 'uploading'
-              AND f.file_name LIKE '_vfs_tmp_%'
-              AND ws.tmp_id IS NULL AND us.upload_id IS NULL
-         )`,
-        Date.now(),
-        MULTIPART_TERMINAL_RETENTION_MS
-      )
-      .toArray()[0]?.deadline;
+    const nextPending = nextPendingMaintenanceAt(this);
 
     // Reschedule while any bounded maintenance queue still has work.
     const maintenanceHasMore =
@@ -1884,27 +1850,20 @@ export class UserDOCore extends DurableObject<Env> {
       retentionHasMore ||
       schemaHasMore ||
       yjsHasMore;
-    if (
-      maintenanceHasMore ||
-      (nextCleanupAttempt !== null && nextCleanupAttempt !== undefined) ||
-      (nextUploadExpiry !== null && nextUploadExpiry !== undefined)
-    ) {
+    if (maintenanceHasMore || nextPending !== null) {
       let target = maintenanceHasMore
         ? Date.now() + (multipartHasMore ? 1_000 : 60_000)
         : Number.POSITIVE_INFINITY;
-      if (nextCleanupAttempt !== null && nextCleanupAttempt !== undefined) {
-        target = Math.min(
-          target,
-          Math.max(Date.now() + 1_000, nextCleanupAttempt)
-        );
+      if (nextPending !== null) {
+        target = Math.min(target, Math.max(Date.now() + 1_000, nextPending));
       }
-      if (nextUploadExpiry !== null && nextUploadExpiry !== undefined) {
-        target = Math.min(
-          target,
-          Math.max(Date.now() + 1_000, nextUploadExpiry)
-        );
-      }
-      await scheduleAlarmAt(this, target);
+      // Set only for what SQL shows pending, a write that leaves nothing of it
+      // pending takes it back.
+      await scheduleAlarmAt(
+        this,
+        target,
+        maintenanceHasMore ? "other" : "pending"
+      );
     }
   }
 

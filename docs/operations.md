@@ -169,7 +169,7 @@ SELECT ts, op, target, payload
 
 ### Retention
 
-Per-tenant cap defaults to **10,000 rows**; oldest rows trim down to a 9,800-row floor when the cap is exceeded. Trim runs from the existing UserDO alarm; no separate scheduling. Operators can override per-tenant via `vfs_meta.key='audit_log_max_rows'`:
+Per-tenant cap defaults to **10,000 rows**; the insert that takes a log past its cap trims the oldest rows down to a floor 2% under it (9,800 rows). A log grows only when its tenant writes, so no alarm is involved. Operators can override per-tenant via `vfs_meta.key='audit_log_max_rows'`:
 
 ```sql
 INSERT OR REPLACE INTO vfs_meta (key, value) VALUES ('audit_log_max_rows', '50000');
@@ -181,9 +181,9 @@ Insertion is best-effort &mdash; a SQL failure during `insertAuditLog` is swallo
 
 ## Alarm-handler failure alerting
 
-The UserDO alarm handles four sweeps in sequence: stale tmp-row reaper, expired multipart sessions, shard capacity poll, and audit-log retention trim. Bare `catch {}` is forbidden; every alarm exception goes through `recordAlarmFailure`:
+The UserDO alarm handles three sweeps in sequence: stale tmp-row reaper, expired multipart sessions, and shard capacity poll. Bare `catch {}` is forbidden; every alarm exception goes through `recordAlarmFailure`:
 
-1. Logs `event=alarm_handler_failed` via `logError` with `sweepKind` (`stale_tmp_sweep` / `multipart_sweep` / `shard_capacity_poll` / `audit_log_reap`) and the underlying error code/message/stack.
+1. Logs `event=alarm_handler_failed` via `logError` with `sweepKind` (`stale_tmp_sweep` / `multipart_sweep` / `shard_capacity_poll`) and the underlying error code/message/stack.
 2. Increments a persistent `vfs_meta.alarm_failures` counter (UPSERT pattern with INTEGER cast).
 3. Continues processing &mdash; alarms have at-least-once retry semantics; throwing replays the alarm without progress on the remaining work.
 
