@@ -80,6 +80,29 @@ export class UserDO extends UserDOCore {
    * The reconciler is best-effort: any error is logged and swallowed
    * so it never blocks Core's alarm reschedule logic.
    */
+  /**
+   * A published file not yet search-indexed is maintenance the alarm owes:
+   * its reconciler (below) is how a file whose SPA never posted the index
+   * gets one, so a completed write does not take the alarm back from it.
+   * Matches `appListUnindexedFiles`.
+   */
+  protected override hasPendingMaintenance(): boolean {
+    if (super.hasPendingMaintenance()) return true;
+    return (
+      this.sql
+        .exec(
+          `SELECT 1 FROM files f
+             ${FILE_HEAD_JOIN}
+            WHERE f.status = 'complete'
+              AND f.indexed_at IS NULL
+              AND COALESCE(f.index_attempts, 0) < 5
+              AND (f.head_version_id IS NULL OR fv.deleted IS NULL OR fv.deleted = 0)
+            LIMIT 1`
+        )
+        .toArray().length > 0
+    );
+  }
+
   override async alarm(): Promise<void> {
     await super.alarm();
     try {

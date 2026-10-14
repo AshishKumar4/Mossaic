@@ -113,6 +113,7 @@ import {
 import {
   alarmRunning,
   nextPendingMaintenanceAt,
+  registerMaintenanceCheck,
   scheduleAlarmAt,
   scheduleStaleUploadSweep,
   transactionSync,
@@ -176,6 +177,31 @@ export class UserDOCore extends DurableObject<Env> {
     this.state = ctx;
     this.storage = ctx.storage;
     this.envPublic = env;
+    registerMaintenanceCheck(this, () => this.hasPendingMaintenance());
+  }
+
+  /**
+   * Maintenance the alarm still owes beyond the deadlines the SQL shows
+   * (`nextPendingMaintenanceAt`): a version-retention operation still
+   * running, a schema maintenance page (the retention order among them)
+   * still to run, a Yjs cleanup still queued. A subclass adds its own.
+   * Read only: an instance that has not opened its schema keeps its alarm
+   * rather than run schema maintenance from inside another operation.
+   */
+  protected hasPendingMaintenance(): boolean {
+    if (!this.initialized) return true;
+    return (
+      this.sql
+        .exec(
+          `SELECT 1 FROM version_retention_operations WHERE status = 'running'
+           UNION ALL
+           SELECT 1 FROM schema_maintenance WHERE state <> 'ready'
+           UNION ALL
+           SELECT 1 FROM yjs_cleanup_operations
+           LIMIT 1`
+        )
+        .toArray().length > 0
+    );
   }
 
   /**

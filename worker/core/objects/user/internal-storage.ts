@@ -170,17 +170,36 @@ export function nextPendingMaintenanceAt(
   return deadlines.length === 0 ? null : Math.min(...deadlines);
 }
 
+const maintenanceChecks = new WeakMap<StorageCapability, () => boolean>();
+
+/**
+ * How an object says it has maintenance its alarm still owes beyond the
+ * deadlines {@link nextPendingMaintenanceAt} reads: a retention operation or
+ * a schema page still to run, a Yjs cleanup, and whatever a subclass adds
+ * (the App's files not yet search-indexed). An object that registers none
+ * never has its alarm taken back.
+ */
+export function registerMaintenanceCheck(
+  durableObject: StorageCapability,
+  pending: () => boolean
+): void {
+  maintenanceChecks.set(durableObject, pending);
+}
+
 /**
  * Takes back an object's alarm once nothing it was set for is pending: called
  * as a write, a delete or a cleanup drain finishes. A completed write armed
  * the stale-upload sweep and left it nothing, so the alarm would wake the
- * object 10 minutes later to find nothing to do.
+ * object 10 minutes later to find nothing to do. Every need the alarm serves
+ * keeps it: a deadline the SQL shows, the object's own maintenance check, or a
+ * reason other than "pending".
  */
 export async function settlePendingSweep(
   durableObject: StorageCapability
 ): Promise<void> {
   if (alarmReasons.get(durableObject) !== "pending") return;
   if (nextPendingMaintenanceAt(durableObject) !== null) return;
+  if (maintenanceChecks.get(durableObject)?.() ?? true) return;
   alarmReasons.delete(durableObject);
   await durableObject.storage.deleteAlarm();
 }
